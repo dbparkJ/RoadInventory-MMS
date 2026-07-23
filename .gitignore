@@ -1,0 +1,56 @@
+# Python environments and generated caches
+.venv/
+venv/
+env/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# MMS source data and generated calibration value sheets
+TRK500Neo/
+data/
+datasets/
+calibration.json
+calibration_values.json
+calibration_values.csv
+*.las
+*.laz
+*.pcdb
+*.db
+
+# Model binaries
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Pipeline results, logs, and GIS sidecars
+outputs*/
+output/
+logs/
+*.log
+*.shp
+*.shx
+*.dbf
+*.prj
+*.qpj
+*.wkt2
+*.cpg
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp

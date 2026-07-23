@@ -1,0 +1,320 @@
+# MMS 도로표지 3차원 위치 생성 파이프라인 설정
+# 실행 방법:
+#   Windows : .\.venv\Scripts\python.exe run_pipeline.py
+#   Linux   : ./.venv/bin/python run_pipeline.py
+# 다른 설정을 쓸 때는 `python run_pipeline.py 다른설정.yaml`처럼 파일 하나만 전달합니다.
+# 상대 경로는 현재 터미널 위치가 아니라 이 YAML 파일이 있는 폴더를 기준으로 해석됩니다.
+# true/false는 따옴표 없이 쓰고, 값이 없는 선택 항목은 null로 둡니다.
+config_version: 1
+
+paths:
+  # Leica 프로젝트 또는 기존 MMS 데이터의 최상위 폴더입니다.
+  data_root: TRK500Neo
+  # extract_calibration.py로 생성한 보정 스냅샷입니다.
+  calibration_path: calibration.json
+  # YOLO detection/segmentation 가중치 파일입니다.
+  model_path: best.pt
+  # TXT, SHP, 디버그 영상, LAS crop, 로그가 생성될 폴더입니다.
+  output_dir: outputs_ver9_noclass
+  # 대용량 LAS/PCDB 공간 인덱스 캐시입니다. 데이터가 바뀌면 자동 갱신됩니다.
+  pointcloud_cache_path: .cache/pointcloud_catalog.json
+  # 업체가 별도로 확정한 CRS WKT가 있을 때 지정합니다. 입력 LAS WKT를 쓸 때는 null입니다.
+  crs_wkt_path: null
+
+input:
+  # auto는 legacy CAM CSV와 Leica Sphere CSV를 자동 판별합니다.
+  # 가능한 값: auto, legacy, leica-sphere
+  pose_format: auto
+  # auto는 PCDB를 우선 찾고, 없으면 LAS를 사용합니다. 가능한 값: auto, pcdb, las
+  point_source: auto
+  # true이면 각 pose track에 일치하는 calibration.json 항목이 없을 때 즉시 중단합니다.
+  require_calibration: true
+  # Leica GPS seconds-of-week에 적용할 GPS week입니다. null이면 job.db/calibration에서 추론합니다.
+  gps_week: null
+  # GPS 시각에서 UTC 시각으로 바꿀 때 빼는 초입니다. 2025년 데이터는 18초입니다.
+  gps_utc_offset_seconds: 18
+  # LAS 인덱스 한 chunk에 읽을 점 개수입니다. 메모리가 부족하면 줄입니다.
+  las_index_chunk_points: 250000
+  # pose와 가장 가까운 점군 bbox 사이 허용 거리(m)입니다. CRS 오류 탐지용이며 0이면 검사를 끕니다.
+  max_pose_pointcloud_separation_m: 1000.0
+
+yolo:
+  # YOLO 입력 영상 크기입니다. 키우면 작은 표지 검출률과 GPU 메모리 사용량이 함께 증가합니다.
+  imgsz: 1280
+  # 검출 confidence 하한입니다. 누락이 많으면 낮추고 오검출이 많으면 높입니다. 범위 0~1.
+  conf: 0.8
+  # YOLO NMS IoU 임계값입니다. 중복 검출이 많으면 낮춰 봅니다. 범위 0~1.
+  iou: 0.45
+  # 이미지 한 장에서 허용할 최대 검출 개수입니다.
+  max_det: 100
+  # auto는 CUDA가 있으면 cuda:0, 없으면 cpu를 사용합니다. 직접 cuda:0 또는 cpu로 지정할 수 있습니다.
+  device: auto
+
+panorama_detection:
+  # forward는 차량 정면축을 중심으로 왜곡을 편 rectilinear 영상 한 장에서만 검출합니다.
+  # panorama는 기존처럼 360도 전체/타일 검출을 사용합니다. 도로 전방 표지는 forward를 권장합니다.
+  detection_view_mode: forward
+  # 정면 검출용 정사각 영상의 한 변 크기(px)입니다. YOLO imgsz와 같게 두는 것이 일반적입니다.
+  forward_view_size: 1280
+  # 정면 검출 영상의 수평 시야각입니다. 70도 문맥을 YOLO에 보여 주되 최종 좌표 채택은 아래 max_center_ray_angle_deg=25로 제한합니다.
+  # 정사각 영상에서 표지 비율이 찌그러지지 않도록 수직 시야각과 반드시 같게 둡니다.
+  forward_view_hfov_deg: 70.0
+  # 정면 검출 영상의 수직 시야각입니다. 수평값과 같은 70도로 두어 픽셀 축척을 동일하게 유지합니다.
+  forward_view_vfov_deg: 70.0
+  # true이면 파노라마 전체를 한 번에 보는 검출 단계를 끕니다.
+  disable_full_panorama_detection: false
+  # true이면 겹치는 tile 검출 단계를 끕니다. 두 검출 단계를 동시에 끌 수는 없습니다.
+  disable_tiled_detection: false
+  # tile 너비(px)입니다. 0이면 파노라마 너비의 1/4로 자동 설정합니다.
+  tile_width_px: 0
+  # tile 높이(px)입니다. 0이면 파노라마 전체 높이를 사용합니다.
+  tile_height_px: 0
+  # 인접 tile 사이 중첩 폭(px)입니다. 경계 표지 누락 방지에 사용합니다.
+  tile_overlap_px: 384
+  # 한 번의 YOLO 호출에 넣는 tile 수입니다. GPU 메모리가 부족하면 줄입니다.
+  tile_batch_size: 4
+  # 전체/타일 검출 결과를 같은 표지로 병합하는 circular IoU 임계값입니다. 범위 0~1.
+  tile_merge_iou: 0.5
+
+panorama_alignment:
+  # 파노라마 픽셀과 점군 투영 사이의 수평 잔차 보정각(deg)입니다.
+  # 양수는 점군 투영 위치를 영상 오른쪽으로 이동시킵니다. 여러 프레임 RGB 대조에서 측정한 +3px(7040px 기준)를 반영했습니다.
+  # 이 값은 파노라마 래스터 정렬만 보정하며, Sphere CSV에 이미 반영된 카메라 위치/자세나 calibration 원시 lever-arm을 다시 적용하지 않습니다.
+  panorama_yaw_offset_deg: 0.1534
+  # 수직 잔차 보정각(deg)입니다. 양수는 점군 투영 위치를 영상 아래쪽으로 이동시킵니다.
+  # 현재 프레임별 수직 잔차 방향이 일정하지 않아 0으로 유지합니다.
+  panorama_pitch_offset_deg: 0.0
+  # true이면 실행 시작 시 여러 주행 구간의 파노라마 RGB와 LAS RGB를 대조해 잔여 정렬 오차를 로그 JSON으로만 보고합니다.
+  # 측정값을 자동 적용하지 않으므로 아래 수동 보정값이 실행 중 임의로 바뀌지 않습니다.
+  alignment_qa_enabled: true
+  # 정렬 QA에 사용할 이미지 수입니다. 서로 다른 주행 구간에서 고르게 선택합니다.
+  alignment_qa_sample_images: 8
+  # 이미지 한 장당 RGB 비교에 사용할 점의 최대 개수입니다. 늘리면 안정성 및 실행 시간이 함께 증가합니다.
+  alignment_qa_max_points_per_image: 20000
+  # 현재 보정값 주변에서 추가로 탐색할 최대 픽셀 이동량입니다.
+  alignment_qa_search_radius_px: 6
+  # RGB 오차가 작은 점 중 점수 계산에 사용할 비율입니다. 가림·움직이는 객체의 영향을 줄이기 위해 0.8을 사용합니다.
+  alignment_qa_trim_fraction: 0.80
+  # 정렬 QA에 사용할 점의 최소 카메라 거리(m)입니다. 너무 가까운 차량·장비 점을 배제합니다.
+  alignment_qa_min_range_m: 2.0
+  # 정렬 QA에 사용할 점의 최대 카메라 거리(m)입니다. 멀리 있는 희박한 점의 영향을 제한합니다.
+  alignment_qa_max_range_m: 15.0
+  # 자동 권고값을 만들기 위해 필요한 최소 유효 이미지 수입니다.
+  alignment_qa_min_valid_samples: 3
+  # 프레임별 이동량 중앙절대편차(MAD)가 이 값(px) 이하여야 안정적인 권고로 표시합니다. 노선별 차이를 숨기지 않도록 1px로 엄격히 둡니다.
+  alignment_qa_max_mad_px: 1.0
+
+point_matching:
+  # 이미지마다 검색할 인접 LAS/PCDB 파일의 최대 개수입니다.
+  pointcloud_neighbor_count: 6
+  # mask/bbox 주변 점군 검색 영역에 더하는 영상 여백(px)입니다.
+  point_padding_px: 24
+  # 카메라에서 사용할 점까지의 최대 거리(m)입니다.
+  max_range_m: 12.0
+  # strict 거리 안에서 검출 mask에 점이 하나도 없을 때만 제한적으로 더 먼 점군을 다시 검색합니다.
+  # true여도 strict 결과가 한 점이라도 있으면 재검색하지 않으므로 기존 정상 결과에는 영향을 주지 않습니다.
+  point_range_fallback_enabled: true
+  # no-points 재검색의 최대 카메라-점 거리(m)입니다. max_range_m보다 커야 합니다.
+  # 배경 혼입을 제한하면서 12~15m의 작은 표지를 복구하도록 15m를 사용합니다.
+  point_range_fallback_max_range_m: 15.0
+  # fallback에서만 허용하는 최종 밀집 군집의 최소 점 개수입니다. 일반 min_point_count는 그대로 유지됩니다.
+  point_range_fallback_min_point_count: 60
+  # 전방 깊이창에 남은 점 중 선택된 단일 밀집 군집이 차지해야 하는 최소 비율입니다.
+  # 낮추면 여러 물체가 섞인 희박한 점군이 채택될 가능성이 커집니다.
+  point_range_fallback_min_cluster_fraction: 0.80
+  # fallback 군집점 중 padding을 제외한 원래 segmentation mask/bbox 안에 있어야 하는 최소 비율입니다.
+  # 대표점도 반드시 원래 mask 내부에 있어야 하며 이 조건은 배경 식생 매칭을 줄입니다.
+  point_range_fallback_min_core_mask_fraction: 0.45
+  # fallback 군집의 카메라 거리 5~95 분위수 폭 최대값(m)입니다.
+  # 서로 다른 깊이의 표지·식생·배경면이 한 군집에 섞인 경우를 제거합니다.
+  point_range_fallback_max_depth_span_m: 0.50
+  # 전면 거리 기준으로 뒤쪽 점을 허용할 깊이 창(m)입니다. 배경 혼입 시 줄입니다.
+  depth_window_m: 1.0
+  # 전면을 단일 최근접점이 아닌 거리 분위수로 잡습니다. 범위 0~1.
+  front_surface_quantile: 0.02
+  # 전면 거리 anchor 결정 전에 확보할 최소 정렬 점 개수입니다.
+  front_surface_min_support: 6
+  # 후보 점군 block 검색 원뿔에 더하는 각도 여유(deg)입니다.
+  block_angle_margin_deg: 1.5
+  # 카메라 정면과 검출 중심 ray의 최대 각도(deg)입니다. YOLO에는 70도 문맥을 주지만 SHP에는 정면 ±25도만 채택합니다.
+  max_center_ray_angle_deg: 25.0
+  # 이보다 최종 점이 적은 일반 검출은 SHP에서 제외합니다. no-points 거리 fallback은 위 별도 최소점을 사용합니다.
+  min_point_count: 100
+
+perspective_rectification:
+  # 검출 주변을 펼쳐 만드는 정사각 perspective 영상 크기(px)입니다.
+  perspective_view_size: 1024
+  # 검출 각범위 바깥에 추가할 시야각 여유(deg)입니다.
+  perspective_margin_deg: 6.0
+  # perspective 영상의 최소 시야각(deg)입니다.
+  perspective_min_fov_deg: 18.0
+  # perspective 영상의 최대 시야각(deg)입니다. 최소값보다 작게 설정할 수 없습니다.
+  perspective_max_fov_deg: 110.0
+
+clustering:
+  # 선택 점의 밀도 군집화 이웃 반경(m)입니다.
+  cluster_radius_m: 0.35
+  # 밀집 군집에 포함되기 위한 최소 이웃 점 개수입니다.
+  cluster_min_neighbors: 6
+  # 군집 median에서 반경의 이 배수보다 먼 점을 제거합니다.
+  cluster_trim_radius_multiplier: 2.5
+
+pole_detection:
+  # true이면 검출된 표지 점을 기준으로 지주 축과 지면의 교점을 추가 계산합니다.
+  # 초기 검수 기간에는 false로 기존 결과와 비교한 뒤 true로 전환하는 것을 권장합니다.
+  pole_detection: true
+  # 지주·지면 계산에서 LAS classification을 사용하는 방식입니다.
+  # auto(기본): 아래에 설정한 ground/pole/excluded ID가 선택 LAS에 실제로 있을 때만 class+형상(HYBRID)을 사용하고,
+  #             전부 0/1이거나 공식 매핑이 없는 custom ID뿐이면 class를 무시한 형상(GEOMETRY) 방식으로 자동 전환합니다.
+  # off: LAS에 class가 있어도 알고리즘에는 전달하지 않고 항상 형상 방식만 사용합니다. 원본 class는 검수용 pole LAS에 보존됩니다.
+  # require: 선택된 모든 LAS에 설정한 의미 class가 있어야 실행하며, PCDB·미분류·미매핑 데이터면 시작 단계에서 오류를 냅니다.
+  pole_classification_mode: off
+  # 표지 주변 지주가 함께 보이도록 만드는 광시야 디버그 영상의 최소 시야각(deg)입니다.
+  pole_min_fov_deg: 90.0
+  # 표지 bbox 너비를 기준으로 좌우 지주 탐색 통로를 확장하는 배수입니다. 캔틸레버 표지는 3~5를 권장합니다.
+  pole_corridor_side_expand_ratio: 4.0
+  # 표지 bbox 높이를 기준으로 탐색 통로의 시작점을 위로 올리는 비율입니다. 수평 암 연결부를 포함합니다.
+  pole_corridor_top_margin_ratio: 0.25
+  # 표지 대표점의 XY 주변에서 지주 후보를 찾는 최대 반경(m)입니다.
+  pole_search_radius_m: 8.0
+  # 표지 높이에서 아래쪽으로 검색하는 최대 높이 차(m)입니다. 높은 신호등 암과 가려진 지주 하단까지 포함하도록 8m를 사용합니다.
+  pole_max_drop_m: 8.0
+  # 표지 높이보다 위쪽 점도 후보에 포함할 여유(m)입니다.
+  pole_top_margin_m: 3.0
+  # 지주 후보를 XY 격자로 요약할 셀 크기(m)입니다. 작을수록 가는 지주에 민감하지만 노이즈가 늘 수 있습니다.
+  pole_xy_voxel_m: 0.10
+  # 수직 연속성을 검사할 Z 구간 높이(m)입니다.
+  pole_z_bin_m: 0.15
+  # 인접 XY 셀을 하나의 지주 후보로 묶는 반경(m)입니다.
+  pole_axis_cluster_radius_m: 0.24
+  # 추정 지주 중심축에서 이 거리(m) 안의 점만 축 inlier로 사용합니다.
+  pole_axis_inlier_radius_m: 0.18
+  # 지주로 인정할 최소 수직 길이(m)입니다. 짧은 차량·난간 조각을 제거합니다.
+  pole_min_vertical_span_m: 0.75
+  # 지주가 연속해서 차지해야 하는 최소 Z 구간 개수입니다.
+  pole_min_vertical_bins: 5
+  # 실제 점이 끊기지 않고 연속해서 차지해야 하는 최소 Z 구간 개수입니다. 지면과 상부 물체만 떨어져 있는 가짜 축을 제거합니다.
+  pole_min_consecutive_vertical_bins: 4
+  # 지주 축 관측점 사이에서 허용할 최대 수직 공백(m)입니다. 큰 공백은 지주로 이어 붙이지 않습니다.
+  pole_max_observed_z_gap_m: 1.0
+  # 관측된 최저~최고 높이 사이 Z 구간 중 점이 들어 있는 구간의 최소 비율입니다.
+  pole_min_vertical_occupancy_ratio: 0.35
+  # 지주 최저점에서 전체 관측 높이의 이 비율 위쪽부터 중간부 연속성 검사를 시작합니다. 하단 가림은 허용합니다.
+  pole_middle_support_start_fraction: 0.20
+  # 위 시작점부터 최고점까지 기대되는 Z 구간 중 실제 지주 점이 있는 최소 비율입니다.
+  pole_min_middle_support_coverage_ratio: 0.30
+  # 후보 축의 (중간 높이 점유율, 관측 높이/표지-지면 높이) 중 작은 값입니다.
+  # 이 값 이상인 전체 지주축을 짧은 표지 가장자리·상부 부속물 축보다 먼저 선택합니다.
+  # 이 값만으로 나무를 모두 구분할 수는 없으므로 아래 GEOMETRY 원격 gate와 함께 사용합니다.
+  pole_preferred_min_completeness_ratio: 0.75
+  # class를 쓰지 않는 GEOMETRY 모드에서 각 XY 지면 셀의 저점보다 이 높이(m) 이내인 점을 축 후보에서만 제외합니다.
+  # 지면 계산에는 원본 점을 그대로 사용합니다. 0이면 이 선제 지면 제거를 끕니다.
+  pole_geometry_ground_clearance_m: 0.20
+  # GEOMETRY 모드의 원격 지주(표지 바로 아래가 아닌 측면 지주)에 적용하는 최소 축 완전도입니다.
+  # 적재물·나뭇가지의 짧은 수직 조각을 지주로 채택하지 않도록 하는 하드 기준입니다.
+  pole_geometry_remote_min_completeness_ratio: 0.75
+  # GEOMETRY 모드 원격 축의 최대 방사 RMSE(m)입니다. 값이 작을수록 곧고 가는 축만 허용합니다.
+  pole_geometry_remote_max_axis_rmse_m: 0.095
+  # GEOMETRY 모드 원격 축 주변 지면 평면의 최대 RMSE(m)입니다. 적재물 상면을 지면으로 오인하는 것을 줄입니다.
+  pole_geometry_remote_max_ground_rmse_m: 0.15
+  # 한 지주 축 후보에 필요한 최소 점 개수입니다.
+  pole_min_points: 18
+  # 수직선에서 허용할 지주 축의 최대 기울기(deg)입니다.
+  pole_max_axis_tilt_deg: 15.0
+  # 이 거리(m) 안의 축은 표지에 직접 붙은 지주로 봅니다. 여러 후보가 있으면 가장 가까운 실제 지주를 우선합니다.
+  pole_direct_max_axis_sign_distance_m: 0.75
+  # 측면 캔틸레버·신호등 암 끝 지주까지 찾는 최대 수평거리(m)입니다. 이 범위의 원격 축은 아래 수평 연결봉 검사를 반드시 통과해야 합니다.
+  pole_max_axis_sign_distance_m: 8.0
+  # 표지 중심에서 원격 지주까지 이어지는 수평 연결봉을 검사할 때 선분 좌우 허용 폭(m)입니다.
+  pole_horizontal_connection_radius_m: 0.25
+  # 수평 연결봉 점으로 인정할 표지 중심 높이와의 최대 Z 차(m)입니다.
+  pole_horizontal_connection_z_tolerance_m: 0.30
+  # 수평 연결 선분을 연속성 검사 구간으로 나누는 간격(m)입니다.
+  pole_horizontal_connection_bin_m: 0.25
+  # 한 연결 구간이 채워졌다고 인정할 최소 점 개수입니다.
+  pole_horizontal_connection_min_points_per_bin: 2
+  # 전체 연결 구간 중 점군이 이어져 있어야 하는 최소 비율입니다. 0.5는 절반 이상 실제 봉 근거가 있어야 원격 지주를 허용합니다.
+  pole_min_horizontal_connection_coverage: 0.50
+  # 축 inlier의 대표 class가 ground/road일 때 허용하는 최대 비율입니다. 도로 점열을 지주로 오인하는 것을 막습니다.
+  pole_max_ground_class_fraction: 0.35
+  # 추정 지면은 표지보다 최소 이 거리(m)만큼 낮아야 합니다. 수평 암이나 표지 뒷면을 지면으로 오인하는 것을 막습니다.
+  pole_min_ground_drop_m: 1.8
+  # true면 신뢰할 로컬 지면 평면이 없는 축은 pole_bottoms.shp에 내보내지 않습니다.
+  pole_require_ground: true
+  # 지주 하단 주변의 지면 평면을 찾는 최대 반경(m)입니다.
+  pole_ground_search_radius_m: 1.5
+  # 연석 건너 도로면으로 내려가는 것을 막기 위한 근거리 지면의 최대 반경(m)입니다. 필요한 셀이 모이는 가장 작은 반경을 자동 선택합니다.
+  pole_ground_core_radius_m: 0.75
+  # 지주 자체 점을 지면 계산에서 제외할 중심 반경(m)입니다.
+  pole_ground_exclusion_radius_m: 0.24
+  # 지면의 낮은 점을 요약하는 XY 셀 크기(m)입니다.
+  pole_ground_cell_size_m: 0.25
+  # 분류 지면이 없을 때 각 셀에서 선택할 Z 분위수입니다. 분류 지면(2/11)은 잡음 편향을 막기 위해 중앙값을 씁니다.
+  pole_ground_cell_quantile: 0.10
+  # 지면 평면 계산에 필요한 최소 유효 셀 개수입니다.
+  pole_ground_min_cells: 6
+  # 자동 지면으로 인정할 평면 적합 RMSE 상한(m)입니다.
+  pole_ground_max_rmse_m: 0.20
+  # 분류된 도로면보다 형상 기반 근거리 평면의 대표 반경이 이 값(m) 이상 가까우면 근거리 평면을 사용합니다.
+  # 지주 앞 적재물 뒤에서 먼 도로면으로 과도하게 내려가는 00192 유형을 막습니다.
+  pole_ground_geometry_preference_margin_m: 0.10
+  # 관측된 지주 최하단과 추정 지면의 차이가 이 값(m)보다 크면 하단 가림으로 표시합니다.
+  pole_occlusion_gap_m: 0.35
+  # 공급사 LAS에서 지면으로 사용할 class ID 목록입니다. 일반 ground=2와 road=11을 기본 사용합니다.
+  pole_ground_class_ids: [2, 11]
+  # 공급사가 확인한 지주 전용 class ID 목록입니다. 모르면 빈 목록으로 두어 형상 기반으로 찾습니다.
+  # 현재 샘플에서 84가 관찰됐지만 정식 class map 확인 전에는 [84]로 고정하지 마십시오.
+  pole_class_ids: []
+  # 지주 후보에서 제외할 class ID 목록입니다. LAS 표준 저·중·고 식생은 3, 4, 5입니다.
+  pole_excluded_pole_class_ids: [3, 4, 5]
+  # 인접 프레임에서 얻은 같은 지주 하단점을 하나로 합칠 XY 반경(m)입니다.
+  pole_observation_merge_radius_m: 0.75
+  # 최종 pole_bottoms.shp에 쓰기 위해 필요한 최소 프레임 관측 수입니다. 초기 검수는 1, 운영은 2 이상을 권장합니다.
+  pole_min_observations: 1
+  # 같은 주행 레코드·같은 클래스·같은 지주에 속한 표지 관측을 하나로 합칠 최대 XY 차(m)입니다.
+  sign_observation_merge_xy_radius_m: 0.25
+  # 위 동일 표지 관측을 합칠 최대 Z 차(m)입니다.
+  sign_observation_merge_z_radius_m: 0.25
+  # 한 프레임에서 지주를 못 찾은 관측을 지주가 확인된 이전/인접 프레임 관측에 합칠 더 엄격한 XY 차(m)입니다.
+  sign_observation_fallback_xy_radius_m: 0.15
+  # 지주가 없는 관측을 이전/인접 프레임 관측에 합칠 더 엄격한 Z 차(m)입니다.
+  sign_observation_fallback_z_radius_m: 0.20
+  # true이면 표지·지주·축·하단점을 함께 그린 광시야 디버그 영상을 저장하지 않습니다.
+  disable_pole_debug: false
+  # true이면 지주 축 inlier만 담은 별도 LAS 파일을 저장하지 않습니다.
+  disable_pole_point_crop: false
+
+debug_output:
+  # 저장할 검출 crop 주위의 영상 여백(px)입니다.
+  debug_crop_padding_px: 32
+  # 검출 mask 채움 투명도(0=완전 투명, 255=불투명)입니다.
+  # 원본 표지가 잘 보이도록 기본값을 8로 낮췄으며, 선만 보려면 0을 사용합니다.
+  debug_mask_alpha: 8
+  # 점군 QA 미리보기 패널 한 변의 크기(px)입니다.
+  point_preview_size: 320
+  # 대표점 기준으로 저장할 LAS crop의 XYZ 반경(m)입니다. 0 이하는 선택 군집 전체를 저장합니다.
+  las_crop_half_extent_m: 1.0
+
+execution:
+  # 병렬 worker 수입니다. 단일 GPU에서는 1을 권장합니다.
+  num_workers: 1
+  # true이면 여러 worker가 같은 CUDA device를 공유하도록 강제 허용합니다. 메모리 충돌 위험이 있어 기본은 false입니다.
+  allow_unsafe_cuda_multiprocessing: false
+  # worker가 상세 진행 로그 파일에 상태를 남길 이미지 간격입니다. 콘솔 상태바와는 별개입니다.
+  worker_progress_every: 10
+  # 다중 worker 실행 시 run.log heartbeat와 중간 SHP 갱신 간격(초)입니다.
+  progress_log_interval_sec: 60
+  # true이면 실행 중 중간 SHP 생성을 끄고 마지막에만 생성합니다.
+  disable_intermediate_shp: false
+  # true이면 콘솔 상태바를 숨깁니다. false이면 처리율과 예상 잔여 시간(ETA)을 표시합니다.
+  disable_console_progress: false
+  # logs/run.log와 logs/workers/*.log에 기록할 최소 단계입니다: DEBUG, INFO, WARNING, ERROR
+  log_level: INFO
+
+resume_and_scope:
+  # true이면 동일 입력·모델·설정 fingerprint의 완성된 결과를 재사용합니다.
+  skip_existing: true
+  # 정렬된 전체 이미지 목록에서 시작할 0 기반 인덱스입니다.
+  start_index: 0
+  # 처리할 이미지 수입니다. 0이면 start_index 이후 전부 처리합니다.
+  limit_images: 0

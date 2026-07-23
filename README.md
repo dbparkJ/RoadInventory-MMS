@@ -1,0 +1,500 @@
+# MMS 도로표지·지주 3차원 좌표 생성
+
+MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 LAS/PCDB 점군을 영상에 투영해 표지의 3차원 대표점을 계산하는 파이프라인입니다. 선택적으로 표지에 연결된 단일 지주 축을 찾고 로컬 지면까지 연장해 지주 중앙 하단점도 생성합니다.
+
+최종 결과는 표지와 지주를 분리한 `POINTZ` Shapefile입니다. 동일 표지의 반복 관측은 병합하고, 한 지주에 서로 다른 표지가 여러 개 달린 경우에는 각 표지의 `det_id`에 대응하도록 같은 지주 좌표를 반복 기록합니다.
+
+> 이 결과는 자동 후보입니다. 특히 지주 하단이 차량·적재물·식생에 가려진 경우와 점군 분류가 불완전한 구간은 `pole_debug`와 `status`, `obs_count`, RMSE 필드를 검수한 뒤 납품해야 합니다. 최종 측량 정확도는 독립 검사점으로 확인해야 합니다.
+
+## 주요 기능
+
+- Leica TRK500Neo Sphere와 기존 MMS 데이터 구조 자동 탐색
+- 차량 진행 방향 중심의 정사각 rectilinear 영상으로 파노라마 왜곡을 줄인 YOLO-seg 추론
+- YAML 한 파일로 모델 confidence, 시야각, 거리, 점군, 지주, 디버그, 병렬 실행 설정
+- segmentation mask와 보정된 카메라 자세를 이용한 2D 검출 → 3D 점군 역매칭
+- 전면 표면 깊이 선택과 밀도 군집화로 배경점 혼입 억제
+- 직접 지주와 수평 연결봉이 확인된 원격 지주 탐색
+- 지주 하단 가림 시 관측 축과 로컬 지면 평면의 교점 계산
+- 표지·지주 분리 `POINTZ` SHP, CRS sidecar, JSON, QA 이미지, LAS crop 생성
+- 콘솔 상태바/처리율/ETA 표시와 전체 파일 로그 저장
+- Windows/Linux 공용 가상환경 자동 구성 및 PyTorch/CUDA smoke test
+
+수집업체에 전달할 입력 데이터 요구사항은 [docs/MMS_DATA_SPEC.md](docs/MMS_DATA_SPEC.md)에 정리되어 있습니다. 환경 구성 세부사항은 [ENV_SETUP.md](ENV_SETUP.md)를 참고하십시오.
+
+## 저장소 구성
+
+| 경로 | 역할 |
+|---|---|
+| `run_pipeline.py` | YAML 설정으로 전체 파이프라인 실행 |
+| `config.yaml` | 기본 실행 설정과 모든 옵션의 한국어 설명 |
+| `best.pt` | YOLO detection/segmentation 가중치 |
+| `extract_calibration.py` | Pegasus DB에서 카메라·LiDAR 보정 snapshot 추출 |
+| `export_calibration_values.py` | 보정 snapshot에서 숫자·단위만 JSON/CSV로 내보내기 |
+| `calibration_values.yaml` | 값 전용 보정 내보내기 입력·출력 설정 |
+| `bootstrap_environment.py` | Windows/Linux `.venv` 생성, 고정 패키지 설치, CUDA 검사 |
+| `verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
+| `mms_shp_detection/` | 데이터 탐색, 투영, 점군, 지주, SHP 구현 |
+| `tests/` | 설정·투영·점군·지주·SHP 회귀 테스트 |
+| `docs/MMS_DATA_SPEC.md` | MMS 수집업체 전달용 데이터 명세 |
+
+## 지원 입력
+
+### Leica TRK500Neo
+
+`paths.data_root` 아래에서 다음 파일을 재귀 탐색합니다.
+
+```text
+<data_root>/
+  MultiJob.PegasusProject/
+    Export/
+      JPEG/<Job>/<Track>/Sphere/
+        *_Sphere.csv          # 프레임별 위치·자세
+        *_Sphere.txt          # equirectangular 크기/범위 sidecar
+        *_Sphere_*.jpg        # 360° Sphere 영상
+      LAS/
+        <Job>_<Track>.las     # 전체본 또는 검증 가능한 _1, _2, ... 분할본
+    <Job>.job/
+      job.db                  # GPS week, LiDAR-to-IMU 보정
+      <Track>.scan/scan.db    # 카메라 내부·외부 보정
+```
+
+현재 Sphere CSV는 세미콜론 구분, 무헤더 17열 형식입니다.
+
+```text
+JPEG;GPS_SOW;X;Y;Z;omega_gon;phi_gon;kappa_gon;R11;...;R33
+```
+
+3×3 행렬은 local panorama → world 회전이며 코드에서는 다음 축으로 해석합니다.
+
+```text
+right   = R[:, 0]
+up      = R[:, 1]
+forward = -R[:, 2]
+```
+
+Leica가 Front/Rear 물리 카메라의 EUCM 내부표정과 보어사이트를 적용해 7040×3520 equirectangular Sphere를 생성하므로, 파이프라인은 raw 카메라 보정값을 Sphere에 다시 적용하지 않습니다. `calibration.json`은 센서·출력 크기·GPS week·보정 provenance를 검증하는 데 사용하고, 프레임 위치와 자세는 `*_Sphere.csv`를 사용합니다.
+
+LAS 전체본과 `_1`, `_2`, … 분할본이 함께 있으면 분할 번호의 연속성, 점 수 합계, bounds, CRS, scale, point format을 검사합니다. 분할본이 완전할 때만 분할본을 사용하며, 불완전하면 전체본을 선택합니다. 영상 Job과 관계없는 LAS는 인덱싱 대상에서 제외됩니다.
+
+### 기존 MMS
+
+기존 구조도 유지됩니다.
+
+```text
+<data_root>/
+  CAM/**/*.csv
+  CAM/**/*.{jpg,jpeg,png,tif,tiff}
+  LAS/**/*.pcdb
+```
+
+```yaml
+input:
+  pose_format: legacy
+  point_source: pcdb
+```
+
+`pose_format: auto`는 `CAM`이 있으면 기존 형식을, 그렇지 않으면 Leica `*_Sphere.csv`를 선택합니다. `point_source: auto`는 PCDB를 우선하고 없으면 LAS를 사용하므로, 혼합 폴더에서는 `las` 또는 `pcdb`를 명시하십시오.
+
+## 빠른 시작
+
+### 1. 기본 파일 경로 확인
+
+[config.yaml](config.yaml)의 다음 값을 먼저 실제 데이터에 맞춥니다. 상대경로는 터미널의 현재 위치가 아니라 YAML 파일이 있는 폴더 기준입니다.
+
+```yaml
+paths:
+  data_root: TRK500Neo
+  calibration_path: calibration.json
+  model_path: best.pt
+  output_dir: outputs_ver5
+```
+
+새 `best.pt`로 교체하면 모델 SHA-256이 실행 fingerprint에 포함되므로 `skip_existing: true`여도 이전 결과를 재사용하지 않고 다시 처리합니다.
+
+### 2. 가상환경 자동 구성
+
+64-bit CPython 3.12가 필요합니다. bootstrap은 운영체제, Python, `nvidia-smi`, driver가 지원하는 CUDA 버전과 GPU compute capability를 확인한 뒤 프로젝트 전용 `.venv`를 만들거나 재사용합니다.
+
+Windows PowerShell:
+
+```powershell
+Set-Location C:\work\mms_project
+py -3.12 .\bootstrap_environment.py
+```
+
+Linux:
+
+```bash
+cd /path/to/mms_project
+python3.12 bootstrap_environment.py
+```
+
+파일이나 패키지를 변경하지 않고 탐지 결과와 설치 예정 명령만 확인하려면 `--dry-run`을 사용합니다.
+
+```powershell
+py -3.12 .\bootstrap_environment.py --dry-run
+```
+
+GPU가 없는 장비에서 CPU 실행을 의도한 경우에만 `--allow-cpu`를 명시합니다.
+
+```bash
+python3.12 bootstrap_environment.py --allow-cpu
+```
+
+기존 `.venv`가 손상됐거나 Python 3.12가 아니면 bootstrap은 자동 삭제하지 않고 중단합니다. 필요한 파일을 보존한 뒤 해당 폴더를 직접 다른 이름으로 이동하고 다시 실행하십시오.
+
+#### CUDA/PyTorch 버전 원칙
+
+`requirements.txt`는 다음 조합을 고정합니다.
+
+```text
+torch       2.7.1+cu118
+torchvision 0.22.1+cu118
+torchaudio  2.7.1+cu118
+```
+
+`nvidia-smi`의 `CUDA Version`은 설치된 Toolkit 버전이 아니라 NVIDIA driver가 지원하는 최대 CUDA 버전입니다. PyTorch wheel은 CUDA 11.8 runtime을 자체 포함하므로 시스템 CUDA Toolkit이나 `nvcc`를 같은 버전으로 별도 설치할 필요가 없습니다. bootstrap은 driver 호환성과 실제 CUDA tensor/NMS 실행을 함께 확인합니다.
+
+설치 후 검증:
+
+```powershell
+.\.venv\Scripts\python.exe .\verify_environment.py
+.\.venv\Scripts\python.exe -m pip check
+```
+
+Linux:
+
+```bash
+./.venv/bin/python verify_environment.py
+./.venv/bin/python -m pip check
+```
+
+GPU 환경의 핵심 정상 출력은 다음과 같습니다.
+
+```text
+torch=2.7.1+cu118
+torchvision=0.22.1+cu118
+torch_cuda_runtime=11.8
+cuda_available=True
+cuda_nms=[0]
+environment_check=OK
+```
+
+현재 개발 장비의 RTX 4070 Laptop GPU에서도 위 조합을 확인했습니다. 다른 장비에서도 장비명이 아니라 마지막 `environment_check=OK`와 종료 코드 0을 정상 기준으로 사용하십시오.
+
+### 3. 캘리브레이션 추출
+
+Pegasus 프로젝트의 `Track*.scan/scan.db`와 각 Job의 `job.db`에서 보정 snapshot을 만듭니다.
+
+```powershell
+.\.venv\Scripts\python.exe extract_calibration.py `
+  .\TRK500Neo\MultiJob.PegasusProject `
+  --output .\calibration.json
+```
+
+Linux:
+
+```bash
+./.venv/bin/python extract_calibration.py \
+  ./TRK500Neo/MultiJob.PegasusProject \
+  --output ./calibration.json
+```
+
+추출 파일에는 Sphere 출력 모델/크기, Front/Rear EUCM `fx/fy/cx/cy/alpha/beta`, distortion, internal/external boresight, LiDAR-to-IMU Distance/Angles/Mounting, GPS week와 원본 값 provenance가 들어갑니다. Leica 내부 DB의 일부 값은 단위 메타데이터 없이 저장되므로 공급업체가 frame·축 순서·회전 정의·단위를 명시한 권위 보정 파일을 함께 제공하는 것이 가장 안전합니다.
+
+#### 숫자와 단위만 별도 추출
+
+검토표나 외부 문서에 넣을 값만 필요하면 `calibration_values.yaml`을 확인한 뒤 다음 명령을 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\export_calibration_values.py
+```
+
+```bash
+./.venv/bin/python export_calibration_values.py
+```
+
+기본 설정은 기존 `calibration.json`을 읽어 다음 두 파일을 만듭니다.
+
+```text
+calibration_values.json  # 센서/항목 계층과 단위를 유지한 읽기 쉬운 값 파일
+calibration_values.csv   # 값 하나당 한 행인 Excel 검토용 UTF-8 BOM CSV
+```
+
+내보내는 항목은 Sphere 크기/투영 모델, 카메라 EUCM·왜곡·내외부 boresight, LiDAR→IMU 보정, GPS week, 좌표계 EPSG/축/타원체/투영 파라미터입니다. base64, hex, 전체 WKT와 원본 DB 경로는 제외합니다. Leica DB가 단위를 선언하지 않은 카메라 boresight 값은 임의 단위를 붙이지 않고 `not_declared_in_leica_db`로 표시합니다.
+
+입력은 `calibration.json` 또는 PegasusProject 디렉터리를 사용할 수 있습니다. JSON을 입력하면서 `project.db`의 좌표계 값도 포함하려면 `input.project_root`를 함께 지정합니다. 다른 설정은 YAML 경로 하나만 전달합니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\export_calibration_values.py .\my_calibration_values.yaml
+```
+
+CSV가 필요 없으면 YAML의 `output.csv_path`를 `null`로 둡니다. 이 값 전용 파일은 검토/전달 편의를 위한 것이며, 파이프라인의 보정 provenance 검증에는 원본 구조를 보존한 `calibration.json`을 계속 사용합니다.
+
+### 4. YAML 기반 실행
+
+기본 실행에는 인자를 사용하지 않습니다. 저장소 루트의 `config.yaml`을 자동으로 읽습니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\run_pipeline.py
+```
+
+```bash
+./.venv/bin/python run_pipeline.py
+```
+
+별도 설정 파일을 사용할 때만 YAML 경로 하나를 전달합니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\run_pipeline.py .\config_verify.yaml
+```
+
+한 프레임만 검증할 때는 `config.yaml`을 복사한 별도 YAML에서 다음처럼 범위를 제한하십시오.
+
+```yaml
+paths:
+  output_dir: outputs_verify
+
+resume_and_scope:
+  skip_existing: false
+  start_index: 175   # 정렬된 전체 프레임의 0 기반 인덱스
+  limit_images: 1
+```
+
+## YAML 설정
+
+모든 항목의 의미, 단위, 조정 방향은 [config.yaml](config.yaml)의 항목 바로 위에 한국어 주석으로 적혀 있습니다. 일반적으로 먼저 조정하는 값은 다음과 같습니다.
+
+| 키 | 현재 예시값 | 용도/조정 기준 |
+|---|---:|---|
+| `yolo.imgsz` | `1280` | 작은 표지 누락 시 GPU 메모리를 확인하며 증가 |
+| `yolo.conf` | `0.8` | 누락이 많으면 낮추고 오검출이 많으면 높임 |
+| `panorama_detection.detection_view_mode` | `forward` | 전방 표지는 왜곡을 편 정면 view 권장 |
+| `forward_view_hfov_deg`, `forward_view_vfov_deg` | `70`, `70` | 정사각 입력에서 두 값을 같게 유지해 비율 왜곡 방지 |
+| `point_matching.max_center_ray_angle_deg` | `25` | 최종 좌표로 채택할 차량 전방 중심각 |
+| `point_matching.max_range_m` | `12` | 카메라에서 점까지 허용하는 최대 거리 |
+| `point_matching.point_range_fallback_enabled` | `true` | strict 범위의 mask 점이 0개일 때만 제한적 거리 재탐색 |
+| `point_matching.point_range_fallback_max_range_m` | `15` | no-points 재탐색 최대 거리; 일반 탐색 거리에는 영향 없음 |
+| `point_matching.point_range_fallback_min_point_count` | `60` | 품질 gate를 모두 통과한 fallback 단일 군집의 최소점 |
+| `point_matching.point_range_fallback_min_cluster_fraction` | `0.80` | 전방 깊이점 중 선택 단일 군집이 차지해야 하는 최소 비율 |
+| `point_matching.point_range_fallback_min_core_mask_fraction` | `0.45` | fallback 군집 중 원본 비팽창 mask 내부 점의 최소 비율 |
+| `point_matching.point_range_fallback_max_depth_span_m` | `0.50` | fallback 군집 거리의 5~95% 분위수 폭 최대값 |
+| `point_matching.min_point_count` | `100` | 이보다 점이 적은 검출은 SHP에서 제외 |
+| `pole_detection.pole_detection` | `true` | 지주 탐색 전체 기능 on/off |
+| `pole_classification_mode` | `auto` | LAS class 자동 사용(`auto`), 완전 무시(`off`), 필수 검증(`require`) |
+| `pole_direct_max_axis_sign_distance_m` | `0.75` | 표지에 직접 붙은 지주의 최대 수평 연관 거리 |
+| `pole_max_axis_sign_distance_m` | `8.0` | 수평 암 검증을 거치는 원격 지주의 최대 거리 |
+| `pole_min_horizontal_connection_coverage` | `0.50` | 원격 지주까지 실제 연결봉이 채운 구간 비율 |
+| `pole_preferred_min_completeness_ratio` | `0.75` | 짧은 가장자리보다 지면~표지 높이를 충분히 관측한 전체 지주축 우선 |
+| `pole_geometry_ground_clearance_m` | `0.20` | class가 없을 때 저점 지면대의 점을 축 후보에서만 제거; `0`이면 해제 |
+| `pole_geometry_remote_min_completeness_ratio` | `0.75` | class 없는 원격 지주의 최소 축 완전도 하드 기준 |
+| `pole_geometry_remote_max_axis_rmse_m` | `0.095` | class 없는 원격 지주의 최대 축 방사 오차(m) |
+| `pole_geometry_remote_max_ground_rmse_m` | `0.15` | class 없는 원격 지주의 최대 지면 평면 오차(m) |
+| `pole_require_ground` | `true` | 신뢰 가능한 지면이 없으면 지주 하단점 보류 |
+| `debug_output.debug_mask_alpha` | `8` | 표지가 보이도록 검출 mask 채움 투명도 조정, 선만 보려면 0 |
+| `execution.num_workers` | `2` | CPU는 병렬 가능, 단일 GPU는 실질적으로 1부터 권장 |
+| `resume_and_scope.skip_existing` | `true` | fingerprint와 산출물이 모두 일치하는 프레임만 재사용 |
+
+단일 GPU에서 여러 worker가 같은 `cuda:0`을 공유하면 메모리 충돌이 날 수 있습니다. `allow_unsafe_cuda_multiprocessing: false`이면 요청값이 2 이상이어도 런타임이 안전하게 1개 worker로 낮춥니다.
+
+`skip_existing`의 재사용 판단에는 코드, 모델 checksum, calibration checksum, 영상/pose signature, 점군 signature, CRS와 처리 설정이 포함됩니다. 설정 또는 입력이 달라지면 기존 TXT가 있어도 다시 계산합니다. 참조된 crop/debug 파일이 사라진 결과도 재사용하지 않습니다.
+
+## 처리 파이프라인
+
+```mermaid
+flowchart LR
+    A[Sphere/pose 탐색] --> B[캘리브레이션·CRS 검증]
+    B --> C[차량 정면 rectilinear 변환]
+    C --> D[YOLO-seg 표지 검출]
+    D --> E[mask를 파노라마 좌표로 복원]
+    E --> F[ray 기반 점군 block 선택]
+    F --> G[mask 내부 3D 점 선택·군집화]
+    G --> H[표지 3D 대표점]
+    H --> I{지주 탐색?}
+    I -- 아니오 --> L[표지 SHP/QA]
+    I -- 예 --> J[지주 축·연결봉·지면 추정]
+    J --> K[복수 관측 병합·중복 제거]
+    K --> L[표지/지주 POINTZ SHP·QA]
+```
+
+### 1. 입력·보정·좌표계 검증
+
+1. pose CSV와 Sphere sidecar를 읽고 이미지 존재 여부, 행렬 직교성/행렬식, 영상 크기, 투영 범위를 검사합니다.
+2. `calibration.json`을 Job/Track과 매칭하고 Sphere 크기와 GPS week를 교차검증합니다. raw 카메라 보정은 이미 stitched Sphere에 적용됐으므로 다시 곱하지 않습니다.
+3. LAS/PCDB 공간 인덱스를 `.cache/pointcloud_catalog.json`에 만듭니다. LAS XYZ는 대규모 northing에서도 정밀도가 줄지 않도록 전 구간 `float64`로 유지합니다.
+4. 선택될 점군 파일의 CRS가 의미상 같은지 확인하고, pose 원점과 점군 bbox의 XY 거리가 과도하면 Job/CRS 불일치로 중단합니다.
+5. `alignment_qa_enabled: true`이면 여러 프레임의 파노라마 RGB와 LAS RGB 잔차를 측정해 `panorama_alignment_qa.json`에 권고값만 기록합니다. 실행 중 yaw/pitch 설정을 자동 변경하지 않습니다.
+
+### 2. 파노라마 표지 검출
+
+기본 `forward` 모드는 프레임별 차량 진행축을 중심으로 70°×70° 정사각 rectilinear 영상을 렌더링합니다. equirectangular 원본을 그대로 축소할 때 생기는 비율·극점 왜곡을 줄이고, 작은 전방 표지가 YOLO 입력에서 차지하는 픽셀을 보존하기 위한 단계입니다. YOLO에는 표시가 없는 원본 배열을 전달하고, `forward_views`의 QA 복사본에만 중심축과 최종 허용각을 그립니다.
+
+`panorama` 모드는 360° 전체 영상과 겹치는 perspective tile 검출을 지원합니다. 겹치는 결과는 파노라마 seam을 고려한 circular IoU로 병합합니다. 전방 도로표지 작업에는 `forward`를 권장하며, 후방/측방 표지까지 필요할 때만 `panorama`와 tile 옵션을 사용하십시오.
+
+YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩니다. 이후 검출 중심 ray가 `max_center_ray_angle_deg`를 넘으면 최종 SHP 대상에서 제외합니다. 0°/360° seam을 가로지르는 polygon과 bbox는 X 좌표를 순환 좌표로 풀어 처리합니다.
+
+### 3. 표지 2D mask → 3D 대표점
+
+각 검출은 다음 순서로 3차원화됩니다.
+
+1. bbox/mask의 각반경과 중심 ray로 교차 가능한 LAS/PCDB spatial block만 선택합니다.
+2. 검출 주변을 정사각 perspective view로 다시 펼치고 세계좌표 점들을 해당 view에 투영합니다.
+3. segmentation mask가 있으면 mask 내부를, 없으면 bbox와 설정 여백 내부를 선택합니다.
+4. strict `max_range_m` 안의 mask 점이 정확히 0개이고 fallback이 켜진 경우에만 더 긴 `point_range_fallback_max_range_m`로 block 선택부터 한 번 다시 수행합니다. strict 범위에서 한 점이라도 얻었다면 기존 결과를 유지하고 fallback을 실행하지 않습니다.
+5. 카메라 거리의 낮은 분위수와 최소 지지점으로 robust front-surface anchor를 구합니다. 단일 최근접 잡음점이 전체 깊이 창을 결정하지 않게 한 뒤 `depth_window_m` 이내 점만 남깁니다.
+6. 3D 이웃 밀도 군집을 만들고 가까운 유효 군집을 선택한 뒤, 군집 중심에서 과도하게 먼 점을 trim합니다.
+7. fallback 결과는 최소점 외에도 단일 군집, 군집 점유율, 대표점의 원본 mask 포함, 원본 mask 지지율, robust 깊이폭을 모두 통과해야 합니다. 단순히 15m 안의 배경 식생점을 가져오지 않기 위한 별도 gate입니다.
+8. 최종 군집의 XYZ 중앙값을 표지 대표점으로 사용합니다. 일반 결과는 `min_point_count`, fallback은 별도 최소점과 품질 gate를 적용하며 거리/각도 기준 밖 또는 유효 군집이 없는 검출은 JSON과 QA에 사유를 남기되 SHP에서는 제외합니다.
+
+`point_crops/*.las`는 이 선택 과정을 검수하기 위한 파생 점군입니다. XYZ와 파노라마에서 샘플링한 RGB를 담지만 원본 intensity, classification, GPS time, return, point ID를 보존하는 원본 레코드 crop은 아닙니다.
+
+### 4. 지주 검출과 하단점 계산
+
+`pole_detection.pole_detection: true`일 때만 실행합니다. 현재 구현은 문형식/두 지주의 중앙을 가정하지 않고 표지 detection당 하나의 물리 지주(`SINGLE`)를 찾습니다.
+
+1. **탐색 영역 구성**: 표지 주변을 넓게 rectification하고 bbox 아래·좌우 corridor를 먼저 검색합니다. 직접 지주가 없으면 아래쪽 수직 band를 좌우 전체로 넓혀 원격 지주 후보를 다시 찾습니다.
+2. **class 정책과 필터**: 기본값 `pole_classification_mode: auto`는 YAML의 ground(`2`, `11`), excluded vegetation(`3`, `4`, `5`), 공급사 확인 pole ID 중 하나가 선택 LAS에 실제로 있을 때만 class와 형상을 함께 쓰는 `HYBRID` 모드가 됩니다. LAS가 전부 미분류 `0/1`이거나 매핑되지 않은 custom ID만 있으면 자동으로 `GEOMETRY`가 되어 class 필터와 분류 지면을 사용하지 않습니다. `off`는 class가 있어도 강제로 완전히 무시하고, `require`는 선택된 모든 LAS에 설정한 의미 class가 없으면 처리 전에 실패합니다. 현재 TRK500Neo 샘플에 여러 class가 관찰되지만 이것은 공급업체의 공식 계약 map을 확인했다는 뜻이 아니므로, 임의 custom ID를 계약 확인 없이 `pole_class_ids`에 고정하면 안 됩니다. 원본 classification은 어느 모드에서도 검수용 `pole_crops` LAS에 보존됩니다.
+3. **수직 축 생성**: XY voxel의 세로 연속 셀로 seed를 만들고 `x(z), y(z)`를 robust fitting합니다. class가 없는 `GEOMETRY` 모드에서는 주변 저점 셀로 지면대를 먼저 추정해 축 후보에서만 제외하고, 세로 근거가 있는 셀의 점만 최초 fitting에 사용합니다. seed는 연결요소당 고정 개수로 자르지 않고 공간 NMS로 전체 후보 영역을 덮으므로, 지면·식생이 하나의 큰 연결요소가 되어도 가는 실제 지주가 seed에서 탈락하지 않습니다. 점 수, 수직 span, 연속 Z-bin 수, 최대 Z 공백, 점유율, 중간부 지지율, 축 기울기와 radial RMSE 기준을 모두 통과해야 합니다.
+4. **축 완전도 계산**: 각 후보의 `completeness_ratio`는 `min(중간부 Z-bin 지지율, min(1, 관측 Z span / (표지 Z - 지면 Z)))`입니다. 표지판의 짧은 수직 가장자리나 상부 부속축은 표지에 더 가까워도 전체 표지-지면 높이를 지지하지 못하므로 낮은 완전도를 받습니다.
+5. **직접/원격 지주 검증**: 표지 높이에서 축까지 0.75m 이내이면 직접 지주입니다. 그보다 먼 축은 표지와 축 사이의 3D 수평 구간을 bin으로 나누고 실제 점군 연결봉 coverage가 기준 이상일 때만 후보에 남깁니다. `GEOMETRY` 원격 후보에는 완전도·축 RMSE·지면 RMSE 하드 기준도 추가 적용합니다. 멀리 있는 나무·건물 모서리를 임의 지주로 연결하지 않기 위한 gate입니다.
+6. **후보 순위 결정**: 먼저 `pole_preferred_min_completeness_ratio` 이상인 전체 축 tier와 직접 지주를 우선합니다. 원격 지주끼리는 `coverage × sqrt(검사 bin 수)`에 축 완전도를 더하고 축 RMSE, multi-return 비율, 연관 거리를 감점한 복합 연결 근거를 비교합니다. 짧은 4/4 잡음 연결이 수 m에 걸친 실제 수평봉을 이기지 않으면서, 긴 구간 일부만 우연히 채운 나무도 억제하기 위한 기준입니다. 직접축은 같은 완전도 tier에서 bounded 물리 점수를 먼저 비교합니다. 축 길이 보상은 표지-지면 예상 높이에서 상한을 두며, strict 결과를 expanded 결과가 무조건 덮어쓰지 않고 같은 품질 순위로 비교합니다.
+7. **로컬 지면 추정**: 지주 중심을 제외한 근거리 셀에서 LAS ground/road 분류 기반 평면과 형상 기반 낮은 셀 평면을 각각 robust fitting합니다. 형상 지면은 최소 표지-지면 높이보다 위에 있는 수평봉·표지점부터 제외하고, class가 없을 때는 더 많은 독립 XY 셀 근거를 요구합니다. 분류된 도로면이 연석 너머 멀리 있고 더 가까운 보도면이 있으면 거리 기준으로 형상 평면을 선택합니다. 셀 수와 RMSE 기준을 못 만족하면 `pole_require_ground: true`에서 하단점을 만들지 않습니다.
+8. **가림 처리**: 관측된 축 최하단과 지면 사이가 `pole_occlusion_gap_m`보다 크면 `OCCLUDED`로 표시하고, 보이는 상·중부 축을 지면 평면까지 연장해 `GROUND_EXTR` 좌표를 만듭니다. 축 자체가 전혀 보이지 않는 완전 가림은 임의 수직선을 만들지 않습니다.
+9. **품질 상태**: 하단이 보이면 `GROUND_SNAP`, 가려져 외삽하면 `GROUND_EXTR`입니다. 낮은 완전도, 높은 지면 RMSE, 또는 class 없는 직접축의 큰 방사 오차는 `REVIEW`로 기록해 같은 위치의 더 좋은 detection/다중 프레임 관측이 최종 좌표 계산에서 우선되게 합니다.
+
+이 방식은 XDROAD에서 작업자가 보이는 지주 한 점을 찍어 아래로 내리는 작업을 3차원 축과 로컬 지면으로 확장한 것입니다. 단, 표지 바로 아래 임의점이 아니라 실제 수직 연속성과 지면 근거가 있어야 좌표를 생성합니다.
+
+### 5. 복수 관측 병합과 중복 제거
+
+- 같은 주행 `record_name` 안에서 지주 하단 XY가 `pole_observation_merge_radius_m` 이내인 관측을 물리 지주 하나로 묶고, 프레임별 최고 품질 관측을 사용해 가중 평균 좌표를 계산합니다.
+- 지주별 `support_id`를 만들고 연결된 각 표지의 `det_id`에 같은 지주 좌표를 한 행씩 연결합니다. 따라서 한 지주에 서로 다른 클래스의 표지가 두 개면 `pole_bottoms.shp`에도 동일 XYZ의 두 행이 생깁니다.
+- 같은 record·같은 class·같은 support의 반복 표지는 XY/Z 허용범위를 모두 만족할 때만 complete-link 방식으로 병합합니다. 거리 체인이 서로 다른 두 표지를 이어 붙이지 못하며, 같은 프레임의 서로 다른 bbox는 자동 병합하지 않습니다.
+- 지주가 누락된 관측은 더 엄격한 fallback XY/Z 범위 안에서만 지주가 확인된 다른 프레임의 같은 클래스 표지에 흡수될 수 있습니다.
+- `pole_min_observations`는 최종 지주에 필요한 서로 다른 프레임 수입니다. 초기 디버깅은 `1`, 운영 납품은 노선 특성 검증 후 `2` 이상을 권장합니다.
+
+같은 프레임에서 가까운 두 표지 중 하나가 좋은 지주를 찾았더라도, 그 좌표를 다른 detection에 무조건 복사하지 않습니다. 영상상 위·아래 또는 인접 detection이라는 사실만으로 같은 물리 지주임을 보장할 수 없고, 실제 검증에서도 단순 수직 하강과 낮은 detection의 지주 공유에는 잔여 좌표 오차가 있었습니다. 각 detection이 독립적으로 전체 3D 축 근거를 통과한 뒤, 실제 하단 좌표가 병합 반경 안에 있을 때만 같은 `support_id`로 합칩니다.
+
+## 출력과 검수
+
+`paths.output_dir` 아래에 다음 구조가 생성됩니다.
+
+```text
+<output_dir>/
+  forward_views/<job_track>/*.jpg       # 정면 YOLO 입력 QA 사본
+  image_crops/<job_track>/*.jpg         # bbox/mask/대표점/선택점 검수
+  point_crops/<job_track>/*.las         # 표지 선택점 파생 LAS
+  point_previews/<job_track>/*.png      # 정면·상면·측면 점군 미리보기
+  pole_crops/<job_track>/*.las          # 지주 축 inlier 파생 LAS
+  pole_debug/<job_track>/*.jpg          # 표지+지주+축+지면 근거 통합 영상
+  txt/<job_track>/*.txt                 # 프레임별 JSON 결과와 provenance
+  shp/
+    detected_signs.{shp,shx,dbf,prj,cpg,qpj,wkt2}
+    pole_bottoms.{shp,shx,dbf,prj,cpg,qpj,wkt2}
+    .mms_shp_publish.lock
+  logs/
+    run.log
+    workers/*.log
+    effective_config.json
+    pole_classification_policy.json
+    panorama_alignment_qa.json
+```
+
+### 콘솔과 로그
+
+정상 콘솔에는 `Alignment QA`와 `MMS processing` 상태바가 표시됩니다. 본 상태바에는 처리 프레임 수, 처리율, 표지/점/오류 수와 예상 잔여 시간(ETA)이 나옵니다. 상세 메시지와 traceback은 콘솔에 쏟지 않고 `logs/run.log`와 `logs/workers/*.log`에 기록합니다.
+
+실행에 실제 적용된 값은 `logs/effective_config.json`에서, class 자동 판정 근거·관측 ID·실제 `HYBRID/GEOMETRY` 모드는 `logs/pole_classification_policy.json`에서 확인할 수 있습니다. 오류가 발생하면 우선 콘솔에 표시된 로그 경로의 마지막 traceback을 확인하십시오.
+
+### 디버그 영상 읽는 법
+
+`pole_debug`의 주요 색상은 다음과 같습니다.
+
+| 색 | 의미 |
+|---|---|
+| cyan | 표지에서 선택한 3D 점 |
+| 진한 magenta 실선 | 실제 관측된 지주 축 |
+| orange | 원격 지주를 허용한 수평 연결봉 경로 |
+| 연한 pink 점선 | 관측 축에서 지면까지 외삽한 구간 |
+| green | 최종 지주 하단점 |
+| blue 점·hull | 지면 평면 계산에 실제 사용된 셀 |
+
+표지 중심 crop에서 하단이나 지면 근거가 잘리면 결과의 표지·축·하단·지면 셀을 포함하는 적응형 perspective로 디버그 영상을 다시 구성합니다. 영상에는 탐색 corridor를 그리고, 상단에는 축 완전도(`complete`), 관측 span, 연결 coverage, 연관 거리, 유효 return 중 multi-return 비율, 지면 방법/셀 수/RMSE/Z가 기록됩니다.
+
+`forward_views`는 YOLO에 실제 들어간 정면 영상과 동일 픽셀의 QA 복사본입니다. cyan은 진행 중심축, orange는 최종 `max_center_ray_angle_deg` 경계입니다. 이 선들은 QA 파일에만 그리며 YOLO 입력에는 포함되지 않습니다.
+
+### SHP 연결 키와 좌표계
+
+두 최종 레이어는 모두 Z를 포함한 `POINTZ`입니다.
+
+- `detected_signs.shp`: 표지 3D 대표점
+- `pole_bottoms.shp`: 지주 축과 지면의 교점
+- `det_id`: 같은 표지 detection을 두 레이어에서 연결
+- `support_id`: 같은 물리 지주 관측을 연결
+- `obs_count`: 지주 좌표에 기여한 서로 다른 프레임 수
+- `complete`: 중간부 지지율과 관측 높이 비율 중 작은 값인 지주축 완전도
+- `class_req`, `class_mode`: 요청한 class 정책(`auto/off/require`)과 실제 계산 방식(`HYBRID/GEOMETRY`)
+- `assoc_m`, `arm_cov`, `axis_rmse`, `grnd_rmse`: 지주 선택 근거와 품질
+
+Shapefile 형식은 `.shp` 파일 내부에 CRS를 저장하지 않습니다. 전달·복사할 때 같은 basename의 파일을 모두 한 묶음으로 유지해야 합니다.
+
+- `.prj`: ArcGIS/XDROAD 계열 호환성을 위한 수평 CRS `WKT1_ESRI`
+- `.wkt2`: 입력에서 확인한 전체 CRS의 WKT2_2019
+- `.qpj`: QGIS가 전체 WKT2를 읽을 수 있도록 둔 사본
+- `.cpg`: DBF 문자열 인코딩 `UTF-8`
+
+LAS 입력에서는 매칭된 파일의 CRS를 의미 비교해 사용하며, 명시적인 권위 WKT가 있으면 다음처럼 덮어쓸 수 있습니다.
+
+```yaml
+paths:
+  crs_wkt_path: authoritative_crs.wkt
+```
+
+샘플 LAS의 수평 CRS는 WGS 84 / UTM zone 52N(EPSG:32652 상당)입니다. 프로젝트의 수직 datum 메타데이터는 EGM2008과 타원체고 표기가 서로 모순되므로, 현재 코드는 Z를 임의 변환하지 않고 점군 값을 그대로 보존합니다. 공급업체로부터 권위 있는 수직 datum과 compound WKT를 받아 확정해야 합니다.
+
+최종 sign/pole SHP는 완성된 임시 bundle을 재개방해 `POINTZ`, record 수, 필수 sidecar를 검사한 뒤 함께 게시합니다. QGIS·ArcGIS·XDROAD가 기존 DBF/SHP를 열고 있으면 Windows에서 교체가 실패할 수 있으므로 실행 전에 해당 레이어를 닫거나 새 `output_dir`을 사용하십시오. `.mms_shp_publish.lock` 파일이 남아 있는 것은 정상이며 실제 배타 잠금은 프로세스 종료 시 해제됩니다.
+
+### JSON과 LAS provenance
+
+프레임별 `txt/*.txt`는 확장자가 TXT이지만 내용은 JSON입니다. 주요 정보는 다음과 같습니다.
+
+- `schema_version`, `run_fingerprint`, `model_sha256`, `calibration_sha256`
+- pose 원본 행, GPS week/SOW, origin, 카메라 축과 local-to-world 행렬
+- panorama/정렬/검출 mapping
+- 매칭·실사용 점군 파일, CRS, front-surface anchor
+- bbox/mask, 표지 XYZ, 점 수, 채택/제외 사유, QA 파일 경로
+- `point_match_mode`, 실제 검색 거리·최소점, range fallback 시도/사용 여부와 cluster·core-mask·깊이폭 gate 결과
+- 지주 축/지면/가림/연결봉/분류 순도, 요청·실제 classification 모드, 후보별 `completeness_ratio`·`multi_return_fraction`과 선택 근거
+- `point_crop_semantics`, `pole_crop_semantics`
+
+`pole_crops/*.las`는 지주 축 inlier를 Point Format 7로 저장합니다. LAS 원본에 있으면 intensity, classification, GPS time, return metadata를 보존하고 RGB는 8-bit로 정규화합니다. PCDB에 없는 속성은 명시적인 unknown/default 값입니다.
+
+## 운영 권고와 알려진 한계
+
+- `yolo.conf`, 거리, 각도, 지주 임계값은 한두 장이 아니라 노선별 정답셋으로 조정하십시오. 같은 자료로 조정과 정확도 평가를 동시에 하면 성능을 과대평가합니다.
+- `forward` 모드는 전방 품질을 높이는 대신 설정 FOV 밖의 표지를 검출하지 않습니다. 작업 범위가 360°이면 `panorama` 모드를 별도 검증하십시오.
+- 완전히 가려져 수직 축 점군이 없는 지주는 자동 생성하지 않습니다. `pole_bottoms`가 비어 있는 것이 잘못된 임의 하단점보다 안전한 결과입니다.
+- 수평 암, 신호등, 건물 모서리, 식생이 가까운 구간은 `complete`, `arm_cov`, class purity, 축/지면 RMSE와 debug 영상을 함께 확인하십시오.
+- 지면 class가 잘못됐거나 인도·연석·적재물 표면이 혼재하면 Z가 달라질 수 있습니다. blue 지면 셀과 hull이 실제 하단 주변 바닥을 나타내는지 확인하십시오.
+- `pole_min_observations: 1`은 단일 프레임 오판단이 최종 SHP에 들어갈 수 있는 검수 설정입니다. 데이터 중복 관측이 충분하면 `2` 이상을 권장합니다.
+- 점군과 영상의 시각적 정렬이 맞더라도 절대 측량 정확도를 보증하지 않습니다. 독립 검사점으로 XY/Z RMSE와 CE95/LE95를 산출하십시오.
+
+## 검사와 개발
+
+환경과 전체 회귀 테스트:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe .\verify_environment.py
+.\.venv\Scripts\python.exe -m compileall -q mms_shp_detection tests run_pipeline.py extract_calibration.py export_calibration_values.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Linux에서는 `.\.venv\Scripts\python.exe` 대신 `./.venv/bin/python`을 사용합니다.
+
+권장 변경 검증 순서는 다음과 같습니다.
+
+1. `config_verify.yaml`과 별도 `output_dir`로 문제 프레임 1~수 장 실행
+2. `image_crops`, `point_previews`, `pole_debug`, JSON의 제외/품질 사유 확인
+3. 단위 테스트와 `compileall` 실행
+4. 전체 노선 재실행 후 표지/지주 feature 수와 CRS sidecar 확인
+5. 독립 정답점으로 최종 정확도 평가

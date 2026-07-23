@@ -1,0 +1,22 @@
+# 캘리브레이션의 숫자와 단위만 읽기 쉽게 내보내는 설정입니다.
+# 실행:
+#   Windows: .\.venv\Scripts\python.exe export_calibration_values.py
+#   Linux:   ./.venv/bin/python export_calibration_values.py
+config_version: 1
+
+input:
+  # calibration.json 또는 Leica *.PegasusProject 디렉터리를 지정합니다.
+  # JSON을 지정하면 DB를 다시 해독하지 않고 기존 스냅샷의 값을 사용합니다.
+  source: calibration.json
+
+  # 좌표계는 project.db에 있으므로 JSON 입력일 때 프로젝트 루트를 같이 지정합니다.
+  # source가 PegasusProject 디렉터리이면 null로 두어도 자동 탐색합니다.
+  project_root: TRK500Neo/MultiJob.PegasusProject
+
+output:
+  # 사람이 읽기 쉬운 계층형 값 파일입니다. base64, hex, WKT, 원본 경로는 제외됩니다.
+  json_path: calibration_values.json
+
+  # 숫자 한 개를 한 행으로 펼친 검토/엑셀용 파일입니다.
+  # 필요하지 않으면 null로 바꿉니다.
+  csv_path: calibration_values.csv

@@ -1,0 +1,16 @@
+--index-url https://download.pytorch.org/whl/cu118
+--extra-index-url https://pypi.org/simple
+
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+ultralytics==8.4.46
+opencv-python==4.11.0.86
+numpy==2.5.1
+Pillow==12.3.0
+laspy==2.7.0
+pyproj==3.7.2
+pyshp==3.0.3
+PyYAML==6.0.3
+tqdm==4.67.3
+scipy==1.17.1
