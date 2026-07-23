@@ -275,6 +275,25 @@ def match_task_calibration(task: dict[str, Any], bundle: dict[str, Any]) -> dict
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _delivery_calibration_sha256(metadata: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    paths = (
+        ("mms_ini", metadata.get("ini_path")),
+        ("sphere_internal_orientation", metadata.get("internal_orientation_path")),
+    )
+    for role, path_value in paths:
+        if not path_value:
+            continue
+        path = Path(str(path_value)).resolve()
+        digest.update(role.encode("ascii"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def attach_calibration_metadata(
     tasks: list[dict[str, Any]],
     calibration_path: Path | None,
@@ -287,17 +306,47 @@ def attach_calibration_metadata(
     Raw Front/Rear EUCM and boresight values are already consumed by Leica when
     exporting a stitched Sphere. They are intentionally *not* applied again.
     """
-    if calibration_path is None or not calibration_path.is_file():
-        if require_calibration:
-            raise FileNotFoundError(f"Calibration JSON not found: {calibration_path}")
-        logger.warning("Calibration JSON was not supplied; continuing with exported frame poses only.")
-        return None
-
-    bundle = load_calibration_bundle(calibration_path)
+    bundle = (
+        load_calibration_bundle(calibration_path)
+        if calibration_path is not None and calibration_path.is_file()
+        else None
+    )
     unmatched: set[tuple[str | None, str | None]] = set()
     matched_count = 0
+    delivery_hashes: dict[tuple[str, str], str] = {}
     for task in tasks:
-        match = match_task_calibration(task, bundle)
+        delivery = task.get("delivery_calibration")
+        if isinstance(delivery, dict):
+            ini_path = Path(str(delivery.get("ini_path") or ""))
+            internal_path = Path(str(delivery.get("internal_orientation_path") or ""))
+            if not ini_path.is_file() or not internal_path.is_file():
+                unmatched.add((task.get("job_name"), task.get("track_name")))
+                task["calibration"] = None
+                continue
+            delivery_key = (str(ini_path.resolve()), str(internal_path.resolve()))
+            delivery_sha256 = delivery_hashes.get(delivery_key)
+            if delivery_sha256 is None:
+                delivery_sha256 = _delivery_calibration_sha256(delivery)
+                delivery_hashes[delivery_key] = delivery_sha256
+            task["calibration"] = {
+                "calibration_path": str(ini_path.resolve()),
+                "calibration_sha256": delivery_sha256,
+                "job": task.get("job_name"),
+                "track": task.get("track_name"),
+                "imaging_sensor_id": delivery.get("camera_name"),
+                "imaging_sensor_name": "Sphere",
+                "raw_camera_serials": [],
+                "gps_week": task.get("gps_week"),
+                "manufacturer": delivery.get("manufacturer"),
+                "model_name": delivery.get("model_name"),
+                "system_serial_number": delivery.get("serial_number"),
+                "internal_orientation_path": str(internal_path.resolve()),
+                "application": "validated_vendor_delivery_sphere_metadata",
+            }
+            matched_count += 1
+            continue
+
+        match = match_task_calibration(task, bundle) if bundle is not None else None
         if match is None:
             unmatched.add((task.get("job_name"), task.get("track_name")))
             task["calibration"] = None
@@ -365,11 +414,16 @@ def attach_calibration_metadata(
     if unmatched:
         message = ", ".join(f"{job}/{track}" for job, track in sorted(unmatched, key=str))
         if require_calibration:
+            if bundle is None:
+                raise FileNotFoundError(
+                    f"Calibration JSON not found: {calibration_path}; no delivery calibration for: "
+                    f"{message}"
+                )
             raise ValueError(f"No matching calibration for: {message}")
         logger.warning("No matching calibration for %s", message)
     logger.info(
         "Matched calibration %s to %d/%d image tasks (raw camera calibration is not double-applied).",
-        bundle["sha256"][:12],
+        bundle["sha256"][:12] if bundle is not None else "delivery-only",
         matched_count,
         len(tasks),
     )

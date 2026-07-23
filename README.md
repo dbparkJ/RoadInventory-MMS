@@ -8,7 +8,7 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 
 ## 주요 기능
 
-- Leica TRK500Neo Sphere와 기존 MMS 데이터 구조 자동 탐색
+- 상위 데이터 폴더 아래의 Leica Pegasus Sphere, TRK700 Neo 표준 납품본, 기존 MMS 구조 재귀 자동 탐색
 - 차량 진행 방향 중심의 정사각 rectilinear 영상으로 파노라마 왜곡을 줄인 YOLO-seg 추론
 - YAML 한 파일로 모델 confidence, 시야각, 거리, 점군, 지주, 디버그, 병렬 실행 설정
 - segmentation mask와 보정된 카메라 자세를 이용한 2D 검출 → 3D 점군 역매칭
@@ -39,7 +39,7 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 
 ## 지원 입력
 
-### Leica TRK500Neo
+### Leica Pegasus 프로젝트
 
 `paths.data_root` 아래에서 다음 파일을 재귀 탐색합니다.
 
@@ -76,6 +76,24 @@ Leica가 Front/Rear 물리 카메라의 EUCM 내부표정과 보어사이트를 
 
 LAS 전체본과 `_1`, `_2`, … 분할본이 함께 있으면 분할 번호의 연속성, 점 수 합계, bounds, CRS, scale, point format을 검사합니다. 분할본이 완전할 때만 분할본을 사용하며, 불완전하면 전체본을 선택합니다. 영상 Job과 관계없는 LAS는 인덱싱 대상에서 제외됩니다.
 
+### Leica 표준 납품 폴더(TRK700 Neo 포함)
+
+국토지리정보원 MMS 설정 INI가 포함된 다음 구조도 재귀 탐색합니다. Camera01~04의 일반 영상은 제외하고, Sphere 메타데이터가 있는 카메라만 처리합니다.
+
+```text
+<data_root>/<delivery>/<survey>/<TRACK>/
+  MMS_Leica_<Model>_<Serial>.ini
+  Camera05/
+    External Orientation.csv
+    Internal Orientation.txt
+    *Sphere*.jpg
+  Laser01/
+    *.las
+  <TRACK>_Trajectory.prj
+```
+
+`External Orientation.csv`의 17열 위치·자세와 `Internal Orientation.txt`의 7040×3520 Sphere 정보를 사용합니다. INI의 제조사·모델·시리얼과 Sphere 내부표정 파일은 해당 트랙의 보정 provenance로 검증합니다. LAS 헤더에 CRS가 없으면 같은 트랙에서 가장 가까운 단일 `.prj`를 사용하며, 여러 서로 다른 PRJ가 있어 모호하면 자동 선택하지 않습니다.
+
 ### 기존 MMS
 
 기존 구조도 유지됩니다.
@@ -93,7 +111,7 @@ input:
   point_source: pcdb
 ```
 
-`pose_format: auto`는 `CAM`이 있으면 기존 형식을, 그렇지 않으면 Leica `*_Sphere.csv`를 선택합니다. `point_source: auto`는 PCDB를 우선하고 없으면 LAS를 사용하므로, 혼합 폴더에서는 `las` 또는 `pcdb`를 명시하십시오.
+`pose_format: auto`는 상위 폴더 전체에서 legacy CAM, Leica `*_Sphere.csv`, 표준 납품 `External Orientation.csv`를 함께 찾습니다. `point_source: auto`도 서로 독립된 PCDB와 LAS 납품본이 같이 있으면 둘 다 카탈로그에 넣고, 작업/트랙 경로와 공간 범위로 해당 점군만 매칭합니다. 특정 형식만 처리하려면 `legacy`, `leica-sphere`, `leica-delivery` 또는 `pcdb`, `las`를 명시하십시오.
 
 ## 빠른 시작
 
@@ -103,7 +121,7 @@ input:
 
 ```yaml
 paths:
-  data_root: TRK500Neo
+  data_root: data
   calibration_path: calibration.json
   model_path: best.pt
   output_dir: outputs_ver5

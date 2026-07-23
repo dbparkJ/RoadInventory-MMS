@@ -12,7 +12,10 @@ from unittest import mock
 import numpy as np
 from pyproj import CRS
 
-from mms_shp_detection.calibration import _decode_leica_calibration_value
+from mms_shp_detection.calibration import (
+    _decode_leica_calibration_value,
+    attach_calibration_metadata,
+)
 from mms_shp_detection.dataset import gps_sow_to_utc, scan_image_tasks
 from mms_shp_detection.geometry import (
     apply_panorama_angular_offsets,
@@ -85,6 +88,93 @@ class LeicaDatasetTests(unittest.TestCase):
         self.assertEqual(week, 2357)
         self.assertTrue(inferred)
         self.assertEqual(timestamp.isoformat(), "2025-03-11T02:01:18.447723+00:00")
+
+    def test_auto_recursively_combines_pegasus_and_standard_delivery_spheres(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pegasus_dir = (
+                root
+                / "nested"
+                / "MultiJob.PegasusProject"
+                / "Export"
+                / "JPEG"
+                / "Job_20250311_1043"
+                / "Track01"
+                / "Sphere"
+            )
+            pegasus_dir.mkdir(parents=True)
+            pegasus_image = "Job_20250311_1043_Track01_Sphere_00001.jpg"
+            (pegasus_dir / pegasus_image).write_bytes(b"fixture")
+            (pegasus_dir / "Job_20250311_1043_Track01_Sphere.csv").write_text(
+                f"{pegasus_image};180096.0;300000;4100000;100;0;0;0;"
+                "1;0;0;0;1;0;0;0;1\n",
+                encoding="utf-8",
+            )
+
+            track_dir = root / "SEC006_sample_250903" / "SURV01" / "TRACK01"
+            camera_dir = track_dir / "Camera05"
+            camera_dir.mkdir(parents=True)
+            delivery_image = "Track01-Sphere-17.jpg"
+            (camera_dir / delivery_image).write_bytes(b"fixture")
+            (camera_dir / "Internal Orientation.txt").write_text(
+                "PanoramaHotSpot=180,90\n"
+                "WidthLimits=0,360\n"
+                "HeightLimits=0,180\n"
+                "SphereRadius=100\n"
+                "ImageSize=7040,3520\n",
+                encoding="utf-8",
+            )
+            (camera_dir / "External Orientation.csv").write_text(
+                f"{delivery_image};281430.869;465216.066;3911273.445;47.495;"
+                "0;0;0;1;0;0;0;1;0;0;0;1\n",
+                encoding="utf-8",
+            )
+            (track_dir / "MMS_Leica_PegasusTRK700Neo_291112.ini").write_text(
+                "[MMSIdentification]\n"
+                "Manufacturer=Leica\n"
+                "ModelName=PegasusTRK700Neo\n"
+                "SerialNumber=291112\n",
+                encoding="utf-8",
+            )
+
+            tasks = scan_image_tasks(root, LOGGER, pose_format="auto")
+
+            self.assertEqual(
+                {task["pose_format"] for task in tasks},
+                {"leica-sphere", "leica-delivery"},
+            )
+            delivery = next(
+                task for task in tasks if task["pose_format"] == "leica-delivery"
+            )
+            self.assertEqual(delivery["panorama"]["image_width"], 7040)
+            self.assertEqual(
+                delivery["panorama"]["longitude_limits_deg"],
+                [-180.0, 180.0],
+            )
+            self.assertEqual(delivery["panorama"]["panorama_hotspot"], [0.0, 0.0])
+            self.assertEqual(delivery["gps_week"], 2382)
+            self.assertEqual(
+                delivery["timestamp_iso"],
+                "2025-09-03T06:10:12.869000+00:00",
+            )
+            self.assertEqual(
+                delivery["delivery_calibration"]["model_name"],
+                "PegasusTRK700Neo",
+            )
+            self.assertEqual(delivery["pointcloud_scope"], str(track_dir.resolve()))
+
+            bundle = attach_calibration_metadata(
+                [delivery],
+                None,
+                LOGGER,
+                require_calibration=True,
+            )
+            self.assertIsNone(bundle)
+            self.assertEqual(
+                delivery["calibration"]["application"],
+                "validated_vendor_delivery_sphere_metadata",
+            )
+            self.assertEqual(delivery["calibration"]["manufacturer"], "Leica")
 
 
 class GeometryTests(unittest.TestCase):

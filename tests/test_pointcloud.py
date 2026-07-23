@@ -176,6 +176,105 @@ class PointCloudLasTests(unittest.TestCase):
             self.assertNotEqual(catalog_a["signature"], catalog_b["signature"])
             self.assertNotEqual(catalog_a["include_job_keys"], catalog_b["include_job_keys"])
 
+    def test_standard_delivery_las_uses_track_identity_scope_and_nearest_prj(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            track_dir = root / "SEC006" / "SURV01" / "TRACK01"
+            laser_dir = track_dir / "Laser01"
+            laser_dir.mkdir(parents=True)
+            path = laser_dir / "Track01_Scanner Profiler.zfs_0.las"
+            xyz = np.asarray(
+                [
+                    [465_216.0, 3_911_273.0, 47.0],
+                    [465_217.0, 3_911_274.0, 48.0],
+                ]
+            )
+            _write_las(path, xyz, with_wkt=False)
+            (track_dir / "TRACK01_Trajectory.prj").write_text(
+                TEST_WKT,
+                encoding="utf-8",
+            )
+
+            catalog = build_pointcloud_catalog(
+                root,
+                root / "catalog.json",
+                source="las",
+                include_jobs={"SURV01"},
+            )
+
+            self.assertEqual(len(catalog["files"]), 1)
+            item = catalog["files"][0]
+            self.assertEqual(item["job_name"], "SURV01")
+            self.assertEqual(item["track_name"], "TRACK01")
+            self.assertEqual(item["split_index"], 0)
+            self.assertEqual(item["provenance"]["crs_source"], "nearest_delivery_prj")
+            self.assertIn("Synthetic MMS metres", item["crs_wkt"])
+
+            matched = match_nearest_pointcloud_files(
+                {
+                    "origin": [465_216.5, 3_911_273.5, 47.5],
+                    "job_name": "SURV01",
+                    "track_name": "TRACK01",
+                    "pointcloud_scope": str(track_dir),
+                },
+                catalog,
+                neighbor_count=1,
+            )
+            self.assertEqual([entry["path"] for entry in matched], [str(path.resolve())])
+
+    def test_auto_catalog_keeps_independent_pcdb_and_las_deliveries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pcdb_path = root / "legacy" / "synthetic.pcdb"
+            pcdb_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(pcdb_path)
+            try:
+                connection.execute("CREATE TABLE CRYSTAL_CUBE (NAME TEXT, DATA BLOB)")
+                header = struct.pack(
+                    "<6dI",
+                    100.0,
+                    200.0,
+                    10.0,
+                    101.0,
+                    201.0,
+                    11.0,
+                    1,
+                )
+                connection.execute(
+                    "INSERT INTO CRYSTAL_CUBE (NAME, DATA) VALUES (?, ?)",
+                    ("block.bpc", header),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            track_dir = root / "delivery" / "SURV01" / "TRACK01"
+            laser_dir = track_dir / "Laser01"
+            laser_dir.mkdir(parents=True)
+            las_path = laser_dir / "Track01_Scanner Profiler.zfs_0.las"
+            _write_las(
+                las_path,
+                np.asarray([[465_216.0, 3_911_273.0, 47.0]]),
+                with_wkt=False,
+            )
+            (track_dir / "TRACK01_Trajectory.prj").write_text(
+                TEST_WKT,
+                encoding="utf-8",
+            )
+
+            catalog = build_pointcloud_catalog(
+                root,
+                root / "catalog.json",
+                source="auto",
+                include_jobs={"SURV01"},
+            )
+
+            self.assertEqual(catalog["selected_source_type"], "mixed")
+            self.assertEqual(
+                {item["source_type"] for item in catalog["files"]},
+                {"pcdb", "las"},
+            )
+
     def test_catalog_prefers_splits_indexes_chunks_and_reuses_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -8,8 +8,9 @@
 config_version: 1
 
 paths:
-  # Leica 프로젝트 또는 기존 MMS 데이터의 최상위 폴더입니다.
-  data_root: TRK500Neo
+  # 여러 Leica 프로젝트·표준 납품본·기존 MMS 데이터를 포함하는 상위 폴더입니다.
+  # 하위 폴더를 재귀 탐색하므로 개별 Neo 모델 폴더로 바꿀 필요가 없습니다.
+  data_root: data
   # extract_calibration.py로 생성한 보정 스냅샷입니다.
   calibration_path: calibration.json
   # YOLO detection/segmentation 가중치 파일입니다.
@@ -22,12 +23,12 @@ paths:
   crs_wkt_path: null
 
 input:
-  # auto는 legacy CAM CSV와 Leica Sphere CSV를 자동 판별합니다.
-  # 가능한 값: auto, legacy, leica-sphere
+  # auto는 legacy CAM, Pegasus Sphere, Leica 표준 납품본을 재귀적으로 함께 탐색합니다.
+  # 가능한 값: auto, legacy, leica-sphere, leica-delivery
   pose_format: auto
-  # auto는 PCDB를 우선 찾고, 없으면 LAS를 사용합니다. 가능한 값: auto, pcdb, las
+  # auto는 재귀 탐색한 독립 PCDB와 LAS 납품본을 함께 사용합니다. 가능한 값: auto, pcdb, las
   point_source: auto
-  # true이면 각 pose track에 일치하는 calibration.json 항목이 없을 때 즉시 중단합니다.
+  # true이면 각 pose track에 calibration.json 또는 납품 INI+Sphere 내부표정 근거가 없을 때 중단합니다.
   require_calibration: true
   # Leica GPS seconds-of-week에 적용할 GPS week입니다. null이면 job.db/calibration에서 추론합니다.
   gps_week: null

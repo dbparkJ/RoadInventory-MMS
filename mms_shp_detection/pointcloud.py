@@ -29,12 +29,16 @@ from .pcdb import (
 )
 
 
-POINTCLOUD_CATALOG_VERSION = 4
+POINTCLOUD_CATALOG_VERSION = 5
 DEFAULT_LAS_CHUNK_SIZE = 250_000
 NEUTRAL_RGB = np.asarray([128, 128, 128], dtype=np.uint8)
 
 _LAS_NAME_PATTERN = re.compile(
     r"^(?P<job>.+)_(?P<track>Track[_-]?\d+)(?:_(?P<split>[1-9]\d*))?$",
+    re.IGNORECASE,
+)
+_DELIVERY_LAS_NAME_PATTERN = re.compile(
+    r"^(?P<base>.+?\.zfs)_(?P<split>\d+)$",
     re.IGNORECASE,
 )
 
@@ -109,19 +113,37 @@ def _discover_sources(data_root: Path) -> tuple[list[Path], list[Path]]:
 
 def _parse_las_identity(path: Path) -> dict[str, Any]:
     match = _LAS_NAME_PATTERN.match(path.stem)
-    if match is None:
+    if match is not None:
+        split_text = match.group("split")
         return {
-            "job_name": None,
-            "track_name": None,
-            "split_index": None,
-            "split_base_stem": path.stem,
+            "job_name": match.group("job"),
+            "track_name": match.group("track"),
+            "split_index": int(split_text) if split_text is not None else None,
+            "split_base_stem": f"{match.group('job')}_{match.group('track')}",
         }
-    split_text = match.group("split")
+
+    delivery_match = _DELIVERY_LAS_NAME_PATTERN.match(path.stem)
+    track_dir = next(
+        (
+            parent
+            for parent in path.parents
+            if re.fullmatch(r"Track[_-]?\d+", parent.name, re.IGNORECASE)
+        ),
+        None,
+    )
+    if delivery_match is not None and track_dir is not None:
+        return {
+            "job_name": track_dir.parent.name,
+            "track_name": track_dir.name,
+            "split_index": int(delivery_match.group("split")),
+            "split_base_stem": delivery_match.group("base"),
+        }
+
     return {
-        "job_name": match.group("job"),
-        "track_name": match.group("track"),
-        "split_index": int(split_text) if split_text is not None else None,
-        "split_base_stem": f"{match.group('job')}_{match.group('track')}",
+        "job_name": None,
+        "track_name": track_dir.name if track_dir is not None else None,
+        "split_index": None,
+        "split_base_stem": path.stem,
     }
 
 
@@ -407,6 +429,46 @@ def _las_crs_wkt(header: laspy.LasHeader) -> str | None:
     return None
 
 
+def _associated_crs_sidecar(path: Path, data_root: Path) -> Path | None:
+    """Find the nearest unambiguous PRJ supplied with a LAS delivery track."""
+
+    resolved_root = data_root.resolve()
+    current = path.resolve().parent
+    while True:
+        candidates = sorted(
+            (candidate for candidate in current.glob("*.prj") if candidate.is_file()),
+            key=lambda item: item.name.casefold(),
+        )
+        if candidates:
+            texts: dict[str, Path] = {}
+            for candidate in candidates:
+                try:
+                    text = candidate.read_text(encoding="utf-8-sig").replace("\x00", "").strip()
+                except (OSError, UnicodeError):
+                    continue
+                if text:
+                    texts.setdefault(text, candidate)
+            if len(texts) == 1:
+                return next(iter(texts.values()))
+            # Multiple different CRS declarations at one level are ambiguous;
+            # do not climb higher and silently choose a broader file.
+            return None
+        if current == resolved_root or resolved_root not in current.parents:
+            return None
+        current = current.parent
+
+
+def _sidecar_crs_wkt(path: Path, data_root: Path) -> tuple[str | None, Path | None]:
+    sidecar = _associated_crs_sidecar(path, data_root)
+    if sidecar is None:
+        return None, None
+    try:
+        value = sidecar.read_text(encoding="utf-8-sig").replace("\x00", "").strip()
+    except (OSError, UnicodeError):
+        return None, None
+    return (value or None), sidecar
+
+
 def _xyz_from_las_points(points: Any) -> np.ndarray:
     if len(points) == 0:
         return np.empty((0, 3), dtype=np.float64)
@@ -476,6 +538,12 @@ def _index_single_las(
             start += actual_count
 
         crs_wkt = _las_crs_wkt(header)
+        crs_sidecar_path: Path | None = None
+        crs_source = "las_header" if crs_wkt else None
+        if not crs_wkt:
+            crs_wkt, crs_sidecar_path = _sidecar_crs_wkt(path, data_root)
+            if crs_wkt:
+                crs_source = "nearest_delivery_prj"
         scales = [float(value) for value in header.scales]
         offsets = [float(value) for value in header.offsets]
         point_format_id = int(header.point_format.id)
@@ -510,6 +578,16 @@ def _index_single_las(
         "system_identifier": system_identifier,
         "generating_software": generating_software,
         "creation_date": creation_date,
+        "crs_source": crs_source,
+        "crs_sidecar_path": (
+            str(crs_sidecar_path.resolve()) if crs_sidecar_path is not None else None
+        ),
+        "crs_sidecar_file_size": (
+            int(crs_sidecar_path.stat().st_size) if crs_sidecar_path is not None else None
+        ),
+        "crs_sidecar_mtime_ns": (
+            int(crs_sidecar_path.stat().st_mtime_ns) if crs_sidecar_path is not None else None
+        ),
         **selection_provenance,
     }
     return {
@@ -716,12 +794,31 @@ def _cached_file_map(cached: Any, chunk_size: int) -> dict[str, dict[str, Any]]:
     }
 
 
-def _same_file_signature(cached_file: dict[str, Any], path: Path) -> bool:
+def _same_file_signature(
+    cached_file: dict[str, Any],
+    path: Path,
+    data_root: Path,
+) -> bool:
     stat = path.stat()
-    return (
+    if not (
         cached_file.get("file_size") == int(stat.st_size)
         and cached_file.get("mtime_ns") == int(stat.st_mtime_ns)
         and cached_file.get("source_type") == path.suffix.casefold().lstrip(".")
+    ):
+        return False
+    if path.suffix.casefold() != ".las":
+        return True
+    provenance = cached_file.get("provenance") or {}
+    if provenance.get("crs_source") == "las_header":
+        return True
+    sidecar = _associated_crs_sidecar(path, data_root)
+    if sidecar is None:
+        return provenance.get("crs_sidecar_path") is None
+    sidecar_stat = sidecar.stat()
+    return (
+        provenance.get("crs_sidecar_path") == str(sidecar.resolve())
+        and provenance.get("crs_sidecar_file_size") == int(sidecar_stat.st_size)
+        and provenance.get("crs_sidecar_mtime_ns") == int(sidecar_stat.st_mtime_ns)
     )
 
 
@@ -746,12 +843,11 @@ def build_pointcloud_catalog(
 ) -> dict[str, Any]:
     """Discover point clouds and build or load their persistent spatial catalog.
 
-    ``source='auto'`` intentionally prefers PCDB when at least one PCDB exists.
-    This preserves legacy behavior and prevents a LAS export in the same tree
-    from being read in addition to its PCDB source.  Use ``source='las'`` to
-    explicitly select LAS in a mixed tree.  ``include_jobs`` limits LAS discovery
-    to the named Leica jobs before any file is opened or spatially indexed; it is
-    ignored for the legacy PCDB backend.
+    ``source='auto'`` catalogs both PCDB and LAS when a recursive parent contains
+    independent legacy and Leica deliveries. Task identity and spatial scope keep
+    duplicate backends from being mixed at projection time. ``include_jobs``
+    limits LAS discovery to named Leica jobs before files are opened; it does not
+    filter legacy PCDB files.
     """
 
     data_root = Path(data_root)
@@ -766,7 +862,13 @@ def build_pointcloud_catalog(
 
     pcdb_paths, all_las_paths = _discover_sources(data_root)
     if source_mode == "auto":
-        selected_source_type = "pcdb" if pcdb_paths else "las"
+        selected_source_type = (
+            "mixed"
+            if pcdb_paths and all_las_paths
+            else "pcdb"
+            if pcdb_paths
+            else "las"
+        )
     else:
         selected_source_type = source_mode
 
@@ -809,24 +911,42 @@ def build_pointcloud_catalog(
                 len(all_las_paths),
                 ", ".join(include_job_names or []),
             )
-        selected_paths, selection_provenance, excluded_files = _prefer_numbered_las_splits(
+        selected_las_paths, selection_provenance, excluded_files = _prefer_numbered_las_splits(
             job_las_paths,
             logger=logger,
         )
+        selected_paths = (
+            [*pcdb_paths, *selected_las_paths]
+            if selected_source_type == "mixed"
+            else selected_las_paths
+        )
         # Include excluded full companions in the signature so adding/removing a
         # split invalidates the selection decision, not only the point index.
-        discovered_paths = job_las_paths
+        discovered_paths = (
+            [*pcdb_paths, *job_las_paths]
+            if selected_source_type == "mixed"
+            else job_las_paths
+        )
 
     if not selected_paths:
         if source_mode == "auto":
             raise FileNotFoundError(f"No .pcdb or .las files found under {data_root}")
-        if selected_source_type == "las" and include_job_keys is not None:
+        if selected_source_type in {"las", "mixed"} and include_job_keys is not None:
             requested = ", ".join(include_job_names or []) or "<empty>"
             raise FileNotFoundError(
                 f"No .las files for include_jobs ({requested}) found under {data_root}"
             )
         raise FileNotFoundError(f"No .{selected_source_type} files found under {data_root}")
 
+    crs_sidecars = sorted(
+        {
+            sidecar.resolve()
+            for path in discovered_paths
+            if path.suffix.casefold() == ".las"
+            if (sidecar := _associated_crs_sidecar(path, data_root)) is not None
+        },
+        key=lambda item: str(item).casefold(),
+    )
     signature = {
         "catalog_version": POINTCLOUD_CATALOG_VERSION,
         "source_mode": source_mode,
@@ -834,6 +954,7 @@ def build_pointcloud_catalog(
         "las_chunk_size": las_chunk_size,
         "include_job_keys": effective_include_job_keys,
         "source_files": _source_signature(discovered_paths, data_root),
+        "crs_sidecars": _source_signature(crs_sidecars, data_root),
     }
     cached: dict[str, Any] | None = None
     if cache_path.exists():
@@ -865,9 +986,9 @@ def build_pointcloud_catalog(
     for index, path in enumerate(selected_paths, start=1):
         path_text = str(path.resolve())
         cached_file = cached_files.get(path_text)
-        if cached_file is not None and _same_file_signature(cached_file, path):
+        if cached_file is not None and _same_file_signature(cached_file, path, data_root):
             # Selection provenance can change without source bytes changing.
-            if selected_source_type == "las":
+            if path.suffix.casefold() == ".las":
                 cached_file = dict(cached_file)
                 cached_file["provenance"] = {
                     **cached_file.get("provenance", {}),
@@ -879,7 +1000,7 @@ def build_pointcloud_catalog(
 
         file_started_at = time.perf_counter()
         _log(logger, "info", "Indexing point cloud %d/%d: %s", index, len(selected_paths), path.name)
-        if selected_source_type == "pcdb":
+        if path.suffix.casefold() == ".pcdb":
             indexed = _index_single_pcdb(path, data_root)
         else:
             indexed = _index_single_las(
@@ -993,6 +1114,20 @@ def match_nearest_pointcloud_files(
     files = list(catalog.get("files", []))
     if not files:
         return []
+
+    pointcloud_scope = image_task.get("pointcloud_scope")
+    if pointcloud_scope:
+        scope = Path(str(pointcloud_scope)).resolve()
+        scoped_files = []
+        for item in files:
+            try:
+                candidate = Path(str(item.get("path"))).resolve()
+                candidate.relative_to(scope)
+            except (TypeError, ValueError):
+                continue
+            scoped_files.append(item)
+        if scoped_files:
+            files = scoped_files
 
     job_name, track_name = _task_job_track(image_task)
     job_key = _canonical_name(job_name)

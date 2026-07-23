@@ -75,7 +75,7 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(configured["pole_min_ground_drop_m"], 1.8)
         self.assertEqual(configured["sign_observation_merge_xy_radius_m"], 0.25)
         self.assertTrue(configured["pole_require_ground"])
-        self.assertEqual(configured["data_root"], (PROJECT_ROOT / "TRK500Neo").resolve())
+        self.assertEqual(configured["data_root"], (PROJECT_ROOT / "data").resolve())
 
     def test_no_argument_loads_default_yaml_and_cli_can_override_it(self) -> None:
         parser = build_arg_parser()

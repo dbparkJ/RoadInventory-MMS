@@ -271,14 +271,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("TRK500Neo"),
-        help="Legacy MMS root or Leica Pegasus project/parent folder.",
+        default=Path("data"),
+        help="Parent folder recursively containing legacy or Leica MMS deliveries.",
     )
     parser.add_argument(
         "--pose-format",
-        choices=("auto", "legacy", "leica-sphere"),
+        choices=("auto", "legacy", "leica-sphere", "leica-delivery"),
         default="auto",
-        help="Image pose input format. Auto detects legacy CAM or Leica Sphere exports.",
+        help=(
+            "Image pose input format. Auto recursively combines legacy CAM, "
+            "Pegasus Sphere, and Leica standard-delivery exports."
+        ),
     )
     parser.add_argument(
         "--point-source",
@@ -1015,6 +1018,10 @@ def build_dataset_signature(image_tasks: list[dict[str, Any]]) -> dict[str, Any]
         "imaging_sensor_name",
         "raw_camera_serials",
         "gps_week",
+        "manufacturer",
+        "model_name",
+        "system_serial_number",
+        "internal_orientation_path",
         "application",
     )
 
@@ -5384,7 +5391,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         include_jobs={
             str(task["job_name"])
             for task in image_tasks
-            if task.get("pose_format") == "leica-sphere" and task.get("job_name")
+            if task.get("pose_format") in {"leica-sphere", "leica-delivery"}
+            and task.get("job_name")
         }
         or None,
     )
@@ -5462,7 +5470,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
     )
     pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
-    if pointcloud_catalog.get("selected_source_type") == "las" and not crs_wkt:
+    if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
         raise ValueError(
             "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
         )
