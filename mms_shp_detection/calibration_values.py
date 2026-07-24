@@ -424,7 +424,7 @@ def export_from_config(config_path: Path) -> tuple[Path, Path | None]:
 
 def main() -> None:
     if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}):
-        print("Usage: python export_calibration_values.py [calibration_values.yaml]")
+        print("Usage: python scripts/export_calibration_values.py [calibration_values.yaml]")
         if len(sys.argv) > 2:
             raise SystemExit(2)
         return

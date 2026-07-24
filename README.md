@@ -25,14 +25,15 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 
 | 경로 | 역할 |
 |---|---|
-| `run_pipeline.py` | YAML 설정으로 전체 파이프라인 실행 |
+| `scripts/run_pipeline.py` | YAML 설정으로 전체 파이프라인 실행 |
 | `config.yaml` | 기본 실행 설정과 모든 옵션의 한국어 설명 |
 | `models/*.pt` | 자동 발견되는 YOLO detection/segmentation 가중치 |
-| `extract_calibration.py` | Pegasus DB에서 카메라·LiDAR 보정 snapshot 추출 |
-| `export_calibration_values.py` | 보정 snapshot에서 숫자·단위만 JSON/CSV로 내보내기 |
+| `scripts/extract_calibration.py` | Pegasus DB에서 카메라·LiDAR 보정 snapshot 추출 |
+| `scripts/export_calibration_values.py` | 보정 snapshot에서 숫자·단위만 JSON/CSV로 내보내기 |
 | `calibration_values.yaml` | 값 전용 보정 내보내기 입력·출력 설정 |
-| `bootstrap_environment.py` | Windows/Linux `.venv` 생성, 고정 패키지 설치, CUDA 검사 |
-| `verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
+| `scripts/setup.ps1`, `scripts/setup.sh` | OS별 Python 3.12 자동 탐색과 환경 구성 시작 |
+| `scripts/bootstrap_environment.py` | `.venv` 생성, 고정 패키지 설치, GPU/CUDA 사전 검사 |
+| `scripts/verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
 | `mms_shp_detection/` | 데이터 탐색, 투영, 점군, 지주, SHP 구현 |
 | `tests/` | 설정·투영·점군·지주·SHP 회귀 테스트 |
 | `docs/MMS_DATA_SPEC.md` | MMS 수집업체 전달용 데이터 명세 |
@@ -134,32 +135,48 @@ paths:
 
 ### 2. 가상환경 자동 구성
 
-64-bit CPython 3.12가 필요합니다. bootstrap은 운영체제, Python, `nvidia-smi`, driver가 지원하는 CUDA 버전과 GPU compute capability를 확인한 뒤 프로젝트 전용 `.venv`를 만들거나 재사용합니다.
+64-bit CPython 3.12가 필요합니다. OS별 setup launcher는 현재 터미널에서 사용 가능한 Python 명령을 순서대로 검사합니다. 이어서 bootstrap이 운영체제, Python, `nvidia-smi`, driver가 지원하는 CUDA 버전과 GPU compute capability를 확인한 뒤 프로젝트 전용 `.venv`를 만들거나 재사용합니다. 활성화된 가상환경이나 전역 `pip`는 사용하지 않습니다.
 
 Windows PowerShell:
 
 ```powershell
 Set-Location C:\work\mms_project
-py -3.12 .\bootstrap_environment.py
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
 Linux:
 
 ```bash
 cd /path/to/mms_project
-python3.12 bootstrap_environment.py
+bash scripts/setup.sh
 ```
 
-파일이나 패키지를 변경하지 않고 탐지 결과와 설치 예정 명령만 확인하려면 `--dry-run`을 사용합니다.
+launcher는 Python이나 운영체제 패키지를 임의로 설치하지 않습니다. 64-bit CPython 3.12를 찾지 못하면 설치와 터미널 재실행이 필요하다는 오류를 출력합니다. Linux에서 `venv`가 별도 패키지인 배포판은 Python 3.12용 venv 패키지도 준비해야 합니다.
+
+파일이나 패키지를 변경하지 않고 탐지 결과와 설치 예정 명령만 확인하려면 인자를 그대로 전달합니다.
 
 ```powershell
-py -3.12 .\bootstrap_environment.py --dry-run
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 --dry-run
+```
+
+```bash
+bash scripts/setup.sh --dry-run
 ```
 
 GPU가 없는 장비에서 CPU 실행을 의도한 경우에만 `--allow-cpu`를 명시합니다.
 
 ```bash
-python3.12 bootstrap_environment.py --allow-cpu
+bash scripts/setup.sh --allow-cpu
+```
+
+launcher를 사용하지 않고 bootstrap을 직접 실행할 수도 있습니다. 호출한 Python이 3.12가 아니더라도 bootstrap은 같은 터미널의 `py -3.12`, `python3.12`, `python3`, `python` 등을 검색해 올바른 interpreter를 선택합니다.
+
+```powershell
+py .\scripts\bootstrap_environment.py
+```
+
+```bash
+python3 scripts/bootstrap_environment.py
 ```
 
 기존 `.venv`가 손상됐거나 Python 3.12가 아니면 bootstrap은 자동 삭제하지 않고 중단합니다. 필요한 파일을 보존한 뒤 해당 폴더를 직접 다른 이름으로 이동하고 다시 실행하십시오.
@@ -179,14 +196,14 @@ torchaudio  2.7.1+cu118
 설치 후 검증:
 
 ```powershell
-.\.venv\Scripts\python.exe .\verify_environment.py
+.\.venv\Scripts\python.exe .\scripts\verify_environment.py
 .\.venv\Scripts\python.exe -m pip check
 ```
 
 Linux:
 
 ```bash
-./.venv/bin/python verify_environment.py
+./.venv/bin/python scripts/verify_environment.py
 ./.venv/bin/python -m pip check
 ```
 
@@ -208,7 +225,7 @@ environment_check=OK
 Pegasus 프로젝트의 `Track*.scan/scan.db`와 각 Job의 `job.db`에서 보정 snapshot을 만듭니다.
 
 ```powershell
-.\.venv\Scripts\python.exe extract_calibration.py `
+.\.venv\Scripts\python.exe .\scripts\extract_calibration.py `
   .\TRK500Neo\MultiJob.PegasusProject `
   --output .\calibration.json
 ```
@@ -216,7 +233,7 @@ Pegasus 프로젝트의 `Track*.scan/scan.db`와 각 Job의 `job.db`에서 보�
 Linux:
 
 ```bash
-./.venv/bin/python extract_calibration.py \
+./.venv/bin/python scripts/extract_calibration.py \
   ./TRK500Neo/MultiJob.PegasusProject \
   --output ./calibration.json
 ```
@@ -228,11 +245,11 @@ Linux:
 검토표나 외부 문서에 넣을 값만 필요하면 `calibration_values.yaml`을 확인한 뒤 다음 명령을 실행합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe .\export_calibration_values.py
+.\.venv\Scripts\python.exe .\scripts\export_calibration_values.py
 ```
 
 ```bash
-./.venv/bin/python export_calibration_values.py
+./.venv/bin/python scripts/export_calibration_values.py
 ```
 
 기본 설정은 기존 `calibration.json`을 읽어 다음 두 파일을 만듭니다.
@@ -247,7 +264,7 @@ calibration_values.csv   # 값 하나당 한 행인 Excel 검토용 UTF-8 BOM CS
 입력은 `calibration.json` 또는 PegasusProject 디렉터리를 사용할 수 있습니다. JSON을 입력하면서 `project.db`의 좌표계 값도 포함하려면 `input.project_root`를 함께 지정합니다. 다른 설정은 YAML 경로 하나만 전달합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe .\export_calibration_values.py .\my_calibration_values.yaml
+.\.venv\Scripts\python.exe .\scripts\export_calibration_values.py .\my_calibration_values.yaml
 ```
 
 CSV가 필요 없으면 YAML의 `output.csv_path`를 `null`로 둡니다. 이 값 전용 파일은 검토/전달 편의를 위한 것이며, 파이프라인의 보정 provenance 검증에는 원본 구조를 보존한 `calibration.json`을 계속 사용합니다.
@@ -257,17 +274,17 @@ CSV가 필요 없으면 YAML의 `output.csv_path`를 `null`로 둡니다. 이 �
 기본 실행에는 인자를 사용하지 않습니다. 저장소 루트의 `config.yaml`을 자동으로 읽습니다.
 
 ```powershell
-.\.venv\Scripts\python.exe .\run_pipeline.py
+.\.venv\Scripts\python.exe .\scripts\run_pipeline.py
 ```
 
 ```bash
-./.venv/bin/python run_pipeline.py
+./.venv/bin/python scripts/run_pipeline.py
 ```
 
 별도 설정 파일을 사용할 때만 YAML 경로 하나를 전달합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe .\run_pipeline.py .\config_verify.yaml
+.\.venv\Scripts\python.exe .\scripts\run_pipeline.py .\config_verify.yaml
 ```
 
 한 프레임만 검증할 때는 `config.yaml`을 복사한 별도 YAML에서 다음처럼 범위를 제한하십시오.
@@ -316,6 +333,8 @@ resume_and_scope:
 | `pole_geometry_remote_max_axis_rmse_m` | `0.095` | class 없는 원격 지주의 최대 축 방사 오차(m) |
 | `pole_geometry_remote_max_ground_rmse_m` | `0.15` | class 없는 원격 지주의 최대 지면 평면 오차(m) |
 | `pole_require_ground` | `true` | 신뢰 가능한 지면이 없으면 지주 하단점 보류 |
+| `pole_max_ground_penetration_m` | `0.10` | 관측 축이 지면 아래로 들어간 것으로 볼 최대 허용 오차; 초과 시 `GROUND_CONFLICT/REVIEW` |
+| `pole_max_ground_support_distance_m` | `0.35` | 하단점에서 지면 근거 셀까지의 자동 승인 최대 거리(m) |
 | `debug_output.debug_mask_alpha` | `8` | 표지가 보이도록 검출 mask 채움 투명도 조정, 선만 보려면 0 |
 | `execution.num_workers` | `1` | CPU는 병렬 가능, 단일 GPU는 실질적으로 1부터 권장 |
 | `resume_and_scope.skip_existing` | `true` | fingerprint와 산출물이 모두 일치하는 프레임만 재사용 |
@@ -379,19 +398,19 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 1. **탐색 영역 구성**: 표지 주변을 넓게 rectification하고 bbox 아래·좌우 corridor를 먼저 검색합니다. 직접 지주가 없으면 아래쪽 수직 band를 좌우 전체로 넓혀 원격 지주 후보를 다시 찾습니다.
 2. **class 정책과 필터**: 기본값 `pole_classification_mode: auto`는 YAML의 ground(`2`, `11`), excluded vegetation(`3`, `4`, `5`), 공급사 확인 pole ID 중 하나가 선택 LAS에 실제로 있을 때만 class와 형상을 함께 쓰는 `HYBRID` 모드가 됩니다. LAS가 전부 미분류 `0/1`이거나 매핑되지 않은 custom ID만 있으면 자동으로 `GEOMETRY`가 되어 class 필터와 분류 지면을 사용하지 않습니다. `off`는 class가 있어도 강제로 완전히 무시하고, `require`는 선택된 모든 LAS에 설정한 의미 class가 없으면 처리 전에 실패합니다. 현재 TRK500Neo 샘플에 여러 class가 관찰되지만 이것은 공급업체의 공식 계약 map을 확인했다는 뜻이 아니므로, 임의 custom ID를 계약 확인 없이 `pole_class_ids`에 고정하면 안 됩니다. 원본 classification은 어느 모드에서도 검수용 `pole_crops` LAS에 보존됩니다.
-3. **수직 축 생성**: XY voxel의 세로 연속 셀로 seed를 만들고 `x(z), y(z)`를 robust fitting합니다. class가 없는 `GEOMETRY` 모드에서는 주변 저점 셀로 지면대를 먼저 추정해 축 후보에서만 제외하고, 세로 근거가 있는 셀의 점만 최초 fitting에 사용합니다. seed는 연결요소당 고정 개수로 자르지 않고 공간 NMS로 전체 후보 영역을 덮으므로, 지면·식생이 하나의 큰 연결요소가 되어도 가는 실제 지주가 seed에서 탈락하지 않습니다. 점 수, 수직 span, 연속 Z-bin 수, 최대 Z 공백, 점유율, 중간부 지지율, 축 기울기와 radial RMSE 기준을 모두 통과해야 합니다.
+3. **수직 축 생성**: XY voxel의 세로 연속 셀로 seed를 만들고 Z-bin 중앙값에 Theil–Sen 초기축과 MAD 재적합을 적용해 `x(z), y(z)`를 구합니다. 높이 일부에서 식생·차량·수평 암 때문에 축이 갑자기 옆으로 꺾이면 가장 긴 물리적 연속 구간으로 축을 안정화하되, 전 구간 기울기가 일관된 실제 경사 지주는 강제로 수직화하지 않습니다. class가 없는 `GEOMETRY` 모드에서는 주변 저점 셀로 지면대를 먼저 추정해 축 후보에서만 제외합니다. 점 수, 수직 span, 연속 Z-bin 수, 최대 Z 공백, 점유율, 중간부 지지율, 축 기울기와 radial RMSE 기준을 모두 통과해야 합니다.
 4. **축 완전도 계산**: 각 후보의 `completeness_ratio`는 `min(중간부 Z-bin 지지율, min(1, 관측 Z span / (표지 Z - 지면 Z)))`입니다. 표지판의 짧은 수직 가장자리나 상부 부속축은 표지에 더 가까워도 전체 표지-지면 높이를 지지하지 못하므로 낮은 완전도를 받습니다.
 5. **직접/원격 지주 검증**: 표지 높이에서 축까지 0.75m 이내이면 직접 지주입니다. 그보다 먼 축은 표지와 축 사이의 3D 수평 구간을 bin으로 나누고 실제 점군 연결봉 coverage가 기준 이상일 때만 후보에 남깁니다. `GEOMETRY` 원격 후보에는 완전도·축 RMSE·지면 RMSE 하드 기준도 추가 적용합니다. 멀리 있는 나무·건물 모서리를 임의 지주로 연결하지 않기 위한 gate입니다.
 6. **후보 순위 결정**: 먼저 `pole_preferred_min_completeness_ratio` 이상인 전체 축 tier와 직접 지주를 우선합니다. 원격 지주끼리는 `coverage × sqrt(검사 bin 수)`에 축 완전도를 더하고 축 RMSE, multi-return 비율, 연관 거리를 감점한 복합 연결 근거를 비교합니다. 짧은 4/4 잡음 연결이 수 m에 걸친 실제 수평봉을 이기지 않으면서, 긴 구간 일부만 우연히 채운 나무도 억제하기 위한 기준입니다. 직접축은 같은 완전도 tier에서 bounded 물리 점수를 먼저 비교합니다. 축 길이 보상은 표지-지면 예상 높이에서 상한을 두며, strict 결과를 expanded 결과가 무조건 덮어쓰지 않고 같은 품질 순위로 비교합니다.
-7. **로컬 지면 추정**: 지주 중심을 제외한 근거리 셀에서 LAS ground/road 분류 기반 평면과 형상 기반 낮은 셀 평면을 각각 robust fitting합니다. 형상 지면은 최소 표지-지면 높이보다 위에 있는 수평봉·표지점부터 제외하고, class가 없을 때는 더 많은 독립 XY 셀 근거를 요구합니다. 분류된 도로면이 연석 너머 멀리 있고 더 가까운 보도면이 있으면 거리 기준으로 형상 평면을 선택합니다. 셀 수와 RMSE 기준을 못 만족하면 `pole_require_ground: true`에서 하단점을 만들지 않습니다.
-8. **가림 처리**: 관측된 축 최하단과 지면 사이가 `pole_occlusion_gap_m`보다 크면 `OCCLUDED`로 표시하고, 보이는 상·중부 축을 지면 평면까지 연장해 `GROUND_EXTR` 좌표를 만듭니다. 축 자체가 전혀 보이지 않는 완전 가림은 임의 수직선을 만들지 않습니다.
-9. **품질 상태**: 하단이 보이면 `GROUND_SNAP`, 가려져 외삽하면 `GROUND_EXTR`입니다. 낮은 완전도, 높은 지면 RMSE, 또는 class 없는 직접축의 큰 방사 오차는 `REVIEW`로 기록해 같은 위치의 더 좋은 detection/다중 프레임 관측이 최종 좌표 계산에서 우선되게 합니다.
+7. **로컬 지면 추정**: 지주 중심을 제외한 근거리 셀에서 LAS ground/road 분류 기반 평면과 형상 기반 낮은 셀 평면을 각각 robust fitting합니다. 형상 지면은 최소 표지-지면 높이보다 위에 있는 수평봉·표지점부터 제외하고, class가 없을 때는 더 많은 독립 XY 셀 근거를 요구합니다. 분류된 도로면이 연석 너머 멀리 있고 더 가까운 보도면이 있으면 거리 기준으로 형상 평면을 선택합니다. 최종 하단은 단순히 지면 Z를 축에 대입하지 않고 fitted 축과 경사 지면 평면의 정확한 교점으로 계산합니다.
+8. **가림·지면 충돌 처리**: 관측된 축 최하단과 지면 사이가 `pole_occlusion_gap_m`보다 크면 `OCCLUDED/GROUND_EXTR/REVIEW`로 표시합니다. 반대로 관측축이 지면보다 `pole_max_ground_penetration_m` 이상 아래에 있으면 음수 `bottom_gap_m`을 보존하고 `GROUND_CONFLICT/REVIEW`로 기록합니다. 지면 근거 셀이 하단에서 너무 먼 경우도 자동 승인하지 않습니다. 축 자체가 전혀 보이지 않는 완전 가림은 임의 수직선을 만들지 않습니다.
+9. **품질 상태**: 하단이 보이면 `GROUND_SNAP`, 가려져 외삽하면 `GROUND_EXTR`입니다. 낮은 완전도, 높은 지면 RMSE, 먼 지면 근거, 큰 외삽, 지면 관통 또는 class 없는 직접축의 큰 방사 오차는 `REVIEW`로 기록합니다.
 
 이 방식은 XDROAD에서 작업자가 보이는 지주 한 점을 찍어 아래로 내리는 작업을 3차원 축과 로컬 지면으로 확장한 것입니다. 단, 표지 바로 아래 임의점이 아니라 실제 수직 연속성과 지면 근거가 있어야 좌표를 생성합니다.
 
 ### 5. 복수 관측 병합과 중복 제거
 
-- 같은 주행 `record_name` 안에서 지주 하단 XY가 `pole_observation_merge_radius_m` 이내인 관측을 물리 지주 하나로 묶고, 프레임별 최고 품질 관측을 사용해 가중 평균 좌표를 계산합니다.
+- 같은 주행 `record_name` 안에서 지주 하단 XY가 `pole_observation_merge_radius_m` 이내인 관측을 물리 지주 하나로 묶고, 프레임별 최고 품질 관측을 사용해 가중 geometric median을 계산합니다. 정상 군집에서 XY/Z가 크게 벗어난 관측과 `GROUND_CONFLICT`는 좌표 합의에서 제외하고 결과를 `REVIEW`로 남깁니다.
 - 지주별 `support_id`를 만들고 연결된 각 표지의 `det_id`에 같은 지주 좌표를 한 행씩 연결합니다. 따라서 한 지주에 서로 다른 클래스의 표지가 두 개면 `pole_bottoms.shp`에도 동일 XYZ의 두 행이 생깁니다.
 - 같은 record·같은 class·같은 support의 반복 표지는 XY/Z 허용범위를 모두 만족할 때만 complete-link 방식으로 병합합니다. 거리 체인이 서로 다른 두 표지를 이어 붙이지 못하며, 같은 프레임의 서로 다른 bbox는 자동 병합하지 않습니다.
 - 지주가 누락된 관측은 더 엄격한 fallback XY/Z 범위 안에서만 지주가 확인된 다른 프레임의 같은 클래스 표지에 흡수될 수 있습니다.
@@ -403,7 +422,7 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 `paths.model_dir`를 사용하면 `paths.output_dir` 아래에 모델별로 완전히 분리된 구조가 생성됩니다. 단일 `model_path` 호환 모드에서는 아래 `<model_stem>/` 단계 없이 기존 구조를 그대로 사용합니다.
 
-`execution.multi_model_parallel: true`이면 데이터 스캔·점군 카탈로그·정렬 QA를 한 번만 준비하고, 프레임도 한 번만 디코드하여 공통 정면뷰를 생성합니다. 각 모델은 같은 무표시 RGB 배열로 동시에 추론하며, 결과는 모델별 bounded queue로 넘겨져 점군/지주 후처리와 다음 프레임 GPU 추론이 겹쳐 실행됩니다. `multi_model_pole_workers: 1`은 대용량 지주 검색을 도착 순서 FIFO로 직렬화해 대기 중인 모델의 요청이 끼어들 수 있게 하고 메모리 피크를 제한합니다. 동시 CUDA 추론에서 OOM이 발생하면 해당 프레임을 직렬로 다시 실행하고 이후 동시성을 자동으로 1로 낮춥니다. 직렬 재시도도 OOM이면 해당 모델만 남은 프레임에서 중단하고 다른 모델은 계속 진행합니다.
+`execution.multi_model_parallel: true`이면 데이터 스캔·점군 카탈로그·정렬 QA를 한 번만 준비하고, 프레임도 한 번만 디코드하여 공통 정면뷰를 생성합니다. 입력과 설정 fingerprint가 같은 재실행은 완료된 정렬 QA 보고서를 재사용합니다. 각 모델은 같은 무표시 RGB 배열로 동시에 추론하며, 결과는 모델별 bounded queue로 넘겨져 점군/지주 후처리와 다음 프레임 GPU 추론이 겹쳐 실행됩니다. 지주 탐색은 neighborhood마다 XY KD-tree를 한 번 만들고 후보별 지면·수평 암의 근거리 점만 조회하며, strict/expanded 검색은 동일 terrain mask를 재사용합니다. `multi_model_pole_workers: 1`은 대용량 지주 검색을 도착 순서 FIFO로 직렬화해 대기 중인 모델의 요청이 끼어들 수 있게 하고 메모리 피크를 제한합니다. 동시 CUDA 추론에서 OOM이 발생하면 해당 프레임을 직렬로 다시 실행하고 이후 동시성을 자동으로 1로 낮춥니다. 직렬 재시도도 OOM이면 해당 모델만 남은 프레임에서 중단하고 다른 모델은 계속 진행합니다.
 
 ```text
 <output_dir>/
@@ -466,6 +485,8 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 - `complete`: 중간부 지지율과 관측 높이 비율 중 작은 값인 지주축 완전도
 - `class_req`, `class_mode`: 요청한 class 정책(`auto/off/require`)과 실제 계산 방식(`HYBRID/GEOMETRY`)
 - `assoc_m`, `arm_cov`, `axis_rmse`, `grnd_rmse`: 지주 선택 근거와 품질
+- `axis_stab`, `btm_gap`, `grnd_dist`: 높이 구간 축 안정화 여부, signed 하단 간격, 하단에서 지면 근거까지 거리
+- `outlier_n`: 다중 프레임 좌표 합의에서 제외된 이상 관측 수
 - `model_nm`, `obj_type`: 해당 행을 만든 모델 파일명과 객체 유형
 - `search_md`, `fallback`: 지주 strict/fallback 탐색 방식과 물리 fallback 사용 여부
 
@@ -518,8 +539,8 @@ paths:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip check
-.\.venv\Scripts\python.exe .\verify_environment.py
-.\.venv\Scripts\python.exe -m compileall -q mms_shp_detection tests run_pipeline.py extract_calibration.py export_calibration_values.py
+.\.venv\Scripts\python.exe .\scripts\verify_environment.py
+.\.venv\Scripts\python.exe -m compileall -q mms_shp_detection scripts tests
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 

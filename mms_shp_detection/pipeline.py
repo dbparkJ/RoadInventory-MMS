@@ -64,6 +64,7 @@ from .pointcloud import (
 )
 from .pole import (
     PoleSearchParameters,
+    PoleSearchWorkspace,
     blocks_intersecting_bounds,
     cluster_pole_observations,
     find_pole_bases,
@@ -79,8 +80,13 @@ from .shp_writer import (
 )
 
 
-RESULT_SCHEMA_VERSION = 13
+RESULT_SCHEMA_VERSION = 14
 DATASET_SIGNATURE_VERSION = 1
+PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION = 1
+PANORAMA_ALIGNMENT_QA_CACHE_VERSION = 1
+PANORAMA_ALIGNMENT_QA_FINAL_STATUSES = frozenset(
+    {"recommendation", "insufficient_data", "ambiguous"}
+)
 POINT_CROP_SEMANTICS = {
     "kind": "derived_selected_points_visualization",
     "coordinate_dimensions_preserved": ["X", "Y", "Z"],
@@ -460,7 +466,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Detect signs in MMS panoramas, match calibrated point clouds, and export a SHP.",
         allow_abbrev=False,
         epilog=(
-            "YAML-first usage: run_pipeline.py [config.yaml]. With no arguments, "
+            "YAML-first usage: scripts/run_pipeline.py [config.yaml]. With no arguments, "
             "./config.yaml is loaded when present. --config FILE is equivalent; "
             "--no-config keeps legacy CLI-only behavior. Remaining CLI options override YAML."
         ),
@@ -490,7 +496,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--calibration-path",
         type=Path,
         default=Path("calibration.json"),
-        help="Calibration snapshot made by extract_calibration.py.",
+        help="Calibration snapshot made by scripts/extract_calibration.py.",
     )
     parser.add_argument(
         "--require-calibration",
@@ -1041,6 +1047,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.10,
     )
     parser.add_argument("--pole-occlusion-gap-m", type=float, default=0.35)
+    parser.add_argument("--pole-max-ground-penetration-m", type=float, default=0.10)
+    parser.add_argument("--pole-max-ground-support-distance-m", type=float, default=0.35)
     parser.add_argument(
         "--pole-ground-class-ids",
         type=parse_class_id_list,
@@ -1622,6 +1630,76 @@ def build_dataset_signature(image_tasks: list[dict[str, Any]]) -> dict[str, Any]
         ),
         "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     }
+
+
+def build_panorama_alignment_qa_fingerprint(
+    image_tasks: list[dict[str, Any]],
+    pointcloud_catalog: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    dataset_signature: dict[str, Any] | None = None,
+) -> str:
+    """Fingerprint every input that can affect panorama alignment QA.
+
+    The point-cloud catalog signature already contains source paths, sizes, and
+    nanosecond mtimes.  Hashing the estimator and its direct processing
+    dependencies also invalidates reports when the QA implementation changes.
+    """
+
+    package_root = Path(__file__).resolve().parent
+    code_sha256 = {
+        name: _sha256_file(package_root / name)
+        for name in (
+            "alignment.py",
+            "geometry.py",
+            "pcdb.py",
+            "pointcloud.py",
+        )
+    }
+    parameters = {
+        "pointcloud_neighbor_count": max(
+            1, int(getattr(args, "pointcloud_neighbor_count"))
+        ),
+        "sample_images": int(getattr(args, "alignment_qa_sample_images")),
+        "max_points_per_image": int(
+            getattr(args, "alignment_qa_max_points_per_image")
+        ),
+        "search_radius_px": int(getattr(args, "alignment_qa_search_radius_px")),
+        "trim_fraction": float(getattr(args, "alignment_qa_trim_fraction")),
+        "minimum_range_m": float(getattr(args, "alignment_qa_min_range_m")),
+        "maximum_range_m": float(getattr(args, "alignment_qa_max_range_m")),
+        "minimum_valid_samples": int(
+            getattr(args, "alignment_qa_min_valid_samples")
+        ),
+        "maximum_mad_px": float(getattr(args, "alignment_qa_max_mad_px")),
+        "base_yaw_offset_deg": float(
+            getattr(args, "panorama_yaw_offset_deg", 0.0)
+        ),
+        "base_pitch_offset_deg": float(
+            getattr(args, "panorama_pitch_offset_deg", 0.0)
+        ),
+    }
+    payload = {
+        "cache_version": PANORAMA_ALIGNMENT_QA_CACHE_VERSION,
+        "estimator_version": PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION,
+        "code_sha256": code_sha256,
+        "parameters": parameters,
+        "dataset_signature": dataset_signature
+        if dataset_signature is not None
+        else build_dataset_signature(image_tasks),
+        "pointcloud_catalog": {
+            "selected_source_type": pointcloud_catalog.get("selected_source_type"),
+            "signature": pointcloud_catalog.get("signature"),
+        },
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def build_run_fingerprint(
@@ -3594,6 +3672,12 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
             runtime["pole_ground_geometry_preference_margin_m"]
         ),
         occlusion_gap_m=float(runtime["pole_occlusion_gap_m"]),
+        max_ground_penetration_m=float(
+            runtime["pole_max_ground_penetration_m"]
+        ),
+        max_ground_support_distance_m=float(
+            runtime["pole_max_ground_support_distance_m"]
+        ),
         ground_class_ids=tuple(runtime["pole_ground_class_ids"]),
         pole_class_ids=tuple(runtime["pole_class_ids"]),
         excluded_pole_class_ids=tuple(runtime["pole_excluded_pole_class_ids"]),
@@ -3885,6 +3969,9 @@ def find_pole_bases_with_corridor_fallback(
     classifications: np.ndarray | None = None,
     return_numbers: np.ndarray | None = None,
     number_of_returns: np.ndarray | None = None,
+    *,
+    workspace: PoleSearchWorkspace | None = None,
+    ground_classifications: np.ndarray | None = None,
 ) -> tuple[Any | None, np.ndarray, str, int, int]:
     """Search the strict sign corridor, then retry connected remote supports."""
 
@@ -3896,6 +3983,7 @@ def find_pole_bases_with_corridor_fallback(
         corridor_bbox,
         parameters,
     )
+    search_workspace = workspace or PoleSearchWorkspace(neighborhood_xyz)
     result = find_pole_bases(
         neighborhood_xyz,
         strict_mask,
@@ -3904,6 +3992,8 @@ def find_pole_bases_with_corridor_fallback(
         classifications,
         return_numbers,
         number_of_returns,
+        workspace=search_workspace,
+        ground_classifications=ground_classifications,
     )
     mode = "strict"
     searched_mask = strict_mask
@@ -3928,6 +4018,8 @@ def find_pole_bases_with_corridor_fallback(
             classifications,
             return_numbers,
             number_of_returns,
+            workspace=search_workspace,
+            ground_classifications=ground_classifications,
         )
         if expanded_result is not None and (
             result is None
@@ -4532,6 +4624,7 @@ def extract_pole_for_detection(
             selected_classes,
             classification_policy,
         )
+        pole_workspace = PoleSearchWorkspace(selected_records["xyz"])
         selected_pixels, selected_valid = _project_points_to_rectified_view(
             selected_records["xyz"],
             origin_xyz,
@@ -4556,6 +4649,8 @@ def extract_pole_for_detection(
                 selected_records["number_of_returns"],
                 dtype=np.int16,
             ),
+            workspace=pole_workspace,
+            ground_classifications=selected_algorithm_classes,
         )
         return {
             "records": selected_records,
@@ -4879,12 +4974,26 @@ def extract_pole_for_detection(
                 else float(item.horizontal_connection_coverage_ratio)
             ),
             "axis_rmse_m": float(item.radial_rmse_m),
+            "axis_stabilized": bool(item.axis_stabilized),
+            "axis_bin_inlier_count": (
+                None
+                if item.axis_bin_inlier_count is None
+                else int(item.axis_bin_inlier_count)
+            ),
+            "axis_bin_count": (
+                None if item.axis_bin_count is None else int(item.axis_bin_count)
+            ),
             "lowest_observed_z": float(item.lowest_observed_z),
             "ground_z": None if item.ground_z is None else float(item.ground_z),
             "ground_rmse_m": None
             if item.ground_rmse_m is None
             else float(item.ground_rmse_m),
             "bottom_gap_m": None if item.bottom_gap_m is None else float(item.bottom_gap_m),
+            "ground_support_distance_m": (
+                None
+                if item.ground_support_distance_m is None
+                else float(item.ground_support_distance_m)
+            ),
             "occluded_bottom": item.occluded_bottom,
             "occlusion_status": item.occlusion_status,
             "method": item.method,
@@ -4937,6 +5046,11 @@ def extract_pole_for_detection(
         "quality": quality,
         "axis_rmse_m": axis_rmse,
         "ground_rmse_m": ground_rmse,
+        "axis_stabilized": bool(primary.axis_stabilized),
+        "axis_bin_inlier_count": primary.axis_bin_inlier_count,
+        "axis_bin_count": primary.axis_bin_count,
+        "bottom_gap_m": primary.bottom_gap_m,
+        "ground_support_distance_m": primary.ground_support_distance_m,
         "dominant_class_id": primary.dominant_class_id,
         "dominant_class_fraction": primary.dominant_class_fraction,
         "multi_return_fraction": primary.multi_return_fraction,
@@ -6368,6 +6482,8 @@ def run_panorama_alignment_qa(
     args: argparse.Namespace,
     report_path: Path,
     logger: Any,
+    *,
+    dataset_signature: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a report-only RGB reprojection recommendation.
 
@@ -6378,8 +6494,60 @@ def run_panorama_alignment_qa(
     """
 
     enabled = bool(getattr(args, "alignment_qa_enabled", False))
+    cache_fingerprint = (
+        build_panorama_alignment_qa_fingerprint(
+            image_tasks,
+            pointcloud_catalog,
+            args,
+            dataset_signature=dataset_signature,
+        )
+        if enabled
+        else None
+    )
+    if enabled and report_path.is_file():
+        try:
+            cached = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Ignoring unreadable panorama alignment QA cache %s: %s",
+                report_path,
+                exc,
+            )
+        else:
+            cache_valid = (
+                isinstance(cached, dict)
+                and cached.get("cache_version")
+                == PANORAMA_ALIGNMENT_QA_CACHE_VERSION
+                and cached.get("estimator_version")
+                == PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION
+                and cached.get("cache_fingerprint") == cache_fingerprint
+                and cached.get("status") in PANORAMA_ALIGNMENT_QA_FINAL_STATUSES
+                and cached.get("report_only") is True
+            )
+            if cache_valid:
+                report = dict(cached)
+                report["cache_hit"] = True
+                report["report_path"] = str(report_path.resolve())
+                atomic_write_text(
+                    report_path,
+                    json.dumps(report, ensure_ascii=False, indent=2),
+                )
+                logger.info(
+                    "Panorama alignment QA cache hit: status=%s fingerprint=%s",
+                    report["status"],
+                    cache_fingerprint[:12],
+                )
+                return report
+            logger.info(
+                "Panorama alignment QA cache miss: input fingerprint changed or "
+                "the previous report is incomplete."
+            )
+
     report: dict[str, Any] = {
-        "estimator_version": 1,
+        "estimator_version": PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION,
+        "cache_version": PANORAMA_ALIGNMENT_QA_CACHE_VERSION,
+        "cache_fingerprint": cache_fingerprint,
+        "cache_hit": False,
         "status": "disabled" if not enabled else "running",
         "report_only": True,
         "applied_yaw_offset_deg": float(getattr(args, "panorama_yaw_offset_deg", 0.0)),
@@ -6520,6 +6688,7 @@ def prepare_shared_pipeline_context(
         args,
         alignment_report_path,
         logger,
+        dataset_signature=dataset_signature,
     )
     return {
         "image_tasks": image_tasks,

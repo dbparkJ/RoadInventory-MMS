@@ -11,11 +11,7 @@ import ultralytics
 from torchvision.ops import nms
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Verify the isolated MMS inference environment.")
-    parser.add_argument("--allow-cpu", action="store_true", help="Do not fail when CUDA is unavailable.")
-    args = parser.parse_args()
-
+def verify_environment(*, allow_cpu: bool) -> None:
     print(f"torch={torch.__version__}")
     print(f"torchvision={torchvision.__version__}")
     print(f"torch_cuda_runtime={torch.version.cuda}")
@@ -36,10 +32,14 @@ def main() -> None:
     if pyproj.__version__ != "3.7.2":
         raise RuntimeError(f"Expected pyproj 3.7.2, got {pyproj.__version__}")
     if not torch.cuda.is_available():
-        if args.allow_cpu:
+        if allow_cpu:
             print("CUDA smoke test skipped (--allow-cpu).")
+            print("environment_check=OK")
             return
-        raise RuntimeError("CUDA is unavailable. Ensure this script is run with .venv\\Scripts\\python.exe")
+        raise RuntimeError(
+            "CUDA is unavailable. Run scripts/bootstrap_environment.py with the intended "
+            "virtual environment, or pass --allow-cpu for an intentional CPU setup."
+        )
 
     device = torch.device("cuda:0")
     print(f"gpu={torch.cuda.get_device_name(device)}")
@@ -52,6 +52,13 @@ def main() -> None:
         raise RuntimeError("CUDA matrix multiplication returned a non-finite value")
     print(f"cuda_nms={kept.cpu().tolist()}")
     print("environment_check=OK")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Verify the isolated MMS inference environment.")
+    parser.add_argument("--allow-cpu", action="store_true", help="Do not fail when CUDA is unavailable.")
+    args = parser.parse_args()
+    verify_environment(allow_cpu=args.allow_cpu)
 
 
 if __name__ == "__main__":

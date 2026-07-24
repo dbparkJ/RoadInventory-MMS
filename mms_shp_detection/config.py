@@ -154,6 +154,8 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "pole_ground_max_rmse_m": (0, None),
     "pole_ground_geometry_preference_margin_m": (0, None),
     "pole_occlusion_gap_m": (0, None),
+    "pole_max_ground_penetration_m": (0, None),
+    "pole_max_ground_support_distance_m": (0, None),
     "pole_observation_merge_radius_m": (0, None),
     "pole_min_observations": (1, None),
     "sign_observation_merge_xy_radius_m": (0, None),
@@ -432,8 +434,9 @@ def parse_args_with_config(
 ) -> argparse.Namespace:
     """Parse YAML-first pipeline arguments while preserving legacy CLI overrides.
 
-    Supported normal invocations are ``run_pipeline.py`` (loads config.yaml),
-    ``run_pipeline.py custom.yaml``, and ``run_pipeline.py --config custom.yaml``.
+    Supported normal invocations are ``scripts/run_pipeline.py`` (loads config.yaml),
+    ``scripts/run_pipeline.py custom.yaml``, and
+    ``scripts/run_pipeline.py --config custom.yaml``.
     Remaining legacy CLI flags override YAML values and ``--no-config`` opts out.
     """
 

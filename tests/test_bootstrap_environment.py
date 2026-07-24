@@ -9,7 +9,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import bootstrap_environment as bootstrap
+from scripts import bootstrap_environment as bootstrap
+from scripts import verify_environment as verifier
 
 
 def _python_info(path: Path) -> bootstrap.PythonInfo:
@@ -133,6 +134,27 @@ class PythonDiscoveryTests(unittest.TestCase):
             root / "bin" / "python",
         )
 
+    def test_relocated_parser_defaults_point_back_to_repository(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        args = bootstrap.build_parser().parse_args([])
+        self.assertEqual(args.project_root, repository_root)
+        self.assertEqual(args.verify_script, Path("scripts/verify_environment.py"))
+        self.assertTrue((repository_root / "scripts" / "setup.ps1").is_file())
+        self.assertTrue((repository_root / "scripts" / "setup.sh").is_file())
+
+
+class EnvironmentVerifierTests(unittest.TestCase):
+    def test_explicit_cpu_fallback_prints_success_marker(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(verifier.torch.cuda, "is_available", return_value=False),
+            redirect_stdout(output),
+        ):
+            verifier.verify_environment(allow_cpu=True)
+        rendered = output.getvalue()
+        self.assertIn("CUDA smoke test skipped (--allow-cpu).", rendered)
+        self.assertIn("environment_check=OK", rendered)
+
 
 class CommandPlanTests(unittest.TestCase):
     def test_plan_uses_venv_interpreter_and_existing_verifier(self) -> None:
@@ -141,7 +163,7 @@ class CommandPlanTests(unittest.TestCase):
             venv_dir=Path("/repo/.venv"),
             venv_python=Path("/repo/.venv/bin/python"),
             requirements_path=Path("/repo/requirements.txt"),
-            verify_script=Path("/repo/verify_environment.py"),
+            verify_script=Path("/repo/scripts/verify_environment.py"),
             create_venv=True,
             allow_cpu=True,
         )
@@ -158,12 +180,14 @@ class CommandPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "requirements.txt").write_text("example==1.0\n", encoding="utf-8")
-            (root / "verify_environment.py").write_text("print('ok')\n", encoding="utf-8")
+            verifier_path = root / "scripts" / "verify_environment.py"
+            verifier_path.parent.mkdir()
+            verifier_path.write_text("print('ok')\n", encoding="utf-8")
             args = argparse.Namespace(
                 project_root=root,
                 venv_dir=Path(".venv"),
                 requirements=Path("requirements.txt"),
-                verify_script=Path("verify_environment.py"),
+                verify_script=Path("scripts/verify_environment.py"),
                 python=None,
                 nvidia_smi=None,
                 allow_cpu=False,
@@ -193,7 +217,9 @@ class CommandPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "requirements.txt").write_text("example==1.0\n", encoding="utf-8")
-            (root / "verify_environment.py").write_text("print('ok')\n", encoding="utf-8")
+            verifier_path = root / "scripts" / "verify_environment.py"
+            verifier_path.parent.mkdir()
+            verifier_path.write_text("print('ok')\n", encoding="utf-8")
             venv = root / ".venv"
             venv.mkdir()
             sentinel = venv / "user-file.txt"
@@ -202,7 +228,7 @@ class CommandPlanTests(unittest.TestCase):
                 project_root=root,
                 venv_dir=Path(".venv"),
                 requirements=Path("requirements.txt"),
-                verify_script=Path("verify_environment.py"),
+                verify_script=Path("scripts/verify_environment.py"),
                 python=None,
                 nvidia_smi=None,
                 allow_cpu=False,
@@ -226,7 +252,9 @@ class CommandPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "requirements.txt").write_text("example==1.0\n", encoding="utf-8")
-            (root / "verify_environment.py").write_text("print('ok')\n", encoding="utf-8")
+            verifier_path = root / "scripts" / "verify_environment.py"
+            verifier_path.parent.mkdir()
+            verifier_path.write_text("print('ok')\n", encoding="utf-8")
             venv_python = root / ".venv" / "bin" / "python"
             venv_python.parent.mkdir(parents=True)
             venv_python.write_text("placeholder", encoding="utf-8")
@@ -234,7 +262,7 @@ class CommandPlanTests(unittest.TestCase):
                 project_root=root,
                 venv_dir=Path(".venv"),
                 requirements=Path("requirements.txt"),
-                verify_script=Path("verify_environment.py"),
+                verify_script=Path("scripts/verify_environment.py"),
                 python=None,
                 nvidia_smi=None,
                 allow_cpu=False,

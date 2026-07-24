@@ -560,6 +560,11 @@ def collect_pole_records(
                 "pole_quality": pole.get("quality"),
                 "axis_rmse_m": pole.get("axis_rmse_m"),
                 "ground_rmse_m": pole.get("ground_rmse_m"),
+                "axis_stabilized": pole.get("axis_stabilized"),
+                "bottom_gap_m": pole.get("bottom_gap_m"),
+                "ground_support_distance_m": pole.get(
+                    "ground_support_distance_m"
+                ),
                 "association_distance_m": pole.get("association_distance_m"),
                 "horizontal_connection_coverage_ratio": pole.get(
                     "horizontal_connection_coverage_ratio"
@@ -1163,7 +1168,7 @@ def write_pole_shapefile(
                     str(item.get("pole_method") or "")[:16],
                     str(item.get("pole_status") or "")[:12],
                     occluded_value,
-                    occlusion_status[:10],
+                    occlusion_status[:16],
                     int(item.get("pole_count") or 0),
                     observation_count,
                     detection_count,
@@ -1175,6 +1180,17 @@ def write_pole_shapefile(
                     else None,
                     float(item["ground_rmse_m"])
                     if item.get("ground_rmse_m") is not None
+                    else None,
+                    (
+                        bool(item.get("axis_stabilized"))
+                        if item.get("axis_stabilized") is not None
+                        else None
+                    ),
+                    float(item["bottom_gap_m"])
+                    if item.get("bottom_gap_m") is not None
+                    else None,
+                    float(item["ground_support_distance_m"])
+                    if item.get("ground_support_distance_m") is not None
                     else None,
                     float(item["association_distance_m"])
                     if item.get("association_distance_m") is not None
@@ -1205,6 +1221,7 @@ def write_pole_shapefile(
                     float(item["z_spread_m"])
                     if item.get("z_spread_m") is not None
                     else None,
+                    int(item.get("consensus_outlier_count") or 0),
                     str(item.get("image_name") or "")[:80],
                     str(item.get("timestamp_iso") or "")[:26],
                     Path(str(item["pole_point_crop_path"])).name[:100]
@@ -1228,7 +1245,7 @@ def write_pole_shapefile(
         ("method", "C", 16, 0),
         ("status", "C", 12, 0),
         ("occluded", "L", 1, 0),
-        ("occ_state", "C", 10, 0),
+        ("occ_state", "C", 16, 0),
         ("pole_cnt", "N", 50, 0),
         ("obs_count", "N", 50, 0),
         ("det_count", "N", 50, 0),
@@ -1237,6 +1254,9 @@ def write_pole_shapefile(
         ("pt_count", "N", 50, 0),
         ("axis_rmse", "F", 10, 4),
         ("grnd_rmse", "F", 10, 4),
+        ("axis_stab", "L", 1, 0),
+        ("btm_gap", "F", 10, 4),
+        ("grnd_dist", "F", 10, 4),
         ("assoc_m", "F", 10, 4),
         ("arm_cov", "F", 10, 4),
         ("complete", "F", 10, 4),
@@ -1248,6 +1268,7 @@ def write_pole_shapefile(
         ("fallback", "L", 1, 0),
         ("xy_spread", "F", 10, 4),
         ("z_spread", "F", 10, 4),
+        ("outlier_n", "N", 10, 0),
         ("img_name", "C", 80, 0),
         ("img_time", "C", 26, 0),
         ("las_file", "C", 100, 0),

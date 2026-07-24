@@ -1,8 +1,8 @@
 # MMS 도로표지 3차원 위치 생성 파이프라인 설정
 # 실행 방법:
-#   Windows : .\.venv\Scripts\python.exe run_pipeline.py
-#   Linux   : ./.venv/bin/python run_pipeline.py
-# 다른 설정을 쓸 때는 `python run_pipeline.py 다른설정.yaml`처럼 파일 하나만 전달합니다.
+#   Windows : .\.venv\Scripts\python.exe .\scripts\run_pipeline.py
+#   Linux   : ./.venv/bin/python scripts/run_pipeline.py
+# 다른 설정을 쓸 때는 `python scripts/run_pipeline.py 다른설정.yaml`처럼 파일 하나만 전달합니다.
 # 상대 경로는 현재 터미널 위치가 아니라 이 YAML 파일이 있는 폴더를 기준으로 해석됩니다.
 # true/false는 따옴표 없이 쓰고, 값이 없는 선택 항목은 null로 둡니다.
 config_version: 1
@@ -11,7 +11,7 @@ paths:
   # 여러 Leica 프로젝트·표준 납품본·기존 MMS 데이터를 포함하는 상위 폴더입니다.
   # 하위 폴더를 재귀 탐색하므로 개별 Neo 모델 폴더로 바꿀 필요가 없습니다.
   data_root: data/SEC006_마산교차로_하천리155-17_250903
-  # extract_calibration.py로 생성한 보정 스냅샷입니다.
+  # scripts/extract_calibration.py로 생성한 보정 스냅샷입니다.
   calibration_path: calibration.json
   # 단일 모델 호환 옵션입니다. model_dir를 사용할 때는 null로 두며 직접 모델을 선택하지 않습니다.
   model_path: null
@@ -45,6 +45,8 @@ model_filters:
       pole_max_drop_m: 8.0
       pole_min_vertical_span_m: 0.75
       pole_max_axis_sign_distance_m: 8.0
+      pole_max_ground_penetration_m: 0.10
+      pole_max_ground_support_distance_m: 0.35
       pole_range_fallback_enabled: true
       pole_fallback_search_radius_m: 10.0
       pole_fallback_max_drop_m: 12.0
@@ -84,6 +86,8 @@ model_filters:
       pole_axis_inlier_radius_m: 0.22
       pole_min_vertical_span_m: 1.2
       pole_max_axis_sign_distance_m: 12.0
+      pole_max_ground_penetration_m: 0.10
+      pole_max_ground_support_distance_m: 0.40
       pole_horizontal_connection_above_tolerance_m: 1.0
       pole_geometry_remote_max_axis_rmse_m: 0.13
       # 더 긴 교차로 암과 8m 초과 지주는 완화된 2차 탐색 후 REVIEW로 기록합니다.
@@ -365,6 +369,10 @@ pole_detection:
   pole_ground_geometry_preference_margin_m: 0.10
   # 관측된 지주 최하단과 추정 지면의 차이가 이 값(m)보다 크면 하단 가림으로 표시합니다.
   pole_occlusion_gap_m: 0.35
+  # 추정 지면이 관측 축 최하단보다 이 값(m) 이상 높으면 물리 충돌로 보고 REVIEW 처리합니다.
+  pole_max_ground_penetration_m: 0.10
+  # 계산된 하단점에서 지면 근거 셀까지 이 거리(m)를 넘으면 자동 승인하지 않습니다.
+  pole_max_ground_support_distance_m: 0.35
   # 공급사 LAS에서 지면으로 사용할 class ID 목록입니다. 일반 ground=2와 road=11을 기본 사용합니다.
   pole_ground_class_ids: [2, 11]
   # 공급사가 확인한 지주 전용 class ID 목록입니다. 모르면 빈 목록으로 두어 형상 기반으로 찾습니다.

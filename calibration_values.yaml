@@ -1,7 +1,7 @@
 # 캘리브레이션의 숫자와 단위만 읽기 쉽게 내보내는 설정입니다.
 # 실행:
-#   Windows: .\.venv\Scripts\python.exe export_calibration_values.py
-#   Linux:   ./.venv/bin/python export_calibration_values.py
+#   Windows: .\.venv\Scripts\python.exe .\scripts\export_calibration_values.py
+#   Linux:   ./.venv/bin/python scripts/export_calibration_values.py
 config_version: 1
 
 input:

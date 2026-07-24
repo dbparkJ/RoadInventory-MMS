@@ -1,15 +1,17 @@
 # MMS 실행환경 자동 구성
 
-`bootstrap_environment.py`는 Windows와 Linux에서 다음 작업을 비대화형으로 수행합니다.
+`scripts/setup.ps1`과 `scripts/setup.sh`는 현재 터미널에서 64-bit CPython 3.12를 자동으로 찾은 뒤 `scripts/bootstrap_environment.py`를 실행합니다. bootstrap은 Windows와 Linux에서 다음 작업을 비대화형으로 수행합니다.
 
 1. 운영체제와 64-bit CPython 3.12 자동 탐지
 2. `nvidia-smi`를 통한 NVIDIA GPU, driver, compute capability, driver 지원 CUDA 버전 확인
 3. 프로젝트의 `.venv` 생성 또는 기존 환경 재사용
 4. `requirements.txt`의 고정 버전 설치
 5. `pip check` 실행
-6. `verify_environment.py`를 통한 torch/torchvision 버전, CUDA 11.8 runtime, CUDA NMS와 행렬곱 smoke test
+6. `scripts/verify_environment.py`를 통한 torch/torchvision 버전, CUDA 11.8 runtime, CUDA NMS와 행렬곱 smoke test
 
 PyTorch wheel은 자체 CUDA 11.8 runtime을 포함하므로 시스템 CUDA Toolkit이나 `nvcc` 설치는 필수가 아닙니다. `nvidia-smi`의 `CUDA Version`은 설치된 Toolkit 버전이 아니라 현재 driver가 지원하는 최대 CUDA 버전입니다.
+
+setup launcher는 Python이나 운영체제 패키지를 자동 설치하지 않습니다. 설치 여부를 임의로 바꾸거나 관리자 권한을 요구하는 대신, 찾을 수 있는 Python 명령을 검사하고 필요한 조치를 설명하는 오류로 종료합니다.
 
 ## Windows
 
@@ -17,30 +19,40 @@ PowerShell에서 프로젝트 루트로 이동한 뒤 실행합니다.
 
 ```powershell
 Set-Location D:\mms_project
-py -3.12 .\bootstrap_environment.py
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
-스크립트는 활성화된 환경이나 전역 `pip`를 사용하지 않고 항상 `.venv\Scripts\python.exe -m pip`를 호출합니다.
+launcher는 `py -3.12`, `python3.12`, `python`, `python3` 순으로 64-bit CPython 3.12를 찾습니다. bootstrap은 활성화된 환경이나 전역 `pip`를 사용하지 않고 항상 `.venv\Scripts\python.exe -m pip`를 호출합니다.
 
 ## Linux
 
 ```bash
 cd /path/to/mms_project
-python3.12 bootstrap_environment.py
+bash scripts/setup.sh
 ```
 
-배포판에서 `venv` 모듈을 별도 패키지로 제공한다면 먼저 Python 3.12용 venv 패키지가 설치돼 있어야 합니다. 예를 들어 Ubuntu 계열에서는 관리자에게 `python3.12-venv` 설치를 요청합니다.
+launcher는 `python3.12`, `python3`, `python` 순으로 64-bit CPython 3.12를 찾습니다. 배포판에서 `venv` 모듈을 별도 패키지로 제공한다면 먼저 Python 3.12용 venv 패키지가 설치돼 있어야 합니다. 예를 들어 Ubuntu 계열에서는 관리자에게 `python3.12-venv` 설치를 요청합니다.
+
+launcher 없이 bootstrap을 직접 실행해도 됩니다. 이 경우 호출한 interpreter가 3.12가 아니더라도 bootstrap이 터미널에서 올바른 3.12 interpreter를 다시 검색합니다.
+
+```powershell
+py .\scripts\bootstrap_environment.py
+```
+
+```bash
+python3 scripts/bootstrap_environment.py
+```
 
 ## 사전 확인만 하기
 
 아래 명령은 OS/Python/GPU/driver를 탐지하고 실행 예정 명령을 출력하지만 `.venv`나 패키지를 변경하지 않습니다.
 
 ```powershell
-py -3.12 .\bootstrap_environment.py --dry-run
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 --dry-run
 ```
 
 ```bash
-python3.12 bootstrap_environment.py --dry-run
+bash scripts/setup.sh --dry-run
 ```
 
 ## CPU fallback
@@ -48,7 +60,11 @@ python3.12 bootstrap_environment.py --dry-run
 GPU가 없거나 driver가 CUDA 11.8을 지원하지 않으면 기본 실행은 즉시 실패합니다. CPU 실행을 의도한 경우에만 `--allow-cpu`를 명시합니다.
 
 ```powershell
-py -3.12 .\bootstrap_environment.py --allow-cpu
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 --allow-cpu
+```
+
+```bash
+bash scripts/setup.sh --allow-cpu
 ```
 
 이 옵션은 requirements를 임의로 CPU 전용 wheel로 바꾸지 않습니다. 고정된 PyTorch 2.7.1+cu118 wheel을 설치하되 CUDA smoke test를 생략할 수 있게 하며, 같은 환경을 CPU 추론에 사용합니다.
@@ -64,7 +80,7 @@ py -3.12 .\bootstrap_environment.py --allow-cpu
 특정 Python이나 `nvidia-smi`를 지정할 수 있습니다.
 
 ```powershell
-py -3.12 .\bootstrap_environment.py `
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 `
   --python C:\Python312\python.exe `
   --nvidia-smi C:\Windows\System32\nvidia-smi.exe
 ```
@@ -72,7 +88,7 @@ py -3.12 .\bootstrap_environment.py `
 다른 프로젝트 사본이나 가상환경 경로를 검사할 때:
 
 ```bash
-python3.12 bootstrap_environment.py \
+python3 scripts/bootstrap_environment.py \
   --project-root /srv/mms_project \
   --venv-dir .venv
 ```
@@ -99,4 +115,3 @@ cuda_nms=[0]
 ```
 
 자동화/CI에서는 종료 코드가 0인지 확인하면 됩니다. 탐지 또는 설치 실패는 2, 사용자 중단은 130을 반환합니다.
-

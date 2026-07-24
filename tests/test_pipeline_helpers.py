@@ -27,6 +27,7 @@ from mms_shp_detection.pipeline import (
     build_arg_parser,
     build_dataset_signature,
     build_forward_detection_mapping,
+    build_panorama_alignment_qa_fingerprint,
     build_pole_fallback_parameters,
     build_pole_debug_axis_segments,
     build_pole_debug_overview_view,
@@ -162,8 +163,9 @@ class PoleClassificationPolicyTests(unittest.TestCase):
 
 
 class PanoramaAlignmentQaTests(unittest.TestCase):
-    def test_zero_pixel_mad_is_a_stable_recommendation(self) -> None:
-        args = SimpleNamespace(
+    @staticmethod
+    def _args() -> SimpleNamespace:
+        return SimpleNamespace(
             alignment_qa_enabled=True,
             panorama_yaw_offset_deg=0.0,
             panorama_pitch_offset_deg=0.0,
@@ -177,7 +179,10 @@ class PanoramaAlignmentQaTests(unittest.TestCase):
             alignment_qa_min_valid_samples=3,
             alignment_qa_max_mad_px=2.0,
         )
-        estimate = {
+
+    @staticmethod
+    def _estimate() -> dict[str, object]:
+        return {
             "status": "ok",
             "valid_sample_count": 3,
             "estimated_yaw_residual_deg": 0.0,
@@ -190,9 +195,12 @@ class PanoramaAlignmentQaTests(unittest.TestCase):
                 {"dx_px": 0, "dy_px": 0},
             ],
         }
+
+    def test_zero_pixel_mad_is_a_stable_recommendation(self) -> None:
+        args = self._args()
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
             "mms_shp_detection.pipeline.estimate_panorama_alignment",
-            return_value=estimate,
+            return_value=self._estimate(),
         ):
             report = run_panorama_alignment_qa(
                 [],
@@ -204,6 +212,136 @@ class PanoramaAlignmentQaTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "recommendation")
         self.assertTrue(report["stable_recommendation"])
+        self.assertFalse(report["cache_hit"])
+
+    def test_matching_complete_report_skips_estimator(self) -> None:
+        args = self._args()
+        dataset_signature = {"signature_version": 1, "sha256": "dataset-a"}
+        catalog = {
+            "selected_source_type": "las",
+            "signature": {"source_files": [{"path": "cloud.las", "mtime_ns": 1}]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "mms_shp_detection.pipeline.estimate_panorama_alignment",
+            return_value=self._estimate(),
+        ) as estimator:
+            report_path = Path(temp_dir) / "alignment.json"
+            first = run_panorama_alignment_qa(
+                [],
+                catalog,
+                args,
+                report_path,
+                mock.Mock(),
+                dataset_signature=dataset_signature,
+            )
+            second = run_panorama_alignment_qa(
+                [],
+                catalog,
+                args,
+                report_path,
+                mock.Mock(),
+                dataset_signature=dataset_signature,
+            )
+
+            stored = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(estimator.call_count, 1)
+        self.assertFalse(first["cache_hit"])
+        self.assertTrue(second["cache_hit"])
+        self.assertTrue(stored["cache_hit"])
+        self.assertEqual(
+            first["cache_fingerprint"],
+            second["cache_fingerprint"],
+        )
+
+    def test_changed_catalog_signature_invalidates_cached_report(self) -> None:
+        args = self._args()
+        dataset_signature = {"signature_version": 1, "sha256": "dataset-a"}
+        first_catalog = {
+            "selected_source_type": "las",
+            "signature": {"source_files": [{"path": "cloud.las", "mtime_ns": 1}]},
+        }
+        changed_catalog = copy.deepcopy(first_catalog)
+        changed_catalog["signature"]["source_files"][0]["mtime_ns"] = 2
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "mms_shp_detection.pipeline.estimate_panorama_alignment",
+            return_value=self._estimate(),
+        ) as estimator:
+            report_path = Path(temp_dir) / "alignment.json"
+            first = run_panorama_alignment_qa(
+                [],
+                first_catalog,
+                args,
+                report_path,
+                mock.Mock(),
+                dataset_signature=dataset_signature,
+            )
+            second = run_panorama_alignment_qa(
+                [],
+                changed_catalog,
+                args,
+                report_path,
+                mock.Mock(),
+                dataset_signature=dataset_signature,
+            )
+
+        self.assertEqual(estimator.call_count, 2)
+        self.assertFalse(second["cache_hit"])
+        self.assertNotEqual(
+            first["cache_fingerprint"],
+            second["cache_fingerprint"],
+        )
+
+    def test_fingerprint_covers_dataset_calibration_catalog_and_qa_config(self) -> None:
+        args = self._args()
+        catalog = {
+            "selected_source_type": "las",
+            "signature": {"source_files": [{"path": "cloud.las", "mtime_ns": 1}]},
+        }
+        dataset = {
+            "signature_version": 1,
+            "sha256": "image-pose-and-calibration-a",
+        }
+        baseline = build_panorama_alignment_qa_fingerprint(
+            [],
+            catalog,
+            args,
+            dataset_signature=dataset,
+        )
+        self.assertEqual(
+            baseline,
+            build_panorama_alignment_qa_fingerprint(
+                [],
+                copy.deepcopy(catalog),
+                copy.deepcopy(args),
+                dataset_signature=copy.deepcopy(dataset),
+            ),
+        )
+
+        changed_dataset = dict(dataset, sha256="image-pose-and-calibration-b")
+        changed_catalog = copy.deepcopy(catalog)
+        changed_catalog["signature"]["source_files"][0]["mtime_ns"] = 2
+        changed_args = copy.deepcopy(args)
+        changed_args.alignment_qa_trim_fraction = 0.7
+        for candidate_args, candidate_catalog, candidate_dataset in (
+            (args, catalog, changed_dataset),
+            (args, changed_catalog, dataset),
+            (changed_args, catalog, dataset),
+        ):
+            with self.subTest(
+                dataset=candidate_dataset["sha256"],
+                catalog=candidate_catalog["signature"],
+                trim=candidate_args.alignment_qa_trim_fraction,
+            ):
+                self.assertNotEqual(
+                    baseline,
+                    build_panorama_alignment_qa_fingerprint(
+                        [],
+                        candidate_catalog,
+                        candidate_args,
+                        dataset_signature=candidate_dataset,
+                    ),
+                )
 
 
 class PanoramaSeamTests(unittest.TestCase):

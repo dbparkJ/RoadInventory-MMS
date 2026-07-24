@@ -54,6 +54,8 @@ class PoleSearchParameters:
     ground_max_rmse_m: float = 0.20
     ground_geometry_preference_margin_m: float = 0.10
     occlusion_gap_m: float = 0.35
+    max_ground_penetration_m: float = 0.10
+    max_ground_support_distance_m: float = 0.35
     ground_class_ids: tuple[int, ...] = (2, 11)
     pole_class_ids: tuple[int, ...] = ()
     excluded_pole_class_ids: tuple[int, ...] = (3, 4, 5)
@@ -84,6 +86,8 @@ class PoleSearchParameters:
             "ground_geometry_preference_margin_m": (
                 self.ground_geometry_preference_margin_m
             ),
+            "max_ground_penetration_m": self.max_ground_penetration_m,
+            "max_ground_support_distance_m": self.max_ground_support_distance_m,
             "geometry_remote_max_axis_rmse_m": self.geometry_remote_max_axis_rmse_m,
             "geometry_remote_max_ground_rmse_m": self.geometry_remote_max_ground_rmse_m,
             "direct_max_axis_sign_distance_m": self.direct_max_axis_sign_distance_m,
@@ -159,6 +163,115 @@ class PoleSearchParameters:
                 raise ValueError("LAS class IDs must be between 0 and 255")
 
 
+class PoleSearchWorkspace:
+    """Reusable spatial index and invariant masks for one pole neighborhood."""
+
+    def __init__(self, neighborhood_xyz: np.ndarray) -> None:
+        points = np.asarray(neighborhood_xyz, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("neighborhood_xyz must have shape (N, 3)")
+        self.points = points
+        self._finite_xy_indices = np.flatnonzero(
+            np.all(np.isfinite(points[:, :2]), axis=1)
+        ).astype(np.int64, copy=False)
+        self._xy_tree = (
+            cKDTree(points[self._finite_xy_indices, :2])
+            if self._finite_xy_indices.size
+            else None
+        )
+        self._terrain_masks: dict[
+            tuple[tuple[float, float, float], PoleSearchParameters],
+            np.ndarray,
+        ] = {}
+
+    def _check_points(self, points: np.ndarray) -> None:
+        same_layout = (
+            points.__array_interface__["data"][0]
+            == self.points.__array_interface__["data"][0]
+            and points.strides == self.points.strides
+        )
+        if (
+            points.shape != self.points.shape
+            or not same_layout
+        ):
+            raise ValueError("PoleSearchWorkspace does not match neighborhood_xyz")
+
+    def query_radius(
+        self,
+        points: np.ndarray,
+        center_xy: np.ndarray,
+        radius_m: float,
+    ) -> np.ndarray:
+        """Return original point indices in an exact XY-radius query."""
+
+        self._check_points(points)
+        if self._xy_tree is None:
+            return np.empty((0,), dtype=np.int64)
+        local = np.asarray(
+            self._xy_tree.query_ball_point(
+                np.asarray(center_xy, dtype=np.float64),
+                float(radius_m),
+            ),
+            dtype=np.int64,
+        )
+        return self._finite_xy_indices[local]
+
+    def query_connection_capsule(
+        self,
+        points: np.ndarray,
+        start_xy: np.ndarray,
+        end_xy: np.ndarray,
+        radius_m: float,
+    ) -> np.ndarray:
+        """Return an exact superset of an XY line-segment capsule."""
+
+        self._check_points(points)
+        if self._xy_tree is None:
+            return np.empty((0,), dtype=np.int64)
+        start = np.asarray(start_xy, dtype=np.float64)
+        end = np.asarray(end_xy, dtype=np.float64)
+        distance = float(np.linalg.norm(end - start))
+        if distance <= 1e-9:
+            return self.query_radius(points, start, radius_m)
+
+        # Every point in the capsule lies within this radius of its nearest
+        # sample. The original analytic mask is still applied afterwards, so
+        # this query changes only the amount of data scanned, not the result.
+        sample_count = max(2, int(math.ceil(distance / max(radius_m, 1e-6))) + 1)
+        fractions = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+        samples = start[None, :] + (fractions[:, None] * (end - start)[None, :])
+        sample_spacing = distance / float(sample_count - 1)
+        query_radius = math.hypot(radius_m, sample_spacing * 0.5)
+        groups = self._xy_tree.query_ball_point(samples, query_radius)
+        nonempty = [
+            np.asarray(group, dtype=np.int64)
+            for group in groups
+            if len(group)
+        ]
+        if not nonempty:
+            return np.empty((0,), dtype=np.int64)
+        local = np.unique(np.concatenate(nonempty))
+        return self._finite_xy_indices[local]
+
+    def terrain_clearance_mask(
+        self,
+        points: np.ndarray,
+        sign_xyz: np.ndarray,
+        parameters: PoleSearchParameters,
+    ) -> np.ndarray:
+        """Cache the expensive geometry-only terrain mask across corridor retries."""
+
+        self._check_points(points)
+        sign_key = tuple(float(value) for value in np.asarray(sign_xyz, dtype=np.float64))
+        key = (sign_key, parameters)
+        cached = self._terrain_masks.get(key)
+        if cached is None:
+            cached = _geometry_terrain_clearance_mask(points, sign_xyz, parameters)
+            cached.setflags(write=False)
+            self._terrain_masks[key] = cached
+        return cached
+
+
 @dataclass(frozen=True)
 class GroundEstimate:
     z: float
@@ -206,6 +319,10 @@ class PoleAxisCandidate:
     dominant_class_fraction: float | None
     multi_return_fraction: float | None
     ground_estimate: GroundEstimate | None
+    axis_stabilized: bool = False
+    axis_bin_inlier_count: int | None = None
+    axis_bin_count: int | None = None
+    ground_support_distance_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -246,6 +363,9 @@ class _AxisFitResult:
     radial_rmse_m: float
     z_reference: float
     continuity: _VerticalContinuity
+    stabilized: bool
+    bin_inlier_count: int
+    bin_count: int
 
 
 @dataclass(frozen=True)
@@ -435,12 +555,135 @@ def _horizontal_connection_coverage(
     )
 
 
+def _stable_axis_bin_indices(
+    bin_medians: np.ndarray,
+    parameters: PoleSearchParameters,
+) -> np.ndarray:
+    """Select the longest physically continuous section of a shaft.
+
+    A vehicle, vegetation, or a horizontal arm can dominate the median in only
+    one height range. A real tilted pole moves smoothly from one z bin to the
+    next, whereas that contamination normally introduces an abrupt lateral
+    step. Keeping the longest coherent section avoids extrapolating that bend
+    to the ground without forcing genuinely tilted poles to be vertical.
+    """
+
+    if bin_medians.shape[0] <= parameters.min_vertical_bins:
+        return np.arange(bin_medians.shape[0], dtype=np.int64)
+    delta_z = np.diff(bin_medians[:, 2])
+    delta_xy = np.linalg.norm(np.diff(bin_medians[:, :2], axis=0), axis=1)
+    noise_allowance = min(
+        parameters.axis_inlier_radius_m,
+        max(0.06, parameters.xy_voxel_m * 0.75),
+    )
+    smooth_tilt = math.tan(math.radians(parameters.max_axis_tilt_deg)) * np.maximum(
+        delta_z,
+        0.0,
+    )
+    breaks = np.flatnonzero(
+        (delta_z <= 0.0)
+        | (delta_z > parameters.max_observed_z_gap_m)
+        | (delta_xy > noise_allowance + smooth_tilt)
+    )
+    starts = np.concatenate((np.asarray([0]), breaks + 1))
+    stops = np.concatenate((breaks + 1, np.asarray([bin_medians.shape[0]])))
+    sections: list[np.ndarray] = []
+    for start, stop in zip(starts, stops):
+        indices = np.arange(int(start), int(stop), dtype=np.int64)
+        if (
+            indices.size >= parameters.min_vertical_bins
+            and float(np.ptp(bin_medians[indices, 2]))
+            >= parameters.min_vertical_span_m
+        ):
+            sections.append(indices)
+    if not sections:
+        return np.arange(bin_medians.shape[0], dtype=np.int64)
+    return max(
+        sections,
+        key=lambda indices: (
+            float(np.ptp(bin_medians[indices, 2])),
+            int(indices.size),
+            float(np.median(bin_medians[indices, 2])),
+        ),
+    )
+
+
+def _robust_bin_axis_coefficients(
+    bin_medians: np.ndarray,
+    initial_indices: np.ndarray,
+    parameters: PoleSearchParameters,
+) -> tuple[np.ndarray, float, np.ndarray] | None:
+    """Use a Theil-Sen seed and capped MAD refits for x(z), y(z)."""
+
+    initial = bin_medians[np.asarray(initial_indices, dtype=np.int64)]
+    z_reference = float(np.median(initial[:, 2]))
+    pair_i, pair_j = np.triu_indices(initial.shape[0], k=1)
+    pair_dz = initial[pair_j, 2] - initial[pair_i, 2]
+    minimum_pair_span = min(
+        1.0,
+        max(parameters.z_bin_m * 4.0, parameters.min_vertical_span_m * 0.5),
+    )
+    valid_pairs = pair_dz >= minimum_pair_span
+    if not np.any(valid_pairs):
+        valid_pairs = pair_dz > 0.0
+    if not np.any(valid_pairs):
+        return None
+    slopes = (
+        initial[pair_j[valid_pairs], :2] - initial[pair_i[valid_pairs], :2]
+    ) / pair_dz[valid_pairs, None]
+    slope = np.median(slopes, axis=0)
+    intercept = np.median(
+        initial[:, :2] - ((initial[:, 2] - z_reference)[:, None] * slope[None, :]),
+        axis=0,
+    )
+    coefficients = np.vstack((slope, intercept))
+    design_all = np.column_stack(
+        (
+            bin_medians[:, 2] - z_reference,
+            np.ones(bin_medians.shape[0], dtype=np.float64),
+        )
+    )
+    residual_floor = min(
+        parameters.axis_inlier_radius_m,
+        max(0.06, parameters.xy_voxel_m * 0.75),
+    )
+    seed_mask = np.zeros(bin_medians.shape[0], dtype=bool)
+    seed_mask[np.asarray(initial_indices, dtype=np.int64)] = True
+    keep = seed_mask
+    for _ in range(5):
+        residuals = np.linalg.norm(
+            bin_medians[:, :2] - (design_all @ coefficients),
+            axis=1,
+        )
+        seed_residuals = residuals[keep]
+        median = float(np.median(seed_residuals))
+        mad = float(np.median(np.abs(seed_residuals - median)))
+        threshold = min(
+            parameters.axis_inlier_radius_m,
+            max(residual_floor, median + (3.0 * 1.4826 * mad)),
+        )
+        next_keep = residuals <= threshold
+        if int(next_keep.sum()) < parameters.min_vertical_bins:
+            next_keep = keep
+        design = design_all[next_keep]
+        coefficients, *_ = np.linalg.lstsq(
+            design,
+            bin_medians[next_keep, :2],
+            rcond=None,
+        )
+        if np.array_equal(next_keep, keep):
+            keep = next_keep
+            break
+        keep = next_keep
+    return coefficients, z_reference, keep
+
+
 def _robust_axis_fit(
     points_xyz: np.ndarray,
     source_indices: np.ndarray,
     parameters: PoleSearchParameters,
 ) -> _AxisFitResult | None:
-    """Fit x(z), y(z) to vertical-bin medians and return source inliers."""
+    """Fit a height-stable x(z), y(z) shaft axis and return source inliers."""
 
     if points_xyz.shape[0] < parameters.min_points:
         return None
@@ -457,31 +700,15 @@ def _robust_axis_fit(
     if float(np.ptp(bin_medians[:, 2])) < parameters.min_vertical_span_m:
         return None
 
-    z_reference = float(np.median(bin_medians[:, 2]))
-    keep = np.ones(bin_medians.shape[0], dtype=bool)
-    coefficients = np.zeros((2, 2), dtype=np.float64)
-    for _ in range(4):
-        design = np.column_stack(
-            (bin_medians[keep, 2] - z_reference, np.ones(int(keep.sum()), dtype=np.float64))
-        )
-        if design.shape[0] < 2:
-            return None
-        coefficients, *_ = np.linalg.lstsq(design, bin_medians[keep, :2], rcond=None)
-        all_design = np.column_stack(
-            (bin_medians[:, 2] - z_reference, np.ones(bin_medians.shape[0], dtype=np.float64))
-        )
-        residuals = np.linalg.norm(bin_medians[:, :2] - (all_design @ coefficients), axis=1)
-        median = float(np.median(residuals))
-        mad = float(np.median(np.abs(residuals - median)))
-        threshold = min(
-            parameters.axis_inlier_radius_m,
-            max(parameters.xy_voxel_m * 0.75, median + (3.0 * 1.4826 * mad)),
-        )
-        next_keep = residuals <= threshold
-        if next_keep.sum() < parameters.min_vertical_bins or np.array_equal(next_keep, keep):
-            break
-        keep = next_keep
-
+    stable_indices = _stable_axis_bin_indices(bin_medians, parameters)
+    fitted = _robust_bin_axis_coefficients(
+        bin_medians,
+        stable_indices,
+        parameters,
+    )
+    if fitted is None:
+        return None
+    coefficients, z_reference, kept_bins = fitted
     slope_xy = coefficients[0]
     tilt_deg = math.degrees(math.atan(float(np.linalg.norm(slope_xy))))
     if tilt_deg > parameters.max_axis_tilt_deg:
@@ -492,7 +719,11 @@ def _robust_axis_fit(
     )
     predicted_xy = design_points @ coefficients
     radial_residuals = np.linalg.norm(points_xyz[:, :2] - predicted_xy, axis=1)
-    point_inliers = radial_residuals <= parameters.axis_inlier_radius_m
+    point_inlier_radius = min(
+        parameters.axis_inlier_radius_m,
+        max(0.10, parameters.xy_voxel_m * 1.5),
+    )
+    point_inliers = radial_residuals <= point_inlier_radius
     if int(point_inliers.sum()) < parameters.min_points:
         return None
 
@@ -510,7 +741,10 @@ def _robust_axis_fit(
     ):
         return None
 
-    radial_rmse = float(np.sqrt(np.mean(np.square(radial_residuals[point_inliers]))))
+    quality_inliers = radial_residuals <= parameters.axis_inlier_radius_m
+    radial_rmse = float(
+        np.sqrt(np.mean(np.square(radial_residuals[quality_inliers])))
+    )
     axis_direction = np.asarray([slope_xy[0], slope_xy[1], 1.0], dtype=np.float64)
     axis_direction /= np.linalg.norm(axis_direction)
     return _AxisFitResult(
@@ -520,6 +754,12 @@ def _robust_axis_fit(
         radial_rmse_m=radial_rmse,
         z_reference=z_reference,
         continuity=continuity,
+        stabilized=bool(
+            stable_indices.size < bin_medians.shape[0]
+            or int(kept_bins.sum()) < bin_medians.shape[0]
+        ),
+        bin_inlier_count=int(kept_bins.sum()),
+        bin_count=int(bin_medians.shape[0]),
     )
 
 
@@ -1060,6 +1300,35 @@ def pole_candidate_rank_key(
     )
 
 
+def _axis_ground_intersection(
+    coefficients: np.ndarray,
+    z_reference: float,
+    ground: GroundEstimate,
+) -> np.ndarray:
+    """Intersect x(z), y(z) with the fitted local ground plane."""
+
+    slope_xy = np.asarray(coefficients[0], dtype=np.float64)
+    intercept_xy = np.asarray(coefficients[1], dtype=np.float64)
+    plane = np.asarray(ground.plane_coefficients, dtype=np.float64)
+    reference_xy = np.asarray(ground.reference_xy, dtype=np.float64)
+    slope_coupling = float(np.dot(plane[:2], slope_xy))
+    denominator = 1.0 - slope_coupling
+    if abs(denominator) <= 1e-6:
+        z_value = float(ground.z)
+    else:
+        constant = (
+            float(np.dot(plane[:2], intercept_xy - reference_xy))
+            + float(plane[2])
+            - (slope_coupling * float(z_reference))
+        )
+        z_value = constant / denominator
+    if not math.isfinite(z_value):
+        z_value = float(ground.z)
+    design = np.asarray([z_value - z_reference, 1.0], dtype=np.float64)
+    xy_value = design @ coefficients
+    return np.asarray([xy_value[0], xy_value[1], z_value], dtype=np.float64)
+
+
 def find_pole_bases(
     neighborhood_xyz: np.ndarray,
     corridor_mask: np.ndarray,
@@ -1068,6 +1337,9 @@ def find_pole_bases(
     classifications: np.ndarray | None = None,
     return_numbers: np.ndarray | None = None,
     number_of_returns: np.ndarray | None = None,
+    *,
+    workspace: PoleSearchWorkspace | None = None,
+    ground_classifications: np.ndarray | None = None,
 ) -> PoleSearchResult | None:
     """Find vertical pole axes and place their representative point on local ground.
 
@@ -1087,11 +1359,20 @@ def find_pole_bases(
         raise ValueError("corridor_mask must have one value per neighborhood point")
     if sign.shape != (3,) or not np.all(np.isfinite(sign)):
         raise ValueError("sign_xyz must be a finite three-vector")
+    search_workspace = workspace or PoleSearchWorkspace(points)
+    search_workspace._check_points(points)
     classes = None
     if classifications is not None:
         classes = np.asarray(classifications, dtype=np.int16)
         if classes.shape != (points.shape[0],):
             raise ValueError("classifications must have one value per neighborhood point")
+    ground_classes = classes
+    if ground_classifications is not None:
+        ground_classes = np.asarray(ground_classifications, dtype=np.int16)
+        if ground_classes.shape != (points.shape[0],):
+            raise ValueError(
+                "ground_classifications must have one value per neighborhood point"
+            )
     returns = None
     return_totals = None
     if return_numbers is not None or number_of_returns is not None:
@@ -1125,7 +1406,7 @@ def find_pole_bases(
         elif parameters.excluded_pole_class_ids:
             candidate_mask &= ~np.isin(classes, parameters.excluded_pole_class_ids)
     else:
-        candidate_mask &= _geometry_terrain_clearance_mask(
+        candidate_mask &= search_workspace.terrain_clearance_mask(
             points,
             sign,
             parameters,
@@ -1161,15 +1442,44 @@ def find_pole_bases(
         z_reference = fit.z_reference
         continuity = fit.continuity
         inlier_points = points[inlier_indices]
+        shaft_quality_mask = (
+            inlier_points[:, 2]
+            < float(sign[2]) - parameters.horizontal_connection_z_tolerance_m
+        )
+        if int(shaft_quality_mask.sum()) >= parameters.min_points:
+            shaft_design = np.column_stack(
+                (
+                    inlier_points[shaft_quality_mask, 2] - z_reference,
+                    np.ones(int(shaft_quality_mask.sum()), dtype=np.float64),
+                )
+            )
+            shaft_residuals = np.linalg.norm(
+                inlier_points[shaft_quality_mask, :2]
+                - (shaft_design @ coefficients),
+                axis=1,
+            )
+            radial_rmse = max(
+                radial_rmse,
+                float(np.sqrt(np.mean(np.square(shaft_residuals)))),
+            )
         lowest_observed_z = float(np.quantile(inlier_points[:, 2], 0.02))
         lowest_design = np.asarray([lowest_observed_z - z_reference, 1.0], dtype=np.float64)
         lowest_axis_xy = lowest_design @ coefficients
-        ground = estimate_local_ground(
+        ground_indices = search_workspace.query_radius(
             points,
+            lowest_axis_xy,
+            parameters.ground_search_radius_m,
+        )
+        ground = estimate_local_ground(
+            points[ground_indices],
             lowest_axis_xy,
             float(sign[2]),
             parameters,
-            classes,
+            (
+                ground_classes[ground_indices]
+                if ground_classes is not None
+                else None
+            ),
         )
         if ground is None and parameters.require_ground:
             continue
@@ -1210,6 +1520,15 @@ def find_pole_bases(
             )
         if ground is None:
             base_z = lowest_observed_z
+            base_design = np.asarray(
+                [base_z - z_reference, 1.0],
+                dtype=np.float64,
+            )
+            base_xy = base_design @ coefficients
+            base_xyz = np.asarray(
+                [base_xy[0], base_xy[1], base_z],
+                dtype=np.float64,
+            )
             method = "OBS_BOTTOM"
             status = "REVIEW"
             bottom_gap = None
@@ -1217,27 +1536,53 @@ def find_pole_bases(
             occlusion_status = "UNKNOWN"
             ground_z = None
             ground_rmse = None
+            ground_support_distance = None
         else:
-            base_z = float(ground.z)
-            bottom_gap = max(0.0, lowest_observed_z - base_z)
+            base_xyz = _axis_ground_intersection(
+                coefficients,
+                z_reference,
+                ground,
+            )
+            base_z = float(base_xyz[2])
+            bottom_gap = lowest_observed_z - base_z
             occluded = bottom_gap > parameters.occlusion_gap_m
-            occlusion_status = "OCCLUDED" if occluded else "VISIBLE"
+            ground_conflict = bottom_gap < -parameters.max_ground_penetration_m
+            occlusion_status = (
+                "GROUND_CONFLICT"
+                if ground_conflict
+                else "OCCLUDED"
+                if occluded
+                else "VISIBLE"
+            )
             method = "GROUND_EXTR" if occluded else "GROUND_SNAP"
+            ground_support_distance = (
+                float(
+                    np.min(
+                        np.linalg.norm(
+                            ground.support_xyz[:, :2] - base_xyz[None, :2],
+                            axis=1,
+                        )
+                    )
+                )
+                if ground.support_xyz.size
+                else math.inf
+            )
             status = (
                 "REVIEW"
                 if (
-                    ground.rmse_m > parameters.ground_max_rmse_m * 0.75
+                    ground_conflict
+                    or occluded
+                    or ground.rmse_m > parameters.ground_max_rmse_m * 0.75
                     or float(completeness_ratio or 0.0)
                     < parameters.preferred_min_completeness_ratio
+                    or ground_support_distance
+                    > parameters.max_ground_support_distance_m
                 )
                 else "AUTO"
             )
             ground_z = base_z
             ground_rmse = ground.rmse_m
 
-        base_design = np.asarray([base_z - z_reference, 1.0], dtype=np.float64)
-        base_xy = base_design @ coefficients
-        base_xyz = np.asarray([base_xy[0], base_xy[1], base_z], dtype=np.float64)
         vertical_span = float(np.ptp(inlier_points[:, 2]))
         attachment_design = np.asarray(
             [float(sign[2]) - z_reference, 1.0],
@@ -1251,12 +1596,22 @@ def find_pole_bases(
         horizontal_connection_expected_bins: int | None = None
         horizontal_connection_coverage: float | None = None
         if association_distance > parameters.direct_max_axis_sign_distance_m:
-            connection = _horizontal_connection_coverage(
+            connection_indices = search_workspace.query_connection_capsule(
                 points,
+                sign[:2],
+                attachment_xy,
+                parameters.horizontal_connection_radius_m,
+            )
+            connection = _horizontal_connection_coverage(
+                points[connection_indices],
                 sign,
                 attachment_xy,
                 parameters,
-                classes,
+                (
+                    ground_classes[connection_indices]
+                    if ground_classes is not None
+                    else None
+                ),
             )
             horizontal_connection_bins = connection.occupied_bin_count
             horizontal_connection_expected_bins = connection.expected_bin_count
@@ -1371,6 +1726,10 @@ def find_pole_bases(
                 dominant_class_fraction=dominant_class_fraction,
                 multi_return_fraction=multi_return_fraction,
                 ground_estimate=ground,
+                axis_stabilized=fit.stabilized,
+                axis_bin_inlier_count=fit.bin_inlier_count,
+                axis_bin_count=fit.bin_count,
+                ground_support_distance_m=ground_support_distance,
             )
         )
 
@@ -1391,6 +1750,30 @@ def find_pole_bases(
         occluded_bottom=selected.occluded_bottom,
         occlusion_status=selected.occlusion_status,
     )
+
+
+def _weighted_geometric_median(
+    coordinates: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Return a deterministic robust centre using Weiszfeld iterations."""
+
+    if coordinates.shape[0] == 1:
+        return coordinates[0].copy()
+    current = np.average(coordinates, axis=0, weights=weights)
+    for _ in range(40):
+        distances = np.linalg.norm(coordinates - current[None, :], axis=1)
+        coincident = np.flatnonzero(distances <= 1e-9)
+        if coincident.size:
+            return coordinates[int(coincident[np.argmax(weights[coincident])])].copy()
+        scaled = weights / np.maximum(distances, 1e-9)
+        updated = np.sum(coordinates * scaled[:, None], axis=0) / float(
+            scaled.sum()
+        )
+        if float(np.linalg.norm(updated - current)) <= 1e-7:
+            return updated
+        current = updated
+    return current
 
 
 def cluster_pole_observations(
@@ -1448,10 +1831,62 @@ def cluster_pole_observations(
                 ],
                 dtype=np.float64,
             )
-            representative = np.average(xyz, axis=0, weights=weights)
-            best = max(unique_members, key=lambda item: float(item.get("pole_quality") or 0.0))
+            physically_valid = np.asarray(
+                [
+                    str(item.get("pole_occlusion_status") or "")
+                    != "GROUND_CONFLICT"
+                    for item in unique_members
+                ],
+                dtype=bool,
+            )
+            seed_mask = (
+                physically_valid
+                if int(physically_valid.sum()) >= 2
+                else np.ones(xyz.shape[0], dtype=bool)
+            )
+            seed_centre = _weighted_geometric_median(
+                xyz[seed_mask],
+                weights[seed_mask],
+            )
+            xy_distances = np.linalg.norm(
+                xyz[:, :2] - seed_centre[None, :2],
+                axis=1,
+            )
+            z_distances = np.abs(xyz[:, 2] - seed_centre[2])
+            seed_xy = xy_distances[seed_mask]
+            seed_z = z_distances[seed_mask]
+            xy_median = float(np.median(seed_xy))
+            z_median = float(np.median(seed_z))
+            xy_mad = 1.4826 * float(np.median(np.abs(seed_xy - xy_median)))
+            z_mad = 1.4826 * float(np.median(np.abs(seed_z - z_median)))
+            consensus_mask = (
+                physically_valid
+                & (xy_distances <= max(0.20, xy_median + (3.0 * xy_mad)))
+                & (z_distances <= max(0.20, z_median + (3.0 * z_mad)))
+            )
+            if not np.any(consensus_mask):
+                consensus_mask = seed_mask
+            consensus_xyz = xyz[consensus_mask]
+            consensus_weights = weights[consensus_mask]
+            representative = _weighted_geometric_median(
+                consensus_xyz,
+                consensus_weights,
+            )
+            consensus_members = [
+                item
+                for item, keep in zip(unique_members, consensus_mask)
+                if bool(keep)
+            ]
+            consensus_outlier_count = int((~consensus_mask).sum())
+            best = max(
+                consensus_members,
+                key=lambda item: float(item.get("pole_quality") or 0.0),
+            )
             pole_types = {str(item.get("pole_type") or "") for item in members}
-            all_auto = all(str(item.get("pole_status")) == "AUTO" for item in members)
+            all_auto = all(
+                str(item.get("pole_status")) == "AUTO"
+                for item in consensus_members
+            )
             occlusion_states = {
                 str(
                     item.get("pole_occlusion_status")
@@ -1546,7 +1981,15 @@ def cluster_pole_observations(
                 "pole_method": "MULTI_FRAME"
                 if len(unique_members) > 1
                 else str(best.get("pole_method") or ""),
-                "pole_status": "AUTO" if all_auto and len(pole_types) == 1 else "REVIEW",
+                "pole_status": (
+                    "AUTO"
+                    if (
+                        all_auto
+                        and len(pole_types) == 1
+                        and consensus_outlier_count == 0
+                    )
+                    else "REVIEW"
+                ),
                 "pole_search_mode": aggregate_search_mode,
                 "pole_fallback_attempted": fallback_attempted_count > 0,
                 "pole_fallback_attempted_count": fallback_attempted_count,
@@ -1556,21 +1999,25 @@ def cluster_pole_observations(
                     np.sqrt(
                         np.average(
                             np.sum(
-                                np.square(xyz[:, :2] - representative[None, :2]),
+                                np.square(
+                                    consensus_xyz[:, :2]
+                                    - representative[None, :2]
+                                ),
                                 axis=1,
                             ),
-                            weights=weights,
+                            weights=consensus_weights,
                         )
                     )
                 ),
                 "z_spread_m": float(
                     np.sqrt(
                         np.average(
-                            np.square(xyz[:, 2] - representative[2]),
-                            weights=weights,
+                            np.square(consensus_xyz[:, 2] - representative[2]),
+                            weights=consensus_weights,
                         )
                     )
                 ),
+                "consensus_outlier_count": consensus_outlier_count,
             }
             for member in members:
                 relation = dict(member)

@@ -637,8 +637,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--project-root",
         type=Path,
-        default=Path(__file__).resolve().parent,
-        help="Project directory. Defaults to the directory containing this script.",
+        default=Path(__file__).resolve().parents[1],
+        help="Project directory. Defaults to the repository containing scripts/.",
     )
     parser.add_argument(
         "--venv-dir",
@@ -655,7 +655,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verify-script",
         type=Path,
-        default=Path("verify_environment.py"),
+        default=Path("scripts/verify_environment.py"),
         help="Post-install smoke verifier, relative to project-root by default.",
     )
     parser.add_argument(
