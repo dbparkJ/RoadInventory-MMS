@@ -15,9 +15,12 @@ import math
 import re
 import sqlite3
 import struct
+import threading
 import time
+from collections import OrderedDict
+from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import laspy
 import numpy as np
@@ -31,6 +34,8 @@ from .pcdb import (
 
 POINTCLOUD_CATALOG_VERSION = 5
 DEFAULT_LAS_CHUNK_SIZE = 250_000
+DEFAULT_DECODED_BLOCK_CACHE_MAX_ENTRIES = 64
+DEFAULT_DECODED_BLOCK_CACHE_MAX_BYTES = 512 * 1024 * 1024
 NEUTRAL_RGB = np.asarray([128, 128, 128], dtype=np.uint8)
 
 _LAS_NAME_PATTERN = re.compile(
@@ -1282,17 +1287,61 @@ def _rgb8_from_las(points: Any) -> np.ndarray:
 
 
 class PointCloudReaderCache:
-    """Process-local cache for precise PCDB blocks and seekable LAS readers."""
+    """Thread-safe cache for source handles and decoded point-cloud blocks.
 
-    def __init__(self) -> None:
+    Decoded arrays are shared between :meth:`read_block_points` and
+    :meth:`read_block_records`.  Returned arrays are read-only so a caller
+    cannot accidentally corrupt a cached block.  The LRU is constrained by
+    both entry count and decoded array bytes; a block larger than the byte
+    budget is returned but not retained.
+    """
+
+    def __init__(
+        self,
+        *,
+        decoded_cache_max_entries: int = DEFAULT_DECODED_BLOCK_CACHE_MAX_ENTRIES,
+        decoded_cache_max_bytes: int = DEFAULT_DECODED_BLOCK_CACHE_MAX_BYTES,
+    ) -> None:
+        if decoded_cache_max_entries < 0:
+            raise ValueError("decoded_cache_max_entries must be non-negative")
+        if decoded_cache_max_bytes < 0:
+            raise ValueError("decoded_cache_max_bytes must be non-negative")
+        self._state_lock = threading.RLock()
+        self._source_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._closed = False
         self._pcdb_connections: dict[str, sqlite3.Connection] = {}
         self._las_readers: dict[str, laspy.LasReader] = {}
+        self._decoded_cache_max_entries = int(decoded_cache_max_entries)
+        self._decoded_cache_max_bytes = int(decoded_cache_max_bytes)
+        self._decoded_cache_bytes = 0
+        self._decoded_blocks: OrderedDict[
+            tuple[str, str, str | int, int | None],
+            tuple[dict[str, np.ndarray], int],
+        ] = OrderedDict()
+        self._inflight_decodes: dict[
+            tuple[str, str, str | int, int | None],
+            Future[dict[str, np.ndarray]],
+        ] = {}
+
+    def _source_lock(self, source_type: str, resolved_path: str) -> threading.RLock:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("PointCloudReaderCache is closed")
+            key = (source_type, resolved_path)
+            lock = self._source_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._source_locks[key] = lock
+            return lock
 
     def _pcdb_connection(self, path: str) -> sqlite3.Connection:
         resolved = str(Path(path).resolve())
         connection = self._pcdb_connections.get(resolved)
         if connection is None:
-            connection = sqlite3.connect(resolved)
+            # The enclosing re-entrant lock serializes use of a connection.
+            # Disabling SQLite's creator-thread check lets later worker threads
+            # safely reuse that same serialized connection.
+            connection = sqlite3.connect(resolved, check_same_thread=False)
             self._pcdb_connections[resolved] = connection
         return connection
 
@@ -1437,6 +1486,122 @@ class PointCloudReaderCache:
             "source_index": np.full((count,), -1, dtype=np.int64),
         }
 
+    @staticmethod
+    def _freeze_records(
+        records: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], int]:
+        """Make decoded arrays immutable and return their unique byte size."""
+
+        frozen: dict[str, np.ndarray] = {}
+        byte_size = 0
+        seen_arrays: set[int] = set()
+        for name, value in records.items():
+            array = np.asarray(value)
+            array.setflags(write=False)
+            frozen[name] = array
+            array_identity = id(array)
+            if array_identity not in seen_arrays:
+                byte_size += int(array.nbytes)
+                seen_arrays.add(array_identity)
+        return frozen, byte_size
+
+    def _cached_records(
+        self,
+        key: tuple[str, str, str | int, int | None],
+        source_lock: threading.RLock,
+        decode: Callable[[], dict[str, np.ndarray]],
+    ) -> dict[str, np.ndarray]:
+        """Return one immutable decoded block, updating the bounded LRU."""
+
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("PointCloudReaderCache is closed")
+            cached = self._decoded_blocks.get(key)
+            if cached is not None:
+                self._decoded_blocks.move_to_end(key)
+                return cached[0]
+
+            future = self._inflight_decodes.get(key)
+            decode_owner = future is None
+            if future is None:
+                future = Future()
+                self._inflight_decodes[key] = future
+
+        if not decode_owner:
+            records = future.result()
+            with self._state_lock:
+                if key in self._decoded_blocks:
+                    self._decoded_blocks.move_to_end(key)
+            return records
+
+        with source_lock:
+            with self._state_lock:
+                if self._closed:
+                    error = RuntimeError("PointCloudReaderCache is closed")
+                    pending = self._inflight_decodes.pop(key, None)
+                    if pending is not None and not pending.done():
+                        pending.set_exception(error)
+                    raise error
+            try:
+                records, byte_size = self._freeze_records(decode())
+            except BaseException as exc:
+                with self._state_lock:
+                    pending = self._inflight_decodes.pop(key, None)
+                    if pending is not None and not pending.done():
+                        pending.set_exception(exc)
+                raise
+
+            with self._state_lock:
+                if (
+                    not self._closed
+                    and self._decoded_cache_max_entries > 0
+                    and self._decoded_cache_max_bytes > 0
+                    and byte_size <= self._decoded_cache_max_bytes
+                ):
+                    self._decoded_blocks[key] = (records, byte_size)
+                    self._decoded_cache_bytes += byte_size
+                    while (
+                        len(self._decoded_blocks) > self._decoded_cache_max_entries
+                        or self._decoded_cache_bytes > self._decoded_cache_max_bytes
+                    ):
+                        _evicted_key, (_evicted_records, evicted_bytes) = (
+                            self._decoded_blocks.popitem(last=False)
+                        )
+                        self._decoded_cache_bytes -= evicted_bytes
+                pending = self._inflight_decodes.pop(key, None)
+                if pending is not None and not pending.done():
+                    pending.set_result(records)
+            return records
+
+    def _cached_pcdb_records(
+        self,
+        path: str,
+        block_name: str,
+    ) -> dict[str, np.ndarray]:
+        resolved = str(Path(path).resolve())
+        source_lock = self._source_lock("pcdb", resolved)
+        key = ("pcdb", resolved, block_name, None)
+        return self._cached_records(
+            key,
+            source_lock,
+            lambda: self._read_pcdb_records(resolved, block_name),
+        )
+
+    def _cached_las_records(
+        self,
+        path: str,
+        start: int,
+        count: int,
+    ) -> dict[str, np.ndarray]:
+        resolved = str(Path(path).resolve())
+        source_lock = self._source_lock("las", resolved)
+        key = ("las", resolved, start, count)
+        return self._cached_records(
+            key,
+            source_lock,
+            lambda: self._read_las_records(resolved, start, count),
+        )
+
     def read_block_points(
         self,
         pointcloud: str | Path | dict[str, Any],
@@ -1468,11 +1633,13 @@ class PointCloudReaderCache:
             count = None
 
         if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
-            return self._read_pcdb(path, block_name)
+            records = self._cached_pcdb_records(path, block_name)
+            return records["xyz"], records["rgb"], records["intensity"]
         if source_type == "las" or Path(path).suffix.casefold() == ".las":
             if start is None or count is None:
                 start, count = _parse_las_block_name(block_name)
-            return self._read_las(path, int(start), int(count))
+            records = self._cached_las_records(path, int(start), int(count))
+            return records["xyz"], records["rgb"], records["intensity"]
         raise ValueError(f"Unsupported point-cloud source type for {path}")
 
     def read_block_records(
@@ -1507,20 +1674,39 @@ class PointCloudReaderCache:
             count = None
 
         if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
-            return self._read_pcdb_records(path, block_name)
+            return dict(self._cached_pcdb_records(path, block_name))
         if source_type == "las" or Path(path).suffix.casefold() == ".las":
             if start is None or count is None:
                 start, count = _parse_las_block_name(block_name)
-            return self._read_las_records(path, int(start), int(count))
+            return dict(self._cached_las_records(path, int(start), int(count)))
         raise ValueError(f"Unsupported point-cloud source type for {path}")
 
     def close(self) -> None:
-        for connection in self._pcdb_connections.values():
-            connection.close()
-        self._pcdb_connections.clear()
-        for reader in self._las_readers.values():
-            reader.close()
-        self._las_readers.clear()
+        with self._state_lock:
+            self._closed = True
+            source_locks = list(self._source_locks.values())
+
+        for source_lock in source_locks:
+            source_lock.acquire()
+        try:
+            for connection in self._pcdb_connections.values():
+                connection.close()
+            self._pcdb_connections.clear()
+            for reader in self._las_readers.values():
+                reader.close()
+            self._las_readers.clear()
+            with self._state_lock:
+                self._decoded_blocks.clear()
+                self._decoded_cache_bytes = 0
+                error = RuntimeError("PointCloudReaderCache is closed")
+                for future in self._inflight_decodes.values():
+                    if not future.done():
+                        future.set_exception(error)
+                self._inflight_decodes.clear()
+                self._source_locks.clear()
+        finally:
+            for source_lock in reversed(source_locks):
+                source_lock.release()
 
     def __enter__(self) -> "PointCloudReaderCache":
         return self
@@ -1530,6 +1716,8 @@ class PointCloudReaderCache:
 
 
 __all__ = [
+    "DEFAULT_DECODED_BLOCK_CACHE_MAX_BYTES",
+    "DEFAULT_DECODED_BLOCK_CACHE_MAX_ENTRIES",
     "DEFAULT_LAS_CHUNK_SIZE",
     "POINTCLOUD_CATALOG_VERSION",
     "PointCloudReaderCache",

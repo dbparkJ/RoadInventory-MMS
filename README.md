@@ -442,7 +442,7 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 `paths.model_dir`를 사용하면 `paths.output_dir` 아래에 모델별로 완전히 분리된 구조가 생성됩니다. 단일 `model_path` 호환 모드에서는 아래 `<model_stem>/` 단계 없이 기존 구조를 그대로 사용합니다.
 
-`execution.multi_model_parallel: true`이면 데이터 스캔·점군 카탈로그·정렬 QA를 한 번만 준비하고, 프레임도 한 번만 디코드하여 공통 정면뷰를 생성합니다. 입력과 설정 fingerprint가 같은 재실행은 완료된 정렬 QA 보고서를 재사용합니다. 각 모델은 같은 무표시 RGB 배열로 동시에 추론하며, 결과는 모델별 bounded queue로 넘겨져 점군/지주 후처리와 다음 프레임 GPU 추론이 겹쳐 실행됩니다. 지주 탐색은 neighborhood마다 XY KD-tree를 한 번 만들고 후보별 지면·수평 암의 근거리 점만 조회하며, strict/expanded 검색은 동일 terrain mask를 재사용합니다. `multi_model_pole_workers: 1`은 대용량 지주 검색을 도착 순서 FIFO로 직렬화해 대기 중인 모델의 요청이 끼어들 수 있게 하고 메모리 피크를 제한합니다. 동시 CUDA 추론에서 OOM이 발생하면 해당 프레임을 직렬로 다시 실행하고 이후 동시성을 자동으로 1로 낮춥니다. 직렬 재시도도 OOM이면 해당 모델만 남은 프레임에서 중단하고 다른 모델은 계속 진행합니다.
+`execution.multi_model_parallel: true`이면 데이터 스캔·점군 카탈로그·정렬 QA를 한 번만 준비하고, 프레임도 한 번만 디코드하여 공통 정면뷰를 생성합니다. 입력과 설정 fingerprint가 같은 재실행은 완료된 정렬 QA 보고서를 재사용합니다. 각 모델은 같은 무표시 RGB 배열로 동시에 추론하며, 결과는 모델별 bounded queue로 넘겨져 점군/지주 후처리와 다음 프레임 GPU 추론이 겹쳐 실행됩니다. 기본 queue depth는 4이며 메모리 여건에 따라 `multi_model_queue_depth`로 조정할 수 있습니다. LAS/PCDB 블록의 전체 레코드는 모델 소비자 사이에서 공유하는 process-local LRU(최대 64개·512 MiB)에 한 번만 디코드되므로, 인접 프레임과 strict/fallback 검색이 겹치는 블록을 다시 읽지 않습니다. 지주 탐색은 neighborhood마다 XY KD-tree를 한 번 만들고 후보별 지면·수평 암의 근거리 점만 조회하며, strict/expanded 검색은 동일 terrain mask를 재사용합니다. `multi_model_pole_workers: 1`은 대용량 지주 검색을 도착 순서 FIFO로 직렬화해 대기 중인 모델의 요청이 끼어들 수 있게 하고 메모리 피크를 제한합니다. 동시 CUDA 추론에서 OOM이 발생하면 해당 프레임을 직렬로 다시 실행하고 이후 동시성을 자동으로 1로 낮춥니다. 직렬 재시도도 OOM이면 해당 모델만 남은 프레임에서 중단하고 다른 모델은 계속 진행합니다.
 
 ```text
 <output_dir>/

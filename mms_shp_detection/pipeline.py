@@ -708,7 +708,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--multi-model-queue-depth",
         type=int,
-        default=1,
+        default=4,
         help="Maximum queued frames per model between GPU inference and point/pole work.",
     )
     parser.add_argument(
@@ -7780,14 +7780,14 @@ def run_parallel_multi_model_pipeline(
             if pending and not made_progress:
                 cancel_event.wait(0.05)
 
+    shared_pointcloud_cache = PointCloudReaderCache()
+
     def consume_model_frames(state: dict[str, Any]) -> None:
         model_key = state["model_key"]
         runtime = state["runtime"]
         logger = state["logger"]
         work_queue = work_queues[model_key]
-        pointcloud_cache: PointCloudReaderCache | None = None
         try:
-            pointcloud_cache = PointCloudReaderCache()
             while True:
                 if cancel_event.is_set():
                     return
@@ -7806,7 +7806,7 @@ def run_parallel_multi_model_pipeline(
                                 runtime=runtime,
                                 model=None,
                                 pointcloud_catalog=state["pointcloud_catalog"],
-                                pointcloud_cache=pointcloud_cache,
+                                pointcloud_cache=shared_pointcloud_cache,
                                 logger=logger,
                                 image_rgb_override=image_rgb,
                                 detection_candidates_override=candidates,
@@ -7833,13 +7833,6 @@ def run_parallel_multi_model_pipeline(
         except BaseException as exc:
             consumer_errors.put((model_key, exc))
             cancel_event.set()
-        finally:
-            if pointcloud_cache is not None:
-                try:
-                    pointcloud_cache.close()
-                except BaseException as exc:
-                    consumer_errors.put((model_key, exc))
-                    cancel_event.set()
 
     consumer_threads = [
         threading.Thread(
@@ -8049,6 +8042,15 @@ def run_parallel_multi_model_pipeline(
                         orchestrator_logger.exception(
                             "Parallel post-processing consumer stopped."
                         )
+        try:
+            shared_pointcloud_cache.close()
+        except BaseException as exc:
+            if producer_error is None:
+                producer_error = exc
+            cancel_event.set()
+            orchestrator_logger.exception(
+                "Could not close the shared point-cloud block cache."
+            )
         if producer_error is None:
             try:
                 raise_pending_consumer_error()

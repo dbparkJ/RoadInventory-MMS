@@ -5,6 +5,7 @@ import sqlite3
 import struct
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -527,6 +528,158 @@ class PointCloudLasTests(unittest.TestCase):
             angle_margin_rad=0.0,
         )
         self.assertEqual([block["name"] for block in selected], ["front"])
+
+
+class PointCloudDecodedBlockCacheTests(unittest.TestCase):
+    def test_las_points_and_records_share_one_immutable_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "shared.las"
+            xyz = np.asarray(
+                [
+                    [300_000.0, 4_100_000.0, 100.0],
+                    [300_001.0, 4_100_001.0, 101.0],
+                ]
+            )
+            rgb16 = np.asarray(
+                [[0, 32768, 65535], [65535, 32768, 0]],
+                dtype=np.uint16,
+            )
+            _write_las(path, xyz, rgb16=rgb16)
+            block = {"source_type": "las", "start": 0, "count": 2}
+
+            with PointCloudReaderCache() as readers, mock.patch.object(
+                readers,
+                "_read_las_records",
+                wraps=readers._read_las_records,
+            ) as decode:
+                points_xyz, points_rgb, points_intensity = (
+                    readers.read_block_points(path, block)
+                )
+                records = readers.read_block_records(path, block)
+
+                self.assertEqual(decode.call_count, 1)
+                self.assertIs(points_xyz, records["xyz"])
+                self.assertIs(points_rgb, records["rgb"])
+                self.assertIs(points_intensity, records["intensity"])
+                self.assertTrue(all(not value.flags.writeable for value in records.values()))
+                with self.assertRaises(ValueError):
+                    points_xyz[0, 0] = 0.0
+
+                # The mapping itself is per-call, so replacing one of its values
+                # also cannot change the cached record mapping.
+                records["xyz"] = np.zeros_like(points_xyz)
+                self.assertIs(
+                    readers.read_block_records(path, block)["xyz"],
+                    points_xyz,
+                )
+
+    def test_pcdb_points_and_records_share_one_decode_across_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "shared.pcdb"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("CREATE TABLE CRYSTAL_CUBE (NAME TEXT, DATA BLOB)")
+                header = struct.pack(
+                    "<6dI",
+                    300_000.0,
+                    4_100_000.0,
+                    100.0,
+                    300_002.0,
+                    4_100_002.0,
+                    102.0,
+                    1,
+                )
+                point = struct.pack("<3f3BH", 0.25, 0.5, 0.75, 1, 2, 3, 10)
+                connection.execute(
+                    "INSERT INTO CRYSTAL_CUBE (NAME, DATA) VALUES (?, ?)",
+                    ("block.bpc", header + point),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with PointCloudReaderCache() as readers, mock.patch.object(
+                readers,
+                "_read_pcdb_records",
+                wraps=readers._read_pcdb_records,
+            ) as decode:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [
+                        executor.submit(
+                            readers.read_block_records
+                            if index % 2
+                            else readers.read_block_points,
+                            path,
+                            "block.bpc",
+                        )
+                        for index in range(24)
+                    ]
+                    results = [future.result() for future in futures]
+
+                self.assertEqual(decode.call_count, 1)
+                point_results = [
+                    result for result in results if isinstance(result, tuple)
+                ]
+                record_results = [
+                    result for result in results if isinstance(result, dict)
+                ]
+                self.assertTrue(point_results)
+                self.assertTrue(record_results)
+                self.assertIs(point_results[0][0], record_results[0]["xyz"])
+                self.assertFalse(point_results[0][0].flags.writeable)
+
+    def test_lru_enforces_entry_and_byte_limits_and_close_clears_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "bounded.las"
+            xyz = np.asarray(
+                [
+                    [300_000.0, 4_100_000.0, 100.0],
+                    [300_001.0, 4_100_001.0, 101.0],
+                ]
+            )
+            _write_las(path, xyz)
+            first = {"source_type": "las", "start": 0, "count": 1}
+            second = {"source_type": "las", "start": 1, "count": 1}
+            readers = PointCloudReaderCache(
+                decoded_cache_max_entries=1,
+                decoded_cache_max_bytes=1_024,
+            )
+            with mock.patch.object(
+                readers,
+                "_read_las_records",
+                wraps=readers._read_las_records,
+            ) as decode:
+                readers.read_block_records(path, first)
+                readers.read_block_records(path, second)
+                readers.read_block_records(path, first)
+
+            self.assertEqual(decode.call_count, 3)
+            self.assertEqual(len(readers._decoded_blocks), 1)
+            self.assertLessEqual(readers._decoded_cache_bytes, 1_024)
+            self.assertTrue(readers._las_readers)
+
+            readers.close()
+            self.assertEqual(len(readers._decoded_blocks), 0)
+            self.assertEqual(readers._decoded_cache_bytes, 0)
+            self.assertEqual(readers._las_readers, {})
+
+            uncached = PointCloudReaderCache(
+                decoded_cache_max_entries=10,
+                decoded_cache_max_bytes=1,
+            )
+            try:
+                with mock.patch.object(
+                    uncached,
+                    "_read_las_records",
+                    wraps=uncached._read_las_records,
+                ) as decode:
+                    uncached.read_block_records(path, first)
+                    uncached.read_block_records(path, first)
+                self.assertEqual(decode.call_count, 2)
+                self.assertEqual(len(uncached._decoded_blocks), 0)
+                self.assertEqual(uncached._decoded_cache_bytes, 0)
+            finally:
+                uncached.close()
 
 
 class PointCloudPcdbPrecisionTests(unittest.TestCase):
