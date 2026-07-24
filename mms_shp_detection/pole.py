@@ -463,6 +463,64 @@ def _vertical_continuity(
     )
 
 
+def _group_integer_xy_cells(
+    cells_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Group integer XY cells through an order-preserving scalar encoding.
+
+    ``np.unique(..., axis=0)`` sorts a two-column structured array and is
+    disproportionately expensive for million-point pole neighborhoods.  The
+    shifted row-major IDs below preserve the same lexicographic cell order and
+    therefore produce identical unique cells, inverse IDs, and counts through
+    the substantially faster one-dimensional unique path.
+    """
+
+    cells = np.asarray(cells_xy, dtype=np.int64)
+    if cells.ndim != 2 or cells.shape[1] != 2:
+        raise ValueError("cells_xy must have shape (N, 2)")
+    if cells.shape[0] == 0:
+        return (
+            np.empty((0, 2), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    minimum_x = int(cells[:, 0].min())
+    maximum_x = int(cells[:, 0].max())
+    minimum_y = int(cells[:, 1].min())
+    maximum_y = int(cells[:, 1].max())
+    x_span = maximum_x - minimum_x
+    y_span = (maximum_y - minimum_y) + 1
+    int64_max = int(np.iinfo(np.int64).max)
+    if (
+        x_span > int64_max
+        or y_span > int64_max
+        or x_span > int64_max // y_span
+    ):
+        # This cannot occur for the bounded metric search windows used here,
+        # but retain a correct fallback for adversarial direct calls.
+        return np.unique(
+            cells,
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+
+    minima = np.asarray([minimum_x, minimum_y], dtype=np.int64)
+    shifted = cells - minima[None, :]
+    cell_ids = (shifted[:, 0] * y_span) + shifted[:, 1]
+    unique_ids, inverse, counts = np.unique(
+        cell_ids,
+        return_inverse=True,
+        return_counts=True,
+    )
+    unique_cells = np.column_stack(
+        (unique_ids // y_span, unique_ids % y_span)
+    ).astype(np.int64, copy=False)
+    unique_cells += minima[None, :]
+    return unique_cells, inverse, counts
+
+
 def _middle_support_coverage(
     z_values: np.ndarray,
     ground_z: float,
@@ -799,7 +857,7 @@ def _fit_local_ground_hypothesis(
     cells = np.floor(
         (ground_points[:, :2] - pole_xy[None, :]) / parameters.ground_cell_size_m
     ).astype(np.int64)
-    _unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+    _unique_cells, inverse, _cell_counts = _group_integer_xy_cells(cells)
     order = np.argsort(inverse, kind="stable")
     ordered_groups = inverse[order]
     group_starts = np.concatenate(
@@ -1007,12 +1065,7 @@ def _geometry_terrain_clearance_mask(
         (support_points[:, :2] - sign_xyz[None, :2])
         / parameters.ground_cell_size_m
     ).astype(np.int64)
-    unique_cells, inverse, counts = np.unique(
-        cells,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
+    unique_cells, inverse, counts = _group_integer_xy_cells(cells)
     order = np.lexsort((support_points[:, 2], inverse))
     starts = np.cumsum(np.concatenate(([0], counts[:-1]))).astype(np.int64)
     quantile_offsets = np.floor(
@@ -1058,12 +1111,7 @@ def _eligible_axis_cells(
         (candidate_points[:, :2] - sign_xyz[None, :2])
         / parameters.xy_voxel_m
     ).astype(np.int64)
-    _unique_cells, inverse, counts = np.unique(
-        xy_cells,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
+    _unique_cells, inverse, counts = _group_integer_xy_cells(xy_cells)
     order = np.argsort(inverse, kind="stable")
     starts = np.cumsum(np.concatenate(([0], counts[:-1]))).astype(np.int64)
     minimum_members = max(3, parameters.min_points // 5)
@@ -1462,6 +1510,59 @@ def find_pole_bases(
                 radial_rmse,
                 float(np.sqrt(np.mean(np.square(shaft_residuals)))),
             )
+        attachment_design = np.asarray(
+            [float(sign[2]) - z_reference, 1.0],
+            dtype=np.float64,
+        )
+        attachment_xy = attachment_design @ coefficients
+        association_distance = float(np.linalg.norm(attachment_xy - sign[:2]))
+        if association_distance > parameters.max_axis_sign_distance_m:
+            continue
+
+        is_remote = (
+            association_distance > parameters.direct_max_axis_sign_distance_m
+        )
+        # Geometry-only searches commonly discover hundreds of vertical pieces
+        # in buildings and vegetation. A noisy remote fit can never pass the
+        # final geometry gate, so reject it before fitting local ground or
+        # scanning the sign-to-axis capsule.
+        if (
+            is_remote
+            and classes is None
+            and radial_rmse > parameters.geometry_remote_max_axis_rmse_m
+        ):
+            continue
+
+        horizontal_connection_bins: int | None = None
+        horizontal_connection_expected_bins: int | None = None
+        horizontal_connection_coverage: float | None = None
+        if is_remote:
+            connection_indices = search_workspace.query_connection_capsule(
+                points,
+                sign[:2],
+                attachment_xy,
+                parameters.horizontal_connection_radius_m,
+            )
+            connection = _horizontal_connection_coverage(
+                points[connection_indices],
+                sign,
+                attachment_xy,
+                parameters,
+                (
+                    ground_classes[connection_indices]
+                    if ground_classes is not None
+                    else None
+                ),
+            )
+            horizontal_connection_bins = connection.occupied_bin_count
+            horizontal_connection_expected_bins = connection.expected_bin_count
+            horizontal_connection_coverage = connection.coverage_ratio
+            if (
+                horizontal_connection_coverage
+                < parameters.min_horizontal_connection_coverage
+            ):
+                continue
+
         lowest_observed_z = float(np.quantile(inlier_points[:, 2], 0.02))
         lowest_design = np.asarray([lowest_observed_z - z_reference, 1.0], dtype=np.float64)
         lowest_axis_xy = lowest_design @ coefficients
@@ -1584,43 +1685,7 @@ def find_pole_bases(
             ground_rmse = ground.rmse_m
 
         vertical_span = float(np.ptp(inlier_points[:, 2]))
-        attachment_design = np.asarray(
-            [float(sign[2]) - z_reference, 1.0],
-            dtype=np.float64,
-        )
-        attachment_xy = attachment_design @ coefficients
-        association_distance = float(np.linalg.norm(attachment_xy - sign[:2]))
-        if association_distance > parameters.max_axis_sign_distance_m:
-            continue
-        horizontal_connection_bins: int | None = None
-        horizontal_connection_expected_bins: int | None = None
-        horizontal_connection_coverage: float | None = None
-        if association_distance > parameters.direct_max_axis_sign_distance_m:
-            connection_indices = search_workspace.query_connection_capsule(
-                points,
-                sign[:2],
-                attachment_xy,
-                parameters.horizontal_connection_radius_m,
-            )
-            connection = _horizontal_connection_coverage(
-                points[connection_indices],
-                sign,
-                attachment_xy,
-                parameters,
-                (
-                    ground_classes[connection_indices]
-                    if ground_classes is not None
-                    else None
-                ),
-            )
-            horizontal_connection_bins = connection.occupied_bin_count
-            horizontal_connection_expected_bins = connection.expected_bin_count
-            horizontal_connection_coverage = connection.coverage_ratio
-            if (
-                horizontal_connection_coverage
-                < parameters.min_horizontal_connection_coverage
-            ):
-                continue
+        if is_remote:
             if classes is None:
                 if (
                     float(completeness_ratio or 0.0)

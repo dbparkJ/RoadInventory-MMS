@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
 from mms_shp_detection.pole import (
     PoleSearchParameters,
+    _group_integer_xy_cells,
     blocks_intersecting_bounds,
     cluster_pole_observations,
     estimate_local_ground,
@@ -90,6 +92,43 @@ def _rising_arm(
 
 
 class PoleSearchTests(unittest.TestCase):
+    def test_integer_xy_cell_grouping_matches_axis_unique(self) -> None:
+        rng = np.random.default_rng(77)
+        cells = rng.integers(-300, 500, size=(20_000, 2), dtype=np.int64)
+        cells[::7] = cells[0]
+
+        expected = np.unique(
+            cells,
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        actual = _group_integer_xy_cells(cells)
+
+        for actual_array, expected_array in zip(actual, expected):
+            np.testing.assert_array_equal(actual_array, expected_array)
+
+    def test_integer_xy_cell_grouping_handles_int64_extremes(self) -> None:
+        cells = np.asarray(
+            [
+                [np.iinfo(np.int64).min, 0],
+                [np.iinfo(np.int64).max, 0],
+                [np.iinfo(np.int64).min, 0],
+            ],
+            dtype=np.int64,
+        )
+
+        expected = np.unique(
+            cells,
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        actual = _group_integer_xy_cells(cells)
+
+        for actual_array, expected_array in zip(actual, expected):
+            np.testing.assert_array_equal(actual_array, expected_array)
+
     def test_rank_balances_remote_arm_length_with_shaft_quality(self) -> None:
         parameters = PoleSearchParameters()
         actual = SimpleNamespace(
@@ -433,15 +472,20 @@ class PoleSearchTests(unittest.TestCase):
             )
         )
 
-        result = find_pole_bases(
-            neighborhood,
-            corridor,
-            np.asarray([0.0, 0.0, 5.0]),
-            PoleSearchParameters(),
-            classifications,
-        )
+        with mock.patch(
+            "mms_shp_detection.pole.estimate_local_ground",
+            wraps=estimate_local_ground,
+        ) as ground_estimate:
+            result = find_pole_bases(
+                neighborhood,
+                corridor,
+                np.asarray([0.0, 0.0, 5.0]),
+                PoleSearchParameters(),
+                classifications,
+            )
 
         self.assertIsNone(result)
+        self.assertEqual(ground_estimate.call_count, 0)
 
     def test_direct_axis_does_not_require_horizontal_connection(self) -> None:
         pole = _pole_surface(0.3, 0.0, 0.08, 4.9, seed=146)
@@ -620,15 +664,20 @@ class PoleSearchTests(unittest.TestCase):
         corridor = np.zeros(neighborhood.shape[0], dtype=bool)
         corridor[: branch.shape[0] + arm.shape[0]] = True
 
-        result = find_pole_bases(
-            neighborhood,
-            corridor,
-            np.asarray([0.0, 0.0, 5.0]),
-            PoleSearchParameters(),
-            None,
-        )
+        with mock.patch(
+            "mms_shp_detection.pole.estimate_local_ground",
+            wraps=estimate_local_ground,
+        ) as ground_estimate:
+            result = find_pole_bases(
+                neighborhood,
+                corridor,
+                np.asarray([0.0, 0.0, 5.0]),
+                PoleSearchParameters(),
+                None,
+            )
 
         self.assertIsNone(result)
+        self.assertEqual(ground_estimate.call_count, 0)
 
     def test_return_metadata_is_reported_without_becoming_a_class_requirement(self) -> None:
         pole = _pole_surface(0.3, 0.0, 0.08, 4.9, seed=157)
