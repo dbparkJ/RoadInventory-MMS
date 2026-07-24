@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -10,9 +11,19 @@ import os
 import queue
 import re
 import sys
+import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +31,7 @@ import cv2
 import laspy
 import numpy as np
 from laspy.vlrs.known import WktCoordinateSystemVlr
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile
 from pyproj import CRS
 from pyproj.exceptions import CRSError
 from scipy.spatial import cKDTree
@@ -29,11 +40,12 @@ from ultralytics import YOLO
 
 from .alignment import estimate_panorama_alignment
 from .calibration import attach_calibration_metadata
-from .config import parse_args_with_config, serializable_config
+from .config import ConfigError, parse_args_with_config, serializable_config, validate_config_value
 from .dataset import scan_image_tasks
 from .geometry import (
     apply_panorama_angular_offsets,
     angular_radius_from_bbox,
+    build_perspective_panorama_remap,
     build_camera_axes,
     build_view_axes,
     fit_perspective_overview,
@@ -67,7 +79,7 @@ from .shp_writer import (
 )
 
 
-RESULT_SCHEMA_VERSION = 11
+RESULT_SCHEMA_VERSION = 13
 DATASET_SIGNATURE_VERSION = 1
 POINT_CROP_SEMANTICS = {
     "kind": "derived_selected_points_visualization",
@@ -97,6 +109,153 @@ POLE_CROP_SEMANTICS = {
 }
 
 
+class _AdaptiveStageGate:
+    """Thread-safe stage limiter whose capacity can be reduced after CUDA OOM."""
+
+    def __init__(self, capacity: int, *, name: str) -> None:
+        self.name = name
+        self._capacity = max(1, int(capacity))
+        self._active = 0
+        self._condition = threading.Condition()
+        self.wait_seconds = 0.0
+        self.max_active = 0
+
+    @contextmanager
+    def slot(self):
+        started = time.perf_counter()
+        with self._condition:
+            while self._active >= self._capacity:
+                self._condition.wait()
+            self.wait_seconds += time.perf_counter() - started
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+    def reduce_to_one(self) -> bool:
+        with self._condition:
+            changed = self._capacity != 1
+            self._capacity = 1
+            self._condition.notify_all()
+            return changed
+
+    @property
+    def capacity(self) -> int:
+        with self._condition:
+            return self._capacity
+
+
+class _QueuedStageGate:
+    """Arrival-ordered gate used to bound memory-heavy pole processing."""
+
+    def __init__(self, capacity: int, *, name: str) -> None:
+        self.name = name
+        self.capacity = max(1, int(capacity))
+        self._condition = threading.Condition()
+        self._waiters: list[object] = []
+        self.wait_seconds = 0.0
+        self.active = 0
+        self.max_active = 0
+
+    @contextmanager
+    def slot(self):
+        started = time.perf_counter()
+        waiter = object()
+        with self._condition:
+            self._waiters.append(waiter)
+            try:
+                while self._waiters[0] is not waiter or self.active >= self.capacity:
+                    self._condition.wait()
+            except BaseException:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
+                self._condition.notify_all()
+                raise
+            self._waiters.pop(0)
+            self.wait_seconds += time.perf_counter() - started
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self._condition.notify_all()
+        try:
+            yield
+        finally:
+            with self._condition:
+                self.active -= 1
+                self._condition.notify_all()
+
+
+class PersistentCudaOutOfMemoryError(RuntimeError):
+    """Raised when serialized retry still cannot fit one resident model."""
+
+
+class MultiModelCoordinator:
+    """Own shared GPU/pole limits and aggregate scheduling diagnostics."""
+
+    def __init__(
+        self,
+        *,
+        inference_workers: int,
+        pole_workers: int,
+        queue_depth: int,
+    ) -> None:
+        self.inference_gate = _AdaptiveStageGate(
+            inference_workers,
+            name="model_inference",
+        )
+        self.pole_gate = _QueuedStageGate(
+            pole_workers,
+            name="pole_postprocess",
+        )
+        self.queue_depth = max(1, int(queue_depth))
+        self.cuda_oom_fallbacks = 0
+        self._stats_lock = threading.Lock()
+        self.stage_seconds: dict[str, float] = {}
+        self.stage_counts: dict[str, int] = {}
+
+    @contextmanager
+    def timed(self, stage: str):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - started
+            with self._stats_lock:
+                self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + elapsed
+                self.stage_counts[stage] = self.stage_counts.get(stage, 0) + 1
+
+    def downgrade_inference_after_oom(self) -> bool:
+        changed = self.inference_gate.reduce_to_one()
+        with self._stats_lock:
+            self.cuda_oom_fallbacks += 1
+        return changed
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._stats_lock:
+            stages = {
+                key: {
+                    "seconds": float(value),
+                    "count": int(self.stage_counts.get(key, 0)),
+                }
+                for key, value in sorted(self.stage_seconds.items())
+            }
+            oom_fallbacks = int(self.cuda_oom_fallbacks)
+        return {
+            "queue_depth": self.queue_depth,
+            "inference_workers_effective": self.inference_gate.capacity,
+            "inference_max_active": int(self.inference_gate.max_active),
+            "inference_wait_seconds": float(self.inference_gate.wait_seconds),
+            "cuda_oom_sequential_fallbacks": oom_fallbacks,
+            "pole_workers": int(self.pole_gate.capacity),
+            "pole_max_active": int(self.pole_gate.max_active),
+            "pole_wait_seconds": float(self.pole_gate.wait_seconds),
+            "stages": stages,
+        }
+
+
 def parse_class_id_list(value: Any) -> tuple[int, ...]:
     """Parse YAML lists or comma-separated CLI text into unique class IDs."""
 
@@ -117,6 +276,43 @@ def parse_class_id_list(value: Any) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError("every class ID must be an integer") from exc
     if any(item < 0 or item > 255 for item in parsed):
         raise argparse.ArgumentTypeError("LAS class IDs must be between 0 and 255")
+    return parsed
+
+
+def parse_model_filters(value: Any) -> dict[str, dict[str, Any]]:
+    """Parse the per-model filter map from YAML or a JSON CLI value."""
+
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(
+                "model filters must be a YAML mapping or JSON object"
+            ) from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("model filters must be a mapping")
+
+    parsed: dict[str, dict[str, Any]] = {}
+    casefolded_names: set[str] = set()
+    for raw_name, raw_profile in value.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise argparse.ArgumentTypeError(
+                "every model filter name must be a non-empty string"
+            )
+        name = raw_name.strip()
+        folded = name.casefold()
+        if folded in casefolded_names:
+            raise argparse.ArgumentTypeError(
+                f"model filter names must be unique ignoring case: {name!r}"
+            )
+        casefolded_names.add(folded)
+        if not isinstance(raw_profile, dict):
+            raise argparse.ArgumentTypeError(
+                f"model filter {name!r} must contain a mapping"
+            )
+        parsed[name] = copy.deepcopy(raw_profile)
     return parsed
 
 
@@ -262,6 +458,7 @@ def pole_classifications_for_policy(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Detect signs in MMS panoramas, match calibrated point clouds, and export a SHP.",
+        allow_abbrev=False,
         epilog=(
             "YAML-first usage: run_pipeline.py [config.yaml]. With no arguments, "
             "./config.yaml is loaded when present. --config FILE is equivalent; "
@@ -312,7 +509,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=18,
         help="GPS minus UTC offset used for timestamp rendering.",
     )
-    parser.add_argument("--model-path", type=Path, default=Path("best.pt"))
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path("best.pt"),
+        help=(
+            "Legacy single-model checkpoint. Ignored when --model-dir is set; "
+            "use null in YAML for an all-model run."
+        ),
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Run every .pt checkpoint directly inside this directory, in name order.",
+    )
+    parser.add_argument(
+        "--model-filters",
+        type=parse_model_filters,
+        default={},
+        help=(
+            "Per-model filter mapping. YAML mappings are preferred; the CLI accepts JSON."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument(
         "--pointcloud-cache-path",
@@ -459,6 +678,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of worker processes. On a single GPU, start with 1.",
+    )
+    parser.add_argument(
+        "--multi-model-parallel",
+        action="store_true",
+        help=(
+            "Keep all discovered models resident and pipeline shared forward inference "
+            "with bounded per-model post-processing queues."
+        ),
+    )
+    parser.add_argument(
+        "--multi-model-inference-workers",
+        type=int,
+        default=2,
+        help="Maximum concurrent model predictions in a multi-model run.",
+    )
+    parser.add_argument(
+        "--multi-model-pole-workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent memory-heavy pole searches across all models.",
+    )
+    parser.add_argument(
+        "--multi-model-queue-depth",
+        type=int,
+        default=1,
+        help="Maximum queued frames per model between GPU inference and point/pole work.",
     )
     parser.add_argument(
         "--pointcloud-neighbor-count",
@@ -644,11 +889,62 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--pole-min-fov-deg", type=float, default=90.0)
+    parser.add_argument(
+        "--pole-debug-min-fov-deg",
+        type=float,
+        default=18.0,
+        help=(
+            "Minimum FOV for result-focused pole QA crops. Pole search keeps using "
+            "--pole-min-fov-deg independently."
+        ),
+    )
     parser.add_argument("--pole-corridor-side-expand-ratio", type=float, default=4.0)
     parser.add_argument("--pole-corridor-top-margin-ratio", type=float, default=0.25)
     parser.add_argument("--pole-search-radius-m", type=float, default=8.0)
     parser.add_argument("--pole-max-drop-m", type=float, default=8.0)
     parser.add_argument("--pole-top-margin-m", type=float, default=3.0)
+    parser.add_argument(
+        "--pole-range-fallback-enabled",
+        action="store_true",
+        help=(
+            "Retry a rejected pole with a wider horizontal and vertical physical "
+            "search envelope."
+        ),
+    )
+    parser.add_argument("--pole-fallback-search-radius-m", type=float, default=10.0)
+    parser.add_argument("--pole-fallback-max-drop-m", type=float, default=12.0)
+    parser.add_argument("--pole-fallback-top-margin-m", type=float, default=3.0)
+    parser.add_argument(
+        "--pole-fallback-max-axis-sign-distance-m",
+        type=float,
+        default=10.0,
+    )
+    parser.add_argument("--pole-fallback-min-vertical-span-m", type=float, default=0.75)
+    parser.add_argument(
+        "--pole-fallback-horizontal-connection-radius-m",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--pole-fallback-horizontal-connection-z-tolerance-m",
+        type=float,
+        default=0.30,
+    )
+    parser.add_argument(
+        "--pole-fallback-horizontal-connection-above-tolerance-m",
+        type=float,
+        default=0.30,
+    )
+    parser.add_argument(
+        "--pole-fallback-horizontal-connection-bin-m",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--pole-fallback-min-horizontal-connection-coverage",
+        type=float,
+        default=0.50,
+    )
     parser.add_argument("--pole-xy-voxel-m", type=float, default=0.10)
     parser.add_argument("--pole-z-bin-m", type=float, default=0.15)
     parser.add_argument("--pole-axis-cluster-radius-m", type=float, default=0.24)
@@ -705,6 +1001,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--pole-horizontal-connection-z-tolerance-m",
         type=float,
         default=0.30,
+    )
+    parser.add_argument(
+        "--pole-horizontal-connection-above-tolerance-m",
+        type=float,
+        default=0.30,
+        help=(
+            "Maximum height above the detected object accepted as connected mast-arm evidence."
+        ),
     )
     parser.add_argument("--pole-horizontal-connection-bin-m", type=float, default=0.25)
     parser.add_argument(
@@ -851,6 +1155,7 @@ def setup_logging(
     file_mode: str = "a",
     logger_name: str | None = None,
     level: str | int = logging.INFO,
+    capture_root: bool = True,
 ) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(logger_name or f"mms_shp_detection_{os.getpid()}")
@@ -873,20 +1178,21 @@ def setup_logging(
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Capture warnings and third-party Python log records in a file as well.
-    # No StreamHandler is installed: tqdm owns the normal console display.
-    root_logger = logging.getLogger()
-    root_logger.setLevel(resolved_level)
-    for handler in list(root_logger.handlers):
-        if getattr(handler, "_mms_file_handler", False):
-            root_logger.removeHandler(handler)
-            handler.close()
-    root_file_handler = logging.FileHandler(log_path, encoding="utf-8", mode="a")
-    root_file_handler.setLevel(resolved_level)
-    root_file_handler.setFormatter(formatter)
-    root_file_handler._mms_file_handler = True  # type: ignore[attr-defined]
-    root_logger.addHandler(root_file_handler)
-    logging.captureWarnings(True)
+    if capture_root:
+        # Capture warnings and third-party Python log records in a file as well.
+        # Parallel model loggers deliberately skip this process-global handler.
+        root_logger = logging.getLogger()
+        root_logger.setLevel(resolved_level)
+        for handler in list(root_logger.handlers):
+            if getattr(handler, "_mms_file_handler", False):
+                root_logger.removeHandler(handler)
+                handler.close()
+        root_file_handler = logging.FileHandler(log_path, encoding="utf-8", mode="a")
+        root_file_handler.setLevel(resolved_level)
+        root_file_handler.setFormatter(formatter)
+        root_file_handler._mms_file_handler = True  # type: ignore[attr-defined]
+        root_logger.addHandler(root_file_handler)
+        logging.captureWarnings(True)
     return logger
 
 
@@ -896,11 +1202,235 @@ def sanitize_name(value: str) -> str:
     return safe or "item"
 
 
-def ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
+_MODEL_FILTER_SCALAR_KEYS = {
+    "imgsz",
+    "conf",
+    "iou",
+    "max_det",
+    "point_padding_px",
+    "max_range_m",
+    "depth_window_m",
+    "front_surface_quantile",
+    "front_surface_min_support",
+    "block_angle_margin_deg",
+    "max_center_ray_angle_deg",
+    "min_point_count",
+    "perspective_view_size",
+    "perspective_margin_deg",
+    "perspective_min_fov_deg",
+    "perspective_max_fov_deg",
+}
+
+
+def _model_filter_key_allowed(key: str) -> bool:
+    return (
+        key in _MODEL_FILTER_SCALAR_KEYS
+        or key.startswith("point_range_fallback_")
+        or key.startswith("cluster_")
+        or key.startswith("pole_")
+        or key.startswith("sign_observation_")
+    )
+
+
+def discover_model_paths(
+    model_dir: Path | None,
+    model_path: Path | None,
+) -> list[Path]:
+    """Resolve the stable, non-recursive model execution list."""
+
+    if model_dir is None:
+        if model_path is None:
+            raise ValueError("Either model_dir or model_path must be configured")
+        resolved = model_path.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Model checkpoint does not exist: {resolved}")
+        return [resolved]
+
+    resolved_dir = model_dir.expanduser().resolve()
+    if not resolved_dir.is_dir():
+        raise FileNotFoundError(f"Model directory does not exist: {resolved_dir}")
+    paths = sorted(
+        (
+            item.resolve()
+            for item in resolved_dir.iterdir()
+            if item.is_file() and item.suffix.casefold() == ".pt"
+        ),
+        key=lambda item: (item.name.casefold(), item.name),
+    )
+    if not paths:
+        raise FileNotFoundError(f"No .pt model checkpoints found in: {resolved_dir}")
+
+    output_keys: dict[str, Path] = {}
+    for path in paths:
+        output_key = sanitize_name(path.stem).casefold()
+        previous = output_keys.get(output_key)
+        if previous is not None:
+            raise ValueError(
+                "Model names collide after output-path sanitization: "
+                f"{previous.name!r} and {path.name!r}"
+            )
+        output_keys[output_key] = path
+    return paths
+
+
+def _flatten_model_filter_profile(
+    profile_name: str,
+    profile: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    object_type = "generic"
+    leaves: dict[str, Any] = {}
+    source_paths: dict[str, str] = {}
+
+    def visit(value: dict[str, Any], prefix: tuple[str, ...] = ()) -> None:
+        nonlocal object_type
+        for raw_key, item in value.items():
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                raise ConfigError(
+                    f"model_filters.{profile_name} contains an invalid key"
+                )
+            key = raw_key.strip().replace("-", "_")
+            path = (*prefix, key)
+            dotted = ".".join(("model_filters", profile_name, *path))
+            if isinstance(item, dict):
+                visit(item, path)
+                continue
+            if key == "object_type":
+                if prefix:
+                    raise ConfigError(f"'{dotted}' must be at profile top level")
+                if item not in {"traffic_sign", "traffic_signal", "generic"}:
+                    raise ConfigError(
+                        f"'{dotted}' must be traffic_sign, traffic_signal, or generic"
+                    )
+                object_type = str(item)
+                continue
+            if not _model_filter_key_allowed(key):
+                raise ConfigError(
+                    f"'{dotted}' is not a permitted model-specific filter"
+                )
+            if key in leaves:
+                raise ConfigError(
+                    f"model filter '{key}' is defined more than once in "
+                    f"'{source_paths[key]}' and '{dotted}'"
+                )
+            leaves[key] = item
+            source_paths[key] = dotted
+
+    visit(profile)
+    return object_type, leaves
+
+
+def _convert_model_filter_value(
+    key: str,
+    raw_value: Any,
+    current_value: Any,
+    *,
+    dotted_key: str,
+) -> Any:
+    if isinstance(current_value, bool):
+        if not isinstance(raw_value, bool):
+            raise ConfigError(f"'{dotted_key}' must be a YAML boolean")
+        converted = raw_value
+    elif isinstance(current_value, int) and not isinstance(current_value, bool):
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise ConfigError(f"'{dotted_key}' must be an integer")
+        if isinstance(raw_value, float) and not raw_value.is_integer():
+            raise ConfigError(f"'{dotted_key}' must be an integer")
+        converted = int(raw_value)
+    elif isinstance(current_value, float):
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise ConfigError(f"'{dotted_key}' must be a number")
+        converted = float(raw_value)
+    elif isinstance(current_value, tuple):
+        try:
+            converted = parse_class_id_list(raw_value)
+        except argparse.ArgumentTypeError as exc:
+            raise ConfigError(f"Invalid '{dotted_key}': {exc}") from exc
+    elif isinstance(current_value, str):
+        if not isinstance(raw_value, str):
+            raise ConfigError(f"'{dotted_key}' must be a string")
+        converted = raw_value
+    else:
+        raise ConfigError(
+            f"'{dotted_key}' cannot override unsupported value type "
+            f"{type(current_value).__name__}"
+        )
+    validate_config_value(key, converted, dotted_key)
+    return converted
+
+
+def apply_model_filter(
+    args: argparse.Namespace,
+    model_path: Path,
+    *,
+    require_profile: bool,
+) -> tuple[argparse.Namespace, str, str]:
+    """Clone args and apply the filter profile matching one model file."""
+
+    configured = getattr(args, "model_filters", {}) or {}
+    matches = [
+        name
+        for name in configured
+        if name.casefold() in {model_path.name.casefold(), model_path.stem.casefold()}
+    ]
+    if len(matches) > 1:
+        raise ConfigError(
+            f"Model {model_path.name!r} matches more than one filter profile: {matches}"
+        )
+    if require_profile and not matches:
+        raise ConfigError(
+            f"No model_filters profile matches discovered model {model_path.name!r}"
+        )
+
+    selected_name = matches[0] if matches else "<base>"
+    object_type = "generic"
+    leaves: dict[str, Any] = {}
+    if matches:
+        object_type, leaves = _flatten_model_filter_profile(
+            selected_name,
+            configured[selected_name],
+        )
+
+    effective = copy.deepcopy(args)
+    effective.model_path = model_path.resolve()
+    effective.model_dir = None
+    effective.model_filters = {}
+    effective.model_profile = selected_name
+    effective.model_object_type = object_type
+    cli_override_dests = set(getattr(args, "_cli_override_dests", ()))
+    for key, raw_value in leaves.items():
+        if key in cli_override_dests:
+            continue
+        if not hasattr(effective, key):
+            raise ConfigError(
+                f"model filter {selected_name!r} refers to unknown option {key!r}"
+            )
+        dotted = f"model_filters.{selected_name}.{key}"
+        setattr(
+            effective,
+            key,
+            _convert_model_filter_value(
+                key,
+                raw_value,
+                getattr(effective, key),
+                dotted_key=dotted,
+            ),
+        )
+    return effective, selected_name, object_type
+
+
+def ensure_output_dirs(
+    output_dir: Path,
+    *,
+    shared_forward_views_dir: Path | None = None,
+) -> dict[str, Path]:
     dirs = {
         "root": output_dir,
         "txt": output_dir / "txt",
-        "forward_views": output_dir / "forward_views",
+        "forward_views": (
+            shared_forward_views_dir
+            if shared_forward_views_dir is not None
+            else output_dir / "forward_views"
+        ),
         "image_crops": output_dir / "image_crops",
         "point_crops": output_dir / "point_crops",
         "point_previews": output_dir / "point_previews",
@@ -910,7 +1440,7 @@ def ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
         "cache": output_dir / "cache",
         "shp": output_dir / "shp",
     }
-    for path in dirs.values():
+    for path in dict.fromkeys(dirs.values()):
         path.mkdir(parents=True, exist_ok=True)
     return dirs
 
@@ -1104,10 +1634,16 @@ def build_run_fingerprint(
 ) -> str:
     excluded = {
         "output_dir",
+        "model_dir",
+        "model_filters",
         "pointcloud_cache_path",
         "skip_existing",
         "num_workers",
         "allow_unsafe_cuda_multiprocessing",
+        "multi_model_parallel",
+        "multi_model_inference_workers",
+        "multi_model_pole_workers",
+        "multi_model_queue_depth",
         "worker_progress_every",
         "progress_log_interval_sec",
         "log_level",
@@ -1336,6 +1872,31 @@ def validate_panorama_image(image_task: dict[str, Any], image_rgb: np.ndarray) -
         raise ValueError(
             f"Unsupported non-zero Leica PanoramaHotSpot for {image_task['image_name']}: {hotspot}"
         )
+
+
+def load_panorama_rgb(image_path: Path, logger) -> np.ndarray:
+    """Decode strictly, then retry once if Pillow can recover a truncated JPEG."""
+
+    try:
+        with Image.open(image_path) as opened_image:
+            return np.array(opened_image.convert("RGB"))
+    except OSError as strict_error:
+        previous_setting = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        try:
+            with Image.open(image_path) as opened_image:
+                recovered = np.array(opened_image.convert("RGB"))
+        except Exception as recovery_error:
+            raise strict_error from recovery_error
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = previous_setting
+
+        logger.warning(
+            "Recovered a truncated image after strict JPEG decoding failed: %s (%s)",
+            image_path,
+            strict_error,
+        )
+        return recovered
 
 
 def count_txt_files(txt_dir: Path) -> int:
@@ -1846,14 +2407,197 @@ def merge_detection_candidates(
     return kept
 
 
+def _is_cuda_out_of_memory(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "cuda" in text and "out of memory" in text
+
+
+def run_yolo_prediction(
+    model: YOLO,
+    runtime: dict[str, Any],
+    logger,
+    *,
+    coordinator: MultiModelCoordinator | None = None,
+    **predict_kwargs: Any,
+):
+    """Run one prediction with shared concurrency control and OOM downgrade."""
+
+    def predict_once(*, clear_cuda_cache: bool = False):
+        stage = f"yolo/{runtime.get('model_key') or 'model'}"
+        timing = coordinator.timed(stage) if coordinator is not None else nullcontext()
+        gate = (
+            coordinator.inference_gate.slot()
+            if coordinator is not None
+            else nullcontext()
+        )
+        with gate, timing:
+            if clear_cuda_cache:
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    logger.debug(
+                        "Could not clear the CUDA allocator after OOM.",
+                        exc_info=True,
+                    )
+            return model.predict(**predict_kwargs)
+
+    try:
+        return predict_once()
+    except RuntimeError as exc:
+        if coordinator is None or not _is_cuda_out_of_memory(exc):
+            raise
+        changed = coordinator.downgrade_inference_after_oom()
+        logger.warning(
+            "Concurrent CUDA inference ran out of memory for %s; "
+            "retrying with serialized model inference%s.",
+            runtime.get("model_name") or runtime.get("model_key") or "model",
+            " and keeping that mode" if changed else "",
+        )
+
+    # Retry only after leaving the first exception handler. Its traceback may
+    # retain CUDA tensors; ending that scope lets reference counting release
+    # them before empty_cache runs under the serialized inference gate.
+    try:
+        return predict_once(clear_cuda_cache=True)
+    except RuntimeError as retry_exc:
+        if not _is_cuda_out_of_memory(retry_exc):
+            raise
+        model_name = (
+            runtime.get("model_name")
+            or runtime.get("model_key")
+            or "model"
+        )
+        raise PersistentCudaOutOfMemoryError(
+            f"Serialized CUDA inference still ran out of memory for {model_name}; "
+            "the model was circuit-broken for the remainder of this run."
+        ) from retry_exc
+
+
+@lru_cache(maxsize=4)
+def _cached_forward_view_geometry(
+    image_width: int,
+    image_height: int,
+    view_size: int,
+    hfov_deg: float,
+    vfov_deg: float,
+    yaw_offset_deg: float,
+    pitch_offset_deg: float,
+) -> tuple[dict[str, Any], tuple[np.ndarray, np.ndarray]]:
+    """Cache the fixed 1280² ray/remap grid instead of rebuilding it per frame."""
+
+    mapping = build_forward_detection_mapping(
+        image_width,
+        image_height,
+        view_size=view_size,
+        hfov_deg=hfov_deg,
+        vfov_deg=vfov_deg,
+        yaw_offset_deg=yaw_offset_deg,
+        pitch_offset_deg=pitch_offset_deg,
+    )
+    remap_xy = build_perspective_panorama_remap(
+        image_width,
+        image_height,
+        mapping["pano_forward_vec"],
+        mapping["pano_right_vec"],
+        mapping["pano_up_vec"],
+        mapping["view_forward_vec"],
+        mapping["view_right_vec"],
+        mapping["view_up_vec"],
+        mapping["output_width"],
+        mapping["output_height"],
+        mapping["hfov_deg"],
+        mapping["vfov_deg"],
+    )
+    for grid in remap_xy:
+        grid.flags.writeable = False
+    return mapping, remap_xy
+
+
+def render_forward_detection_view(
+    image_rgb: np.ndarray,
+    runtime: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Render the immutable forward RGB array shared by every model."""
+
+    image_height, image_width = image_rgb.shape[:2]
+    mapping, remap_xy = _cached_forward_view_geometry(
+        int(image_width),
+        int(image_height),
+        int(runtime["forward_view_size"]),
+        float(runtime["forward_view_hfov_deg"]),
+        float(runtime["forward_view_vfov_deg"]),
+        float(runtime.get("panorama_yaw_offset_deg", 0.0)),
+        float(runtime.get("panorama_pitch_offset_deg", 0.0)),
+    )
+    forward_rgb = render_perspective_view_from_panorama(
+        image_rgb,
+        mapping["pano_forward_vec"],
+        mapping["pano_right_vec"],
+        mapping["pano_up_vec"],
+        mapping["view_forward_vec"],
+        mapping["view_right_vec"],
+        mapping["view_up_vec"],
+        mapping["output_width"],
+        mapping["output_height"],
+        mapping["hfov_deg"],
+        mapping["vfov_deg"],
+        remap_xy=remap_xy,
+    )
+    return forward_rgb, mapping
+
+
+def run_forward_detection_on_view(
+    forward_rgb: np.ndarray,
+    mapping: dict[str, Any],
+    runtime: dict[str, Any],
+    model: YOLO,
+    logger,
+    *,
+    coordinator: MultiModelCoordinator | None = None,
+) -> list[dict[str, Any]]:
+    """Apply one model to an already-rendered shared forward view."""
+
+    prediction = run_yolo_prediction(
+        model,
+        runtime,
+        logger,
+        coordinator=coordinator,
+        source=Image.fromarray(forward_rgb),
+        imgsz=runtime["imgsz"],
+        conf=runtime["conf"],
+        iou=runtime["iou"],
+        max_det=runtime["max_det"],
+        device=runtime["device"],
+        verbose=False,
+        retina_masks=True,
+    )[0]
+    candidates = extract_detection_candidates_from_prediction(
+        prediction,
+        model,
+        detection_source="forward",
+        panorama_mapping=mapping,
+    )
+    logger.info("Forward perspective detection produced %d detections.", len(candidates))
+    return candidates
+
+
 def run_full_panorama_detection(
     image_rgb: np.ndarray,
     runtime: dict[str, Any],
     model: YOLO,
     logger,
+    *,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> list[dict[str, Any]]:
     logger.info("Running full panorama detection.")
-    prediction = model.predict(
+    prediction = run_yolo_prediction(
+        model,
+        runtime,
+        logger,
+        coordinator=coordinator,
         source=Image.fromarray(image_rgb),
         imgsz=runtime["imgsz"],
         conf=runtime["conf"],
@@ -1878,6 +2622,8 @@ def run_tiled_panorama_detection(
     runtime: dict[str, Any],
     model: YOLO,
     logger,
+    *,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> list[dict[str, Any]]:
 
     image_height, image_width = image_rgb.shape[:2]
@@ -1952,7 +2698,11 @@ def run_tiled_panorama_detection(
             )
             for tile in batch_tiles
         ]
-        batch_predictions = model.predict(
+        batch_predictions = run_yolo_prediction(
+            model,
+            runtime,
+            logger,
+            coordinator=coordinator,
             source=batch_sources,
             imgsz=runtime["imgsz"],
             conf=runtime["conf"],
@@ -1988,32 +2738,11 @@ def run_forward_panorama_detection(
     logger,
     *,
     forward_view_output_path: Path | None = None,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> list[dict[str, Any]]:
     """Run YOLO only on a distortion-reduced vehicle-forward perspective view."""
 
-    image_height, image_width = image_rgb.shape[:2]
-    mapping = build_forward_detection_mapping(
-        image_width,
-        image_height,
-        view_size=int(runtime["forward_view_size"]),
-        hfov_deg=float(runtime["forward_view_hfov_deg"]),
-        vfov_deg=float(runtime["forward_view_vfov_deg"]),
-        yaw_offset_deg=float(runtime.get("panorama_yaw_offset_deg", 0.0)),
-        pitch_offset_deg=float(runtime.get("panorama_pitch_offset_deg", 0.0)),
-    )
-    forward_rgb = render_perspective_view_from_panorama(
-        image_rgb,
-        mapping["pano_forward_vec"],
-        mapping["pano_right_vec"],
-        mapping["pano_up_vec"],
-        mapping["view_forward_vec"],
-        mapping["view_right_vec"],
-        mapping["view_up_vec"],
-        mapping["output_width"],
-        mapping["output_height"],
-        mapping["hfov_deg"],
-        mapping["vfov_deg"],
-    )
+    forward_rgb, mapping = render_forward_detection_view(image_rgb, runtime)
     logger.info(
         "Running forward perspective detection (%dx%d, hfov=%.1f, vfov=%.1f).",
         mapping["output_width"],
@@ -2030,26 +2759,14 @@ def run_forward_panorama_detection(
             max_center_ray_angle_deg=float(runtime["max_center_ray_angle_deg"]),
         )
         logger.info("Saved annotated forward YOLO view: %s", forward_view_output_path)
-    prediction = model.predict(
-        # Only the unannotated array is passed to YOLO.  The QA image above is
-        # rendered from an independent copy.
-        source=Image.fromarray(forward_rgb),
-        imgsz=runtime["imgsz"],
-        conf=runtime["conf"],
-        iou=runtime["iou"],
-        max_det=runtime["max_det"],
-        device=runtime["device"],
-        verbose=False,
-        retina_masks=True,
-    )[0]
-    candidates = extract_detection_candidates_from_prediction(
-        prediction,
+    return run_forward_detection_on_view(
+        forward_rgb,
+        mapping,
+        runtime,
         model,
-        detection_source="forward",
-        panorama_mapping=mapping,
+        logger,
+        coordinator=coordinator,
     )
-    logger.info("Forward perspective detection produced %d detections.", len(candidates))
-    return candidates
 
 
 def run_yolo_detection_on_panorama(
@@ -2059,6 +2776,7 @@ def run_yolo_detection_on_panorama(
     logger,
     *,
     forward_view_output_path: Path | None = None,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> list[dict[str, Any]]:
     if runtime.get("detection_view_mode") == "forward":
         return run_forward_panorama_detection(
@@ -2067,6 +2785,7 @@ def run_yolo_detection_on_panorama(
             model=model,
             logger=logger,
             forward_view_output_path=forward_view_output_path,
+            coordinator=coordinator,
         )
 
     full_candidates: list[dict[str, Any]] = []
@@ -2078,6 +2797,7 @@ def run_yolo_detection_on_panorama(
             runtime=runtime,
             model=model,
             logger=logger,
+            coordinator=coordinator,
         )
     if runtime["use_tiled_detection"]:
         tiled_candidates = run_tiled_panorama_detection(
@@ -2085,6 +2805,7 @@ def run_yolo_detection_on_panorama(
             runtime=runtime,
             model=model,
             logger=logger,
+            coordinator=coordinator,
         )
 
     if not full_candidates and not tiled_candidates:
@@ -2847,6 +3568,9 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         horizontal_connection_z_tolerance_m=float(
             runtime["pole_horizontal_connection_z_tolerance_m"]
         ),
+        horizontal_connection_above_tolerance_m=float(
+            runtime["pole_horizontal_connection_above_tolerance_m"]
+        ),
         horizontal_connection_bin_m=float(
             runtime["pole_horizontal_connection_bin_m"]
         ),
@@ -2876,6 +3600,141 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
     )
     parameters.validate()
     return parameters
+
+
+def build_pole_fallback_parameters(
+    runtime: dict[str, Any],
+    strict: PoleSearchParameters,
+) -> PoleSearchParameters | None:
+    """Build the wider physical pole-search envelope used only after rejection."""
+
+    if not runtime.get("pole_range_fallback_enabled", False):
+        return None
+    fallback = replace(
+        strict,
+        search_radius_m=float(runtime["pole_fallback_search_radius_m"]),
+        max_drop_m=float(runtime["pole_fallback_max_drop_m"]),
+        top_margin_m=float(runtime["pole_fallback_top_margin_m"]),
+        max_axis_sign_distance_m=float(
+            runtime["pole_fallback_max_axis_sign_distance_m"]
+        ),
+        min_vertical_span_m=float(
+            runtime["pole_fallback_min_vertical_span_m"]
+        ),
+        horizontal_connection_radius_m=float(
+            runtime["pole_fallback_horizontal_connection_radius_m"]
+        ),
+        horizontal_connection_z_tolerance_m=float(
+            runtime["pole_fallback_horizontal_connection_z_tolerance_m"]
+        ),
+        horizontal_connection_above_tolerance_m=float(
+            runtime[
+                "pole_fallback_horizontal_connection_above_tolerance_m"
+            ]
+        ),
+        horizontal_connection_bin_m=float(
+            runtime["pole_fallback_horizontal_connection_bin_m"]
+        ),
+        min_horizontal_connection_coverage=float(
+            runtime["pole_fallback_min_horizontal_connection_coverage"]
+        ),
+    )
+    fallback.validate()
+    comparisons = (
+        (
+            "pole_fallback_search_radius_m",
+            fallback.search_radius_m,
+            "pole_search_radius_m",
+            strict.search_radius_m,
+        ),
+        (
+            "pole_fallback_max_drop_m",
+            fallback.max_drop_m,
+            "pole_max_drop_m",
+            strict.max_drop_m,
+        ),
+        (
+            "pole_fallback_top_margin_m",
+            fallback.top_margin_m,
+            "pole_top_margin_m",
+            strict.top_margin_m,
+        ),
+        (
+            "pole_fallback_max_axis_sign_distance_m",
+            fallback.max_axis_sign_distance_m,
+            "pole_max_axis_sign_distance_m",
+            strict.max_axis_sign_distance_m,
+        ),
+    )
+    smaller = [
+        f"{fallback_name}={fallback_value:g} < {strict_name}={strict_value:g}"
+        for fallback_name, fallback_value, strict_name, strict_value in comparisons
+        if fallback_value < strict_value
+    ]
+    if smaller:
+        raise ValueError(
+            "Pole fallback bounds cannot be smaller than strict bounds: "
+            + ", ".join(smaller)
+        )
+    if all(
+        math.isclose(fallback_value, strict_value)
+        for _, fallback_value, _, strict_value in comparisons
+    ):
+        raise ValueError(
+            "Pole range fallback is enabled but none of its bounds expands the strict search"
+        )
+    return fallback
+
+
+def pole_cross_profile_candidate_key(
+    candidate: Any,
+    *,
+    preferred_min_completeness_ratio: float,
+    direct_max_axis_sign_distance_m: float,
+) -> tuple[float, ...]:
+    """Compare strict/fallback candidates without profile-dependent bin counts."""
+
+    completeness = float(
+        getattr(candidate, "completeness_ratio", 0.0) or 0.0
+    )
+    association_distance = float(
+        getattr(candidate, "association_distance_m", math.inf)
+    )
+    direct = association_distance <= direct_max_axis_sign_distance_m
+    connection_coverage = (
+        1.0
+        if direct
+        else float(
+            getattr(
+                candidate,
+                "horizontal_connection_coverage_ratio",
+                0.0,
+            )
+            or 0.0
+        )
+    )
+    axis_rmse = float(getattr(candidate, "radial_rmse_m", math.inf))
+    ground_rmse_value = getattr(candidate, "ground_rmse_m", None)
+    ground_rmse = (
+        float(ground_rmse_value)
+        if ground_rmse_value is not None
+        else math.inf
+    )
+    has_ground = getattr(candidate, "ground_z", None) is not None
+    status = str(getattr(candidate, "status", "REVIEW") or "REVIEW")
+    return (
+        0.0
+        if completeness >= preferred_min_completeness_ratio
+        else 1.0,
+        0.0 if has_ground else 1.0,
+        0.0 if status == "AUTO" else 1.0,
+        -completeness,
+        -connection_coverage,
+        axis_rmse,
+        ground_rmse,
+        association_distance,
+        -float(getattr(candidate, "point_count", 0) or 0),
+    )
 
 
 def _project_points_to_rectified_view(
@@ -3115,12 +3974,13 @@ def build_pole_debug_overview_view(
     fallback_view: dict[str, Any],
     runtime: dict[str, Any],
 ) -> dict[str, Any]:
-    """Render a square QA view containing the sign, fitted pole and ground.
+    """Render a result-focused QA view from the pole top to its base evidence.
 
     This function is deliberately used only after pole fitting.  The original
     rectified view and its corridor remain the inputs to pole search, while the
-    returned view is a result-aware visualization that cannot silently crop an
-    extrapolated base or its supporting ground cells.
+    returned view is a result-aware visualization.  Search can require a very
+    wide FOV (especially for traffic-signal mast arms), but that search FOV must
+    not force the result crop to include the camera body or unrelated road.
     """
 
     pano_height, pano_width = image_rgb.shape[:2]
@@ -3164,8 +4024,13 @@ def build_pole_debug_overview_view(
     axis_rays = _world_points_to_overview_rays(axis_points, origin_xyz)
     ground_rays = _world_points_to_overview_rays(ground_points, origin_xyz)
     configured_max_fov = float(runtime["perspective_max_fov_deg"])
-    configured_min_fov = float(runtime["pole_min_fov_deg"])
-    safe_max_fov = min(179.0, max(configured_max_fov, configured_min_fov))
+    debug_min_fov = float(
+        runtime.get(
+            "pole_debug_min_fov_deg",
+            runtime.get("perspective_min_fov_deg", 18.0),
+        )
+    )
+    safe_max_fov = min(179.0, max(configured_max_fov, debug_min_fov))
     if safe_max_fov <= 0.0:
         raise ValueError("Pole debug overview requires a positive maximum FOV")
 
@@ -3183,10 +4048,11 @@ def build_pole_debug_overview_view(
         )
     )
     # The debug raster is square.  A common FOV retains square pixels, and the
-    # configured pole minimum keeps enough visual context for human review.
+    # result-specific minimum keeps enough context without inheriting the much
+    # wider pole-search FOV.
     overview_fov = min(
         safe_max_fov,
-        max(float(hfov_deg), float(vfov_deg), min(configured_min_fov, safe_max_fov)),
+        max(float(hfov_deg), float(vfov_deg), min(debug_min_fov, safe_max_fov)),
     )
     hfov_deg = overview_fov
     vfov_deg = overview_fov
@@ -3518,6 +4384,7 @@ def extract_pole_for_detection(
         return {"enabled": False, "found": False, "reason": "disabled"}
 
     parameters = build_pole_search_parameters(runtime)
+    fallback_parameters = build_pole_fallback_parameters(runtime, parameters)
     classification_policy = runtime.get("pole_classification_policy") or {
         "requested_mode": str(runtime.get("pole_classification_mode", "auto")),
         "effective_mode": "HYBRID",
@@ -3556,35 +4423,6 @@ def extract_pole_for_detection(
         runtime=wide_runtime,
     )
 
-    neighborhood_radius = parameters.search_radius_m + parameters.ground_search_radius_m
-    minimum = sign_xyz - np.asarray(
-        [neighborhood_radius, neighborhood_radius, parameters.max_drop_m],
-        dtype=np.float64,
-    )
-    maximum = sign_xyz + np.asarray(
-        [neighborhood_radius, neighborhood_radius, parameters.top_margin_m],
-        dtype=np.float64,
-    )
-    blocks = blocks_intersecting_bounds(nearest_pointcloud_files, minimum, maximum)
-    record_parts: list[dict[str, np.ndarray]] = []
-    used_files: set[str] = set()
-    for pointcloud_file, block in blocks:
-        block_records = pointcloud_cache.read_block_records(pointcloud_file, block)
-        xyz = block_records["xyz"]
-        if xyz.shape[0] == 0:
-            continue
-        radial = np.linalg.norm(xyz[:, :2] - sign_xyz[None, :2], axis=1)
-        keep = (
-            np.all(np.isfinite(xyz), axis=1)
-            & (radial <= neighborhood_radius)
-            & (xyz[:, 2] >= minimum[2])
-            & (xyz[:, 2] <= maximum[2])
-        )
-        if not np.any(keep):
-            continue
-        record_parts.append({key: value[keep] for key, value in block_records.items()})
-        used_files.add(str(pointcloud_file["path"]))
-
     class_tag = sanitize_name(f"{detection_payload['class_id']:03d}_{detection_payload['class_name']}")
     base_name = f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}"
     debug_path = (
@@ -3595,8 +4433,214 @@ def extract_pole_for_detection(
         side_expand_ratio=runtime["pole_corridor_side_expand_ratio"],
         top_margin_ratio=runtime["pole_corridor_top_margin_ratio"],
     )
+    configured_class_ids = {
+        int(value)
+        for values in (classification_policy.get("configured") or {}).values()
+        for value in values
+    }
+    origin_xyz = np.asarray(image_task["origin"], dtype=np.float64)
+    pole_search_attempts: list[dict[str, Any]] = []
 
-    if not record_parts:
+    def load_and_search(
+        search_parameters: PoleSearchParameters,
+    ) -> dict[str, Any] | None:
+        neighborhood_radius = (
+            search_parameters.search_radius_m
+            + search_parameters.ground_search_radius_m
+        )
+        minimum = sign_xyz - np.asarray(
+            [
+                neighborhood_radius,
+                neighborhood_radius,
+                search_parameters.max_drop_m,
+            ],
+            dtype=np.float64,
+        )
+        maximum = sign_xyz + np.asarray(
+            [
+                neighborhood_radius,
+                neighborhood_radius,
+                search_parameters.top_margin_m,
+            ],
+            dtype=np.float64,
+        )
+        selected_blocks = blocks_intersecting_bounds(
+            nearest_pointcloud_files,
+            minimum,
+            maximum,
+        )
+        attempt = {
+            "mode": (
+                "physical_fallback"
+                if search_parameters is fallback_parameters
+                else "strict"
+            ),
+            "minimum_xyz": [float(value) for value in minimum],
+            "maximum_xyz": [float(value) for value in maximum],
+            "intersected_block_count": len(selected_blocks),
+            "intersected_pointcloud_files": sorted(
+                {
+                    str(pointcloud_file["path"])
+                    for pointcloud_file, _ in selected_blocks
+                }
+            ),
+            "retained_point_count": 0,
+        }
+        pole_search_attempts.append(attempt)
+        record_parts: list[dict[str, np.ndarray]] = []
+        selected_files: set[str] = set()
+        for pointcloud_file, block in selected_blocks:
+            block_records = pointcloud_cache.read_block_records(
+                pointcloud_file,
+                block,
+            )
+            xyz = block_records["xyz"]
+            if xyz.shape[0] == 0:
+                continue
+            radial = np.linalg.norm(xyz[:, :2] - sign_xyz[None, :2], axis=1)
+            keep = (
+                np.all(np.isfinite(xyz), axis=1)
+                & (radial <= neighborhood_radius)
+                & (xyz[:, 2] >= minimum[2])
+                & (xyz[:, 2] <= maximum[2])
+            )
+            if not np.any(keep):
+                continue
+            record_parts.append(
+                {key: value[keep] for key, value in block_records.items()}
+            )
+            selected_files.add(str(pointcloud_file["path"]))
+        if not record_parts:
+            return None
+        attempt["retained_point_count"] = int(
+            sum(part["xyz"].shape[0] for part in record_parts)
+        )
+
+        keys = tuple(record_parts[0])
+        selected_records = {
+            key: np.concatenate(
+                [part[key] for part in record_parts],
+                axis=0,
+            )
+            for key in keys
+        }
+        selected_classes = np.asarray(
+            selected_records["classification"],
+            dtype=np.int16,
+        )
+        selected_algorithm_classes = pole_classifications_for_policy(
+            selected_classes,
+            classification_policy,
+        )
+        selected_pixels, selected_valid = _project_points_to_rectified_view(
+            selected_records["xyz"],
+            origin_xyz,
+            rectified_view,
+        )
+        (
+            selected_result,
+            selected_corridor_mask,
+            selected_corridor_mode,
+            selected_strict_count,
+            selected_expanded_count,
+        ) = find_pole_bases_with_corridor_fallback(
+            selected_records["xyz"],
+            selected_pixels,
+            selected_valid,
+            sign_xyz,
+            corridor_bbox,
+            search_parameters,
+            selected_algorithm_classes,
+            np.asarray(selected_records["return_number"], dtype=np.int16),
+            np.asarray(
+                selected_records["number_of_returns"],
+                dtype=np.int16,
+            ),
+        )
+        return {
+            "records": selected_records,
+            "classes": selected_classes,
+            "result": selected_result,
+            "corridor_mask": selected_corridor_mask,
+            "corridor_mode": selected_corridor_mode,
+            "strict_count": selected_strict_count,
+            "expanded_count": selected_expanded_count,
+            "used_files": selected_files,
+            "used_block_count": len(selected_blocks),
+        }
+
+    strict_state = load_and_search(parameters)
+    selected_state = strict_state
+    result = strict_state["result"] if strict_state is not None else None
+    strict_corridor_point_count = (
+        int(strict_state["strict_count"]) if strict_state is not None else 0
+    )
+    expanded_corridor_point_count = (
+        int(strict_state["expanded_count"]) if strict_state is not None else 0
+    )
+    pole_fallback_attempted = False
+    pole_fallback_used = False
+    fallback_strict_corridor_point_count: int | None = None
+    fallback_expanded_corridor_point_count: int | None = None
+    if (
+        fallback_parameters is not None
+        and (result is None or result.status != "AUTO")
+    ):
+        pole_fallback_attempted = True
+        fallback_state = load_and_search(fallback_parameters)
+        if fallback_state is not None:
+            fallback_strict_corridor_point_count = int(
+                fallback_state["strict_count"]
+            )
+            fallback_expanded_corridor_point_count = int(
+                fallback_state["expanded_count"]
+            )
+            fallback_result = fallback_state["result"]
+            fallback_state["corridor_mode"] = (
+                f"physical_fallback_{fallback_state['corridor_mode']}"
+            )
+        else:
+            fallback_result = None
+        if result is None and fallback_state is not None:
+            # Keep the wider search state for failure QA even when no pole was
+            # accepted, because it reflects the last physical envelope tested.
+            selected_state = fallback_state
+        if fallback_result is not None:
+            # Wider distance/drop and more tolerant arm gates are deliberately
+            # exposed as REVIEW results even when the geometric fitter itself
+            # rates the candidate AUTO.
+            reviewed_fallback_result = replace(
+                fallback_result,
+                status="REVIEW",
+            )
+            fallback_is_better = (
+                result is None
+                or pole_cross_profile_candidate_key(
+                    fallback_result.candidates[0],
+                    preferred_min_completeness_ratio=(
+                        parameters.preferred_min_completeness_ratio
+                    ),
+                    direct_max_axis_sign_distance_m=(
+                        parameters.direct_max_axis_sign_distance_m
+                    ),
+                )
+                < pole_cross_profile_candidate_key(
+                    result.candidates[0],
+                    preferred_min_completeness_ratio=(
+                        parameters.preferred_min_completeness_ratio
+                    ),
+                    direct_max_axis_sign_distance_m=(
+                        parameters.direct_max_axis_sign_distance_m
+                    ),
+                )
+            )
+            if fallback_is_better:
+                result = reviewed_fallback_result
+                selected_state = fallback_state
+                selected_state["result"] = result
+                pole_fallback_used = True
+
+    if selected_state is None:
         empty_records = {
             "xyz": np.empty((0, 3), dtype=np.float64),
             "rgb": np.empty((0, 3), dtype=np.uint8),
@@ -3609,7 +4653,7 @@ def extract_pole_for_detection(
                 sign_points_xyz=sign_points_xyz,
                 neighborhood_records=empty_records,
                 pole_result=None,
-                origin_xyz=np.asarray(image_task["origin"], dtype=np.float64),
+                origin_xyz=origin_xyz,
                 mask_alpha=runtime["debug_mask_alpha"],
                 label=(
                     f"{detection_payload['class_name']} "
@@ -3625,45 +4669,45 @@ def extract_pole_for_detection(
             "reason": "no_neighborhood_points",
             "classification_neighborhood_point_count": 0,
             "classification_matched_point_count": 0,
+            "neighborhood_point_count": 0,
+            "corridor_point_count": 0,
+            "strict_corridor_point_count": 0,
+            "expanded_corridor_point_count": 0,
+            "fallback_strict_corridor_point_count": None,
+            "fallback_expanded_corridor_point_count": None,
+            "corridor_mode": (
+                "physical_fallback_no_points"
+                if pole_fallback_attempted
+                else "strict_no_points"
+            ),
+            "pole_fallback_enabled": fallback_parameters is not None,
+            "pole_fallback_attempted": pole_fallback_attempted,
+            "pole_fallback_used": False,
+            "pole_search_attempts": pole_search_attempts,
+            "used_pointcloud_files": (
+                pole_search_attempts[-1]["intersected_pointcloud_files"]
+                if pole_search_attempts
+                else []
+            ),
+            "used_block_count": (
+                pole_search_attempts[-1]["intersected_block_count"]
+                if pole_search_attempts
+                else 0
+            ),
             "debug_image_path": str(debug_path.resolve())
             if not runtime["disable_pole_debug"]
             else None,
         }
 
-    keys = tuple(record_parts[0])
-    records = {key: np.concatenate([part[key] for part in record_parts], axis=0) for key in keys}
-    configured_class_ids = {
-        int(value)
-        for values in (classification_policy.get("configured") or {}).values()
-        for value in values
-    }
-    neighborhood_classes = np.asarray(records["classification"], dtype=np.int16)
+    records = selected_state["records"]
+    neighborhood_classes = selected_state["classes"]
     classification_matched_point_count = int(
         np.isin(neighborhood_classes, tuple(configured_class_ids)).sum()
     )
-    algorithm_classifications = pole_classifications_for_policy(
-        neighborhood_classes,
-        classification_policy,
-    )
-    origin_xyz = np.asarray(image_task["origin"], dtype=np.float64)
-    pixels, valid = _project_points_to_rectified_view(records["xyz"], origin_xyz, rectified_view)
-    (
-        result,
-        corridor_mask,
-        corridor_mode,
-        strict_corridor_point_count,
-        expanded_corridor_point_count,
-    ) = find_pole_bases_with_corridor_fallback(
-        records["xyz"],
-        pixels,
-        valid,
-        sign_xyz,
-        corridor_bbox,
-        parameters,
-        algorithm_classifications,
-        np.asarray(records["return_number"], dtype=np.int16),
-        np.asarray(records["number_of_returns"], dtype=np.int16),
-    )
+    corridor_mask = selected_state["corridor_mask"]
+    corridor_mode = str(selected_state["corridor_mode"])
+    used_files = set(selected_state["used_files"])
+    used_block_count = int(selected_state["used_block_count"])
 
     if not runtime["disable_pole_debug"]:
         debug_view = rectified_view
@@ -3691,7 +4735,7 @@ def extract_pole_for_detection(
                     detection_index,
                     exc,
                 )
-        if corridor_mode == "remote_expanded":
+        if corridor_mode.endswith("remote_expanded"):
             debug_corridor_bbox = (
                 0.0,
                 debug_corridor_bbox[1],
@@ -3710,7 +4754,8 @@ def extract_pole_for_detection(
             label=(
                 f"{detection_payload['class_name']} "
                 f"{detection_payload['confidence']:.3f} | "
-                f"class={classification_common['classification_mode']}"
+                f"class={classification_common['classification_mode']} | "
+                f"search={corridor_mode}"
             ),
             reason="no valid support-ground candidate" if result is None else None,
         )
@@ -3724,9 +4769,19 @@ def extract_pole_for_detection(
         "corridor_point_count": int(corridor_mask.sum()),
         "strict_corridor_point_count": strict_corridor_point_count,
         "expanded_corridor_point_count": expanded_corridor_point_count,
+        "fallback_strict_corridor_point_count": (
+            fallback_strict_corridor_point_count
+        ),
+        "fallback_expanded_corridor_point_count": (
+            fallback_expanded_corridor_point_count
+        ),
         "corridor_mode": corridor_mode,
+        "pole_fallback_enabled": fallback_parameters is not None,
+        "pole_fallback_attempted": pole_fallback_attempted,
+        "pole_fallback_used": pole_fallback_used,
+        "pole_search_attempts": pole_search_attempts,
         "used_pointcloud_files": sorted(used_files),
-        "used_block_count": len(blocks),
+        "used_block_count": used_block_count,
         "wide_hfov_deg": float(rectified_view["hfov_deg"]),
         "wide_vfov_deg": float(rectified_view["vfov_deg"]),
         "debug_image_path": str(debug_path.resolve())
@@ -4383,6 +5438,8 @@ def extract_points_for_detection(
     runtime: dict[str, Any],
     pointcloud_cache: PointCloudReaderCache,
     logger,
+    *,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> dict[str, Any]:
     origin_xyz = np.asarray(image_task["origin"], dtype=np.float64)
     rectified_view = build_rectified_detection_view(
@@ -4778,18 +5835,31 @@ def extract_points_for_detection(
     pole_payload: dict[str, Any]
     if runtime["pole_detection"] and accepted_for_shp:
         try:
-            pole_payload = extract_pole_for_detection(
-                image_task=image_task,
-                image_rgb=image_rgb,
-                detection_index=detection_index,
-                detection_payload=detection_payload,
-                sign_points_xyz=points_xyz,
-                sign_xyz=representative_xyz,
-                nearest_pointcloud_files=nearest_pointcloud_files,
-                runtime=runtime,
-                pointcloud_cache=pointcloud_cache,
-                logger=logger,
+            pole_slot = (
+                coordinator.pole_gate.slot()
+                if coordinator is not None
+                else nullcontext()
             )
+            pole_timing = (
+                coordinator.timed(
+                    f"pole/{runtime.get('model_key') or 'model'}"
+                )
+                if coordinator is not None
+                else nullcontext()
+            )
+            with pole_slot, pole_timing:
+                pole_payload = extract_pole_for_detection(
+                    image_task=image_task,
+                    image_rgb=image_rgb,
+                    detection_index=detection_index,
+                    detection_payload=detection_payload,
+                    sign_points_xyz=points_xyz,
+                    sign_xyz=representative_xyz,
+                    nearest_pointcloud_files=nearest_pointcloud_files,
+                    runtime=runtime,
+                    pointcloud_cache=pointcloud_cache,
+                    logger=logger,
+                )
         except Exception as exc:
             logger.exception(
                 "Pole extraction failed for %s detection %d.",
@@ -4919,70 +5989,114 @@ def extract_points_for_detection(
     }
 
 
+def compatible_existing_result_summary(
+    image_task: dict[str, Any],
+    runtime: dict[str, Any],
+    logger,
+) -> dict[str, int] | None:
+    """Return a completed-image summary when skip-existing is safe."""
+
+    if not runtime["skip_existing"]:
+        return None
+    txt_path = (
+        Path(runtime["txt_dir"])
+        / image_task["record_name"]
+        / f"{image_task['image_stem']}.txt"
+    )
+    if not txt_path.exists():
+        return None
+    try:
+        existing_payload = json.loads(txt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing_payload = {}
+    missing_artifacts = missing_result_artifacts(existing_payload)
+    if (
+        existing_payload.get("schema_version") == RESULT_SCHEMA_VERSION
+        and existing_payload.get("run_fingerprint") == runtime["run_fingerprint"]
+        and not missing_artifacts
+    ):
+        logger.info("Skipping compatible existing result: %s", txt_path)
+        existing_detections = existing_payload["detections"]
+        return {
+            "images": 1,
+            "detections": len(existing_detections),
+            "points": sum(
+                int(item.get("point_count") or 0)
+                for item in existing_detections
+                if isinstance(item, dict)
+            ),
+            "failures": 0,
+        }
+    if missing_artifacts:
+        logger.info(
+            "Reprocessing result with %d missing referenced artifact(s): %s",
+            len(missing_artifacts),
+            txt_path,
+        )
+    else:
+        logger.info("Reprocessing stale result with a different input/config: %s", txt_path)
+    return None
+
+
 def process_image_task(
     image_task: dict[str, Any],
     runtime: dict[str, Any],
-    model: YOLO,
+    model: YOLO | None,
     pointcloud_catalog: dict[str, Any],
     pointcloud_cache: PointCloudReaderCache,
     logger,
+    *,
+    image_rgb_override: np.ndarray | None = None,
+    detection_candidates_override: list[dict[str, Any]] | None = None,
+    forward_view_output_path_override: Path | None = None,
+    skip_existing_checked: bool = False,
+    coordinator: MultiModelCoordinator | None = None,
 ) -> dict[str, int]:
     txt_dir = Path(runtime["txt_dir"]) / image_task["record_name"]
     txt_dir.mkdir(parents=True, exist_ok=True)
     txt_path = txt_dir / f"{image_task['image_stem']}.txt"
 
-    if runtime["skip_existing"] and txt_path.exists():
-        try:
-            existing_payload = json.loads(txt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            existing_payload = {}
-        missing_artifacts = missing_result_artifacts(existing_payload)
-        if (
-            existing_payload.get("schema_version") == RESULT_SCHEMA_VERSION
-            and existing_payload.get("run_fingerprint") == runtime["run_fingerprint"]
-            and not missing_artifacts
-        ):
-            logger.info("Skipping compatible existing result: %s", txt_path)
-            existing_detections = existing_payload["detections"]
-            return {
-                "images": 1,
-                "detections": len(existing_detections),
-                "points": sum(
-                    int(item.get("point_count") or 0)
-                    for item in existing_detections
-                    if isinstance(item, dict)
-                ),
-                "failures": 0,
-            }
-        if missing_artifacts:
-            logger.info(
-                "Reprocessing result with %d missing referenced artifact(s): %s",
-                len(missing_artifacts),
-                txt_path,
-            )
-        else:
-            logger.info("Reprocessing stale result with a different input/config: %s", txt_path)
+    if not skip_existing_checked:
+        existing_summary = compatible_existing_result_summary(
+            image_task,
+            runtime,
+            logger,
+        )
+        if existing_summary is not None:
+            return existing_summary
 
     image_path = Path(image_task["image_path"])
     logger.info("Running detection for %s", image_path.name)
 
-    with Image.open(image_path) as opened_image:
-        image_rgb = np.array(opened_image.convert("RGB"))
+    image_rgb = (
+        image_rgb_override
+        if image_rgb_override is not None
+        else load_panorama_rgb(image_path, logger)
+    )
     validate_panorama_image(image_task, image_rgb)
-    forward_view_output_path: Path | None = None
-    if runtime.get("detection_view_mode") == "forward":
+    forward_view_output_path = forward_view_output_path_override
+    if (
+        forward_view_output_path is None
+        and runtime.get("detection_view_mode") == "forward"
+    ):
         forward_view_output_path = (
             Path(runtime["forward_views_dir"])
             / image_task["record_name"]
             / f"{image_task['image_stem']}__forward.jpg"
         )
-    detection_candidates = run_yolo_detection_on_panorama(
-        image_rgb=image_rgb,
-        runtime=runtime,
-        model=model,
-        logger=logger,
-        forward_view_output_path=forward_view_output_path,
-    )
+    if detection_candidates_override is None:
+        if model is None:
+            raise ValueError("A YOLO model is required when detections are not precomputed")
+        detection_candidates = run_yolo_detection_on_panorama(
+            image_rgb=image_rgb,
+            runtime=runtime,
+            model=model,
+            logger=logger,
+            forward_view_output_path=forward_view_output_path,
+            coordinator=coordinator,
+        )
+    else:
+        detection_candidates = detection_candidates_override
     nearest_pointcloud_files = match_nearest_pointcloud_files(
         image_task,
         pointcloud_catalog,
@@ -5014,6 +6128,7 @@ def process_image_task(
                 runtime=runtime,
                 pointcloud_cache=pointcloud_cache,
                 logger=logger,
+                coordinator=coordinator,
             )
             point_payload.setdefault(
                 "pole",
@@ -5042,6 +6157,10 @@ def process_image_task(
     payload = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "run_fingerprint": runtime["run_fingerprint"],
+        "model_name": runtime.get("model_name"),
+        "model_key": runtime.get("model_key"),
+        "model_profile": runtime.get("model_profile"),
+        "model_object_type": runtime.get("model_object_type"),
         "model_sha256": runtime.get("model_sha256"),
         "dataset_signature": runtime["dataset_signature"],
         "image_path": str(image_path.resolve()),
@@ -5334,37 +6453,13 @@ def run_panorama_alignment_qa(
     return report
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
-    validate_point_range_fallback_arguments(args)
-    output_dirs = ensure_output_dirs(args.output_dir)
-    log_path = output_dirs["logs"] / "run.log"
-    logger = setup_logging(
-        log_path,
-        file_mode="w",
-        logger_name="mms_shp_detection_main",
-        level=getattr(args, "log_level", "INFO"),
-    )
-    effective_config_path = output_dirs["logs"] / "effective_config.json"
-    atomic_write_text(
-        effective_config_path,
-        json.dumps(serializable_config(args), ensure_ascii=False, indent=2),
-    )
-    logger.info("Configuration source: %s", getattr(args, "_config_path", None) or "CLI/defaults")
-    logger.info("Effective configuration: %s", effective_config_path.resolve())
-
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
-    device = resolve_device(args.device)
-    actual_num_workers = resolve_num_workers(args, device, logger)
-    logger.info("Using device: %s", device)
-    logger.info("Data root: %s", args.data_root)
-    logger.info("Model path: %s", args.model_path)
-    logger.info("Output root: %s", args.output_dir)
-    logger.info("Point-cloud cache path: %s", args.pointcloud_cache_path)
-    logger.info("Requested workers: %d | Effective workers: %d", args.num_workers, actual_num_workers)
+def prepare_shared_pipeline_context(
+    args: argparse.Namespace,
+    *,
+    alignment_report_path: Path,
+    logger,
+) -> dict[str, Any]:
+    """Prepare immutable dataset/catalog inputs once for every model."""
 
     image_tasks = scan_image_tasks(
         args.data_root,
@@ -5396,6 +6491,264 @@ def run_pipeline(args: argparse.Namespace) -> None:
         }
         or None,
     )
+    crs_wkt = (
+        validate_crs_wkt(
+            args.crs_wkt_path.read_text(encoding="utf-8-sig"),
+            label=str(args.crs_wkt_path),
+        )
+        if args.crs_wkt_path is not None
+        else resolve_matched_crs_wkt(
+            image_tasks,
+            pointcloud_catalog,
+            max(1, args.pointcloud_neighbor_count),
+        )
+    )
+    pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
+    if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
+        raise ValueError(
+            "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
+        )
+    maximum_pose_separation = validate_pose_pointcloud_proximity(
+        image_tasks,
+        pointcloud_catalog,
+        max(1, args.pointcloud_neighbor_count),
+        args.max_pose_pointcloud_separation_m,
+    )
+    alignment_report = run_panorama_alignment_qa(
+        image_tasks,
+        pointcloud_catalog,
+        args,
+        alignment_report_path,
+        logger,
+    )
+    return {
+        "image_tasks": image_tasks,
+        "calibration_bundle": calibration_bundle,
+        "dataset_signature": dataset_signature,
+        "catalog_path": catalog_path,
+        "pointcloud_catalog": pointcloud_catalog,
+        "crs_wkt": crs_wkt,
+        "maximum_pose_separation": maximum_pose_separation,
+        "alignment_report": alignment_report,
+    }
+
+
+def finalize_prepared_model_run(
+    prepared_run: dict[str, Any],
+    summary: dict[str, int],
+) -> dict[str, Any]:
+    """Publish one model's SHP bundles after queued processing completes."""
+
+    output_dirs = prepared_run["output_dirs"]
+    logger = prepared_run["logger"]
+    runtime = prepared_run["runtime"]
+    run_fingerprint = prepared_run["run_fingerprint"]
+    crs_wkt = prepared_run["crs_wkt"]
+    if summary["failures"]:
+        logger.error(
+            "Run has %d failed image/pole operation(s); final SHP publication was withheld. "
+            "Any available partial features remain under *.in_progress.*.",
+            summary["failures"],
+        )
+        raise RuntimeError(
+            f"Pipeline completed with {summary['failures']} failed image/pole operation(s); "
+            "see worker logs."
+        )
+
+    records = collect_detection_records(
+        output_dirs["txt"],
+        logger=logger,
+        run_fingerprint=run_fingerprint,
+    )
+    shp_path = output_dirs["shp"] / "detected_signs.shp"
+    stage_id = f"{run_fingerprint[:12]}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    staged_shp_path = output_dirs["shp"] / f"detected_signs.{stage_id}.ready.shp"
+    pole_shp_path = output_dirs["shp"] / "pole_bottoms.shp"
+    staged_pole_shp_path = output_dirs["shp"] / f"pole_bottoms.{stage_id}.ready.shp"
+    merged_poles: list[dict[str, Any]] = []
+    unique_frame_observations = 0
+    if runtime["pole_detection"]:
+        pole_observations = collect_pole_records(
+            output_dirs["txt"],
+            logger=logger,
+            run_fingerprint=run_fingerprint,
+        )
+        merged_poles = (
+            cluster_pole_observations(
+                pole_observations,
+                radius_m=float(runtime["pole_observation_merge_radius_m"]),
+            )
+            if pole_observations
+            else []
+        )
+        unique_frame_observations = sum(
+            int(item.get("obs_count") or 1)
+            for item in {
+                str(relation.get("support_id")): relation
+                for relation in merged_poles
+            }.values()
+        )
+        merged_poles = [
+            item
+            for item in merged_poles
+            if int(item.get("obs_count") or 1)
+            >= int(runtime["pole_min_observations"])
+        ]
+    attach_support_ids_to_detection_records(records, merged_poles)
+    records, merged_poles = deduplicate_sign_and_pole_observations(
+        records,
+        merged_poles,
+        supported_xy_radius_m=float(runtime["sign_observation_merge_xy_radius_m"]),
+        supported_z_radius_m=float(runtime["sign_observation_merge_z_radius_m"]),
+        unsupported_xy_radius_m=float(
+            runtime["sign_observation_fallback_xy_radius_m"]
+        ),
+        unsupported_z_radius_m=float(
+            runtime["sign_observation_fallback_z_radius_m"]
+        ),
+    )
+
+    publication_pairs = [(staged_shp_path, shp_path)]
+    try:
+        write_shapefile(records, staged_shp_path, crs_wkt=crs_wkt)
+        if runtime["pole_detection"]:
+            write_pole_shapefile(
+                merged_poles,
+                staged_pole_shp_path,
+                crs_wkt=crs_wkt,
+            )
+            publication_pairs.append((staged_pole_shp_path, pole_shp_path))
+        publish_shapefile_bundles(publication_pairs)
+    except BaseException as exc:
+        recovery_preserved = any(
+            "Recovery components were preserved" in note
+            for note in getattr(exc, "__notes__", [])
+        )
+        if recovery_preserved:
+            logger.error(
+                "Final SHP rollback was incomplete; ready/backup components were kept "
+                "for recovery. Do not open the final bundle until the paths in the "
+                "exception notes have been inspected."
+            )
+        else:
+            remove_generated_shapefile_bundle(staged_shp_path, logger)
+            remove_generated_shapefile_bundle(staged_pole_shp_path, logger)
+        raise
+
+    logger.info("Saved shapefile with %d features to %s", len(records), shp_path)
+    if runtime["pole_detection"]:
+        logger.info(
+            "Saved pole shapefile with %d features from %d unique frame observations to %s",
+            len(merged_poles),
+            unique_frame_observations,
+            pole_shp_path,
+        )
+    else:
+        existing_components = [
+            pole_shp_path.with_suffix(suffix)
+            for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qpj", ".wkt2")
+            if pole_shp_path.with_suffix(suffix).exists()
+        ]
+        if existing_components:
+            logger.warning(
+                "Pole detection is disabled; existing pole_bottoms files were left unchanged "
+                "and are not outputs of run %s: %s",
+                run_fingerprint[:12],
+                ", ".join(str(path) for path in existing_components),
+            )
+
+    remove_generated_shapefile_bundle(
+        output_dirs["shp"] / "detected_signs.in_progress.shp",
+        logger,
+    )
+    remove_generated_shapefile_bundle(
+        output_dirs["shp"] / "pole_bottoms.in_progress.shp",
+        logger,
+    )
+    return {
+        "run_fingerprint": run_fingerprint,
+        "final_shapefiles": {
+            "detections": str(shp_path.resolve()),
+            "poles": (
+                str(pole_shp_path.resolve())
+                if runtime["pole_detection"]
+                else None
+            ),
+        },
+        "feature_counts": {
+            "detections": len(records),
+            "poles": len(merged_poles) if runtime["pole_detection"] else 0,
+        },
+    }
+
+
+def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    validate_point_range_fallback_arguments(args)
+    shared_forward_views_dir = getattr(args, "_shared_forward_views_dir", None)
+    output_dirs = ensure_output_dirs(
+        args.output_dir,
+        shared_forward_views_dir=shared_forward_views_dir,
+    )
+    log_path = output_dirs["logs"] / "run.log"
+    model_logger_key = sanitize_name(
+        getattr(args, "model_key", None)
+        or getattr(getattr(args, "model_path", None), "stem", "model")
+    )
+    logger = setup_logging(
+        log_path,
+        file_mode="w",
+        logger_name=f"mms_shp_detection_main_{model_logger_key}",
+        level=getattr(args, "log_level", "INFO"),
+        capture_root=not bool(getattr(args, "_parallel_prepare", False)),
+    )
+    effective_config_path = output_dirs["logs"] / "effective_config.json"
+    atomic_write_text(
+        effective_config_path,
+        json.dumps(serializable_config(args), ensure_ascii=False, indent=2),
+    )
+    logger.info("Configuration source: %s", getattr(args, "_config_path", None) or "CLI/defaults")
+    logger.info("Effective configuration: %s", effective_config_path.resolve())
+
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+    device = resolve_device(args.device)
+    actual_num_workers = (
+        1
+        if getattr(args, "_parallel_prepare", False)
+        else resolve_num_workers(args, device, logger)
+    )
+    logger.info("Using device: %s", device)
+    logger.info("Data root: %s", args.data_root)
+    logger.info("Model path: %s", args.model_path)
+    logger.info(
+        "Model profile: %s | object type: %s",
+        getattr(args, "model_profile", "<base>"),
+        getattr(args, "model_object_type", "generic"),
+    )
+    logger.info("Output root: %s", args.output_dir)
+    logger.info("Point-cloud cache path: %s", args.pointcloud_cache_path)
+    logger.info("Requested workers: %d | Effective workers: %d", args.num_workers, actual_num_workers)
+
+    shared_context = getattr(args, "_shared_pipeline_context", None)
+    if shared_context is None:
+        shared_context = prepare_shared_pipeline_context(
+            args,
+            alignment_report_path=(
+                output_dirs["logs"] / "panorama_alignment_qa.json"
+            ),
+            logger=logger,
+        )
+    image_tasks = list(shared_context["image_tasks"])
+    calibration_bundle = shared_context["calibration_bundle"]
+    dataset_signature = shared_context["dataset_signature"]
+    catalog_path = Path(shared_context["catalog_path"])
+    pointcloud_catalog = shared_context["pointcloud_catalog"]
+    crs_wkt = shared_context["crs_wkt"]
+    maximum_pose_separation = shared_context["maximum_pose_separation"]
+    alignment_report = shared_context["alignment_report"]
     if args.pole_detection:
         pole_classification_policy = resolve_pole_classification_policy(
             pointcloud_catalog,
@@ -5457,36 +6810,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ),
     )
     logger.info("Pole classification policy report: %s", classification_policy_path.resolve())
-    crs_wkt = (
-        validate_crs_wkt(
-            args.crs_wkt_path.read_text(encoding="utf-8-sig"),
-            label=str(args.crs_wkt_path),
-        )
-        if args.crs_wkt_path is not None
-        else resolve_matched_crs_wkt(
-            image_tasks,
-            pointcloud_catalog,
-            max(1, args.pointcloud_neighbor_count),
-        )
-    )
-    pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
-    if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
-        raise ValueError(
-            "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
-        )
-    maximum_pose_separation = validate_pose_pointcloud_proximity(
-        image_tasks,
-        pointcloud_catalog,
-        max(1, args.pointcloud_neighbor_count),
-        args.max_pose_pointcloud_separation_m,
-    )
-    alignment_report = run_panorama_alignment_qa(
-        image_tasks,
-        pointcloud_catalog,
-        args,
-        output_dirs["logs"] / "panorama_alignment_qa.json",
-        logger,
-    )
     model_sha256 = _sha256_file(args.model_path.resolve())
     run_fingerprint = build_run_fingerprint(
         args,
@@ -5530,6 +6853,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     runtime = {
         "model_path": str(args.model_path.resolve()),
+        "model_name": args.model_path.name,
+        "model_key": sanitize_name(args.model_path.stem),
+        "model_profile": str(getattr(args, "model_profile", "<base>")),
+        "model_object_type": str(getattr(args, "model_object_type", "generic")),
         "model_sha256": model_sha256,
         "imgsz": args.imgsz,
         "detection_view_mode": str(args.detection_view_mode),
@@ -5590,11 +6917,39 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "pole_classification_mode": str(args.pole_classification_mode),
         "pole_classification_policy": pole_classification_policy,
         "pole_min_fov_deg": float(args.pole_min_fov_deg),
+        "pole_debug_min_fov_deg": float(args.pole_debug_min_fov_deg),
         "pole_corridor_side_expand_ratio": float(args.pole_corridor_side_expand_ratio),
         "pole_corridor_top_margin_ratio": float(args.pole_corridor_top_margin_ratio),
         "pole_search_radius_m": float(args.pole_search_radius_m),
         "pole_max_drop_m": float(args.pole_max_drop_m),
         "pole_top_margin_m": float(args.pole_top_margin_m),
+        "pole_range_fallback_enabled": bool(args.pole_range_fallback_enabled),
+        "pole_fallback_search_radius_m": float(
+            args.pole_fallback_search_radius_m
+        ),
+        "pole_fallback_max_drop_m": float(args.pole_fallback_max_drop_m),
+        "pole_fallback_top_margin_m": float(args.pole_fallback_top_margin_m),
+        "pole_fallback_max_axis_sign_distance_m": float(
+            args.pole_fallback_max_axis_sign_distance_m
+        ),
+        "pole_fallback_min_vertical_span_m": float(
+            args.pole_fallback_min_vertical_span_m
+        ),
+        "pole_fallback_horizontal_connection_radius_m": float(
+            args.pole_fallback_horizontal_connection_radius_m
+        ),
+        "pole_fallback_horizontal_connection_z_tolerance_m": float(
+            args.pole_fallback_horizontal_connection_z_tolerance_m
+        ),
+        "pole_fallback_horizontal_connection_above_tolerance_m": float(
+            args.pole_fallback_horizontal_connection_above_tolerance_m
+        ),
+        "pole_fallback_horizontal_connection_bin_m": float(
+            args.pole_fallback_horizontal_connection_bin_m
+        ),
+        "pole_fallback_min_horizontal_connection_coverage": float(
+            args.pole_fallback_min_horizontal_connection_coverage
+        ),
         "pole_xy_voxel_m": float(args.pole_xy_voxel_m),
         "pole_z_bin_m": float(args.pole_z_bin_m),
         "pole_axis_cluster_radius_m": float(args.pole_axis_cluster_radius_m),
@@ -5634,6 +6989,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ),
         "pole_horizontal_connection_z_tolerance_m": float(
             args.pole_horizontal_connection_z_tolerance_m
+        ),
+        "pole_horizontal_connection_above_tolerance_m": float(
+            args.pole_horizontal_connection_above_tolerance_m
         ),
         "pole_horizontal_connection_bin_m": float(
             args.pole_horizontal_connection_bin_m
@@ -5720,9 +7078,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 "FOV values; unequal values anisotropically distort sign shapes."
             )
     if runtime["pole_detection"]:
-        build_pole_search_parameters(runtime)
+        strict_pole_parameters = build_pole_search_parameters(runtime)
+        build_pole_fallback_parameters(runtime, strict_pole_parameters)
         if not 1.0 <= runtime["pole_min_fov_deg"] <= 180.0:
             raise ValueError("pole_min_fov_deg must be between 1 and 180")
+        if not 1.0 <= runtime["pole_debug_min_fov_deg"] <= 180.0:
+            raise ValueError("pole_debug_min_fov_deg must be between 1 and 180")
+        if runtime["pole_debug_min_fov_deg"] > runtime["perspective_max_fov_deg"]:
+            raise ValueError(
+                "pole_debug_min_fov_deg cannot exceed perspective_max_fov_deg"
+            )
         if runtime["pole_corridor_side_expand_ratio"] < 0.0:
             raise ValueError("pole_corridor_side_expand_ratio cannot be negative")
         if runtime["pole_corridor_top_margin_ratio"] < 0.0:
@@ -5731,6 +7096,21 @@ def run_pipeline(args: argparse.Namespace) -> None:
             raise ValueError("pole_observation_merge_radius_m must be positive")
         if runtime["pole_min_observations"] < 1:
             raise ValueError("pole_min_observations must be at least 1")
+
+    prepared_run = {
+        "args": args,
+        "output_dirs": output_dirs,
+        "logger": logger,
+        "log_path": log_path,
+        "image_tasks": image_tasks,
+        "pointcloud_catalog": pointcloud_catalog,
+        "runtime": runtime,
+        "run_fingerprint": run_fingerprint,
+        "crs_wkt": crs_wkt,
+        "actual_num_workers": actual_num_workers,
+    }
+    if getattr(args, "_parallel_prepare", False):
+        return prepared_run
 
     progress_totals = {"images": 0, "detections": 0, "points": 0, "failures": 0}
     progress_disabled = bool(getattr(args, "disable_console_progress", False))
@@ -5908,128 +7288,864 @@ def run_pipeline(args: argparse.Namespace) -> None:
             refresh=True,
         )
 
-    if summary["failures"]:
-        logger.error(
-            "Run has %d failed image/pole operation(s); final SHP publication was withheld. "
-            "Any available partial features remain under *.in_progress.*.",
-            summary["failures"],
-        )
-        raise RuntimeError(
-            f"Pipeline completed with {summary['failures']} failed image/pole operation(s); "
-            "see worker logs."
-        )
+    return finalize_prepared_model_run(prepared_run, summary)
 
-    records = collect_detection_records(
-        output_dirs["txt"],
-        logger=logger,
-        run_fingerprint=run_fingerprint,
-    )
-    shp_path = output_dirs["shp"] / "detected_signs.shp"
-    stage_id = f"{run_fingerprint[:12]}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    staged_shp_path = output_dirs["shp"] / f"detected_signs.{stage_id}.ready.shp"
-    pole_shp_path = output_dirs["shp"] / "pole_bottoms.shp"
-    staged_pole_shp_path = output_dirs["shp"] / f"pole_bottoms.{stage_id}.ready.shp"
-    merged_poles: list[dict[str, Any]] = []
-    unique_frame_observations = 0
-    if runtime["pole_detection"]:
-        pole_observations = collect_pole_records(
-            output_dirs["txt"],
-            logger=logger,
-            run_fingerprint=run_fingerprint,
-        )
-        merged_poles = (
-            cluster_pole_observations(
-                pole_observations,
-                radius_m=float(runtime["pole_observation_merge_radius_m"]),
-            )
-            if pole_observations
-            else []
-        )
-        unique_frame_observations = sum(
-            int(item.get("obs_count") or 1)
-            for item in {
-                str(relation.get("support_id")): relation
-                for relation in merged_poles
-            }.values()
-        )
-        merged_poles = [
-            item
-            for item in merged_poles
-            if int(item.get("obs_count") or 1) >= int(runtime["pole_min_observations"])
-        ]
-    attach_support_ids_to_detection_records(records, merged_poles)
-    records, merged_poles = deduplicate_sign_and_pole_observations(
-        records,
-        merged_poles,
-        supported_xy_radius_m=float(runtime["sign_observation_merge_xy_radius_m"]),
-        supported_z_radius_m=float(runtime["sign_observation_merge_z_radius_m"]),
-        unsupported_xy_radius_m=float(
-            runtime["sign_observation_fallback_xy_radius_m"]
-        ),
-        unsupported_z_radius_m=float(
-            runtime["sign_observation_fallback_z_radius_m"]
-        ),
+
+def _accumulate_summary(
+    target: dict[str, int],
+    result: dict[str, int],
+) -> None:
+    for key in ("images", "detections", "points", "failures"):
+        target[key] += int(result.get(key, 0))
+
+
+def _parallel_forward_spec(runtime: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        runtime.get("detection_view_mode"),
+        int(runtime["forward_view_size"]),
+        float(runtime["forward_view_hfov_deg"]),
+        float(runtime["forward_view_vfov_deg"]),
+        float(runtime.get("panorama_yaw_offset_deg", 0.0)),
+        float(runtime.get("panorama_pitch_offset_deg", 0.0)),
+        float(runtime["max_center_ray_angle_deg"]),
     )
 
-    publication_pairs = [(staged_shp_path, shp_path)]
+
+def run_parallel_multi_model_pipeline(
+    prepared: list[tuple[Path, argparse.Namespace, str, str, str]],
+    *,
+    base_output_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    """Run shared-frame inference with bounded model post-processing queues."""
+
+    logs_dir = base_output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    orchestrator_logger = setup_logging(
+        logs_dir / "orchestrator.log",
+        file_mode="w",
+        logger_name="mms_shp_detection_orchestrator",
+        level=getattr(prepared[0][1], "log_level", "INFO"),
+    )
+    shared_forward_views_dir = base_output_dir / "forward_views"
+    shared_forward_views_dir.mkdir(parents=True, exist_ok=True)
+    first_args = prepared[0][1]
+    manifest["execution_mode"] = "frame_parallel_shared_forward"
+    manifest["shared_artifacts"] = {
+        "forward_views": str(shared_forward_views_dir.resolve()),
+        "panorama_alignment_qa": str(
+            (logs_dir / "panorama_alignment_qa.json").resolve()
+        ),
+    }
+    manifest["scheduler"] = {
+        "inference_workers_requested": int(
+            first_args.multi_model_inference_workers
+        ),
+        "pole_workers": int(first_args.multi_model_pole_workers),
+        "per_model_queue_depth": int(first_args.multi_model_queue_depth),
+        "cuda_oom_policy": "retry_serialized_then_circuit_break_model",
+    }
+    for entry in manifest["models"]:
+        entry["status"] = "preparing"
+    atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+    )
+    orchestrator_logger.info(
+        "Preparing one shared dataset context for %d models.", len(prepared)
+    )
     try:
-        write_shapefile(records, staged_shp_path, crs_wkt=crs_wkt)
-        if runtime["pole_detection"]:
-            write_pole_shapefile(
-                merged_poles,
-                staged_pole_shp_path,
-                crs_wkt=crs_wkt,
-            )
-            publication_pairs.append((staged_pole_shp_path, pole_shp_path))
-        publish_shapefile_bundles(publication_pairs)
-    except BaseException as exc:
-        recovery_preserved = any(
-            "Recovery components were preserved" in note
-            for note in getattr(exc, "__notes__", [])
+        shared_context = prepare_shared_pipeline_context(
+            first_args,
+            alignment_report_path=logs_dir / "panorama_alignment_qa.json",
+            logger=orchestrator_logger,
         )
-        if recovery_preserved:
-            logger.error(
-                "Final SHP rollback was incomplete; ready/backup components were kept "
-                "for recovery. Do not open the final bundle until the paths in the "
-                "exception notes have been inspected."
+    except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        error_text = None if interrupted else f"{type(exc).__name__}: {exc}"
+        for entry in manifest["models"]:
+            entry["status"] = "interrupted" if interrupted else "failed"
+            entry["error"] = error_text
+            entry["failure_log"] = str(
+                (logs_dir / "orchestrator.log").resolve()
             )
-        else:
-            # A normal failed finalization must not leave a ready bundle that an
-            # operator could mistake for an independently published result.
-            remove_generated_shapefile_bundle(staged_shp_path, logger)
-            remove_generated_shapefile_bundle(staged_pole_shp_path, logger)
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
         raise
 
-    logger.info("Saved shapefile with %d features to %s", len(records), shp_path)
-    if runtime["pole_detection"]:
-        logger.info(
-            "Saved pole shapefile with %d features from %d unique frame observations to %s",
-            len(merged_poles),
-            unique_frame_observations,
-            pole_shp_path,
+    states: list[dict[str, Any]] = []
+    entry_by_key = {
+        str(entry["model_key"]): entry for entry in manifest["models"]
+    }
+    preparation_failures: list[tuple[str, str]] = []
+    for _model_path, effective, model_key, _profile_name, _object_type in prepared:
+        entry = entry_by_key[model_key]
+        entry["status"] = "preparing"
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
         )
-    else:
-        existing_components = [
-            pole_shp_path.with_suffix(suffix)
-            for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qpj", ".wkt2")
-            if pole_shp_path.with_suffix(suffix).exists()
-        ]
-        if existing_components:
-            logger.warning(
-                "Pole detection is disabled; existing pole_bottoms files were left unchanged "
-                "and are not outputs of run %s: %s",
-                run_fingerprint[:12],
-                ", ".join(str(path) for path in existing_components),
+        effective._shared_pipeline_context = shared_context
+        effective._shared_forward_views_dir = shared_forward_views_dir
+        effective._parallel_prepare = True
+        try:
+            state = _run_single_model_pipeline(effective)
+        except KeyboardInterrupt:
+            for candidate_entry in manifest["models"]:
+                if candidate_entry["status"] in {"pending", "preparing", "running"}:
+                    candidate_entry["status"] = "interrupted"
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise
+        except Exception as exc:
+            logger = setup_logging(
+                Path(effective.output_dir) / "logs" / "run.log",
+                file_mode="a",
+                logger_name=f"mms_shp_detection_prepare_failure_{model_key}",
+                level=getattr(effective, "log_level", "INFO"),
+                capture_root=False,
+            )
+            logger.exception("Parallel model preparation failed for %s.", model_key)
+            error_text = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "failed"
+            entry["error"] = error_text
+            entry["failure_log"] = str(
+                (Path(effective.output_dir) / "logs" / "run.log").resolve()
+            )
+            preparation_failures.append((model_key, error_text))
+        else:
+            state["model_key"] = model_key
+            states.append(state)
+            entry["status"] = "running"
+            entry["run_fingerprint"] = state["run_fingerprint"]
+        finally:
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
             )
 
-    remove_generated_shapefile_bundle(
-        output_dirs["shp"] / "detected_signs.in_progress.shp",
-        logger,
+    if not states:
+        summary = "; ".join(f"{key}: {error}" for key, error in preparation_failures)
+        raise RuntimeError(f"Every model failed during parallel preparation: {summary}")
+
+    specs = {_parallel_forward_spec(state["runtime"]) for state in states}
+    if len(specs) != 1 or next(iter(specs))[0] != "forward":
+        error_text = (
+            "Parallel shared-view execution requires identical forward view, "
+            "alignment, and center-ray settings for every model."
+        )
+        for state in states:
+            entry = entry_by_key[state["model_key"]]
+            entry["status"] = "failed"
+            entry["error"] = error_text
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        raise ValueError(
+            error_text
+        )
+    reference_tasks = states[0]["image_tasks"]
+    reference_task_keys = [
+        (str(item["image_path"]), str(item["timestamp_iso"])) for item in reference_tasks
+    ]
+    for state in states[1:]:
+        task_keys = [
+            (str(item["image_path"]), str(item["timestamp_iso"]))
+            for item in state["image_tasks"]
+        ]
+        if task_keys != reference_task_keys:
+            error_text = "Parallel models resolved different image task scopes"
+            for candidate_state in states:
+                entry = entry_by_key[candidate_state["model_key"]]
+                entry["status"] = "failed"
+                entry["error"] = error_text
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise ValueError(error_text)
+
+    first_args = states[0]["args"]
+    coordinator = MultiModelCoordinator(
+        inference_workers=min(
+            len(states),
+            max(1, int(first_args.multi_model_inference_workers)),
+        ),
+        pole_workers=max(1, int(first_args.multi_model_pole_workers)),
+        queue_depth=max(1, int(first_args.multi_model_queue_depth)),
     )
-    remove_generated_shapefile_bundle(
-        output_dirs["shp"] / "pole_bottoms.in_progress.shp",
-        logger,
+    atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2),
     )
+
+    models: dict[str, YOLO] = {}
+    active_states: list[dict[str, Any]] = []
+    model_failures: list[tuple[str, str]] = list(preparation_failures)
+    for state in states:
+        model_key = state["model_key"]
+        entry = entry_by_key[model_key]
+        try:
+            with coordinator.timed(f"model_load/{model_key}"):
+                models[model_key] = YOLO(state["runtime"]["model_path"])
+        except KeyboardInterrupt:
+            for candidate_entry in manifest["models"]:
+                if candidate_entry["status"] in {"pending", "preparing", "running"}:
+                    candidate_entry["status"] = "interrupted"
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise
+        except Exception as exc:
+            state["logger"].exception("Could not load model %s.", model_key)
+            error_text = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "failed"
+            entry["error"] = error_text
+            entry["failure_log"] = str(Path(state["log_path"]).resolve())
+            model_failures.append((model_key, error_text))
+        else:
+            active_states.append(state)
+    atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+    )
+    if not active_states:
+        summary = "; ".join(f"{key}: {error}" for key, error in model_failures)
+        raise RuntimeError(f"Every model failed to load: {summary}")
+
+    work_queues = {
+        state["model_key"]: queue.Queue(maxsize=coordinator.queue_depth)
+        for state in active_states
+    }
+    stop_token = object()
+    cancel_event = threading.Event()
+    consumer_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
+    terminal_model_errors: dict[str, str] = {}
+    summaries = {
+        state["model_key"]: {
+            "images": 0,
+            "detections": 0,
+            "points": 0,
+            "failures": 0,
+        }
+        for state in active_states
+    }
+    summary_lock = threading.Lock()
+    progress_disabled = bool(first_args.disable_console_progress)
+    progress_bar = tqdm(
+        total=len(reference_tasks) * len(active_states),
+        desc="MMS multi-model",
+        unit="model-frame",
+        dynamic_ncols=True,
+        disable=progress_disabled,
+        file=sys.stderr,
+    )
+
+    def record_result(model_key: str, result: dict[str, int]) -> None:
+        with summary_lock:
+            _accumulate_summary(summaries[model_key], result)
+            progress_bar.update(max(0, int(result.get("images", 0))))
+            total_detections = sum(item["detections"] for item in summaries.values())
+            total_failures = sum(item["failures"] for item in summaries.values())
+            progress_bar.set_postfix(
+                detections=total_detections,
+                errors=total_failures,
+                refresh=False,
+            )
+
+    def raise_pending_consumer_error() -> None:
+        try:
+            model_key, exc = consumer_errors.get_nowait()
+        except queue.Empty:
+            return
+        raise RuntimeError(
+            f"Post-processing consumer for {model_key} stopped unexpectedly: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    def enqueue_consumer_job(model_key: str, job: Any) -> None:
+        work_queue = work_queues[model_key]
+        while True:
+            raise_pending_consumer_error()
+            if cancel_event.is_set():
+                raise RuntimeError(
+                    "Parallel post-processing was cancelled before a queued job "
+                    f"could be delivered to {model_key}."
+                )
+            try:
+                work_queue.put(job, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    def enqueue_frame_jobs_round_robin(
+        frame_jobs: list[tuple[str, Any]],
+    ) -> None:
+        """Deliver ready model jobs without letting one full queue block its peers."""
+
+        pending = list(frame_jobs)
+        while pending:
+            raise_pending_consumer_error()
+            if cancel_event.is_set():
+                raise RuntimeError(
+                    "Parallel post-processing was cancelled while frame jobs "
+                    "were waiting for bounded queues."
+                )
+            remaining: list[tuple[str, Any]] = []
+            made_progress = False
+            for model_key, job in pending:
+                try:
+                    work_queues[model_key].put_nowait(job)
+                except queue.Full:
+                    remaining.append((model_key, job))
+                else:
+                    made_progress = True
+            pending = remaining
+            if pending and not made_progress:
+                cancel_event.wait(0.05)
+
+    def consume_model_frames(state: dict[str, Any]) -> None:
+        model_key = state["model_key"]
+        runtime = state["runtime"]
+        logger = state["logger"]
+        work_queue = work_queues[model_key]
+        pointcloud_cache: PointCloudReaderCache | None = None
+        try:
+            pointcloud_cache = PointCloudReaderCache()
+            while True:
+                if cancel_event.is_set():
+                    return
+                try:
+                    job = work_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    if job is stop_token:
+                        return
+                    image_task, image_rgb, candidates, forward_path = job
+                    try:
+                        with coordinator.timed(f"postprocess/{model_key}"):
+                            result = process_image_task(
+                                image_task=image_task,
+                                runtime=runtime,
+                                model=None,
+                                pointcloud_catalog=state["pointcloud_catalog"],
+                                pointcloud_cache=pointcloud_cache,
+                                logger=logger,
+                                image_rgb_override=image_rgb,
+                                detection_candidates_override=candidates,
+                                forward_view_output_path_override=forward_path,
+                                skip_existing_checked=True,
+                                coordinator=coordinator,
+                            )
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Queued post-processing failed on image %s.",
+                            image_task["image_path"],
+                        )
+                        result = {
+                            "images": 1,
+                            "detections": 0,
+                            "points": 0,
+                            "failures": 1,
+                        }
+                    record_result(model_key, result)
+                finally:
+                    work_queue.task_done()
+        except BaseException as exc:
+            consumer_errors.put((model_key, exc))
+            cancel_event.set()
+        finally:
+            if pointcloud_cache is not None:
+                try:
+                    pointcloud_cache.close()
+                except BaseException as exc:
+                    consumer_errors.put((model_key, exc))
+                    cancel_event.set()
+
+    consumer_threads = [
+        threading.Thread(
+            target=consume_model_frames,
+            args=(state,),
+            name=f"postprocess-{state['model_key']}",
+            daemon=False,
+        )
+        for state in active_states
+    ]
+    started_consumer_threads: list[threading.Thread] = []
+    producer_error: BaseException | None = None
+    try:
+        for thread in consumer_threads:
+            thread.start()
+            started_consumer_threads.append(thread)
+        with ThreadPoolExecutor(
+            max_workers=len(active_states),
+            thread_name_prefix="yolo-model",
+        ) as inference_executor:
+            for image_task in reference_tasks:
+                raise_pending_consumer_error()
+                needed_states: list[dict[str, Any]] = []
+                for state in active_states:
+                    if state["model_key"] in terminal_model_errors:
+                        with summary_lock:
+                            progress_bar.update(1)
+                        continue
+                    existing = compatible_existing_result_summary(
+                        image_task,
+                        state["runtime"],
+                        state["logger"],
+                    )
+                    if existing is None:
+                        needed_states.append(state)
+                    else:
+                        record_result(state["model_key"], existing)
+                if not needed_states:
+                    continue
+
+                image_path = Path(image_task["image_path"])
+                try:
+                    with coordinator.timed("shared_panorama_decode"):
+                        image_rgb = load_panorama_rgb(image_path, orchestrator_logger)
+                        validate_panorama_image(image_task, image_rgb)
+                    with coordinator.timed("shared_forward_render"):
+                        forward_rgb, mapping = render_forward_detection_view(
+                            image_rgb,
+                            needed_states[0]["runtime"],
+                        )
+                    forward_path = (
+                        shared_forward_views_dir
+                        / image_task["record_name"]
+                        / f"{image_task['image_stem']}__forward.jpg"
+                    )
+                    with coordinator.timed("shared_forward_qa_write"):
+                        save_forward_detection_qa_image(
+                            forward_rgb,
+                            forward_path,
+                            hfov_deg=float(mapping["hfov_deg"]),
+                            vfov_deg=float(mapping["vfov_deg"]),
+                            max_center_ray_angle_deg=float(
+                                needed_states[0]["runtime"][
+                                    "max_center_ray_angle_deg"
+                                ]
+                            ),
+                        )
+                except MemoryError:
+                    raise
+                except Exception:
+                    orchestrator_logger.exception(
+                        "Shared panorama preparation failed for %s; "
+                        "recording one failure per required model and continuing.",
+                        image_task["image_path"],
+                    )
+                    for state in needed_states:
+                        state["logger"].error(
+                            "Shared panorama preparation failed for %s.",
+                            image_task["image_path"],
+                            exc_info=True,
+                        )
+                        record_result(
+                            state["model_key"],
+                            {
+                                "images": 1,
+                                "detections": 0,
+                                "points": 0,
+                                "failures": 1,
+                            },
+                        )
+                    continue
+
+                future_states = {
+                    inference_executor.submit(
+                        run_forward_detection_on_view,
+                        forward_rgb,
+                        mapping,
+                        state["runtime"],
+                        models[state["model_key"]],
+                        state["logger"],
+                        coordinator=coordinator,
+                    ): state
+                    for state in needed_states
+                }
+                frame_jobs: list[tuple[str, Any]] = []
+                for future in as_completed(future_states):
+                    state = future_states[future]
+                    model_key = state["model_key"]
+                    try:
+                        candidates = future.result()
+                    except PersistentCudaOutOfMemoryError as exc:
+                        state["logger"].exception(
+                            "Model was disabled after serialized CUDA OOM on image %s.",
+                            image_task["image_path"],
+                        )
+                        error_text = f"{type(exc).__name__}: {exc}"
+                        terminal_model_errors[model_key] = error_text
+                        entry = entry_by_key[model_key]
+                        entry["status"] = "failed"
+                        entry["error"] = error_text
+                        entry["failure_log"] = str(Path(state["log_path"]).resolve())
+                        model_failures.append((model_key, error_text))
+                        try:
+                            # Wait until every other serialized prediction has
+                            # left the GPU before moving failed weights.
+                            with coordinator.inference_gate.slot():
+                                models[model_key].to("cpu")
+                                try:
+                                    import torch
+
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                except Exception:
+                                    state["logger"].debug(
+                                        "Could not clear CUDA cache after model offload.",
+                                        exc_info=True,
+                                    )
+                        except Exception:
+                            state["logger"].debug(
+                                "Could not offload the failed model to CPU.",
+                                exc_info=True,
+                            )
+                        record_result(
+                            model_key,
+                            {
+                                "images": 1,
+                                "detections": 0,
+                                "points": 0,
+                                "failures": 1,
+                            },
+                        )
+                        atomic_write_text(
+                            manifest_path,
+                            json.dumps(manifest, ensure_ascii=False, indent=2),
+                        )
+                        continue
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        state["logger"].exception(
+                            "Model inference failed on image %s.",
+                            image_task["image_path"],
+                        )
+                        record_result(
+                            model_key,
+                            {
+                                "images": 1,
+                                "detections": 0,
+                                "points": 0,
+                                "failures": 1,
+                            },
+                        )
+                        continue
+                    frame_jobs.append(
+                        (
+                            model_key,
+                            (image_task, image_rgb, candidates, forward_path),
+                        )
+                    )
+                enqueue_frame_jobs_round_robin(frame_jobs)
+    except BaseException as exc:
+        producer_error = exc
+        cancel_event.set()
+        orchestrator_logger.exception("Parallel frame producer stopped.")
+    finally:
+        if producer_error is None and not cancel_event.is_set():
+            try:
+                for state in active_states:
+                    enqueue_consumer_job(state["model_key"], stop_token)
+            except BaseException as exc:
+                producer_error = exc
+                cancel_event.set()
+                orchestrator_logger.exception(
+                    "Could not finish the parallel post-processing queues cleanly."
+                )
+        else:
+            cancel_event.set()
+        for thread in started_consumer_threads:
+            while thread.is_alive():
+                thread.join(timeout=0.2)
+                if producer_error is None:
+                    try:
+                        raise_pending_consumer_error()
+                    except BaseException as exc:
+                        producer_error = exc
+                        cancel_event.set()
+                        orchestrator_logger.exception(
+                            "Parallel post-processing consumer stopped."
+                        )
+        if producer_error is None:
+            try:
+                raise_pending_consumer_error()
+            except BaseException as exc:
+                producer_error = exc
+                cancel_event.set()
+                orchestrator_logger.exception(
+                    "Parallel post-processing consumer failed during shutdown."
+                )
+        progress_bar.close()
+
+    performance = coordinator.snapshot()
+    atomic_write_text(
+        logs_dir / "performance.json",
+        json.dumps(performance, ensure_ascii=False, indent=2),
+    )
+    manifest["performance"] = performance
+    if producer_error is not None:
+        interrupted = isinstance(producer_error, KeyboardInterrupt)
+        error_text = (
+            None
+            if interrupted
+            else f"{type(producer_error).__name__}: {producer_error}"
+        )
+        for state in active_states:
+            entry = entry_by_key[state["model_key"]]
+            if entry["status"] == "running":
+                entry["status"] = "interrupted" if interrupted else "failed"
+                entry["error"] = error_text
+                entry["failure_log"] = str(
+                    (logs_dir / "orchestrator.log").resolve()
+                )
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        raise producer_error
+
+    for state in active_states:
+        model_key = state["model_key"]
+        entry = entry_by_key[model_key]
+        expected_paths = list(entry["expected_final_shapefiles"].values())
+        entry["preexisting_final_shapefiles"] = [
+            path for path in expected_paths if Path(path).is_file()
+        ]
+        if model_key in terminal_model_errors:
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            continue
+        try:
+            run_result = finalize_prepared_model_run(
+                state,
+                summaries[model_key],
+            )
+        except KeyboardInterrupt:
+            for candidate_entry in manifest["models"]:
+                if candidate_entry["status"] == "running":
+                    candidate_entry["status"] = "interrupted"
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise
+        except Exception as exc:
+            state["logger"].exception("Model finalization failed for %s.", model_key)
+            error_text = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "failed"
+            entry["error"] = error_text
+            entry["failure_log"] = str(Path(state["log_path"]).resolve())
+            entry["existing_final_shapefiles_after_failure"] = [
+                path for path in expected_paths if Path(path).is_file()
+            ]
+            model_failures.append((model_key, error_text))
+        else:
+            entry["status"] = "completed"
+            entry["published_current_run"] = True
+            entry["run_fingerprint"] = run_result.get("run_fingerprint")
+            entry["final_shapefiles"] = run_result.get("final_shapefiles")
+            entry["feature_counts"] = run_result.get("feature_counts")
+        finally:
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+
+    if model_failures:
+        summary = "; ".join(
+            f"{model_key}: {error_text}"
+            for model_key, error_text in model_failures
+        )
+        raise RuntimeError(
+            f"{len(model_failures)} model run(s) failed after all models were attempted: "
+            f"{summary}"
+        )
+
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    """Run one checkpoint or every configured checkpoint in isolated outputs."""
+
+    configured_model_dir = getattr(args, "model_dir", None)
+    model_paths = discover_model_paths(
+        configured_model_dir,
+        getattr(args, "model_path", None),
+    )
+    multi_model = configured_model_dir is not None
+    base_output_dir = Path(args.output_dir).resolve()
+
+    prepared: list[tuple[Path, argparse.Namespace, str, str, str]] = []
+    for model_path in model_paths:
+        effective, profile_name, object_type = apply_model_filter(
+            args,
+            model_path,
+            require_profile=multi_model,
+        )
+        validate_point_range_fallback_arguments(effective)
+        if effective.pole_detection:
+            strict_pole_parameters = build_pole_search_parameters(vars(effective))
+            build_pole_fallback_parameters(
+                vars(effective),
+                strict_pole_parameters,
+            )
+        model_key = sanitize_name(model_path.stem)
+        effective.output_dir = (
+            base_output_dir / model_key if multi_model else base_output_dir
+        )
+        prepared.append(
+            (model_path, effective, model_key, profile_name, object_type)
+        )
+
+    if not multi_model:
+        _run_single_model_pipeline(prepared[0][1])
+        return
+
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    (base_output_dir / "logs").mkdir(parents=True, exist_ok=True)
+    shared_forward_views_dir = base_output_dir / "forward_views"
+    shared_forward_views_dir.mkdir(parents=True, exist_ok=True)
+    for _model_path, effective, _model_key, _profile_name, _object_type in prepared:
+        effective._shared_forward_views_dir = shared_forward_views_dir
+    manifest_path = base_output_dir / "models_manifest.json"
+    manifest: dict[str, Any] = {
+        "schema_version": 2,
+        "model_dir": str(Path(configured_model_dir).resolve()),
+        "output_dir": str(base_output_dir),
+        "execution_mode": "sequential",
+        "shared_artifacts": {
+            "forward_views": str(shared_forward_views_dir.resolve()),
+        },
+        "models": [
+            {
+                "model_name": model_path.name,
+                "model_key": model_key,
+                "model_path": str(model_path),
+                "model_profile": profile_name,
+                "model_object_type": object_type,
+                "output_dir": str(effective.output_dir),
+                "expected_final_shapefiles": {
+                    "detections": str(
+                        Path(effective.output_dir).resolve()
+                        / "shp"
+                        / "detected_signs.shp"
+                    ),
+                    "poles": str(
+                        Path(effective.output_dir).resolve()
+                        / "shp"
+                        / "pole_bottoms.shp"
+                    ),
+                },
+                "status": "pending",
+                "error": None,
+                "failure_log": None,
+                "published_current_run": False,
+                "run_fingerprint": None,
+            }
+            for model_path, effective, model_key, profile_name, object_type in prepared
+        ],
+    }
+    atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+    )
+
+    if bool(getattr(args, "multi_model_parallel", False)) and len(prepared) > 1:
+        try:
+            run_parallel_multi_model_pipeline(
+                prepared,
+                base_output_dir=base_output_dir,
+                manifest=manifest,
+                manifest_path=manifest_path,
+            )
+        except KeyboardInterrupt:
+            for entry in manifest["models"]:
+                if entry["status"] in {"pending", "preparing", "running"}:
+                    entry["status"] = "interrupted"
+                    entry["error"] = None
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise
+        return
+
+    failures: list[tuple[str, str]] = []
+    for index, (_, effective, model_key, _, _) in enumerate(prepared):
+        entry = manifest["models"][index]
+        expected_paths = list(entry["expected_final_shapefiles"].values())
+        entry["preexisting_final_shapefiles"] = [
+            path for path in expected_paths if Path(path).is_file()
+        ]
+        entry["status"] = "running"
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        try:
+            run_result = _run_single_model_pipeline(effective)
+        except KeyboardInterrupt:
+            entry["status"] = "interrupted"
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            raise
+        except Exception as exc:
+            failure_log_path = Path(effective.output_dir) / "logs" / "run.log"
+            failure_logger = setup_logging(
+                failure_log_path,
+                file_mode="a",
+                logger_name="mms_shp_detection_main",
+                level=getattr(effective, "log_level", "INFO"),
+            )
+            failure_logger.exception(
+                "Model pipeline failed for %s.",
+                effective.model_path,
+            )
+            error_text = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "failed"
+            entry["error"] = error_text
+            entry["failure_log"] = str(failure_log_path.resolve())
+            entry["existing_final_shapefiles_after_failure"] = [
+                path for path in expected_paths if Path(path).is_file()
+            ]
+            failures.append((model_key, error_text))
+        else:
+            entry["status"] = "completed"
+            entry["published_current_run"] = True
+            if isinstance(run_result, dict):
+                entry["run_fingerprint"] = run_result.get("run_fingerprint")
+                entry["final_shapefiles"] = run_result.get("final_shapefiles")
+                entry["feature_counts"] = run_result.get("feature_counts")
+        finally:
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+
+    if failures:
+        summary = "; ".join(
+            f"{model_key}: {error_text}"
+            for model_key, error_text in failures
+        )
+        raise RuntimeError(
+            f"{len(failures)} model run(s) failed after all models were attempted: {summary}"
+        )
 
 
 def main() -> None:

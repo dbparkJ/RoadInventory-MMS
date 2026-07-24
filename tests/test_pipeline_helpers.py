@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import logging
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,30 +17,43 @@ import numpy as np
 from PIL import Image
 from pyproj import CRS
 
+from mms_shp_detection.config import ConfigError, parse_args_with_config
 from mms_shp_detection.pipeline import (
     POINT_CROP_SEMANTICS,
     POLE_CROP_SEMANTICS,
+    MultiModelCoordinator,
+    PersistentCudaOutOfMemoryError,
+    apply_model_filter,
     build_arg_parser,
     build_dataset_signature,
     build_forward_detection_mapping,
+    build_pole_fallback_parameters,
     build_pole_debug_axis_segments,
     build_pole_debug_overview_view,
+    build_pole_search_parameters,
     build_pole_search_corridor_masks,
     build_rectified_detection_view,
     build_run_fingerprint,
     circular_bbox_iou_xyxy,
     collect_detection_points_at_range,
     create_forward_detection_qa_image,
+    discover_model_paths,
     evaluate_point_range_fallback_quality,
+    ensure_output_dirs,
     find_pole_bases_with_corridor_fallback,
+    load_panorama_rgb,
     missing_result_artifacts,
+    pole_cross_profile_candidate_key,
     pole_classifications_for_policy,
     resolve_matched_crs_wkt,
     resolve_num_workers,
     resolve_pole_classification_policy,
+    render_forward_detection_view,
     robust_front_surface_distance,
     run_panorama_alignment_qa,
+    run_parallel_multi_model_pipeline,
     run_pipeline,
+    run_yolo_prediction,
     safely_refresh_shapefile_from_txt,
     save_debug_crop,
     unwrap_panorama_x_coordinates,
@@ -48,6 +65,7 @@ from mms_shp_detection.pipeline import (
     write_pole_las,
 )
 from mms_shp_detection.geometry import (
+    build_perspective_panorama_remap,
     pixel_to_world_ray,
     perspective_pixel_to_world_ray,
     world_ray_to_equirectangular_pixel,
@@ -233,6 +251,30 @@ class PanoramaSeamTests(unittest.TestCase):
             np.arccos(np.clip(np.dot(edge_ray, mapping["view_forward_vec"]), -1.0, 1.0))
         )
         self.assertAlmostEqual(edge_angle, 35.0, places=5)
+
+    def test_forward_remap_grid_is_reused_across_frames(self) -> None:
+        runtime = {
+            "forward_view_size": 320,
+            "forward_view_hfov_deg": 61.25,
+            "forward_view_vfov_deg": 61.25,
+            "panorama_yaw_offset_deg": 0.125,
+            "panorama_pitch_offset_deg": -0.125,
+        }
+        first = np.zeros((180, 360, 3), dtype=np.uint8)
+        second = np.full_like(first, 255)
+        with mock.patch(
+            "mms_shp_detection.pipeline.build_perspective_panorama_remap",
+            wraps=build_perspective_panorama_remap,
+        ) as remap_builder:
+            first_view, first_mapping = render_forward_detection_view(first, runtime)
+            second_view, second_mapping = render_forward_detection_view(second, runtime)
+
+        self.assertEqual(remap_builder.call_count, 1)
+        self.assertEqual(first_view.shape, (320, 320, 3))
+        self.assertEqual(second_view.shape, (320, 320, 3))
+        self.assertEqual(first_mapping["hfov_deg"], second_mapping["hfov_deg"])
+        self.assertEqual(int(first_view.max()), 0)
+        self.assertEqual(int(second_view.min()), 255)
 
     def test_forward_qa_annotation_does_not_modify_yolo_source(self) -> None:
         source = np.full((128, 128, 3), 80, dtype=np.uint8)
@@ -444,10 +486,11 @@ class PanoramaSeamTests(unittest.TestCase):
             "panorama_yaw_offset_deg": 0.0,
             "panorama_pitch_offset_deg": 0.0,
             "perspective_margin_deg": 2.0,
-            "perspective_min_fov_deg": 55.0,
-            "perspective_max_fov_deg": 110.0,
+            "perspective_min_fov_deg": 18.0,
+            "perspective_max_fov_deg": 150.0,
             "perspective_view_size": 1024,
-            "pole_min_fov_deg": 55.0,
+            "pole_min_fov_deg": 140.0,
+            "pole_debug_min_fov_deg": 18.0,
         }
         fallback_view = build_rectified_detection_view(
             image_task=image_task,
@@ -503,8 +546,9 @@ class PanoramaSeamTests(unittest.TestCase):
         self.assertTrue(overview["debug_overview_adaptive"])
         self.assertEqual(overview["rectified_rgb"].shape, (1024, 1024, 3))
         self.assertAlmostEqual(overview["hfov_deg"], overview["vfov_deg"])
-        self.assertGreaterEqual(overview["hfov_deg"], 55.0)
-        self.assertLessEqual(overview["hfov_deg"], 110.0)
+        self.assertGreaterEqual(overview["hfov_deg"], 18.0)
+        self.assertLess(overview["hfov_deg"], 140.0)
+        self.assertLessEqual(overview["hfov_deg"], 150.0)
         self.assertGreater(
             float(np.dot(overview["view_up_vec"], overview["pano_up_vec"])),
             0.0,
@@ -577,6 +621,28 @@ class PanoramaSeamTests(unittest.TestCase):
         validate_panorama_image(task, np.zeros((4, 8, 3), dtype=np.uint8))
         with self.assertRaisesRegex(ValueError, "width mismatch"):
             validate_panorama_image(task, np.zeros((4, 7, 3), dtype=np.uint8))
+
+    def test_truncated_jpeg_is_recovered_without_leaking_global_pillow_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "truncated.jpg"
+            source = np.full((64, 128, 3), 127, dtype=np.uint8)
+            Image.fromarray(source).save(image_path, format="JPEG", quality=90)
+            encoded = image_path.read_bytes()
+            image_path.write_bytes(encoded[:-2])
+
+            logger = mock.Mock()
+            recovered = load_panorama_rgb(image_path, logger)
+
+            self.assertEqual(recovered.shape, source.shape)
+            logger.warning.assert_called_once()
+
+    def test_invalid_image_still_fails_after_truncated_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "invalid.jpg"
+            image_path.write_bytes(b"not an image")
+
+            with self.assertRaises(OSError):
+                load_panorama_rgb(image_path, mock.Mock())
 
 
 class FrontSurfaceTests(unittest.TestCase):
@@ -1072,6 +1138,8 @@ class DatasetFingerprintTests(unittest.TestCase):
             common_args = {
                 "data_root": root,
                 "model_path": model_path,
+                "model_profile": "profile-a",
+                "model_object_type": "traffic_sign",
                 "output_dir": root / "outputs",
                 "pointcloud_cache_path": root / "catalog.json",
                 "point_source": "las",
@@ -1148,16 +1216,734 @@ class DatasetFingerprintTests(unittest.TestCase):
                 ),
                 first_fingerprint,
             )
+            changed_model_metadata = argparse.Namespace(**vars(first_slice))
+            changed_model_metadata.model_object_type = "traffic_signal"
+            self.assertNotEqual(
+                build_run_fingerprint(
+                    changed_model_metadata,
+                    pointcloud_catalog,
+                    calibration_bundle,
+                    dataset_signature,
+                ),
+                first_fingerprint,
+            )
+
+
+class MultiModelExecutionTests(unittest.TestCase):
+    def _parallel_runner_fixture(
+        self,
+        root: Path,
+        *,
+        frame_count: int,
+    ) -> dict[str, object]:
+        args = build_arg_parser().parse_args(["--disable-console-progress"])
+        args.multi_model_inference_workers = 2
+        args.multi_model_pole_workers = 1
+        args.multi_model_queue_depth = 1
+
+        tasks = [
+            {
+                "image_path": str(root / f"frame_{index}.jpg"),
+                "image_stem": f"frame_{index}",
+                "record_name": "track",
+                "timestamp_iso": f"2025-01-01T00:00:0{index}+00:00",
+            }
+            for index in range(frame_count)
+        ]
+        prepared = []
+        states = []
+        manifest_models = []
+        for model_key in ("a", "b"):
+            model_path = root / f"{model_key}.pt"
+            model_path.write_bytes(model_key.encode("ascii"))
+            effective = copy.deepcopy(args)
+            effective.model_path = model_path
+            effective.output_dir = root / model_key
+            prepared.append(
+                (model_path, effective, model_key, model_key, "traffic_sign")
+            )
+            runtime = {
+                "model_path": str(model_path),
+                "detection_view_mode": "forward",
+                "forward_view_size": 32,
+                "forward_view_hfov_deg": 70.0,
+                "forward_view_vfov_deg": 70.0,
+                "panorama_yaw_offset_deg": 0.0,
+                "panorama_pitch_offset_deg": 0.0,
+                "max_center_ray_angle_deg": 45.0,
+            }
+            states.append(
+                {
+                    "args": effective,
+                    "runtime": runtime,
+                    "image_tasks": tasks,
+                    "pointcloud_catalog": {},
+                    "logger": mock.Mock(),
+                    "run_fingerprint": model_key * 64,
+                    "log_path": root / model_key / "logs" / "run.log",
+                    "output_dirs": {"shp": root / model_key / "shp"},
+                    "crs_wkt": None,
+                }
+            )
+            manifest_models.append(
+                {
+                    "model_key": model_key,
+                    "status": "pending",
+                    "error": None,
+                    "failure_log": None,
+                    "published_current_run": False,
+                    "run_fingerprint": None,
+                    "expected_final_shapefiles": {
+                        "detections": str(
+                            root / model_key / "shp" / "detected_signs.shp"
+                        ),
+                        "poles": str(
+                            root / model_key / "shp" / "pole_bottoms.shp"
+                        ),
+                    },
+                }
+            )
+
+        return {
+            "prepared": prepared,
+            "states": states,
+            "manifest": {
+                "schema_version": 2,
+                "execution_mode": "sequential",
+                "models": manifest_models,
+            },
+            "manifest_path": root / "models_manifest.json",
+        }
+
+    def _run_shared_stage_failure_fixture(
+        self,
+        root: Path,
+        *,
+        failing_stage: str,
+    ) -> dict[str, object]:
+        fixture = self._parallel_runner_fixture(root, frame_count=2)
+        image_rgb = np.zeros((8, 16, 3), dtype=np.uint8)
+        forward_rgb = np.zeros((32, 32, 3), dtype=np.uint8)
+        mapping = {"hfov_deg": 70.0, "vfov_deg": 70.0}
+        finalized: dict[str, dict[str, int]] = {}
+
+        def finalize(state, summary):
+            finalized[state["model_key"]] = dict(summary)
+            return {
+                "run_fingerprint": state["run_fingerprint"],
+                "final_shapefiles": {},
+                "feature_counts": {},
+            }
+
+        decode_side_effect = (
+            [RuntimeError("shared decode fixture"), image_rgb]
+            if failing_stage == "decode"
+            else [image_rgb, image_rgb]
+        )
+        render_side_effect = (
+            [RuntimeError("shared render fixture"), (forward_rgb, mapping)]
+            if failing_stage == "render"
+            else [(forward_rgb, mapping)]
+        )
+        progress = mock.Mock()
+        pointcloud_cache = mock.Mock()
+        with (
+            mock.patch(
+                "mms_shp_detection.pipeline.setup_logging",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "mms_shp_detection.pipeline.prepare_shared_pipeline_context",
+                return_value={},
+            ),
+            mock.patch(
+                "mms_shp_detection.pipeline._run_single_model_pipeline",
+                side_effect=fixture["states"],
+            ),
+            mock.patch("mms_shp_detection.pipeline.YOLO", side_effect=[object(), object()]),
+            mock.patch(
+                "mms_shp_detection.pipeline.compatible_existing_result_summary",
+                return_value=None,
+            ),
+            mock.patch(
+                "mms_shp_detection.pipeline.load_panorama_rgb",
+                side_effect=decode_side_effect,
+            ) as decode,
+            mock.patch("mms_shp_detection.pipeline.validate_panorama_image"),
+            mock.patch(
+                "mms_shp_detection.pipeline.render_forward_detection_view",
+                side_effect=render_side_effect,
+            ) as render,
+            mock.patch("mms_shp_detection.pipeline.save_forward_detection_qa_image"),
+            mock.patch(
+                "mms_shp_detection.pipeline.run_forward_detection_on_view",
+                return_value=[],
+            ) as inference,
+            mock.patch(
+                "mms_shp_detection.pipeline.process_image_task",
+                return_value={
+                    "images": 1,
+                    "detections": 0,
+                    "points": 0,
+                    "failures": 0,
+                },
+            ) as postprocess,
+            mock.patch(
+                "mms_shp_detection.pipeline.PointCloudReaderCache",
+                return_value=pointcloud_cache,
+            ),
+            mock.patch(
+                "mms_shp_detection.pipeline.finalize_prepared_model_run",
+                side_effect=finalize,
+            ),
+            mock.patch("mms_shp_detection.pipeline.tqdm", return_value=progress),
+        ):
+            run_parallel_multi_model_pipeline(
+                fixture["prepared"],
+                base_output_dir=root,
+                manifest=fixture["manifest"],
+                manifest_path=fixture["manifest_path"],
+            )
+
+        return {
+            "decode_calls": decode.call_count,
+            "render_calls": render.call_count,
+            "inference_calls": inference.call_count,
+            "postprocess_calls": postprocess.call_count,
+            "finalized": finalized,
+        }
+
+    def test_cross_profile_pole_ranking_ignores_profile_bin_count(self) -> None:
+        common = {
+            "completeness_ratio": 0.90,
+            "association_distance_m": 9.0,
+            "horizontal_connection_coverage_ratio": 0.80,
+            "radial_rmse_m": 0.08,
+            "ground_z": 1.0,
+            "ground_rmse_m": 0.05,
+            "status": "AUTO",
+            "point_count": 120,
+        }
+        strict_candidate = SimpleNamespace(
+            **common,
+            horizontal_connection_expected_bin_count=36,
+        )
+        fallback_candidate = SimpleNamespace(
+            **common,
+            horizontal_connection_expected_bin_count=26,
+        )
+
+        strict_key = pole_cross_profile_candidate_key(
+            strict_candidate,
+            preferred_min_completeness_ratio=0.75,
+            direct_max_axis_sign_distance_m=0.75,
+        )
+        fallback_key = pole_cross_profile_candidate_key(
+            fallback_candidate,
+            preferred_min_completeness_ratio=0.75,
+            direct_max_axis_sign_distance_m=0.75,
+        )
+
+        self.assertEqual(strict_key, fallback_key)
+
+    def test_explicit_cli_filter_overrides_each_model_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "traffic_light_best.pt"
+            model_path.write_bytes(b"fixture")
+            args = parse_args_with_config(
+                build_arg_parser(),
+                ["--max-range-m", "18"],
+                default_config_path=Path(__file__).resolve().parents[1] / "config.yaml",
+            )
+
+            effective, _, object_type = apply_model_filter(
+                args,
+                model_path,
+                require_profile=True,
+            )
+
+            self.assertEqual(effective.max_range_m, 18.0)
+            self.assertEqual(object_type, "traffic_signal")
+            self.assertEqual(effective.pole_search_radius_m, 12.0)
+            self.assertEqual(effective.pole_max_axis_sign_distance_m, 12.0)
+            self.assertEqual(effective.pole_min_fov_deg, 140.0)
+            self.assertEqual(effective.perspective_max_fov_deg, 150.0)
+
+    def test_models_are_discovered_in_stable_order_and_require_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "zeta.pt").write_bytes(b"z")
+            (root / "Alpha.PT").write_bytes(b"a")
+            (root / "ignore.onnx").write_bytes(b"x")
+
+            paths = discover_model_paths(root, None)
+            self.assertEqual([path.name for path in paths], ["Alpha.PT", "zeta.pt"])
+
+            args = build_arg_parser().parse_args([])
+            args.model_filters = {
+                "Alpha.PT": {
+                    "object_type": "traffic_sign",
+                    "point_matching": {"max_range_m": 15.0},
+                }
+            }
+            effective, profile_name, object_type = apply_model_filter(
+                args,
+                paths[0],
+                require_profile=True,
+            )
+            self.assertEqual(profile_name, "Alpha.PT")
+            self.assertEqual(object_type, "traffic_sign")
+            self.assertEqual(effective.max_range_m, 15.0)
+            self.assertEqual(effective.model_path, paths[0])
+
+            with self.assertRaises(ConfigError):
+                apply_model_filter(args, paths[1], require_profile=True)
+
+    def test_multi_model_wrapper_isolates_outputs_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            (model_dir / "b.pt").write_bytes(b"b")
+            (model_dir / "a.pt").write_bytes(b"a")
+            output_dir = root / "outputs"
+
+            args = build_arg_parser().parse_args(
+                [
+                    "--model-dir",
+                    str(model_dir),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            args.model_filters = {
+                "a.pt": {"object_type": "traffic_sign"},
+                "b.pt": {"object_type": "traffic_signal"},
+            }
+
+            with mock.patch(
+                "mms_shp_detection.pipeline._run_single_model_pipeline"
+            ) as single_model:
+                run_pipeline(args)
+
+            self.assertEqual(single_model.call_count, 2)
+            effective_args = [
+                call.args[0] for call in single_model.call_args_list
+            ]
+            self.assertEqual(
+                [item.model_path.name for item in effective_args],
+                ["a.pt", "b.pt"],
+            )
+            self.assertEqual(
+                [item.output_dir for item in effective_args],
+                [output_dir / "a", output_dir / "b"],
+            )
+            shared_forward_views = (output_dir / "forward_views").resolve()
+            self.assertEqual(
+                [
+                    getattr(item, "_shared_forward_views_dir", None)
+                    for item in effective_args
+                ],
+                [shared_forward_views, shared_forward_views],
+            )
+            manifest = json.loads(
+                (output_dir / "models_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["status"] for item in manifest["models"]],
+                ["completed", "completed"],
+            )
+            self.assertTrue(
+                all(item["published_current_run"] for item in manifest["models"])
+            )
+
+    def test_parallel_wrapper_uses_one_shared_forward_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            (model_dir / "a.pt").write_bytes(b"a")
+            (model_dir / "b.pt").write_bytes(b"b")
+            output_dir = root / "outputs"
+            args = build_arg_parser().parse_args(
+                [
+                    "--model-dir",
+                    str(model_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--multi-model-parallel",
+                ]
+            )
+            args.model_filters = {
+                "a.pt": {"object_type": "traffic_sign"},
+                "b.pt": {"object_type": "traffic_signal"},
+            }
+
+            with (
+                mock.patch(
+                    "mms_shp_detection.pipeline.run_parallel_multi_model_pipeline"
+                ) as parallel_run,
+                mock.patch(
+                    "mms_shp_detection.pipeline._run_single_model_pipeline"
+                ) as single_run,
+            ):
+                run_pipeline(args)
+
+            parallel_run.assert_called_once()
+            single_run.assert_not_called()
+            manifest = json.loads(
+                (output_dir / "models_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["schema_version"], 2)
+
+            shared = root / "shared_forward"
+            model_output = root / "one_model"
+            dirs = ensure_output_dirs(
+                model_output,
+                shared_forward_views_dir=shared,
+            )
+            self.assertEqual(dirs["forward_views"], shared)
+            self.assertTrue(shared.is_dir())
+            self.assertFalse((model_output / "forward_views").exists())
+
+    def test_pole_queue_bounds_memory_heavy_work_to_one_slot(self) -> None:
+        coordinator = MultiModelCoordinator(
+            inference_workers=2,
+            pole_workers=1,
+            queue_depth=1,
+        )
+        barrier = threading.Barrier(3)
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def work() -> None:
+            nonlocal active, max_active
+            barrier.wait()
+            with coordinator.pole_gate.slot():
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.02)
+                with active_lock:
+                    active -= 1
+
+        threads = [threading.Thread(target=work) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(coordinator.snapshot()["pole_max_active"], 1)
+
+    def test_serial_cuda_oom_retry_circuit_breaks_model(self) -> None:
+        coordinator = MultiModelCoordinator(
+            inference_workers=2,
+            pole_workers=1,
+            queue_depth=1,
+        )
+        model = mock.Mock()
+        model.predict.side_effect = [
+            RuntimeError("CUDA out of memory"),
+            RuntimeError("CUDA out of memory"),
+        ]
+
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            with self.assertRaises(PersistentCudaOutOfMemoryError):
+                run_yolo_prediction(
+                    model,
+                    {"model_key": "traffic_light"},
+                    mock.Mock(),
+                    coordinator=coordinator,
+                    source=object(),
+                )
+
+        self.assertEqual(model.predict.call_count, 2)
+        snapshot = coordinator.snapshot()
+        self.assertEqual(snapshot["inference_workers_effective"], 1)
+        self.assertEqual(snapshot["cuda_oom_sequential_fallbacks"], 1)
+
+    def test_shared_decode_or_render_failure_marks_all_models_and_continues(self) -> None:
+        for failing_stage in ("decode", "render"):
+            with self.subTest(failing_stage=failing_stage):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    result = self._run_shared_stage_failure_fixture(
+                        Path(temp_dir),
+                        failing_stage=failing_stage,
+                    )
+
+                self.assertEqual(result["decode_calls"], 2)
+                self.assertEqual(
+                    result["render_calls"],
+                    1 if failing_stage == "decode" else 2,
+                )
+                self.assertEqual(result["inference_calls"], 2)
+                self.assertEqual(result["postprocess_calls"], 2)
+                finalized = result["finalized"]
+                self.assertEqual(set(finalized), {"a", "b"})
+                for summary in finalized.values():
+                    self.assertEqual(summary["images"], 2)
+                    self.assertEqual(summary["failures"], 1)
+
+    def test_consumer_startup_failure_does_not_hang_bounded_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = self._parallel_runner_fixture(root, frame_count=1)
+            image_rgb = np.zeros((8, 16, 3), dtype=np.uint8)
+            forward_rgb = np.zeros((32, 32, 3), dtype=np.uint8)
+            mapping = {"hfov_deg": 70.0, "vfov_deg": 70.0}
+            outcome: dict[str, BaseException] = {}
+
+            def invoke_runner() -> None:
+                try:
+                    run_parallel_multi_model_pipeline(
+                        fixture["prepared"],
+                        base_output_dir=root,
+                        manifest=fixture["manifest"],
+                        manifest_path=fixture["manifest_path"],
+                    )
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            with (
+                mock.patch(
+                    "mms_shp_detection.pipeline.setup_logging",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.prepare_shared_pipeline_context",
+                    return_value={},
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline._run_single_model_pipeline",
+                    side_effect=fixture["states"],
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.YOLO",
+                    side_effect=[object(), object()],
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.compatible_existing_result_summary",
+                    return_value=None,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.load_panorama_rgb",
+                    return_value=image_rgb,
+                ),
+                mock.patch("mms_shp_detection.pipeline.validate_panorama_image"),
+                mock.patch(
+                    "mms_shp_detection.pipeline.render_forward_detection_view",
+                    return_value=(forward_rgb, mapping),
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.save_forward_detection_qa_image"
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.run_forward_detection_on_view",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.PointCloudReaderCache",
+                    side_effect=RuntimeError("consumer startup fixture"),
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.finalize_prepared_model_run"
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.tqdm",
+                    return_value=mock.Mock(),
+                ),
+            ):
+                runner = threading.Thread(target=invoke_runner, daemon=True)
+                runner.start()
+                runner.join(timeout=2.0)
+                still_running = runner.is_alive()
+
+        self.assertFalse(
+            still_running,
+            "parallel runner hung while cleaning up a full bounded queue",
+        )
+        self.assertIn("error", outcome)
+        self.assertIn("consumer startup fixture", str(outcome["error"]))
+
+    def test_second_consumer_thread_start_failure_cancels_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = self._parallel_runner_fixture(root, frame_count=0)
+            outcome: dict[str, BaseException] = {}
+            first_consumer: dict[str, threading.Thread] = {}
+            start_count = 0
+            original_start = threading.Thread.start
+
+            def flaky_start(thread: threading.Thread) -> None:
+                nonlocal start_count
+                if thread.name.startswith("postprocess-"):
+                    start_count += 1
+                    if start_count == 2:
+                        raise RuntimeError("second consumer start fixture")
+                    # Keep a broken implementation from pinning the test process.
+                    thread.daemon = True
+                    first_consumer["thread"] = thread
+                original_start(thread)
+
+            def invoke_runner() -> None:
+                try:
+                    with (
+                        mock.patch(
+                            "mms_shp_detection.pipeline.setup_logging",
+                            return_value=mock.Mock(),
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline.prepare_shared_pipeline_context",
+                            return_value={},
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline._run_single_model_pipeline",
+                            side_effect=fixture["states"],
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline.YOLO",
+                            side_effect=[object(), object()],
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline.PointCloudReaderCache",
+                            return_value=mock.Mock(),
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline.finalize_prepared_model_run"
+                        ),
+                        mock.patch(
+                            "mms_shp_detection.pipeline.tqdm",
+                            return_value=mock.Mock(),
+                        ),
+                        mock.patch.object(
+                            threading.Thread,
+                            "start",
+                            autospec=True,
+                            side_effect=flaky_start,
+                        ),
+                    ):
+                        run_parallel_multi_model_pipeline(
+                            fixture["prepared"],
+                            base_output_dir=root,
+                            manifest=fixture["manifest"],
+                            manifest_path=fixture["manifest_path"],
+                        )
+                except BaseException as exc:
+                    outcome["error"] = exc
+
+            runner = threading.Thread(target=invoke_runner, daemon=True)
+            runner.start()
+            runner.join(timeout=2.0)
+            consumer = first_consumer.get("thread")
+            if consumer is not None:
+                consumer.join(timeout=1.0)
+
+        self.assertFalse(runner.is_alive())
+        self.assertIsNotNone(consumer)
+        self.assertFalse(consumer.is_alive())
+        self.assertIn("second consumer start fixture", str(outcome.get("error")))
+
+    def test_multi_model_failure_keeps_running_and_records_model_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            (model_dir / "a.pt").write_bytes(b"a")
+            (model_dir / "b.pt").write_bytes(b"b")
+            output_dir = root / "outputs"
+            args = build_arg_parser().parse_args(
+                [
+                    "--model-dir",
+                    str(model_dir),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            args.model_filters = {
+                "a.pt": {"object_type": "traffic_sign"},
+                "b.pt": {"object_type": "traffic_signal"},
+            }
+
+            try:
+                with mock.patch(
+                    "mms_shp_detection.pipeline._run_single_model_pipeline",
+                    side_effect=[RuntimeError("fixture failure"), {}],
+                ) as single_model:
+                    with self.assertRaisesRegex(RuntimeError, "a: RuntimeError"):
+                        run_pipeline(args)
+
+                self.assertEqual(single_model.call_count, 2)
+                manifest = json.loads(
+                    (output_dir / "models_manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    [item["status"] for item in manifest["models"]],
+                    ["failed", "completed"],
+                )
+                failure_log = Path(manifest["models"][0]["failure_log"])
+                self.assertTrue(failure_log.is_file())
+                failure_text = failure_log.read_text(encoding="utf-8")
+                self.assertIn("fixture failure", failure_text)
+                self.assertIn("Traceback", failure_text)
+            finally:
+                for logger in (
+                    logging.getLogger("mms_shp_detection_main"),
+                    logging.getLogger(),
+                ):
+                    for handler in list(logger.handlers):
+                        if (
+                            logger.name == "mms_shp_detection_main"
+                            or getattr(handler, "_mms_file_handler", False)
+                        ):
+                            logger.removeHandler(handler)
+                            handler.close()
+
+    def test_pole_physical_fallback_expands_bounds_and_arm_tolerance(self) -> None:
+        args = build_arg_parser().parse_args([])
+        runtime = vars(args).copy()
+        runtime.update(
+            {
+                "pole_range_fallback_enabled": True,
+                "pole_fallback_search_radius_m": 16.0,
+                "pole_fallback_max_drop_m": 14.0,
+                "pole_fallback_top_margin_m": 5.0,
+                "pole_fallback_max_axis_sign_distance_m": 16.0,
+                "pole_fallback_min_vertical_span_m": 1.2,
+                "pole_fallback_horizontal_connection_radius_m": 0.35,
+                "pole_fallback_horizontal_connection_z_tolerance_m": 0.55,
+                "pole_fallback_horizontal_connection_above_tolerance_m": 1.5,
+                "pole_fallback_horizontal_connection_bin_m": 0.35,
+                "pole_fallback_min_horizontal_connection_coverage": 0.45,
+            }
+        )
+        strict = build_pole_search_parameters(runtime)
+        fallback = build_pole_fallback_parameters(runtime, strict)
+        self.assertIsNotNone(fallback)
+        assert fallback is not None
+        self.assertEqual(fallback.search_radius_m, 16.0)
+        self.assertEqual(fallback.max_drop_m, 14.0)
+        self.assertEqual(fallback.top_margin_m, 5.0)
+        self.assertEqual(fallback.max_axis_sign_distance_m, 16.0)
+        self.assertEqual(fallback.horizontal_connection_radius_m, 0.35)
+        self.assertEqual(fallback.horizontal_connection_above_tolerance_m, 1.5)
+        self.assertEqual(fallback.min_horizontal_connection_coverage, 0.45)
 
 
 class PipelineInputScopeTests(unittest.TestCase):
     def test_catalog_and_dataset_signature_use_all_jobs_before_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            model_path = root / "model.pt"
+            model_path.write_bytes(b"model fixture")
             args = build_arg_parser().parse_args(
                 [
                     "--data-root",
                     str(root),
+                    "--model-path",
+                    str(model_path),
                     "--output-dir",
                     str(root / "outputs"),
                     "--pointcloud-cache-path",
@@ -1254,3 +2040,5 @@ class PipelineInputScopeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    apply_model_filter,
+    discover_model_paths,

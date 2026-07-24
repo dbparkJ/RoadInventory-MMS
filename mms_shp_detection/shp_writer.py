@@ -477,6 +477,10 @@ def collect_detection_records(
             )
             record["support_id"] = None
             record["run_fingerprint"] = payload.get("run_fingerprint")
+            record["model_name"] = payload.get("model_name")
+            record["model_key"] = payload.get("model_key")
+            record["model_profile"] = payload.get("model_profile")
+            record["model_object_type"] = payload.get("model_object_type")
             record["pose_format"] = payload.get("pose_format")
             record["gps_week"] = payload.get("gps_week")
             record["pointcloud_source"] = payload.get("pointcloud_source")
@@ -526,6 +530,10 @@ def collect_pole_records(
                 "image_name": detection.get("image_name") or payload.get("image_name"),
                 "timestamp_iso": detection.get("timestamp_iso") or payload.get("timestamp_iso"),
                 "run_fingerprint": payload.get("run_fingerprint"),
+                "model_name": payload.get("model_name"),
+                "model_key": payload.get("model_key"),
+                "model_profile": payload.get("model_profile"),
+                "model_object_type": payload.get("model_object_type"),
                 "pose_format": payload.get("pose_format"),
                 "gps_week": payload.get("gps_week"),
                 "pointcloud_source": payload.get("pointcloud_source"),
@@ -564,6 +572,9 @@ def collect_pole_records(
                 ),
                 "classification_mode": pole.get("classification_mode"),
                 "classification_reason": pole.get("classification_reason"),
+                "pole_search_mode": pole.get("corridor_mode"),
+                "pole_fallback_attempted": pole.get("pole_fallback_attempted"),
+                "pole_fallback_used": pole.get("pole_fallback_used"),
                 "pole_point_crop_path": pole.get("point_crop_path"),
                 "pole_debug_image_path": pole.get("debug_image_path"),
             }
@@ -1041,6 +1052,8 @@ def write_shapefile(
                 (
                     int(item["class_id"]),
                     str(item["class_name"])[:40],
+                    str(item.get("model_name") or "")[:80],
+                    str(item.get("model_object_type") or "")[:16],
                     float(item["confidence"]),
                     x,
                     y,
@@ -1065,6 +1078,8 @@ def write_shapefile(
     fields = (
         ("class_id", "N", 50, 0),
         ("class_nm", "C", 40, 0),
+        ("model_nm", "C", 80, 0),
+        ("obj_type", "C", 16, 0),
         ("conf", "F", 10, 4),
         ("x", "F", 18, 4),
         ("y", "F", 18, 4),
@@ -1136,6 +1151,8 @@ def write_pole_shapefile(
                     if item.get("class_id") is not None
                     else -1,
                     str(item.get("class_name") or "")[:40],
+                    str(item.get("model_name") or "")[:80],
+                    str(item.get("model_object_type") or "")[:16],
                     float(item.get("confidence") or 0.0),
                     x,
                     y,
@@ -1176,6 +1193,12 @@ def write_pole_shapefile(
                     else None,
                     str(item.get("classification_mode_requested") or "")[:8],
                     str(item.get("classification_mode") or "")[:10],
+                    str(item.get("pole_search_mode") or "")[:40],
+                    (
+                        bool(item.get("pole_fallback_used"))
+                        if item.get("pole_fallback_used") is not None
+                        else None
+                    ),
                     float(item["xy_spread_m"])
                     if item.get("xy_spread_m") is not None
                     else None,
@@ -1193,6 +1216,8 @@ def write_pole_shapefile(
     fields = (
         ("class_id", "N", 50, 0),
         ("class_nm", "C", 40, 0),
+        ("model_nm", "C", 80, 0),
+        ("obj_type", "C", 16, 0),
         ("conf", "F", 10, 4),
         ("x", "F", 18, 4),
         ("y", "F", 18, 4),
@@ -1219,6 +1244,8 @@ def write_pole_shapefile(
         ("cls_purity", "F", 10, 4),
         ("class_req", "C", 8, 0),
         ("class_mode", "C", 10, 0),
+        ("search_md", "C", 40, 0),
+        ("fallback", "L", 1, 0),
         ("xy_spread", "F", 10, 4),
         ("z_spread", "F", 10, 4),
         ("img_name", "C", 80, 0),

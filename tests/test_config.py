@@ -40,10 +40,10 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(configured["forward_view_hfov_deg"], 70.0)
         self.assertEqual(configured["forward_view_vfov_deg"], 70.0)
         self.assertEqual(configured["conf"], 0.8)
-        self.assertEqual(configured["max_center_ray_angle_deg"], 25.0)
+        self.assertEqual(configured["max_center_ray_angle_deg"], 45.0)
         self.assertTrue(configured["point_range_fallback_enabled"])
-        self.assertEqual(configured["point_range_fallback_max_range_m"], 15.0)
-        self.assertEqual(configured["point_range_fallback_min_point_count"], 60)
+        self.assertEqual(configured["point_range_fallback_max_range_m"], 20.0)
+        self.assertEqual(configured["point_range_fallback_min_point_count"], 50)
         self.assertEqual(
             configured["point_range_fallback_min_cluster_fraction"],
             0.80,
@@ -62,6 +62,8 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(configured["pole_min_consecutive_vertical_bins"], 4)
         self.assertEqual(configured["pole_max_observed_z_gap_m"], 1.0)
         self.assertEqual(configured["pole_max_drop_m"], 8.0)
+        self.assertTrue(configured["pole_range_fallback_enabled"])
+        self.assertEqual(configured["pole_fallback_max_drop_m"], 12.0)
         self.assertEqual(configured["pole_max_axis_sign_distance_m"], 8.0)
         self.assertEqual(configured["pole_direct_max_axis_sign_distance_m"], 0.75)
         self.assertEqual(configured["pole_min_horizontal_connection_coverage"], 0.50)
@@ -75,7 +77,20 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(configured["pole_min_ground_drop_m"], 1.8)
         self.assertEqual(configured["sign_observation_merge_xy_radius_m"], 0.25)
         self.assertTrue(configured["pole_require_ground"])
-        self.assertEqual(configured["data_root"], (PROJECT_ROOT / "data").resolve())
+        self.assertEqual(
+            configured["data_root"],
+            (
+                PROJECT_ROOT
+                / "data"
+                / "SEC006_마산교차로_하천리155-17_250903"
+            ).resolve(),
+        )
+        self.assertIsNone(configured["model_path"])
+        self.assertEqual(configured["model_dir"], (PROJECT_ROOT / "models").resolve())
+        self.assertEqual(
+            set(configured["model_filters"]),
+            {"traffic_sign_best.pt", "traffic_light_best.pt"},
+        )
 
     def test_no_argument_loads_default_yaml_and_cli_can_override_it(self) -> None:
         parser = build_arg_parser()
@@ -87,8 +102,13 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(args.conf, 0.61)
         self.assertEqual(args.limit_images, 2)
         self.assertTrue(args.require_calibration)
-        self.assertEqual(args.model_path, (PROJECT_ROOT / "best.pt").resolve())
+        self.assertIsNone(args.model_path)
+        self.assertEqual(args.model_dir, (PROJECT_ROOT / "models").resolve())
         self.assertEqual(args._config_path, str((PROJECT_ROOT / "config.yaml").resolve()))
+        self.assertEqual(
+            set(args._cli_override_dests),
+            {"conf", "limit_images"},
+        )
 
     def test_positional_config_path_is_supported_and_paths_are_config_relative(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

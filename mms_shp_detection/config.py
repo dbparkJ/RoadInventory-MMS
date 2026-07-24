@@ -69,6 +69,9 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "iou": (0, 1),
     "max_det": (1, None),
     "num_workers": (1, None),
+    "multi_model_inference_workers": (1, None),
+    "multi_model_pole_workers": (1, None),
+    "multi_model_queue_depth": (1, None),
     "pointcloud_neighbor_count": (1, None),
     "point_padding_px": (0, None),
     "debug_crop_padding_px": (0, None),
@@ -98,11 +101,22 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "start_index": (0, None),
     "limit_images": (0, None),
     "pole_min_fov_deg": (1, 180),
+    "pole_debug_min_fov_deg": (1, 180),
     "pole_corridor_side_expand_ratio": (0, None),
     "pole_corridor_top_margin_ratio": (0, None),
     "pole_search_radius_m": (0, None),
     "pole_max_drop_m": (0, None),
     "pole_top_margin_m": (0, None),
+    "pole_fallback_search_radius_m": (0, None),
+    "pole_fallback_max_drop_m": (0, None),
+    "pole_fallback_top_margin_m": (0, None),
+    "pole_fallback_max_axis_sign_distance_m": (0, None),
+    "pole_fallback_min_vertical_span_m": (0, None),
+    "pole_fallback_horizontal_connection_radius_m": (0, None),
+    "pole_fallback_horizontal_connection_z_tolerance_m": (0, None),
+    "pole_fallback_horizontal_connection_above_tolerance_m": (0, None),
+    "pole_fallback_horizontal_connection_bin_m": (0, None),
+    "pole_fallback_min_horizontal_connection_coverage": (0, 1),
     "pole_xy_voxel_m": (0, None),
     "pole_z_bin_m": (0, None),
     "pole_axis_cluster_radius_m": (0, None),
@@ -125,6 +139,7 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "pole_max_axis_sign_distance_m": (0, None),
     "pole_horizontal_connection_radius_m": (0, None),
     "pole_horizontal_connection_z_tolerance_m": (0, None),
+    "pole_horizontal_connection_above_tolerance_m": (0, None),
     "pole_horizontal_connection_bin_m": (0, None),
     "pole_horizontal_connection_min_points_per_bin": (1, None),
     "pole_min_horizontal_connection_coverage": (0, 1),
@@ -159,7 +174,12 @@ def _flatten_config(
             raise ConfigError("YAML configuration keys must be non-empty strings.")
         key = raw_key.strip().replace("-", "_")
         path = (*prefix, key)
-        if isinstance(item, dict):
+        # Model filters are intentionally an opaque mapping.  Their nested
+        # leaves reuse normal pipeline option names (for example ``conf`` and
+        # ``pole_max_drop_m``) once per model, so flattening them here would
+        # incorrectly report duplicate global options.  The pipeline validates
+        # and applies this mapping after a concrete model has been selected.
+        if isinstance(item, dict) and path != ("model_filters",):
             leaves.extend(_flatten_config(item, prefix=path))
         else:
             leaves.append((path, item))
@@ -233,6 +253,12 @@ def _validate_range(dest: str, value: Any, dotted_key: str) -> None:
         raise ConfigError(f"'{dotted_key}' must be at least {lower}; received {value!r}.")
     if upper is not None and value > upper:
         raise ConfigError(f"'{dotted_key}' must be at most {upper}; received {value!r}.")
+
+
+def validate_config_value(dest: str, value: Any, dotted_key: str) -> None:
+    """Validate one already-converted option against the shared numeric ranges."""
+
+    _validate_range(dest, value, dotted_key)
 
 
 def load_config_defaults(
@@ -423,10 +449,19 @@ def parse_args_with_config(
     except ConfigError as exc:
         parser.error(str(exc))
 
+    option_actions = getattr(parser, "_option_string_actions", {})
+    cli_override_dests = {
+        action.dest
+        for token in remaining
+        if token.startswith("-")
+        for action in [option_actions.get(token.split("=", 1)[0])]
+        if action is not None and action.dest not in {argparse.SUPPRESS, "help"}
+    }
     args = parser.parse_args(remaining)
     # Private metadata is excluded from processing fingerprints and is useful
     # only for the run log/effective configuration snapshot.
     args._config_path = str(config_path.resolve()) if config_path is not None else None
+    args._cli_override_dests = tuple(sorted(cli_override_dests))
     return args
 
 

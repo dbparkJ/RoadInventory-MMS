@@ -68,6 +68,27 @@ def _horizontal_arm(
     return np.asarray(rows, dtype=np.float64)
 
 
+def _rising_arm(
+    x_start: float,
+    x_end: float,
+    y: float,
+    z_start: float,
+    z_end: float,
+) -> np.ndarray:
+    rows: list[list[float]] = []
+    for fraction in np.linspace(0.0, 1.0, 100):
+        x = x_start + ((x_end - x_start) * fraction)
+        z = z_start + ((z_end - z_start) * fraction)
+        rows.extend(
+            (
+                [x, y - 0.02, z],
+                [x, y, z + 0.02],
+                [x, y + 0.02, z - 0.02],
+            )
+        )
+    return np.asarray(rows, dtype=np.float64)
+
+
 class PoleSearchTests(unittest.TestCase):
     def test_rank_balances_remote_arm_length_with_shaft_quality(self) -> None:
         parameters = PoleSearchParameters()
@@ -482,6 +503,46 @@ class PoleSearchTests(unittest.TestCase):
             0.9,
         )
 
+    def test_signal_profile_accepts_a_connected_arm_rising_above_detection(self) -> None:
+        pole = _pole_surface(2.5, 0.0, 0.08, 6.2, seed=159)
+        arm = _rising_arm(0.0, 2.5, 0.0, 5.0, 6.2)
+        ground = _ground_surface(2.5, 0.0)
+        neighborhood = np.vstack((pole, arm, ground))
+        corridor = np.zeros(neighborhood.shape[0], dtype=bool)
+        corridor[: pole.shape[0] + arm.shape[0]] = True
+        classifications = np.concatenate(
+            (
+                np.full(pole.shape[0] + arm.shape[0], 84, dtype=np.int16),
+                np.full(ground.shape[0], 2, dtype=np.int16),
+            )
+        )
+        sign_xyz = np.asarray([0.0, 0.0, 5.0])
+
+        strict = find_pole_bases(
+            neighborhood,
+            corridor,
+            sign_xyz,
+            PoleSearchParameters(),
+            classifications,
+        )
+        signal = find_pole_bases(
+            neighborhood,
+            corridor,
+            sign_xyz,
+            PoleSearchParameters(
+                horizontal_connection_above_tolerance_m=1.5,
+            ),
+            classifications,
+        )
+
+        self.assertIsNone(strict)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertGreaterEqual(
+            signal.candidates[0].horizontal_connection_coverage_ratio or 0.0,
+            0.9,
+        )
+
     def test_geometry_mode_does_not_starve_pole_in_large_clutter_component(self) -> None:
         pole = _pole_surface(0.52, 0.0, 0.08, 4.9, seed=152)
         clutter_rows: list[list[float]] = []
@@ -784,8 +845,31 @@ class PoleSearchTests(unittest.TestCase):
     def test_adjacent_frame_observations_are_merged(self) -> None:
         common = {"record_name": "Job_A_Track01", "class_id": 65, "confidence": 0.9}
         observations = [
-            {**common, "image_name": "a.jpg", "pole_x": 10.0, "pole_y": 20.0, "pole_z": 1.0, "pole_quality": 0.9, "pole_status": "AUTO"},
-            {**common, "image_name": "b.jpg", "pole_x": 10.2, "pole_y": 20.1, "pole_z": 1.1, "pole_quality": 0.8, "pole_status": "AUTO", "pole_occluded": True},
+            {
+                **common,
+                "image_name": "a.jpg",
+                "pole_x": 10.0,
+                "pole_y": 20.0,
+                "pole_z": 1.0,
+                "pole_quality": 0.9,
+                "pole_status": "AUTO",
+                "pole_search_mode": "strict",
+                "pole_fallback_attempted": False,
+                "pole_fallback_used": False,
+            },
+            {
+                **common,
+                "image_name": "b.jpg",
+                "pole_x": 10.2,
+                "pole_y": 20.1,
+                "pole_z": 1.1,
+                "pole_quality": 0.8,
+                "pole_status": "AUTO",
+                "pole_occluded": True,
+                "pole_search_mode": "physical_fallback_remote_expanded",
+                "pole_fallback_attempted": True,
+                "pole_fallback_used": True,
+            },
             {**common, "image_name": "c.jpg", "pole_x": 30.0, "pole_y": 40.0, "pole_z": 2.0, "pole_quality": 0.7, "pole_status": "REVIEW"},
         ]
         merged = cluster_pole_observations(observations, radius_m=0.75)
@@ -798,6 +882,11 @@ class PoleSearchTests(unittest.TestCase):
         self.assertEqual(first["occluded_count"], 1)
         self.assertEqual(first["pole_status"], "AUTO")
         self.assertEqual(first["pole_method"], "MULTI_FRAME")
+        self.assertEqual(first["pole_search_mode"], "MIXED")
+        self.assertTrue(first["pole_fallback_attempted"])
+        self.assertEqual(first["pole_fallback_attempted_count"], 1)
+        self.assertTrue(first["pole_fallback_used"])
+        self.assertEqual(first["pole_fallback_used_count"], 1)
 
     def test_different_sign_classes_on_same_support_repeat_the_support_point(self) -> None:
         observations = [

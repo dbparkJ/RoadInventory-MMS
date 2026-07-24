@@ -1335,8 +1335,24 @@ class PointCloudReaderCache:
         return xyz, raw["rgb"].copy(), raw["intensity"].copy()
 
     def _read_las(self, path: str, start: int, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        records = self._read_las_records(path, start, count)
-        return records["xyz"], records["rgb"], records["intensity"]
+        if start < 0 or count < 0:
+            raise ValueError("LAS block start and count must be non-negative")
+        if count == 0:
+            return _empty_points()
+        reader = self._las_reader(path)
+        reader.seek(start)
+        points = reader.read_points(count)
+        xyz = _xyz_from_las_points(points)
+        rgb = _rgb8_from_las(points)
+        dimension_names = {
+            str(name).casefold() for name in points.point_format.dimension_names
+        }
+        intensity = (
+            np.asarray(points.intensity, dtype=np.uint16).copy()
+            if "intensity" in dimension_names
+            else np.zeros((len(points),), dtype=np.uint16)
+        )
+        return xyz, rgb, intensity
 
     def _read_las_records(self, path: str, start: int, count: int) -> dict[str, np.ndarray]:
         if start < 0 or count < 0:
@@ -1432,8 +1448,32 @@ class PointCloudReaderCache:
         ``(path, block_name)`` calling styles are accepted.
         """
 
-        records = self.read_block_records(pointcloud, block)
-        return records["xyz"], records["rgb"], records["intensity"]
+        if isinstance(pointcloud, dict):
+            path = str(pointcloud["path"])
+            source_type = str(
+                pointcloud.get("source_type") or pointcloud.get("format") or ""
+            ).casefold()
+        else:
+            path = str(pointcloud)
+            source_type = Path(path).suffix.casefold().lstrip(".")
+
+        if isinstance(block, dict):
+            block_name = str(block.get("name", ""))
+            source_type = str(block.get("source_type") or source_type).casefold()
+            start = block.get("start")
+            count = block.get("count", block.get("point_count"))
+        else:
+            block_name = str(block)
+            start = None
+            count = None
+
+        if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
+            return self._read_pcdb(path, block_name)
+        if source_type == "las" or Path(path).suffix.casefold() == ".las":
+            if start is None or count is None:
+                start, count = _parse_las_block_name(block_name)
+            return self._read_las(path, int(start), int(count))
+        raise ValueError(f"Unsupported point-cloud source type for {path}")
 
     def read_block_records(
         self,

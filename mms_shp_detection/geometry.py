@@ -417,8 +417,9 @@ def perspective_pixel_to_world_ray(
     return normalize(ray)
 
 
-def render_perspective_view_from_panorama(
-    image_rgb: np.ndarray,
+def build_perspective_panorama_remap(
+    source_width: int,
+    source_height: int,
     pano_forward_vec: np.ndarray,
     pano_right_vec: np.ndarray,
     pano_up_vec: np.ndarray,
@@ -429,10 +430,11 @@ def render_perspective_view_from_panorama(
     output_height: int,
     hfov_deg: float,
     vfov_deg: float,
-) -> np.ndarray:
-    """Render a rectified perspective image from a 360 equirectangular panorama."""
-    import cv2
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build reusable float32 equirectangular remap grids for one view."""
 
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("Panorama source dimensions must be positive")
     x_coords = np.arange(output_width, dtype=np.float64)
     y_coords = np.arange(output_height, dtype=np.float64)
     grid_x, grid_y = np.meshgrid(x_coords, y_coords)
@@ -456,10 +458,47 @@ def render_perspective_view_from_panorama(
     lon = np.arctan2(local_pano_x, local_pano_z)
     lat = np.arcsin(local_pano_y)
 
-    source_width = image_rgb.shape[1]
-    source_height = image_rgb.shape[0]
     pano_u = (((lon / (2.0 * math.pi)) + 0.5) * source_width).astype(np.float32)
     pano_v = ((0.5 - (lat / math.pi)) * source_height).astype(np.float32)
+    return pano_u, pano_v
+
+
+def render_perspective_view_from_panorama(
+    image_rgb: np.ndarray,
+    pano_forward_vec: np.ndarray,
+    pano_right_vec: np.ndarray,
+    pano_up_vec: np.ndarray,
+    view_forward_vec: np.ndarray,
+    view_right_vec: np.ndarray,
+    view_up_vec: np.ndarray,
+    output_width: int,
+    output_height: int,
+    hfov_deg: float,
+    vfov_deg: float,
+    *,
+    remap_xy: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Render a rectified perspective image from a 360 equirectangular panorama."""
+    import cv2
+
+    if remap_xy is None:
+        remap_xy = build_perspective_panorama_remap(
+            image_rgb.shape[1],
+            image_rgb.shape[0],
+            pano_forward_vec,
+            pano_right_vec,
+            pano_up_vec,
+            view_forward_vec,
+            view_right_vec,
+            view_up_vec,
+            output_width,
+            output_height,
+            hfov_deg,
+            vfov_deg,
+        )
+    pano_u, pano_v = remap_xy
+    if pano_u.shape != (output_height, output_width) or pano_v.shape != pano_u.shape:
+        raise ValueError("Perspective remap grids do not match the requested output size")
 
     return cv2.remap(
         image_rgb,

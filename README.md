@@ -27,7 +27,7 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 |---|---|
 | `run_pipeline.py` | YAML 설정으로 전체 파이프라인 실행 |
 | `config.yaml` | 기본 실행 설정과 모든 옵션의 한국어 설명 |
-| `best.pt` | YOLO detection/segmentation 가중치 |
+| `models/*.pt` | 자동 발견되는 YOLO detection/segmentation 가중치 |
 | `extract_calibration.py` | Pegasus DB에서 카메라·LiDAR 보정 snapshot 추출 |
 | `export_calibration_values.py` | 보정 snapshot에서 숫자·단위만 JSON/CSV로 내보내기 |
 | `calibration_values.yaml` | 값 전용 보정 내보내기 입력·출력 설정 |
@@ -123,11 +123,14 @@ input:
 paths:
   data_root: data
   calibration_path: calibration.json
-  model_path: best.pt
-  output_dir: outputs_ver5
+  model_path: null
+  model_dir: models
+  output_dir: outputs_Neo700_models
 ```
 
-새 `best.pt`로 교체하면 모델 SHA-256이 실행 fingerprint에 포함되므로 `skip_existing: true`여도 이전 결과를 재사용하지 않고 다시 처리합니다.
+`model_dir` 바로 아래의 모든 `.pt`를 파일명 순으로 선택합니다. 기본 설정은 모델별 추론을 병렬 실행하며, `execution.multi_model_parallel: false`로 바꾸면 같은 목록을 순차 실행합니다. 두 모드 모두 각 모델은 `model_filters`에 파일명 또는 stem과 정확히 일치하는 프로필이 있어야 하므로, 표지판과 신호등의 거리·점군·지주 필터가 섞이지 않습니다. 모델 SHA-256이 실행 fingerprint에 포함되므로 모델을 교체하면 `skip_existing: true`여도 해당 모델 결과를 다시 처리합니다.
+
+명시적으로 전달한 CLI 필터는 해당 모델 프로필보다 우선합니다. 예를 들어 `--max-range-m 18`은 발견된 모든 모델의 프로필 값보다 우선하므로, 모델별 기본값을 유지하려면 별도 CLI override 없이 실행하십시오. strict/fallback 거리처럼 서로 제약되는 값은 두 옵션을 함께 조정해야 합니다.
 
 ### 2. 가상환경 자동 구성
 
@@ -285,23 +288,27 @@ resume_and_scope:
 
 | 키 | 현재 예시값 | 용도/조정 기준 |
 |---|---:|---|
+| `paths.model_dir` | `models` | 폴더 바로 아래의 모든 `.pt`를 자동 실행 |
+| `model_filters.<model>` | 모델별 설정 | 모델마다 `object_type`, 점군, 지주 필터를 독립 적용 |
 | `yolo.imgsz` | `1280` | 작은 표지 누락 시 GPU 메모리를 확인하며 증가 |
 | `yolo.conf` | `0.8` | 누락이 많으면 낮추고 오검출이 많으면 높임 |
 | `panorama_detection.detection_view_mode` | `forward` | 전방 표지는 왜곡을 편 정면 view 권장 |
 | `forward_view_hfov_deg`, `forward_view_vfov_deg` | `70`, `70` | 정사각 입력에서 두 값을 같게 유지해 비율 왜곡 방지 |
-| `point_matching.max_center_ray_angle_deg` | `25` | 최종 좌표로 채택할 차량 전방 중심각 |
-| `point_matching.max_range_m` | `12` | 카메라에서 점까지 허용하는 최대 거리 |
+| `point_matching.max_center_ray_angle_deg` | `45` | 최종 좌표로 채택할 차량 전방 중심각 |
+| `point_matching.max_range_m` | `15` | 카메라에서 점까지 허용하는 기본 최대 거리 |
 | `point_matching.point_range_fallback_enabled` | `true` | strict 범위의 mask 점이 0개일 때만 제한적 거리 재탐색 |
-| `point_matching.point_range_fallback_max_range_m` | `15` | no-points 재탐색 최대 거리; 일반 탐색 거리에는 영향 없음 |
-| `point_matching.point_range_fallback_min_point_count` | `60` | 품질 gate를 모두 통과한 fallback 단일 군집의 최소점 |
+| `point_matching.point_range_fallback_max_range_m` | `20` | no-points 재탐색 최대 거리; 일반 탐색 거리에는 영향 없음 |
+| `point_matching.point_range_fallback_min_point_count` | `50` | 품질 gate를 모두 통과한 fallback 단일 군집의 최소점 |
 | `point_matching.point_range_fallback_min_cluster_fraction` | `0.80` | 전방 깊이점 중 선택 단일 군집이 차지해야 하는 최소 비율 |
 | `point_matching.point_range_fallback_min_core_mask_fraction` | `0.45` | fallback 군집 중 원본 비팽창 mask 내부 점의 최소 비율 |
 | `point_matching.point_range_fallback_max_depth_span_m` | `0.50` | fallback 군집 거리의 5~95% 분위수 폭 최대값 |
 | `point_matching.min_point_count` | `100` | 이보다 점이 적은 검출은 SHP에서 제외 |
 | `pole_detection.pole_detection` | `true` | 지주 탐색 전체 기능 on/off |
-| `pole_classification_mode` | `auto` | LAS class 자동 사용(`auto`), 완전 무시(`off`), 필수 검증(`require`) |
+| `pole_classification_mode` | `off` | LAS class 자동 사용(`auto`), 완전 무시(`off`), 필수 검증(`require`) |
 | `pole_direct_max_axis_sign_distance_m` | `0.75` | 표지에 직접 붙은 지주의 최대 수평 연관 거리 |
 | `pole_max_axis_sign_distance_m` | `8.0` | 수평 암 검증을 거치는 원격 지주의 최대 거리 |
+| `pole_range_fallback_enabled` | `true` | strict 지주 실패 시 더 넓은 물리 XY/Z 범위로 한 번 재탐색 |
+| `pole_fallback_search_radius_m`, `pole_fallback_max_drop_m` | `10`, `12` | 8m 초과 지주용 2차 탐색 반경과 하강 높이 |
 | `pole_min_horizontal_connection_coverage` | `0.50` | 원격 지주까지 실제 연결봉이 채운 구간 비율 |
 | `pole_preferred_min_completeness_ratio` | `0.75` | 짧은 가장자리보다 지면~표지 높이를 충분히 관측한 전체 지주축 우선 |
 | `pole_geometry_ground_clearance_m` | `0.20` | class가 없을 때 저점 지면대의 점을 축 후보에서만 제거; `0`이면 해제 |
@@ -310,7 +317,7 @@ resume_and_scope:
 | `pole_geometry_remote_max_ground_rmse_m` | `0.15` | class 없는 원격 지주의 최대 지면 평면 오차(m) |
 | `pole_require_ground` | `true` | 신뢰 가능한 지면이 없으면 지주 하단점 보류 |
 | `debug_output.debug_mask_alpha` | `8` | 표지가 보이도록 검출 mask 채움 투명도 조정, 선만 보려면 0 |
-| `execution.num_workers` | `2` | CPU는 병렬 가능, 단일 GPU는 실질적으로 1부터 권장 |
+| `execution.num_workers` | `1` | CPU는 병렬 가능, 단일 GPU는 실질적으로 1부터 권장 |
 | `resume_and_scope.skip_existing` | `true` | fingerprint와 산출물이 모두 일치하는 프레임만 재사용 |
 
 단일 GPU에서 여러 worker가 같은 `cuda:0`을 공유하면 메모리 충돌이 날 수 있습니다. `allow_unsafe_cuda_multiprocessing: false`이면 요청값이 2 이상이어도 런타임이 안전하게 1개 worker로 낮춥니다.
@@ -394,27 +401,34 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 ## 출력과 검수
 
-`paths.output_dir` 아래에 다음 구조가 생성됩니다.
+`paths.model_dir`를 사용하면 `paths.output_dir` 아래에 모델별로 완전히 분리된 구조가 생성됩니다. 단일 `model_path` 호환 모드에서는 아래 `<model_stem>/` 단계 없이 기존 구조를 그대로 사용합니다.
+
+`execution.multi_model_parallel: true`이면 데이터 스캔·점군 카탈로그·정렬 QA를 한 번만 준비하고, 프레임도 한 번만 디코드하여 공통 정면뷰를 생성합니다. 각 모델은 같은 무표시 RGB 배열로 동시에 추론하며, 결과는 모델별 bounded queue로 넘겨져 점군/지주 후처리와 다음 프레임 GPU 추론이 겹쳐 실행됩니다. `multi_model_pole_workers: 1`은 대용량 지주 검색을 도착 순서 FIFO로 직렬화해 대기 중인 모델의 요청이 끼어들 수 있게 하고 메모리 피크를 제한합니다. 동시 CUDA 추론에서 OOM이 발생하면 해당 프레임을 직렬로 다시 실행하고 이후 동시성을 자동으로 1로 낮춥니다. 직렬 재시도도 OOM이면 해당 모델만 남은 프레임에서 중단하고 다른 모델은 계속 진행합니다.
 
 ```text
 <output_dir>/
-  forward_views/<job_track>/*.jpg       # 정면 YOLO 입력 QA 사본
-  image_crops/<job_track>/*.jpg         # bbox/mask/대표점/선택점 검수
-  point_crops/<job_track>/*.las         # 표지 선택점 파생 LAS
-  point_previews/<job_track>/*.png      # 정면·상면·측면 점군 미리보기
-  pole_crops/<job_track>/*.las          # 지주 축 inlier 파생 LAS
-  pole_debug/<job_track>/*.jpg          # 표지+지주+축+지면 근거 통합 영상
-  txt/<job_track>/*.txt                 # 프레임별 JSON 결과와 provenance
-  shp/
-    detected_signs.{shp,shx,dbf,prj,cpg,qpj,wkt2}
-    pole_bottoms.{shp,shx,dbf,prj,cpg,qpj,wkt2}
-    .mms_shp_publish.lock
+  models_manifest.json                   # 전체 모델 실행 상태·프로필·출력 위치
+  forward_views/<job_track>/*.jpg        # 모든 모델이 공유하는 정면 YOLO 입력 QA
   logs/
-    run.log
-    workers/*.log
-    effective_config.json
-    pole_classification_policy.json
-    panorama_alignment_qa.json
+    orchestrator.log                     # 공통 준비·프레임 생산 로그
+    performance.json                     # 단계별 시간·큐 대기·실제 동시 실행 수
+    panorama_alignment_qa.json            # 모델 간 공유하는 정렬 QA
+  <model_stem>/
+    image_crops/<job_track>/*.jpg        # bbox/mask/대표점/선택점 검수
+    point_crops/<job_track>/*.las        # 검출 객체 선택점 파생 LAS
+    point_previews/<job_track>/*.png     # 정면·상면·측면 점군 미리보기
+    pole_crops/<job_track>/*.las         # 지주 축 inlier 파생 LAS
+    pole_debug/<job_track>/*.jpg         # 객체+지주+축+지면 근거 통합 영상
+    txt/<job_track>/*.txt                # 프레임별 JSON 결과와 provenance
+    shp/
+      detected_signs.{shp,shx,dbf,prj,cpg,qpj,wkt2}
+      pole_bottoms.{shp,shx,dbf,prj,cpg,qpj,wkt2}
+      .mms_shp_publish.lock
+    logs/
+      run.log
+      workers/*.log
+      effective_config.json
+      pole_classification_policy.json
 ```
 
 ### 콘솔과 로그
@@ -436,9 +450,9 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 | green | 최종 지주 하단점 |
 | blue 점·hull | 지면 평면 계산에 실제 사용된 셀 |
 
-표지 중심 crop에서 하단이나 지면 근거가 잘리면 결과의 표지·축·하단·지면 셀을 포함하는 적응형 perspective로 디버그 영상을 다시 구성합니다. 영상에는 탐색 corridor를 그리고, 상단에는 축 완전도(`complete`), 관측 span, 연결 coverage, 연관 거리, 유효 return 중 multi-return 비율, 지면 방법/셀 수/RMSE/Z가 기록됩니다.
+지주를 찾은 뒤의 `pole_debug`는 탐색용 광시야각과 분리됩니다. `pole_debug_min_fov_deg`를 하한으로 사용해 검출 객체, 지주 관측 상단, 축, 하단점과 지면 근거만 포함하도록 다시 프레이밍하므로 카메라 차체보다 지주 전체가 화면을 크게 차지합니다. 지주를 찾지 못한 경우에만 원인 검수를 위해 기존 광시야 탐색 영상을 유지합니다. 영상에는 탐색 corridor를 그리고, 상단에는 축 완전도(`complete`), 관측 span, 연결 coverage, 연관 거리, 유효 return 중 multi-return 비율, 지면 방법/셀 수/RMSE/Z가 기록됩니다.
 
-`forward_views`는 YOLO에 실제 들어간 정면 영상과 동일 픽셀의 QA 복사본입니다. cyan은 진행 중심축, orange는 최종 `max_center_ray_angle_deg` 경계입니다. 이 선들은 QA 파일에만 그리며 YOLO 입력에는 포함되지 않습니다.
+`forward_views`는 YOLO에 실제 들어간 정면 영상과 동일 픽셀의 QA 복사본이며 멀티 모델 실행에서는 최상위 폴더의 파일 하나를 모든 모델이 공유합니다. 고정된 정면 remap grid도 메모리에 캐시하여 프레임마다 광선·삼각함수를 다시 계산하지 않습니다. cyan은 진행 중심축, orange는 최종 `max_center_ray_angle_deg` 경계입니다. 이 선들은 QA 파일에만 그리며 YOLO 입력에는 포함되지 않습니다.
 
 ### SHP 연결 키와 좌표계
 
@@ -452,6 +466,8 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 - `complete`: 중간부 지지율과 관측 높이 비율 중 작은 값인 지주축 완전도
 - `class_req`, `class_mode`: 요청한 class 정책(`auto/off/require`)과 실제 계산 방식(`HYBRID/GEOMETRY`)
 - `assoc_m`, `arm_cov`, `axis_rmse`, `grnd_rmse`: 지주 선택 근거와 품질
+- `model_nm`, `obj_type`: 해당 행을 만든 모델 파일명과 객체 유형
+- `search_md`, `fallback`: 지주 strict/fallback 탐색 방식과 물리 fallback 사용 여부
 
 Shapefile 형식은 `.shp` 파일 내부에 CRS를 저장하지 않습니다. 전달·복사할 때 같은 basename의 파일을 모두 한 묶음으로 유지해야 합니다.
 

@@ -38,6 +38,7 @@ class PoleSearchParameters:
     max_axis_sign_distance_m: float = 8.0
     horizontal_connection_radius_m: float = 0.25
     horizontal_connection_z_tolerance_m: float = 0.30
+    horizontal_connection_above_tolerance_m: float = 0.30
     horizontal_connection_bin_m: float = 0.25
     horizontal_connection_min_points_per_bin: int = 2
     min_horizontal_connection_coverage: float = 0.50
@@ -90,6 +91,9 @@ class PoleSearchParameters:
             "horizontal_connection_radius_m": self.horizontal_connection_radius_m,
             "horizontal_connection_z_tolerance_m": (
                 self.horizontal_connection_z_tolerance_m
+            ),
+            "horizontal_connection_above_tolerance_m": (
+                self.horizontal_connection_above_tolerance_m
             ),
             "horizontal_connection_bin_m": self.horizontal_connection_bin_m,
         }
@@ -402,8 +406,12 @@ def _horizontal_connection_coverage(
         & (along <= distance)
         & (perpendicular <= parameters.horizontal_connection_radius_m)
         & (
-            np.abs(points_xyz[:, 2] - float(sign_xyz[2]))
-            <= parameters.horizontal_connection_z_tolerance_m
+            points_xyz[:, 2]
+            >= float(sign_xyz[2]) - parameters.horizontal_connection_z_tolerance_m
+        )
+        & (
+            points_xyz[:, 2]
+            <= float(sign_xyz[2]) + parameters.horizontal_connection_above_tolerance_m
         )
     )
     if classifications is not None and parameters.ground_class_ids:
@@ -551,13 +559,24 @@ def _fit_local_ground_hypothesis(
     cells = np.floor(
         (ground_points[:, :2] - pole_xy[None, :]) / parameters.ground_cell_size_m
     ).astype(np.int64)
-    cell_samples: list[np.ndarray] = []
-    for cell in np.unique(cells, axis=0):
-        cell_mask = np.all(cells == cell[None, :], axis=1)
-        cell_points = ground_points[cell_mask]
-        cell_quantile = (
-            0.50 if method.startswith("classified") else parameters.ground_cell_quantile
+    _unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    ordered_groups = inverse[order]
+    group_starts = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(np.diff(ordered_groups)) + 1,
         )
+    )
+    group_ends = np.concatenate(
+        (group_starts[1:], np.asarray([order.size], dtype=np.int64))
+    )
+    cell_quantile = (
+        0.50 if method.startswith("classified") else parameters.ground_cell_quantile
+    )
+    cell_samples: list[np.ndarray] = []
+    for start, end in zip(group_starts, group_ends):
+        cell_points = ground_points[order[int(start):int(end)]]
         cell_samples.append(
             np.asarray(
                 [
@@ -1455,6 +1474,26 @@ def cluster_pole_observations(
                 merged_occluded = False
             else:
                 merged_occluded = None
+            fallback_attempted_count = sum(
+                bool(item.get("pole_fallback_attempted"))
+                for item in unique_members
+            )
+            fallback_used_count = sum(
+                bool(item.get("pole_fallback_used"))
+                for item in unique_members
+            )
+            search_modes = {
+                str(item.get("pole_search_mode") or "").strip()
+                for item in unique_members
+                if str(item.get("pole_search_mode") or "").strip()
+            }
+            aggregate_search_mode = (
+                next(iter(search_modes))
+                if len(search_modes) == 1
+                else "MIXED"
+                if search_modes
+                else ""
+            )
             detection_ids: list[str] = []
             for member_index, member in enumerate(members):
                 detection_id = str(member.get("detection_id") or "")
@@ -1508,6 +1547,11 @@ def cluster_pole_observations(
                 if len(unique_members) > 1
                 else str(best.get("pole_method") or ""),
                 "pole_status": "AUTO" if all_auto and len(pole_types) == 1 else "REVIEW",
+                "pole_search_mode": aggregate_search_mode,
+                "pole_fallback_attempted": fallback_attempted_count > 0,
+                "pole_fallback_attempted_count": fallback_attempted_count,
+                "pole_fallback_used": fallback_used_count > 0,
+                "pole_fallback_used_count": fallback_used_count,
                 "xy_spread_m": float(
                     np.sqrt(
                         np.average(
