@@ -18,7 +18,15 @@ from typing import Callable, Iterable, Optional, Sequence
 
 
 REQUIRED_PYTHON = (3, 12)
-REQUIRED_CUDA_RUNTIME = (11, 8)
+SUPPORTED_HOST_MACHINES = {
+    "Windows": {"amd64", "x86_64"},
+    "Linux": {"amd64", "x86_64"},
+}
+PYTORCH_PACKAGES = (
+    ("torch", "2.7.1"),
+    ("torchvision", "0.22.1"),
+    ("torchaudio", "2.7.1"),
+)
 PYTHON_PROBE = (
     "import json,platform,struct,sys;"
     "print(json.dumps({"
@@ -63,6 +71,34 @@ class NvidiaInfo:
     gpus: tuple[GpuInfo, ...]
     max_cuda_version: Optional[tuple[int, int]]
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TorchRuntime:
+    tag: str
+    cuda_version: Optional[tuple[int, int]]
+
+    @property
+    def index_url(self) -> str:
+        return f"https://download.pytorch.org/whl/{self.tag}"
+
+    @property
+    def cuda_version_text(self) -> str:
+        if self.cuda_version is None:
+            return "none"
+        return ".".join(str(value) for value in self.cuda_version)
+
+
+CUDA_TORCH_RUNTIMES = (
+    TorchRuntime("cu128", (12, 8)),
+    TorchRuntime("cu126", (12, 6)),
+    TorchRuntime("cu118", (11, 8)),
+)
+CPU_TORCH_RUNTIME = TorchRuntime("cpu", None)
+TORCH_RUNTIME_BY_TAG = {
+    runtime.tag: runtime for runtime in (*CUDA_TORCH_RUNTIMES, CPU_TORCH_RUNTIME)
+}
+TORCH_RUNTIME_CHOICES = ("auto", *TORCH_RUNTIME_BY_TAG)
 
 
 @dataclass(frozen=True)
@@ -170,6 +206,19 @@ def validate_python(info: PythonInfo, *, context: str) -> None:
     if info.bits != 64:
         raise BootstrapError(
             f"{context} must use 64-bit Python for PyTorch CUDA, but found {info.bits}-bit."
+        )
+
+
+def validate_host_platform(*, system_name: str, machine: str) -> None:
+    supported_machines = SUPPORTED_HOST_MACHINES.get(system_name)
+    if supported_machines is None:
+        raise BootstrapError(
+            f"Unsupported operating system {system_name!r}; use x86-64 Windows or Linux."
+        )
+    if machine.strip().lower() not in supported_machines:
+        raise BootstrapError(
+            f"Unsupported host architecture {machine!r} on {system_name}; "
+            "the locked PyTorch wheel matrix supports x86-64 Windows and Linux."
         )
 
 
@@ -344,25 +393,77 @@ def detect_nvcc_version(
     return match.group(1) if match else "present (version not parsed)"
 
 
-def select_execution_mode(nvidia: NvidiaInfo, *, allow_cpu: bool) -> str:
+def _cuda_runtime_unavailable_reason(
+    nvidia: NvidiaInfo,
+    *,
+    required_cuda: tuple[int, int],
+) -> Optional[str]:
     reason: Optional[str] = None
     if not nvidia.gpus:
         reason = nvidia.error or "no NVIDIA GPU was reported"
     elif nvidia.max_cuda_version is None:
         reason = "nvidia-smi did not report its driver-supported CUDA version"
-    elif nvidia.max_cuda_version < REQUIRED_CUDA_RUNTIME:
-        required = ".".join(str(value) for value in REQUIRED_CUDA_RUNTIME)
+    elif nvidia.max_cuda_version < required_cuda:
+        required = ".".join(str(value) for value in required_cuda)
         actual = ".".join(str(value) for value in nvidia.max_cuda_version)
         reason = f"the NVIDIA driver supports CUDA {actual}, below required CUDA {required}"
+    return reason
 
-    if reason is None:
-        return "cuda"
+
+def select_torch_runtime(
+    nvidia: NvidiaInfo,
+    *,
+    requested_runtime: str,
+    allow_cpu: bool,
+) -> TorchRuntime:
+    if requested_runtime not in TORCH_RUNTIME_CHOICES:
+        choices = ", ".join(TORCH_RUNTIME_CHOICES)
+        raise BootstrapError(
+            f"Unknown PyTorch runtime {requested_runtime!r}; choose one of: {choices}."
+        )
+
+    if requested_runtime == CPU_TORCH_RUNTIME.tag:
+        return CPU_TORCH_RUNTIME
+
+    if requested_runtime != "auto":
+        selected = TORCH_RUNTIME_BY_TAG[requested_runtime]
+        assert selected.cuda_version is not None
+        reason = _cuda_runtime_unavailable_reason(
+            nvidia,
+            required_cuda=selected.cuda_version,
+        )
+        if reason is not None:
+            raise BootstrapError(
+                f"Requested PyTorch runtime {selected.tag} is incompatible: {reason}. "
+                "Choose auto, a compatible lower CUDA runtime, or cpu."
+            )
+        return selected
+
+    if nvidia.gpus and nvidia.max_cuda_version is not None:
+        for candidate in CUDA_TORCH_RUNTIMES:
+            assert candidate.cuda_version is not None
+            if nvidia.max_cuda_version >= candidate.cuda_version:
+                return candidate
+
+    minimum_cuda = CUDA_TORCH_RUNTIMES[-1].cuda_version
+    assert minimum_cuda is not None
+    reason = _cuda_runtime_unavailable_reason(nvidia, required_cuda=minimum_cuda)
     if allow_cpu:
-        return "cpu-fallback"
+        return CPU_TORCH_RUNTIME
     raise BootstrapError(
         f"CUDA preflight failed: {reason}. CPU fallback is disabled by default; "
-        "pass --allow-cpu explicitly to create/verify a CPU-capable environment."
+        "pass --allow-cpu explicitly or select --torch-runtime cpu."
     )
+
+
+def select_execution_mode(nvidia: NvidiaInfo, *, allow_cpu: bool) -> str:
+    """Backward-compatible execution-mode helper used by external callers."""
+    runtime = select_torch_runtime(
+        nvidia,
+        requested_runtime="auto",
+        allow_cpu=allow_cpu,
+    )
+    return "cuda" if runtime.cuda_version is not None else "cpu-fallback"
 
 
 def venv_python_path(venv_dir: Path, *, system_name: Optional[str] = None) -> Path:
@@ -388,7 +489,7 @@ def build_command_plan(
     requirements_path: Path,
     verify_script: Path,
     create_venv: bool,
-    allow_cpu: bool,
+    torch_runtime: TorchRuntime,
 ) -> list[PlannedCommand]:
     plan: list[PlannedCommand] = []
     if create_venv:
@@ -418,7 +519,25 @@ def build_command_plan(
     plan.extend(
         (
             PlannedCommand(
-                "install locked requirements",
+                f"install locked PyTorch stack ({torch_runtime.tag})",
+                (
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-input",
+                    "--index-url",
+                    torch_runtime.index_url,
+                    # The local version tag forces a reused venv to switch runtimes.
+                    *(
+                        f"{package}=={version}+{torch_runtime.tag}"
+                        for package, version in PYTORCH_PACKAGES
+                    ),
+                ),
+            ),
+            PlannedCommand(
+                "install locked project requirements",
                 (
                     str(venv_python),
                     "-m",
@@ -439,7 +558,9 @@ def build_command_plan(
                 (
                     str(venv_python),
                     str(verify_script),
-                    *(("--allow-cpu",) if allow_cpu else ()),
+                    "--expected-torch-runtime",
+                    torch_runtime.tag,
+                    *(("--allow-cpu",) if torch_runtime.cuda_version is None else ()),
                 ),
             ),
         )
@@ -485,6 +606,8 @@ def _print_host_summary(
     *,
     execution_mode: str,
     nvcc_version: Optional[str],
+    requested_torch_runtime: str,
+    torch_runtime: TorchRuntime,
 ) -> None:
     print(f"[bootstrap] host_os={platform.system()} {platform.release()}", flush=True)
     print(
@@ -518,7 +641,13 @@ def _print_host_summary(
         f"[bootstrap] local_cuda_toolkit={nvcc_version or 'not-found (not required)'}",
         flush=True,
     )
-    print("[bootstrap] locked_torch_cuda_runtime=11.8", flush=True)
+    print(f"[bootstrap] requested_torch_runtime={requested_torch_runtime}", flush=True)
+    print(f"[bootstrap] selected_torch_runtime={torch_runtime.tag}", flush=True)
+    print(
+        f"[bootstrap] selected_torch_cuda_runtime={torch_runtime.cuda_version_text}",
+        flush=True,
+    )
+    print(f"[bootstrap] pytorch_wheel_index={torch_runtime.index_url}", flush=True)
     print(f"[bootstrap] execution_mode={execution_mode}", flush=True)
 
 
@@ -547,6 +676,7 @@ def bootstrap(args: argparse.Namespace, *, runner: RunCallable = subprocess.run)
         raise BootstrapError(f"Environment verifier does not exist: {verify_script}")
 
     system_name = platform.system()
+    validate_host_platform(system_name=system_name, machine=platform.machine())
     python_info = discover_python(
         args.python,
         system_name=system_name,
@@ -554,13 +684,21 @@ def bootstrap(args: argparse.Namespace, *, runner: RunCallable = subprocess.run)
     )
     nvidia_smi = find_nvidia_smi(args.nvidia_smi, system_name=system_name)
     nvidia = detect_nvidia(nvidia_smi, runner=runner)
-    execution_mode = select_execution_mode(nvidia, allow_cpu=args.allow_cpu)
+    requested_torch_runtime = getattr(args, "torch_runtime", "auto")
+    torch_runtime = select_torch_runtime(
+        nvidia,
+        requested_runtime=requested_torch_runtime,
+        allow_cpu=args.allow_cpu,
+    )
+    execution_mode = "cuda" if torch_runtime.cuda_version is not None else "cpu"
     nvcc_version = detect_nvcc_version(runner=runner)
     _print_host_summary(
         python_info,
         nvidia,
         execution_mode=execution_mode,
         nvcc_version=nvcc_version,
+        requested_torch_runtime=requested_torch_runtime,
+        torch_runtime=torch_runtime,
     )
 
     venv_python = venv_python_path(venv_dir, system_name=system_name)
@@ -592,7 +730,7 @@ def bootstrap(args: argparse.Namespace, *, runner: RunCallable = subprocess.run)
         requirements_path=requirements_path,
         verify_script=verify_script,
         create_venv=create_venv,
-        allow_cpu=args.allow_cpu,
+        torch_runtime=torch_runtime,
     )
     if args.dry_run:
         print(
@@ -669,11 +807,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit nvidia-smi path. Auto-detected when omitted.",
     )
     parser.add_argument(
+        "--torch-runtime",
+        choices=TORCH_RUNTIME_CHOICES,
+        default="auto",
+        help=(
+            "PyTorch wheel runtime. auto selects the newest locked CUDA wheel supported "
+            "by the NVIDIA driver (cu128, cu126, then cu118). cpu is always explicit."
+        ),
+    )
+    parser.add_argument(
         "--allow-cpu",
         action="store_true",
         help=(
-            "Explicitly allow setup and verification when a usable NVIDIA CUDA device is unavailable. "
-            "The locked cu118 wheel remains installed and can execute on CPU."
+            "Allow auto mode to choose the CPU wheel when a compatible NVIDIA CUDA device "
+            "is unavailable; the verifier then skips CUDA smoke tests."
         ),
     )
     parser.add_argument(

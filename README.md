@@ -135,7 +135,7 @@ paths:
 
 ### 2. 가상환경 자동 구성
 
-64-bit CPython 3.12가 필요합니다. OS별 setup launcher는 현재 터미널에서 사용 가능한 Python 명령을 순서대로 검사합니다. 이어서 bootstrap이 운영체제, Python, `nvidia-smi`, driver가 지원하는 CUDA 버전과 GPU compute capability를 확인한 뒤 프로젝트 전용 `.venv`를 만들거나 재사용합니다. 활성화된 가상환경이나 전역 `pip`는 사용하지 않습니다.
+x86-64 Windows 또는 Linux와 64-bit CPython 3.12가 필요합니다. OS별 setup launcher는 현재 터미널에서 사용 가능한 Python 명령을 순서대로 검사합니다. 이어서 bootstrap이 운영체제와 CPU architecture, Python, `nvidia-smi`, driver가 지원하는 CUDA 버전과 GPU compute capability를 확인하고 `cu128`, `cu126`, `cu118` 중 가장 높은 호환 PyTorch wheel을 자동으로 선택한 뒤 프로젝트 전용 `.venv`를 만들거나 재사용합니다. 활성화된 가상환경이나 전역 `pip`는 사용하지 않습니다.
 
 Windows PowerShell:
 
@@ -163,7 +163,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 --dry-run
 bash scripts/setup.sh --dry-run
 ```
 
-GPU가 없는 장비에서 CPU 실행을 의도한 경우에만 `--allow-cpu`를 명시합니다.
+GPU가 없거나 지원 CUDA 범위가 너무 낮은 장비에서 CPU 실행을 의도한 경우에만 `--allow-cpu`를 명시합니다. 이때 bootstrap은 CUDA wheel 대신 공식 CPU wheel을 선택합니다.
 
 ```bash
 bash scripts/setup.sh --allow-cpu
@@ -183,15 +183,34 @@ python3 scripts/bootstrap_environment.py
 
 #### CUDA/PyTorch 버전 원칙
 
-`requirements.txt`는 다음 조합을 고정합니다.
+bootstrap은 framework의 기본 버전을 다음과 같이 고정하고, CUDA runtime은 시스템에 맞게 선택합니다.
 
 ```text
-torch       2.7.1+cu118
-torchvision 0.22.1+cu118
-torchaudio  2.7.1+cu118
+torch       2.7.1
+torchvision 0.22.1
+torchaudio  2.7.1
 ```
 
-`nvidia-smi`의 `CUDA Version`은 설치된 Toolkit 버전이 아니라 NVIDIA driver가 지원하는 최대 CUDA 버전입니다. PyTorch wheel은 CUDA 11.8 runtime을 자체 포함하므로 시스템 CUDA Toolkit이나 `nvcc`를 같은 버전으로 별도 설치할 필요가 없습니다. bootstrap은 driver 호환성과 실제 CUDA tensor/NMS 실행을 함께 확인합니다.
+| `nvidia-smi`의 driver 지원 CUDA | 자동 선택 wheel | wheel 내장 runtime |
+|---|---|---|
+| 12.8 이상 | `cu128` | CUDA 12.8 |
+| 12.6 이상, 12.8 미만 | `cu126` | CUDA 12.6 |
+| 11.8 이상, 12.6 미만 | `cu118` | CUDA 11.8 |
+| 11.8 미만 또는 NVIDIA GPU 미탐지 | 기본 실패, `--allow-cpu`일 때 `cpu` | 없음 |
+
+`nvidia-smi`의 `CUDA Version`은 설치된 Toolkit 버전이 아니라 NVIDIA driver가 지원하는 최대 CUDA 버전입니다. PyTorch wheel은 필요한 CUDA runtime을 자체 포함하므로 일반 설치에서는 시스템 CUDA Toolkit이나 `nvcc` 버전과 일치시킬 필요가 없습니다. bootstrap은 driver 호환성과 실제 CUDA tensor/NMS 실행을 함께 확인합니다.
+
+재현이나 문제 분석을 위해 wheel을 명시하려면 `--torch-runtime`을 사용합니다. 선택한 CUDA runtime을 driver가 지원하지 않으면 패키지를 설치하기 전에 실패하며 자동으로 하위 버전으로 바꾸지 않습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 --torch-runtime cu126
+```
+
+CPU wheel을 무조건 선택하려면 다음처럼 명시할 수 있습니다.
+
+```bash
+bash scripts/setup.sh --torch-runtime cpu
+```
 
 설치 후 검증:
 
@@ -207,18 +226,19 @@ Linux:
 ./.venv/bin/python -m pip check
 ```
 
-GPU 환경의 핵심 정상 출력은 다음과 같습니다.
+예를 들어 driver가 CUDA 12.8 이상을 지원하는 GPU 환경의 핵심 정상 출력은 다음과 같습니다.
 
 ```text
-torch=2.7.1+cu118
-torchvision=0.22.1+cu118
-torch_cuda_runtime=11.8
+torch=2.7.1+cu128
+torchvision=0.22.1+cu128
+torchaudio=2.7.1+cu128
+torch_cuda_runtime=12.8
 cuda_available=True
 cuda_nms=[0]
 environment_check=OK
 ```
 
-현재 개발 장비의 RTX 4070 Laptop GPU에서도 위 조합을 확인했습니다. 다른 장비에서도 장비명이 아니라 마지막 `environment_check=OK`와 종료 코드 0을 정상 기준으로 사용하십시오.
+선택 결과는 driver에 따라 `cu126`이나 `cu118`이 될 수 있습니다. 장비명이나 특정 runtime 문자열보다 마지막 `environment_check=OK`와 종료 코드 0을 정상 기준으로 사용하십시오.
 
 ### 3. 캘리브레이션 추출
 
