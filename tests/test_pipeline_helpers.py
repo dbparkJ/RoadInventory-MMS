@@ -2840,6 +2840,11 @@ class PipelineInputScopeTests(unittest.TestCase):
                     "--limit-images",
                     "1",
                     "--disable-intermediate-shp",
+                    "--pole-detection",
+                    "--pole-max-ground-penetration-m",
+                    "0.12",
+                    "--pole-max-ground-support-distance-m",
+                    "0.44",
                 ]
             )
             tasks = [
@@ -2921,6 +2926,9 @@ class PipelineInputScopeTests(unittest.TestCase):
             processed_tasks = worker_mock.call_args.args[0]
             self.assertEqual(len(processed_tasks), 1)
             self.assertEqual(processed_tasks[0]["job_name"], "Job_B")
+            worker_runtime = worker_mock.call_args.args[1]
+            self.assertEqual(worker_runtime["pole_max_ground_penetration_m"], 0.12)
+            self.assertEqual(worker_runtime["pole_max_ground_support_distance_m"], 0.44)
 
 
 if __name__ == "__main__":
