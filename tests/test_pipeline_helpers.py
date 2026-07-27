@@ -18,6 +18,8 @@ from PIL import Image
 from pyproj import CRS
 
 from mms_shp_detection.config import ConfigError, parse_args_with_config
+from mms_shp_detection.pole import PoleSearchParameters, cluster_pole_observations
+from mms_shp_detection.shp_writer import collect_detection_records
 from mms_shp_detection.pipeline import (
     POINT_CROP_SEMANTICS,
     POLE_CROP_SEMANTICS,
@@ -46,6 +48,7 @@ from mms_shp_detection.pipeline import (
     missing_result_artifacts,
     pole_cross_profile_candidate_key,
     pole_classifications_for_policy,
+    reconcile_remote_supports_from_direct_anchors,
     resolve_matched_crs_wkt,
     resolve_num_workers,
     resolve_pole_classification_policy,
@@ -57,6 +60,7 @@ from mms_shp_detection.pipeline import (
     run_yolo_prediction,
     safely_refresh_shapefile_from_txt,
     save_debug_crop,
+    select_cross_profile_pole_candidate,
     unwrap_panorama_x_coordinates,
     validate_crs_wkt,
     validate_panorama_image,
@@ -1584,6 +1588,724 @@ class MultiModelExecutionTests(unittest.TestCase):
 
         self.assertEqual(strict_key, fallback_key)
 
+    def test_cross_profile_pole_ranking_prefers_nearest_valid_junction(self) -> None:
+        common = {
+            "completeness_ratio": 1.0,
+            "radial_rmse_m": 0.09,
+            "ground_z": 1.0,
+            "ground_rmse_m": 0.05,
+            "status": "AUTO",
+            "point_count": 120,
+        }
+        near_support = SimpleNamespace(
+            **common,
+            association_distance_m=5.38,
+            horizontal_connection_coverage_ratio=0.75,
+        )
+        far_structure = SimpleNamespace(
+            **common,
+            association_distance_m=13.07,
+            horizontal_connection_coverage_ratio=1.0,
+        )
+
+        self.assertLess(
+            pole_cross_profile_candidate_key(
+                near_support,
+                preferred_min_completeness_ratio=0.75,
+                direct_max_axis_sign_distance_m=0.75,
+            ),
+            pole_cross_profile_candidate_key(
+                far_structure,
+                preferred_min_completeness_ratio=0.75,
+                direct_max_axis_sign_distance_m=0.75,
+            ),
+        )
+
+    def test_cross_profile_pole_ranking_uses_quality_within_one_metre(self) -> None:
+        common = {
+            "ground_z": 1.0,
+            "ground_rmse_m": 0.05,
+            "status": "AUTO",
+            "point_count": 120,
+        }
+        near_noise = SimpleNamespace(
+            **common,
+            completeness_ratio=0.75,
+            association_distance_m=5.38,
+            horizontal_connection_coverage_ratio=0.50,
+            radial_rmse_m=0.13,
+            multi_return_fraction=0.20,
+        )
+        clean_support = SimpleNamespace(
+            **common,
+            completeness_ratio=1.0,
+            association_distance_m=5.39,
+            horizontal_connection_coverage_ratio=1.0,
+            radial_rmse_m=0.06,
+            multi_return_fraction=0.0,
+        )
+
+        self.assertLess(
+            pole_cross_profile_candidate_key(
+                clean_support,
+                preferred_min_completeness_ratio=0.75,
+                direct_max_axis_sign_distance_m=0.75,
+            ),
+            pole_cross_profile_candidate_key(
+                near_noise,
+                preferred_min_completeness_ratio=0.75,
+                direct_max_axis_sign_distance_m=0.75,
+            ),
+        )
+
+    def test_cross_profile_selection_keeps_opposite_side_density_tie_break(
+        self,
+    ) -> None:
+        common = {
+            "completeness_ratio": 1.0,
+            "horizontal_connection_coverage_ratio": 1.0,
+            "horizontal_connection_coherent_coverage_ratio": 1.0,
+            "radial_rmse_m": 0.09,
+            "multi_return_fraction": 0.0,
+            "ground_z": 1.0,
+            "ground_rmse_m": 0.05,
+            "status": "AUTO",
+        }
+        strict_wrong = SimpleNamespace(
+            **common,
+            association_distance_m=4.323,
+            horizontal_connection_point_count=1816,
+            horizontal_connection_ridge_density_points_per_m=115.0,
+            point_count=4632,
+            support_side="LEFT_OF_TRAVEL",
+        )
+        fallback_actual = SimpleNamespace(
+            **common,
+            association_distance_m=4.754,
+            horizontal_connection_point_count=5611,
+            horizontal_connection_ridge_density_points_per_m=484.0,
+            point_count=7653,
+            support_side="RIGHT_OF_TRAVEL",
+        )
+
+        self.assertIs(
+            select_cross_profile_pole_candidate(
+                (strict_wrong, fallback_actual),
+                PoleSearchParameters(),
+            ),
+            fallback_actual,
+        )
+
+    def test_two_direct_frames_reconcile_one_missing_remote_support(self) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "detection_index": 1,
+            "model_object_type": "traffic_signal",
+            "class_id": 1,
+            "class_name": "vehicular_signal",
+            "confidence": 0.9,
+            "image_name": "frame634.jpg",
+            "timestamp_iso": "634",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.219512,
+                        "horizontal_connection_coherent_coverage_ratio": 0.121951,
+                        "horizontal_connection_coherent_ratio": 0.5556,
+                        "horizontal_connection_coherent_point_fraction": 0.0449,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "detection_index": 1,
+                "class_id": 0,
+                "class_name": "invisible_signal",
+                "confidence": 0.9,
+                "image_name": f"frame{row}.jpg",
+                "timestamp_iso": str(row),
+                "pose_row_number": row,
+                "sign_x": 464356.4,
+                "sign_y": 3911651.1,
+                "sign_z": 41.4,
+                "pole_x": 464356.375 + (0.002 * offset),
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_type": "SINGLE",
+                "pole_method": "GROUND_SNAP",
+                "pole_status": "AUTO",
+                "pole_occluded": False,
+                "pole_occlusion_status": "VISIBLE",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+                "pole_point_crop_path": f"anchor-{row}.las",
+                "pole_debug_image_path": f"anchor-{row}.jpg",
+            }
+            for offset, row in enumerate((635, 636))
+        ]
+
+        reconciled = reconcile_remote_supports_from_direct_anchors(
+            [target],
+            direct_observations,
+        )
+
+        self.assertEqual(len(reconciled), 3)
+        relation = next(item for item in reconciled if item["detection_id"] == "target")
+        self.assertEqual(relation["pole_method"], "MULTI_FRAME_DIRECT_ANCHOR")
+        self.assertEqual(relation["pole_status"], "REVIEW")
+        self.assertAlmostEqual(relation["pole_x"], 464356.376, delta=0.01)
+        self.assertEqual(
+            relation["horizontal_connection_coverage_ratio"],
+            0.219512,
+        )
+        self.assertEqual(
+            relation["horizontal_connection_coherent_coverage_ratio"],
+            0.121951,
+        )
+        self.assertEqual(
+            relation["horizontal_connection_coherent_ratio"],
+            0.5556,
+        )
+        self.assertEqual(
+            relation["horizontal_connection_coherent_point_fraction"],
+            0.0449,
+        )
+        self.assertIs(
+            relation["horizontal_connection_endpoint_anchored"],
+            True,
+        )
+        self.assertEqual(
+            relation["support_hypothesis_rejection_reason"],
+            "raw_coverage",
+        )
+        self.assertEqual(relation["support_anchor_pose_rows"], [635, 636])
+        self.assertEqual(
+            relation["support_anchor_source_detection_ids"],
+            ["direct-635", "direct-636"],
+        )
+        self.assertAlmostEqual(
+            relation["support_anchor_xy_spread_m"],
+            0.001,
+            delta=0.001,
+        )
+        self.assertAlmostEqual(
+            relation["support_anchor_z_spread_m"],
+            0.0,
+        )
+        self.assertIsNone(relation["pole_point_crop_path"])
+        self.assertIsNone(relation["pole_debug_image_path"])
+        clustered = cluster_pole_observations(reconciled, radius_m=0.75)
+        clustered_target = next(
+            item for item in clustered if item["detection_id"] == "target"
+        )
+        self.assertEqual(
+            clustered_target["pole_method"],
+            "MULTI_FRAME_DIRECT_ANCHOR",
+        )
+        self.assertTrue(clustered_target["support_reconciled"])
+        self.assertTrue(
+            all(
+                item["pole_status"] == "AUTO"
+                for item in clustered
+                if item["detection_id"].startswith("direct-")
+            )
+        )
+
+    def test_repeated_anchor_replaces_review_relation_only_with_shaft_hypothesis(
+        self,
+    ) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "detection_index": 1,
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375 + (0.002 * offset),
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for offset, row in enumerate((635, 636))
+        ]
+        wrong_remote = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "image_name": "frame634.jpg",
+            "pose_row_number": 634,
+            "pole_x": 464344.90,
+            "pole_y": 3911656.04,
+            "pole_z": 38.40,
+            "pole_status": "REVIEW",
+            "association_distance_m": 6.40,
+        }
+
+        reconciled = reconcile_remote_supports_from_direct_anchors(
+            [target],
+            [*direct_observations, wrong_remote],
+        )
+
+        target_relations = [
+            item for item in reconciled if item["detection_id"] == "target"
+        ]
+        self.assertEqual(len(target_relations), 1)
+        self.assertEqual(
+            target_relations[0]["pole_method"],
+            "MULTI_FRAME_DIRECT_ANCHOR",
+        )
+        self.assertTrue(
+            target_relations[0]["support_reconciled_replaced_remote"]
+        )
+
+        protected_auto = {**wrong_remote, "pole_status": "AUTO"}
+        protected = reconcile_remote_supports_from_direct_anchors(
+            [target],
+            [*direct_observations, protected_auto],
+        )
+        protected_relation = next(
+            item for item in protected if item["detection_id"] == "target"
+        )
+        self.assertEqual(protected_relation["pole_status"], "AUTO")
+        self.assertEqual(protected_relation["pole_x"], 464344.90)
+        self.assertNotIn("support_reconciled", protected_relation)
+
+    def test_repeated_anchor_rejects_unanchored_or_sub_twenty_percent_hypotheses(
+        self,
+    ) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.375,
+                        "axis_y": 3911650.758,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.0,
+                        "horizontal_connection_coherent_coverage_ratio": 0.0,
+                        "horizontal_connection_endpoint_anchored": False,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375,
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for row in (635, 636)
+        ]
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors(
+                [target],
+                direct_observations,
+            ),
+            direct_observations,
+        )
+        hypothesis = target["pole"]["support_hypotheses"][0]
+        hypothesis.update(
+            {
+                "horizontal_connection_coherent_coverage_ratio": 0.148148,
+                "horizontal_connection_coherent_ratio": 0.8,
+                "horizontal_connection_coherent_point_fraction": 0.6667,
+                "horizontal_connection_endpoint_anchored": True,
+            }
+        )
+        for raw_coverage in (0.185185, 0.15, 0.157895):
+            with self.subTest(raw_coverage=raw_coverage):
+                hypothesis[
+                    "horizontal_connection_coverage_ratio"
+                ] = raw_coverage
+                self.assertEqual(
+                    reconcile_remote_supports_from_direct_anchors(
+                        [target],
+                        direct_observations,
+                    ),
+                    direct_observations,
+                )
+
+    def test_one_direct_frame_cannot_reconcile_remote_support(self) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct = {
+            "record_name": "route_a",
+            "detection_id": "direct-635",
+            "image_name": "frame635.jpg",
+            "pose_row_number": 635,
+            "pole_x": 464356.375,
+            "pole_y": 3911650.758,
+            "pole_z": 38.461,
+            "pole_status": "AUTO",
+            "association_distance_m": 0.394,
+        }
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors([target], [direct]),
+            [direct],
+        )
+
+    def test_two_anchors_must_both_be_near_the_target_frame(self) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375 + (0.002 * offset),
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for offset, row in enumerate((600, 635))
+        ]
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors(
+                [target],
+                direct_observations,
+            ),
+            direct_observations,
+        )
+
+    def test_direct_anchor_cluster_requires_stable_base_height(self) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375,
+                "pole_y": 3911650.758,
+                "pole_z": pole_z,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for row, pole_z in ((635, 38.0), (636, 39.0))
+        ]
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors(
+                [target],
+                direct_observations,
+            ),
+            direct_observations,
+        )
+
+    def test_anchor_consensus_outliers_cannot_reconcile_from_outlier_frames(
+        self,
+    ) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.375,
+                        "axis_y": 3911650.758,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375,
+                "pole_y": 3911650.758,
+                "pole_z": pole_z,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for row, pole_z in (
+                (600, 38.0),
+                (601, 38.0),
+                (602, 38.0),
+                (603, 38.0),
+                (635, 39.0),
+                (636, 39.0),
+            )
+        ]
+        clustered = cluster_pole_observations(
+            [dict(item) for item in direct_observations],
+            radius_m=0.15,
+        )
+        self.assertEqual(clustered[0]["pole_status"], "REVIEW")
+        self.assertEqual(clustered[0]["consensus_outlier_count"], 2)
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors(
+                [target],
+                direct_observations,
+            ),
+            direct_observations,
+        )
+
+    def test_reconciliation_filters_malformed_numeric_observations(self) -> None:
+        target = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "detection_index": 1,
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 464350.625,
+            "y": 3911658.990,
+            "z": 43.602,
+            "pole": {
+                "support_hypotheses": [
+                    {
+                        "axis_x": 464356.39,
+                        "axis_y": 3911650.76,
+                        "rejection_reason": "raw_coverage",
+                        "horizontal_connection_coverage_ratio": 0.22,
+                        "horizontal_connection_coherent_coverage_ratio": 0.12,
+                        "horizontal_connection_endpoint_anchored": True,
+                    }
+                ]
+            },
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "pole_x": 464356.375 + (0.002 * offset),
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_status": "AUTO",
+                "pole_quality": 0.8,
+                "association_distance_m": 0.394,
+            }
+            for offset, row in enumerate((635, 636))
+        ]
+        malformed = [
+            {
+                "record_name": "route_a",
+                "detection_id": "target",
+                "pose_row_number": 634,
+                "pole_x": 464344.9,
+                "pole_y": 3911656.0,
+                "pole_z": 38.4,
+                "pole_status": "AUTO",
+                "association_distance_m": "not-a-number",
+            },
+            {
+                "record_name": "route_a",
+                "detection_id": "nan-coordinate",
+                "pose_row_number": 635,
+                "pole_x": float("nan"),
+                "pole_y": 3911650.758,
+                "pole_z": 38.461,
+                "pole_status": "AUTO",
+                "association_distance_m": 0.2,
+            },
+        ]
+
+        reconciled = reconcile_remote_supports_from_direct_anchors(
+            [None, target],
+            [*malformed, *direct_observations],
+        )
+
+        self.assertEqual(
+            {item["detection_id"] for item in reconciled},
+            {"target", "direct-635", "direct-636"},
+        )
+        relation = next(
+            item for item in reconciled if item["detection_id"] == "target"
+        )
+        self.assertEqual(
+            relation["pole_method"],
+            "MULTI_FRAME_DIRECT_ANCHOR",
+        )
+        cluster_pole_observations(reconciled, radius_m=0.75)
+
+    def test_reconciliation_skips_non_mapping_pole_payload(self) -> None:
+        detection = {
+            "record_name": "route_a",
+            "detection_id": "target",
+            "model_object_type": "traffic_signal",
+            "pose_row_number": 634,
+            "x": 1.0,
+            "y": 2.0,
+            "z": 5.0,
+            "pole": ["malformed"],
+        }
+        direct_observations = [
+            {
+                "record_name": "route_a",
+                "detection_id": f"direct-{row}",
+                "pose_row_number": row,
+                "pole_x": 1.0,
+                "pole_y": 2.0,
+                "pole_z": 0.0,
+                "pole_status": "AUTO",
+                "association_distance_m": 0.2,
+            }
+            for row in (635, 636)
+        ]
+
+        self.assertEqual(
+            reconcile_remote_supports_from_direct_anchors(
+                [detection],
+                direct_observations,
+            ),
+            direct_observations,
+        )
+
+    def test_detection_collection_skips_non_mapping_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            txt_root = Path(temp_dir)
+            (txt_root / "frame.txt").write_text(
+                json.dumps(
+                    {
+                        "record_name": "route_a",
+                        "detections": [
+                            None,
+                            "malformed",
+                            {
+                                "detection_index": 1,
+                                "image_name": "frame.jpg",
+                                "x": 1.0,
+                                "y": 2.0,
+                                "z": 3.0,
+                                "accepted_for_shp": True,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            records = collect_detection_records(txt_root)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["detection_index"], 1)
+
     def test_explicit_cli_filter_overrides_each_model_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "traffic_light_best.pt"
@@ -1636,6 +2358,31 @@ class MultiModelExecutionTests(unittest.TestCase):
 
             with self.assertRaises(ConfigError):
                 apply_model_filter(args, paths[1], require_profile=True)
+
+    def test_model_filter_rejects_zero_for_new_positive_pole_parameters(self) -> None:
+        strictly_positive = (
+            "pole_axis_plumb_endpoint_fraction",
+            "pole_horizontal_connection_coherence_radius_m",
+            "pole_remote_max_endpoint_tilt_deg",
+            "pole_long_remote_distance_m",
+            "pole_long_remote_transition_m",
+            "pole_long_remote_min_vertical_span_m",
+        )
+        args = build_arg_parser().parse_args([])
+        model_path = Path("fixture.pt")
+        for key in strictly_positive:
+            args.model_filters = {
+                model_path.name: {
+                    "pole_detection": {
+                        key: 0,
+                    }
+                }
+            }
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ConfigError, "must be greater than 0"),
+            ):
+                apply_model_filter(args, model_path, require_profile=True)
 
     def test_multi_model_wrapper_isolates_outputs_and_writes_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

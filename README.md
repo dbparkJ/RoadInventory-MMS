@@ -347,6 +347,17 @@ resume_and_scope:
 | `pole_range_fallback_enabled` | `true` | strict 지주 실패 시 더 넓은 물리 XY/Z 범위로 한 번 재탐색 |
 | `pole_fallback_search_radius_m`, `pole_fallback_max_drop_m` | `10`, `12` | 8m 초과 지주용 2차 탐색 반경과 하강 높이 |
 | `pole_min_horizontal_connection_coverage` | `0.50` | 원격 지주까지 실제 연결봉이 채운 구간 비율 |
+| `pole_horizontal_connection_coherence_radius_m` | `0.10` | 표지와 지주 양 끝을 잇는 단일 3D 중심선 주변으로 인정할 연결봉 반경 |
+| `pole_min_horizontal_connection_coherent_ratio` | `0.65` | raw coverage 중 같은 3D 중심선으로 설명되어야 하는 최소 비율 |
+| `pole_min_horizontal_connection_coherent_point_fraction` | `0.30` | 연결 구간 내부 점 중 일관된 3D 중심선을 지지해야 하는 최소 비율 |
+| `pole_axis_plumb_full_tilt_deg`, `pole_axis_plumb_max_tilt_deg` | `2`, `4` | 위·아래 지주 점군 중심을 이용해 작은 축 기울기를 수직 보정하는 각도 범위 |
+| `pole_axis_plumb_endpoint_fraction` | `0.20` | 위·아래 robust 중심을 계산할 때 각 끝에서 사용하는 지주 Z-bin 비율 |
+| `pole_remote_max_endpoint_tilt_deg` | `5.0` | 원격 지주 위·아래 중심이 허용할 최대 축 기울기; 초과하면 비정형 구조로 제외 |
+| `pole_long_remote_distance_m` | `8.0` | 원격 지주의 축·연결 근거를 점진적으로 강화하기 시작하는 연관 거리 |
+| `pole_long_remote_transition_m` | `2.0` | 장거리 강화 기준이 최종값까지 부드럽게 전환되는 거리 |
+| `pole_long_remote_min_vertical_span_m` | `3.5` | 전환 구간 이후 장거리 원격 지주에 요구하는 최소 관측 축 길이 |
+| `pole_long_remote_min_completeness_ratio` | `0.85` | 전환 구간 이후 장거리 원격 지주에 요구하는 최소 축 완전도 |
+| `pole_long_remote_min_connection_coverage_ratio` | `0.85` | 전환 구간 이후 장거리 원격 지주에 요구하는 최소 coherent 3D 연결 coverage |
 | `pole_preferred_min_completeness_ratio` | `0.75` | 짧은 가장자리보다 지면~표지 높이를 충분히 관측한 전체 지주축 우선 |
 | `pole_geometry_ground_clearance_m` | `0.20` | class가 없을 때 저점 지면대의 점을 축 후보에서만 제거; `0`이면 해제 |
 | `pole_geometry_remote_min_completeness_ratio` | `0.75` | class 없는 원격 지주의 최소 축 완전도 하드 기준 |
@@ -418,19 +429,19 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 1. **탐색 영역 구성**: 표지 주변을 넓게 rectification하고 bbox 아래·좌우 corridor를 먼저 검색합니다. 직접 지주가 없으면 아래쪽 수직 band를 좌우 전체로 넓혀 원격 지주 후보를 다시 찾습니다.
 2. **class 정책과 필터**: 기본값 `pole_classification_mode: auto`는 YAML의 ground(`2`, `11`), excluded vegetation(`3`, `4`, `5`), 공급사 확인 pole ID 중 하나가 선택 LAS에 실제로 있을 때만 class와 형상을 함께 쓰는 `HYBRID` 모드가 됩니다. LAS가 전부 미분류 `0/1`이거나 매핑되지 않은 custom ID만 있으면 자동으로 `GEOMETRY`가 되어 class 필터와 분류 지면을 사용하지 않습니다. `off`는 class가 있어도 강제로 완전히 무시하고, `require`는 선택된 모든 LAS에 설정한 의미 class가 없으면 처리 전에 실패합니다. 현재 TRK500Neo 샘플에 여러 class가 관찰되지만 이것은 공급업체의 공식 계약 map을 확인했다는 뜻이 아니므로, 임의 custom ID를 계약 확인 없이 `pole_class_ids`에 고정하면 안 됩니다. 원본 classification은 어느 모드에서도 검수용 `pole_crops` LAS에 보존됩니다.
-3. **수직 축 생성**: XY voxel의 세로 연속 셀로 seed를 만들고 Z-bin 중앙값에 Theil–Sen 초기축과 MAD 재적합을 적용해 `x(z), y(z)`를 구합니다. 높이 일부에서 식생·차량·수평 암 때문에 축이 갑자기 옆으로 꺾이면 가장 긴 물리적 연속 구간으로 축을 안정화하되, 전 구간 기울기가 일관된 실제 경사 지주는 강제로 수직화하지 않습니다. class가 없는 `GEOMETRY` 모드에서는 주변 저점 셀로 지면대를 먼저 추정해 축 후보에서만 제외합니다. 점 수, 수직 span, 연속 Z-bin 수, 최대 Z 공백, 점유율, 중간부 지지율, 축 기울기와 radial RMSE 기준을 모두 통과해야 합니다.
+3. **수직 축 생성**: XY voxel의 세로 연속 셀로 seed를 만들고 Z-bin 중앙값에 Theil–Sen 초기축과 MAD 재적합을 적용해 `x(z), y(z)`를 구합니다. 이어 지주로 판정된 점군의 위·아래 높이대에서 각각 robust XY 평균을 구합니다. 두 중심의 기울기가 작으면 그 중간 위치를 유지한 채 축을 수직으로 보정하고, 2~4° 구간은 부드럽게 혼합하며, 실제로 기울어진 축은 원래 적합을 유지합니다. 높이 일부에서 식생·차량·수평 암 때문에 축이 갑자기 옆으로 꺾이면 가장 긴 물리적 연속 구간으로 축을 안정화합니다. class가 없는 `GEOMETRY` 모드에서는 주변 저점 셀로 지면대를 먼저 추정해 축 후보에서만 제외합니다. 점 수, 수직 span, 연속 Z-bin 수, 최대 Z 공백, 점유율, 중간부 지지율, 축 기울기와 radial RMSE 기준을 모두 통과해야 합니다.
 4. **축 완전도 계산**: 각 후보의 `completeness_ratio`는 `min(중간부 Z-bin 지지율, min(1, 관측 Z span / (표지 Z - 지면 Z)))`입니다. 표지판의 짧은 수직 가장자리나 상부 부속축은 표지에 더 가까워도 전체 표지-지면 높이를 지지하지 못하므로 낮은 완전도를 받습니다.
-5. **직접/원격 지주 검증**: 표지 높이에서 축까지 0.75m 이내이면 직접 지주입니다. 그보다 먼 축은 표지와 축 사이의 3D 수평 구간을 bin으로 나누고 실제 점군 연결봉 coverage가 기준 이상일 때만 후보에 남깁니다. `GEOMETRY` 원격 후보에는 완전도·축 RMSE·지면 RMSE 하드 기준도 추가 적용합니다. 멀리 있는 나무·건물 모서리를 임의 지주로 연결하지 않기 위한 gate입니다.
-6. **후보 순위 결정**: 먼저 `pole_preferred_min_completeness_ratio` 이상인 전체 축 tier와 직접 지주를 우선합니다. 원격 지주끼리는 `coverage × sqrt(검사 bin 수)`에 축 완전도를 더하고 축 RMSE, multi-return 비율, 연관 거리를 감점한 복합 연결 근거를 비교합니다. 짧은 4/4 잡음 연결이 수 m에 걸친 실제 수평봉을 이기지 않으면서, 긴 구간 일부만 우연히 채운 나무도 억제하기 위한 기준입니다. 직접축은 같은 완전도 tier에서 bounded 물리 점수를 먼저 비교합니다. 축 길이 보상은 표지-지면 예상 높이에서 상한을 두며, strict 결과를 expanded 결과가 무조건 덮어쓰지 않고 같은 품질 순위로 비교합니다.
+5. **직접/원격 지주 검증**: 표지 높이에서 축까지 0.75m 이내이면 직접 지주입니다. 그보다 먼 축은 표지와 축 사이를 bin으로 나눈 raw coverage에 더해, 표지 쪽과 지주 쪽 끝점에 고정된 하나의 3D 중심선 주변 점만 다시 검사합니다. 양 끝 관측, coherent coverage, coherent/raw 비율, 내부 coherent 점 비율을 모두 통과해야 하므로 나뭇가지·전선·서로 떨어진 구조가 우연히 bin을 채워도 연결봉으로 인정하지 않습니다. 단, 직접 지주 임계의 4배 이내(기본 3m)의 짧은 연결은 raw/coherent coverage와 coherent/raw 비율이 모두 95% 이상이고 중심선 점 밀도가 20점/m 이상일 때만 내부 점 비율 하한을 10%까지 완화합니다. 중앙 일부가 가려진 실제 연결봉은 양 끝과 동일 중심선이 확인되면 유지합니다. `GEOMETRY` 원격 후보에는 완전도·축 RMSE·지면 RMSE 하드 기준도 추가 적용합니다.
+6. **후보 순위 결정**: 먼저 `pole_preferred_min_completeness_ratio` 이상인 전체 축 tier와 직접 지주를 우선합니다. 원격 지주는 긴 연결 구간 자체를 보상하지 않고, 검증을 통과한 첫 물리적 접합점을 bounded 거리·coverage·완전도·축 오차로 비교합니다. 서로 반대편의 두 축이 모두 실제 연결 구조이고 연관 거리 차가 0.75m 이내인 경우에만, coherent 연결봉 점 밀도가 2.5배 이상이고 raw 연결봉 점/m 밀도가 2배 이상이며 지주축 점 수도 1.5배 이상인 후보가 순서를 바꿀 수 있습니다. 따라서 진행방향 오른쪽을 일괄 선호하지 않으면서 606/608 같은 양방향 근접 후보를 구분합니다. 8m 이후에는 span·완전도·연결 근거 기준이 2m 구간에 걸쳐 점진적으로 엄격해집니다. strict 결과와 expanded 결과도 같은 품질 순위로 비교합니다.
 7. **로컬 지면 추정**: 지주 중심을 제외한 근거리 셀에서 LAS ground/road 분류 기반 평면과 형상 기반 낮은 셀 평면을 각각 robust fitting합니다. 형상 지면은 최소 표지-지면 높이보다 위에 있는 수평봉·표지점부터 제외하고, class가 없을 때는 더 많은 독립 XY 셀 근거를 요구합니다. 분류된 도로면이 연석 너머 멀리 있고 더 가까운 보도면이 있으면 거리 기준으로 형상 평면을 선택합니다. 최종 하단은 단순히 지면 Z를 축에 대입하지 않고 fitted 축과 경사 지면 평면의 정확한 교점으로 계산합니다.
 8. **가림·지면 충돌 처리**: 관측된 축 최하단과 지면 사이가 `pole_occlusion_gap_m`보다 크면 `OCCLUDED/GROUND_EXTR/REVIEW`로 표시합니다. 반대로 관측축이 지면보다 `pole_max_ground_penetration_m` 이상 아래에 있으면 음수 `bottom_gap_m`을 보존하고 `GROUND_CONFLICT/REVIEW`로 기록합니다. 지면 근거 셀이 하단에서 너무 먼 경우도 자동 승인하지 않습니다. 축 자체가 전혀 보이지 않는 완전 가림은 임의 수직선을 만들지 않습니다.
-9. **품질 상태**: 하단이 보이면 `GROUND_SNAP`, 가려져 외삽하면 `GROUND_EXTR`입니다. 낮은 완전도, 높은 지면 RMSE, 먼 지면 근거, 큰 외삽, 지면 관통 또는 class 없는 직접축의 큰 방사 오차는 `REVIEW`로 기록합니다.
+9. **품질 상태와 인접 프레임 보강**: 하단이 보이면 `GROUND_SNAP`, 가려져 외삽하면 `GROUND_EXTR`입니다. 낮은 완전도, 높은 지면 RMSE, 먼 지면 근거, 큰 외삽, 지면 관통 또는 class 없는 직접축의 큰 방사 오차는 `REVIEW`로 기록합니다. 단일 프레임에서 실제 연결봉이 완전히 가려진 경우에는 다른 지주를 억지로 고르지 않습니다. 대신 대상 프레임에서 수직축은 유효하지만 연결봉만 탈락했고 raw coverage가 20% 이상, coherent coverage가 7.5% 이상이며 축 끝점이 연결 구조에 고정된 후보만 보존합니다. 그 축 30cm 안의 직접 `AUTO` 지주가 같은 주행의 인접 프레임 두 개 이상에서 XY 15cm·Z 20cm 이내로 이상치 없이 반복될 때만 `MULTI_FRAME_DIRECT_ANCHOR/REVIEW`로 연결합니다. 기존 `AUTO` 관계는 직접·원격 여부와 관계없이 교체하지 않고, 관계가 없거나 기존 관계가 `REVIEW`인 경우에만 보강합니다. 경쟁 anchor가 비슷하게 가까우면 보강하지 않습니다.
 
 이 방식은 XDROAD에서 작업자가 보이는 지주 한 점을 찍어 아래로 내리는 작업을 3차원 축과 로컬 지면으로 확장한 것입니다. 단, 표지 바로 아래 임의점이 아니라 실제 수직 연속성과 지면 근거가 있어야 좌표를 생성합니다.
 
 ### 5. 복수 관측 병합과 중복 제거
 
-- 같은 주행 `record_name` 안에서 지주 하단 XY가 `pole_observation_merge_radius_m` 이내인 관측을 물리 지주 하나로 묶고, 프레임별 최고 품질 관측을 사용해 가중 geometric median을 계산합니다. 정상 군집에서 XY/Z가 크게 벗어난 관측과 `GROUND_CONFLICT`는 좌표 합의에서 제외하고 결과를 `REVIEW`로 남깁니다.
+- 같은 주행 `record_name` 안에서 지주 하단 XY가 `pole_observation_merge_radius_m` 이내인 관측을 물리 지주 하나로 묶고, 프레임별 최고 품질 관측을 사용해 가중 geometric median을 계산합니다. 정상 군집에서 XY/Z가 크게 벗어난 관측과 `GROUND_CONFLICT`는 좌표 합의에서 제외하고 결과를 `REVIEW`로 남깁니다. 연결봉이 가려져 누락된 관측은 인접 프레임의 반복된 직접 지주 anchor가 유일할 때만 그 좌표를 보강합니다.
 - 지주별 `support_id`를 만들고 연결된 각 표지의 `det_id`에 같은 지주 좌표를 한 행씩 연결합니다. 따라서 한 지주에 서로 다른 클래스의 표지가 두 개면 `pole_bottoms.shp`에도 동일 XYZ의 두 행이 생깁니다.
 - 같은 record·같은 class·같은 support의 반복 표지는 XY/Z 허용범위를 모두 만족할 때만 complete-link 방식으로 병합합니다. 거리 체인이 서로 다른 두 표지를 이어 붙이지 못하며, 같은 프레임의 서로 다른 bbox는 자동 병합하지 않습니다.
 - 지주가 누락된 관측은 더 엄격한 fallback XY/Z 범위 안에서만 지주가 확인된 다른 프레임의 같은 클래스 표지에 흡수될 수 있습니다.
@@ -504,7 +515,9 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 - `obs_count`: 지주 좌표에 기여한 서로 다른 프레임 수
 - `complete`: 중간부 지지율과 관측 높이 비율 중 작은 값인 지주축 완전도
 - `class_req`, `class_mode`: 요청한 class 정책(`auto/off/require`)과 실제 계산 방식(`HYBRID/GEOMETRY`)
-- `assoc_m`, `arm_cov`, `axis_rmse`, `grnd_rmse`: 지주 선택 근거와 품질
+- `assoc_m`, `arm_cov`, `arm_3d`, `arm_ratio`, `arm_pts`, `arm_end`: 지주 연관 거리와 raw/coherent 연결봉 근거
+- `axis_rmse`, `grnd_rmse`: 지주축과 지면 적합 품질
+- `reconciled`, `repl_rem`, `hyp_dist`: 인접 프레임 직접 지주로 보강했는지, 기존 `REVIEW` 원격 관계를 교체했는지, 대상 프레임의 탈락 수직축과 anchor 사이 거리
 - `axis_stab`, `btm_gap`, `grnd_dist`: 높이 구간 축 안정화 여부, signed 하단 간격, 하단에서 지면 근거까지 거리
 - `outlier_n`: 다중 프레임 좌표 합의에서 제외된 이상 관측 수
 - `model_nm`, `obj_type`: 해당 행을 만든 모델 파일명과 객체 유형

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -135,6 +136,9 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "pole_geometry_remote_max_ground_rmse_m": (0, None),
     "pole_min_points": (3, None),
     "pole_max_axis_tilt_deg": (0, 90),
+    "pole_axis_plumb_max_tilt_deg": (0, 90),
+    "pole_axis_plumb_full_tilt_deg": (0, 90),
+    "pole_axis_plumb_endpoint_fraction": (0, 0.5),
     "pole_direct_max_axis_sign_distance_m": (0, None),
     "pole_max_axis_sign_distance_m": (0, None),
     "pole_horizontal_connection_radius_m": (0, None),
@@ -142,7 +146,16 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "pole_horizontal_connection_above_tolerance_m": (0, None),
     "pole_horizontal_connection_bin_m": (0, None),
     "pole_horizontal_connection_min_points_per_bin": (1, None),
+    "pole_horizontal_connection_coherence_radius_m": (0, None),
     "pole_min_horizontal_connection_coverage": (0, 1),
+    "pole_min_horizontal_connection_coherent_ratio": (0, 1),
+    "pole_min_horizontal_connection_coherent_point_fraction": (0, 1),
+    "pole_remote_max_endpoint_tilt_deg": (0, 90),
+    "pole_long_remote_distance_m": (0, None),
+    "pole_long_remote_transition_m": (0, None),
+    "pole_long_remote_min_vertical_span_m": (0, None),
+    "pole_long_remote_min_completeness_ratio": (0, 1),
+    "pole_long_remote_min_connection_coverage_ratio": (0, 1),
     "pole_max_ground_class_fraction": (0, 1),
     "pole_min_ground_drop_m": (0, None),
     "pole_ground_search_radius_m": (0, None),
@@ -162,6 +175,15 @@ _RANGES: dict[str, tuple[float | None, float | None]] = {
     "sign_observation_merge_z_radius_m": (0, None),
     "sign_observation_fallback_xy_radius_m": (0, None),
     "sign_observation_fallback_z_radius_m": (0, None),
+}
+
+_EXCLUSIVE_LOWER_BOUND_KEYS = {
+    "pole_axis_plumb_endpoint_fraction",
+    "pole_horizontal_connection_coherence_radius_m",
+    "pole_remote_max_endpoint_tilt_deg",
+    "pole_long_remote_distance_m",
+    "pole_long_remote_transition_m",
+    "pole_long_remote_min_vertical_span_m",
 }
 
 
@@ -251,6 +273,14 @@ def _validate_range(dest: str, value: Any, dotted_key: str) -> None:
     if value is None or dest not in _RANGES:
         return
     lower, upper = _RANGES[dest]
+    if (
+        dest in _EXCLUSIVE_LOWER_BOUND_KEYS
+        and lower is not None
+        and (not math.isfinite(value) or value <= lower)
+    ):
+        raise ConfigError(
+            f"'{dotted_key}' must be greater than {lower}; received {value!r}."
+        )
     if lower is not None and value < lower:
         raise ConfigError(f"'{dotted_key}' must be at least {lower}; received {value!r}.")
     if upper is not None and value > upper:

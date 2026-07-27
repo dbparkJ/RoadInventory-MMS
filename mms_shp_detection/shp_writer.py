@@ -466,6 +466,13 @@ def collect_detection_records(
                 logger.info("Ignoring result from a different run configuration: %s", txt_path)
             continue
         for detection in payload.get("detections", []):
+            if not isinstance(detection, dict):
+                if logger is not None:
+                    logger.warning(
+                        "Skipping malformed detection entry in %s",
+                        txt_path,
+                    )
+                continue
             if detection.get("x") is None or detection.get("accepted_for_shp") is False:
                 continue
             record = dict(detection)
@@ -482,6 +489,8 @@ def collect_detection_records(
             record["model_profile"] = payload.get("model_profile")
             record["model_object_type"] = payload.get("model_object_type")
             record["pose_format"] = payload.get("pose_format")
+            record["pose_row_number"] = payload.get("pose_row_number")
+            record["route_id"] = payload.get("route_id")
             record["gps_week"] = payload.get("gps_week")
             record["pointcloud_source"] = payload.get("pointcloud_source")
             calibration = payload.get("calibration") or {}
@@ -535,6 +544,8 @@ def collect_pole_records(
                 "model_profile": payload.get("model_profile"),
                 "model_object_type": payload.get("model_object_type"),
                 "pose_format": payload.get("pose_format"),
+                "pose_row_number": payload.get("pose_row_number"),
+                "route_id": payload.get("route_id"),
                 "gps_week": payload.get("gps_week"),
                 "pointcloud_source": payload.get("pointcloud_source"),
                 "sign_x": detection.get("x"),
@@ -568,6 +579,18 @@ def collect_pole_records(
                 "association_distance_m": pole.get("association_distance_m"),
                 "horizontal_connection_coverage_ratio": pole.get(
                     "horizontal_connection_coverage_ratio"
+                ),
+                "horizontal_connection_coherent_coverage_ratio": pole.get(
+                    "horizontal_connection_coherent_coverage_ratio"
+                ),
+                "horizontal_connection_coherent_ratio": pole.get(
+                    "horizontal_connection_coherent_ratio"
+                ),
+                "horizontal_connection_coherent_point_fraction": pole.get(
+                    "horizontal_connection_coherent_point_fraction"
+                ),
+                "horizontal_connection_endpoint_anchored": pole.get(
+                    "horizontal_connection_endpoint_anchored"
                 ),
                 "completeness_ratio": pole.get("completeness_ratio"),
                 "dominant_class_id": pole.get("dominant_class_id"),
@@ -1165,8 +1188,22 @@ def write_pole_shapefile(
                     str(item.get("detection_id") or "")[:20],
                     str(item.get("support_id") or "")[:20],
                     str(item.get("pole_type") or "")[:12],
-                    str(item.get("pole_method") or "")[:16],
+                    str(item.get("pole_method") or "")[:28],
                     str(item.get("pole_status") or "")[:12],
+                    (
+                        bool(item.get("support_reconciled"))
+                        if item.get("support_reconciled") is not None
+                        else False
+                    ),
+                    (
+                        bool(item.get("support_reconciled_replaced_remote"))
+                        if item.get("support_reconciled_replaced_remote")
+                        is not None
+                        else False
+                    ),
+                    float(item["support_hypothesis_distance_m"])
+                    if item.get("support_hypothesis_distance_m") is not None
+                    else None,
                     occluded_value,
                     occlusion_status[:16],
                     int(item.get("pole_count") or 0),
@@ -1198,6 +1235,42 @@ def write_pole_shapefile(
                     float(item["horizontal_connection_coverage_ratio"])
                     if item.get("horizontal_connection_coverage_ratio") is not None
                     else None,
+                    float(
+                        item[
+                            "horizontal_connection_coherent_coverage_ratio"
+                        ]
+                    )
+                    if item.get(
+                        "horizontal_connection_coherent_coverage_ratio"
+                    )
+                    is not None
+                    else None,
+                    float(item["horizontal_connection_coherent_ratio"])
+                    if item.get("horizontal_connection_coherent_ratio")
+                    is not None
+                    else None,
+                    float(
+                        item[
+                            "horizontal_connection_coherent_point_fraction"
+                        ]
+                    )
+                    if item.get(
+                        "horizontal_connection_coherent_point_fraction"
+                    )
+                    is not None
+                    else None,
+                    (
+                        bool(
+                            item[
+                                "horizontal_connection_endpoint_anchored"
+                            ]
+                        )
+                        if item.get(
+                            "horizontal_connection_endpoint_anchored"
+                        )
+                        is not None
+                        else None
+                    ),
                     float(item["completeness_ratio"])
                     if item.get("completeness_ratio") is not None
                     else None,
@@ -1242,8 +1315,11 @@ def write_pole_shapefile(
         ("det_id", "C", 20, 0),
         ("support_id", "C", 20, 0),
         ("pole_type", "C", 12, 0),
-        ("method", "C", 16, 0),
+        ("method", "C", 28, 0),
         ("status", "C", 12, 0),
+        ("reconciled", "L", 1, 0),
+        ("repl_rem", "L", 1, 0),
+        ("hyp_dist", "F", 10, 4),
         ("occluded", "L", 1, 0),
         ("occ_state", "C", 16, 0),
         ("pole_cnt", "N", 50, 0),
@@ -1259,6 +1335,10 @@ def write_pole_shapefile(
         ("grnd_dist", "F", 10, 4),
         ("assoc_m", "F", 10, 4),
         ("arm_cov", "F", 10, 4),
+        ("arm_3d", "F", 10, 4),
+        ("arm_ratio", "F", 10, 4),
+        ("arm_pts", "F", 10, 4),
+        ("arm_end", "L", 1, 0),
         ("complete", "F", 10, 4),
         ("dom_class", "N", 5, 0),
         ("cls_purity", "F", 10, 4),

@@ -18,7 +18,7 @@ paths:
   # 이 폴더 바로 아래의 모든 .pt 모델을 파일명 순서로 각각 실행합니다.
   model_dir: models
   # 모델별로 완전히 분리된 TXT, SHP, 디버그 영상, LAS crop, 로그가 생성될 상위 폴더입니다.
-  output_dir: outputs_Neo700_models
+  output_dir: outputs_Neo700_models_ver2
   # 대용량 LAS/PCDB 공간 인덱스 캐시입니다. 데이터가 바뀌면 자동 갱신됩니다.
   pointcloud_cache_path: .cache/pointcloud_catalog.json
   # 업체가 별도로 확정한 CRS WKT가 있을 때 지정합니다. 입력 LAS WKT를 쓸 때는 null입니다.
@@ -328,6 +328,12 @@ pole_detection:
   pole_min_points: 18
   # 수직선에서 허용할 지주 축의 최대 기울기(deg)입니다.
   pole_max_axis_tilt_deg: 15.0
+  # 위·아래 지주 점군 중심의 기울기가 이 각도 이내이면 축을 수직 방향으로 안정화합니다.
+  pole_axis_plumb_max_tilt_deg: 4.0
+  # 이 각도 이하는 완전히 수직화하고, 이 값부터 최대 각도까지는 부드럽게 혼합합니다.
+  pole_axis_plumb_full_tilt_deg: 2.0
+  # 위·아래 중심을 구할 때 각각 사용하는 동일 가중치 Z-bin 비율입니다.
+  pole_axis_plumb_endpoint_fraction: 0.20
   # 이 거리(m) 안의 축은 표지에 직접 붙은 지주로 봅니다. 여러 후보가 있으면 가장 가까운 실제 지주를 우선합니다.
   pole_direct_max_axis_sign_distance_m: 0.75
   # 측면 캔틸레버·신호등 암 끝 지주까지 찾는 최대 수평거리(m)입니다. 이 범위의 원격 축은 아래 수평 연결봉 검사를 반드시 통과해야 합니다.
@@ -342,8 +348,26 @@ pole_detection:
   pole_horizontal_connection_bin_m: 0.25
   # 한 연결 구간이 채워졌다고 인정할 최소 점 개수입니다.
   pole_horizontal_connection_min_points_per_bin: 2
+  # 표지와 지주 양 끝을 잇는 단일 3D 중심선 주변으로 인정할 반경(m)입니다.
+  pole_horizontal_connection_coherence_radius_m: 0.10
   # 전체 연결 구간 중 점군이 이어져 있어야 하는 최소 비율입니다. 0.5는 절반 이상 실제 봉 근거가 있어야 원격 지주를 허용합니다.
   pole_min_horizontal_connection_coverage: 0.50
+  # raw 연결 bin 중 동일한 3D 중심선이 설명해야 하는 최소 비율입니다.
+  pole_min_horizontal_connection_coherent_ratio: 0.65
+  # 연결 구간 내부 점 중 동일한 3D 중심선 안에 있어야 하는 최소 비율입니다.
+  pole_min_horizontal_connection_coherent_point_fraction: 0.30
+  # 원격 지주축의 위·아래 중심 기울기가 이 각도를 넘으면 나무/비정형 구조로 제외합니다.
+  pole_remote_max_endpoint_tilt_deg: 5.0
+  # 이 거리(m)부터 원격 지주에 더 긴 축과 강한 3D 연결 근거를 점진적으로 요구합니다.
+  pole_long_remote_distance_m: 8.0
+  # 강화 기준을 갑자기 바꾸지 않고 이 거리(m)에 걸쳐 부드럽게 적용합니다.
+  pole_long_remote_transition_m: 2.0
+  # 장거리 원격 지주에 요구할 최종 최소 관측 축 길이(m)입니다.
+  pole_long_remote_min_vertical_span_m: 3.5
+  # 장거리 원격 지주의 최종 최소 축 완전도입니다.
+  pole_long_remote_min_completeness_ratio: 0.85
+  # 장거리 원격 지주의 최종 최소 coherent 3D 연결 coverage입니다.
+  pole_long_remote_min_connection_coverage_ratio: 0.85
   # 축 inlier의 대표 class가 ground/road일 때 허용하는 최대 비율입니다. 도로 점열을 지주로 오인하는 것을 막습니다.
   pole_max_ground_class_fraction: 0.35
   # 추정 지면은 표지보다 최소 이 거리(m)만큼 낮아야 합니다. 수평 암이나 표지 뒷면을 지면으로 오인하는 것을 막습니다.

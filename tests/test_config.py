@@ -141,6 +141,30 @@ class PipelineConfigTests(unittest.TestCase):
                 with self.subTest(name=name), self.assertRaises(ConfigError):
                     load_config_defaults(build_arg_parser(), path)
 
+    def test_new_positive_pole_parameters_reject_zero(self) -> None:
+        strictly_positive = (
+            "pole_axis_plumb_endpoint_fraction",
+            "pole_horizontal_connection_coherence_radius_m",
+            "pole_remote_max_endpoint_tilt_deg",
+            "pole_long_remote_distance_m",
+            "pole_long_remote_transition_m",
+            "pole_long_remote_min_vertical_span_m",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid.yaml"
+            for key in strictly_positive:
+                path.write_text(
+                    "config_version: 1\n"
+                    "pole_detection:\n"
+                    f"  {key}: 0\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(key=key),
+                    self.assertRaisesRegex(ConfigError, "must be greater than 0"),
+                ):
+                    load_config_defaults(build_arg_parser(), path)
+
     def test_no_config_preserves_legacy_parser_defaults(self) -> None:
         args = parse_args_with_config(
             build_arg_parser(),

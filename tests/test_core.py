@@ -876,6 +876,9 @@ class CrsPropagationTests(unittest.TestCase):
                         "pole_type": "SINGLE",
                         "pole_method": "GROUND_EXTR",
                         "pole_status": "REVIEW",
+                        "support_reconciled": True,
+                        "support_reconciled_replaced_remote": True,
+                        "support_hypothesis_distance_m": 0.04,
                         "pole_occluded": True,
                         "pole_occlusion_status": "OCCLUDED",
                         "pole_count": 1,
@@ -888,6 +891,10 @@ class CrsPropagationTests(unittest.TestCase):
                         "ground_rmse_m": 0.04,
                         "association_distance_m": 2.75,
                         "horizontal_connection_coverage_ratio": 0.80,
+                        "horizontal_connection_coherent_coverage_ratio": 0.70,
+                        "horizontal_connection_coherent_ratio": 0.875,
+                        "horizontal_connection_coherent_point_fraction": 0.45,
+                        "horizontal_connection_endpoint_anchored": True,
                         "completeness_ratio": 0.96,
                         "dominant_class_id": 84,
                         "dominant_class_fraction": 0.95,
@@ -906,6 +913,9 @@ class CrsPropagationTests(unittest.TestCase):
             self.assertEqual(record["pole_type"], "SINGLE")
             self.assertEqual(record["det_id"], "Dfixture000000000001")
             self.assertEqual(record["support_id"], "Pfixture000000000001")
+            self.assertTrue(record["reconciled"])
+            self.assertTrue(record["repl_rem"])
+            self.assertAlmostEqual(record["hyp_dist"], 0.04)
             self.assertTrue(record["occluded"])
             self.assertEqual(record["occ_state"], "OCCLUDED")
             self.assertEqual(record["obs_count"], 2)
@@ -914,6 +924,10 @@ class CrsPropagationTests(unittest.TestCase):
             self.assertEqual(record["unk_occ"], 1)
             self.assertAlmostEqual(record["assoc_m"], 2.75)
             self.assertAlmostEqual(record["arm_cov"], 0.80)
+            self.assertAlmostEqual(record["arm_3d"], 0.70)
+            self.assertAlmostEqual(record["arm_ratio"], 0.875)
+            self.assertAlmostEqual(record["arm_pts"], 0.45)
+            self.assertTrue(record["arm_end"])
             self.assertAlmostEqual(record["complete"], 0.96)
             self.assertEqual(record["dom_class"], 84)
             self.assertEqual(record["class_req"], "auto")

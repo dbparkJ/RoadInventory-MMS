@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -34,6 +34,9 @@ class PoleSearchParameters:
     geometry_remote_max_ground_rmse_m: float = 0.15
     min_points: int = 18
     max_axis_tilt_deg: float = 15.0
+    axis_plumb_max_tilt_deg: float = 4.0
+    axis_plumb_full_tilt_deg: float = 2.0
+    axis_plumb_endpoint_fraction: float = 0.20
     direct_max_axis_sign_distance_m: float = 0.75
     max_axis_sign_distance_m: float = 8.0
     horizontal_connection_radius_m: float = 0.25
@@ -41,7 +44,16 @@ class PoleSearchParameters:
     horizontal_connection_above_tolerance_m: float = 0.30
     horizontal_connection_bin_m: float = 0.25
     horizontal_connection_min_points_per_bin: int = 2
+    horizontal_connection_coherence_radius_m: float = 0.10
     min_horizontal_connection_coverage: float = 0.50
+    min_horizontal_connection_coherent_ratio: float = 0.65
+    min_horizontal_connection_coherent_point_fraction: float = 0.30
+    remote_max_endpoint_tilt_deg: float = 5.0
+    long_remote_distance_m: float = 8.0
+    long_remote_transition_m: float = 2.0
+    long_remote_min_vertical_span_m: float = 3.5
+    long_remote_min_completeness_ratio: float = 0.85
+    long_remote_min_connection_coverage_ratio: float = 0.85
     max_ground_class_fraction: float = 0.35
     min_ground_drop_m: float = 1.8
     require_ground: bool = True
@@ -92,6 +104,9 @@ class PoleSearchParameters:
             "geometry_remote_max_ground_rmse_m": self.geometry_remote_max_ground_rmse_m,
             "direct_max_axis_sign_distance_m": self.direct_max_axis_sign_distance_m,
             "max_axis_sign_distance_m": self.max_axis_sign_distance_m,
+            "long_remote_distance_m": self.long_remote_distance_m,
+            "long_remote_transition_m": self.long_remote_transition_m,
+            "long_remote_min_vertical_span_m": self.long_remote_min_vertical_span_m,
             "horizontal_connection_radius_m": self.horizontal_connection_radius_m,
             "horizontal_connection_z_tolerance_m": (
                 self.horizontal_connection_z_tolerance_m
@@ -100,6 +115,9 @@ class PoleSearchParameters:
                 self.horizontal_connection_above_tolerance_m
             ),
             "horizontal_connection_bin_m": self.horizontal_connection_bin_m,
+            "horizontal_connection_coherence_radius_m": (
+                self.horizontal_connection_coherence_radius_m
+            ),
         }
         invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
         if invalid:
@@ -136,6 +154,19 @@ class PoleSearchParameters:
             raise ValueError("min_horizontal_connection_coverage must be between 0 and 1")
         if self.horizontal_connection_min_points_per_bin < 1:
             raise ValueError("horizontal_connection_min_points_per_bin must be positive")
+        if not 0.0 <= self.min_horizontal_connection_coherent_ratio <= 1.0:
+            raise ValueError(
+                "min_horizontal_connection_coherent_ratio must be between 0 and 1"
+            )
+        if not (
+            0.0
+            <= self.min_horizontal_connection_coherent_point_fraction
+            <= 1.0
+        ):
+            raise ValueError(
+                "min_horizontal_connection_coherent_point_fraction must be "
+                "between 0 and 1"
+            )
         if self.direct_max_axis_sign_distance_m > self.max_axis_sign_distance_m:
             raise ValueError(
                 "direct_max_axis_sign_distance_m cannot exceed max_axis_sign_distance_m"
@@ -150,6 +181,34 @@ class PoleSearchParameters:
             raise ValueError("ground_exclusion_radius_m must be smaller than ground_core_radius_m")
         if not 0.0 <= self.max_axis_tilt_deg <= 90.0:
             raise ValueError("max_axis_tilt_deg must be between 0 and 90")
+        if not 0.0 <= self.axis_plumb_max_tilt_deg <= self.max_axis_tilt_deg:
+            raise ValueError(
+                "axis_plumb_max_tilt_deg must be between 0 and max_axis_tilt_deg"
+            )
+        if not 0.0 <= self.axis_plumb_full_tilt_deg <= self.axis_plumb_max_tilt_deg:
+            raise ValueError(
+                "axis_plumb_full_tilt_deg must be between 0 and "
+                "axis_plumb_max_tilt_deg"
+            )
+        if not 0.0 < self.remote_max_endpoint_tilt_deg <= self.max_axis_tilt_deg:
+            raise ValueError(
+                "remote_max_endpoint_tilt_deg must be positive and no greater "
+                "than max_axis_tilt_deg"
+            )
+        if not 0.0 < self.axis_plumb_endpoint_fraction <= 0.5:
+            raise ValueError("axis_plumb_endpoint_fraction must be in (0, 0.5]")
+        if not math.isfinite(self.long_remote_transition_m) or (
+            self.long_remote_transition_m <= 0.0
+        ):
+            raise ValueError("long_remote_transition_m must be finite and positive")
+        if not 0.0 <= self.long_remote_min_completeness_ratio <= 1.0:
+            raise ValueError(
+                "long_remote_min_completeness_ratio must be between 0 and 1"
+            )
+        if not 0.0 <= self.long_remote_min_connection_coverage_ratio <= 1.0:
+            raise ValueError(
+                "long_remote_min_connection_coverage_ratio must be between 0 and 1"
+            )
         if not 0.0 <= self.max_ground_class_fraction <= 1.0:
             raise ValueError("max_ground_class_fraction must be between 0 and 1")
         if not math.isfinite(self.min_ground_drop_m) or self.min_ground_drop_m < 0.0:
@@ -323,6 +382,21 @@ class PoleAxisCandidate:
     axis_bin_inlier_count: int | None = None
     axis_bin_count: int | None = None
     ground_support_distance_m: float | None = None
+    axis_plumb_adjusted: bool = False
+    axis_endpoint_tilt_deg: float | None = None
+    axis_endpoint_drift_m: float | None = None
+    horizontal_connection_point_count: int | None = None
+    horizontal_connection_ridge_point_count: int | None = None
+    horizontal_connection_ridge_density_points_per_m: float | None = None
+    horizontal_connection_coherent_bin_count: int | None = None
+    horizontal_connection_coherent_coverage_ratio: float | None = None
+    horizontal_connection_coherent_ratio: float | None = None
+    horizontal_connection_coherent_point_fraction: float | None = None
+    horizontal_connection_endpoint_anchored: bool | None = None
+    travel_longitudinal_offset_m: float | None = None
+    travel_lateral_offset_m: float | None = None
+    support_side: str | None = None
+    crossroad_alignment_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +440,9 @@ class _AxisFitResult:
     stabilized: bool
     bin_inlier_count: int
     bin_count: int
+    plumb_adjusted: bool
+    endpoint_tilt_deg: float | None
+    endpoint_drift_m: float | None
 
 
 @dataclass(frozen=True)
@@ -373,6 +450,14 @@ class _HorizontalConnection:
     occupied_bin_count: int
     expected_bin_count: int
     coverage_ratio: float
+    point_count: int
+    ridge_point_count: int
+    ridge_density_points_per_m: float
+    coherent_bin_count: int
+    coherent_coverage_ratio: float
+    coherent_ratio: float
+    coherent_point_fraction: float
+    endpoint_anchored: bool
 
 
 def blocks_intersecting_bounds(
@@ -570,14 +655,27 @@ def _horizontal_connection_coverage(
     delta_xy = np.asarray(attachment_xy, dtype=np.float64) - sign_xyz[:2]
     distance = float(np.linalg.norm(delta_xy))
     if distance <= 1e-9:
-        return _HorizontalConnection(1, 1, 1.0)
+        return _HorizontalConnection(
+            1,
+            1,
+            1.0,
+            0,
+            0,
+            0.0,
+            1,
+            1.0,
+            1.0,
+            1.0,
+            True,
+        )
     direction = delta_xy / distance
     relative_xy = points_xyz[:, :2] - sign_xyz[None, :2]
     along = relative_xy @ direction
-    perpendicular = np.abs(
+    signed_perpendicular = (
         (relative_xy[:, 0] * direction[1])
         - (relative_xy[:, 1] * direction[0])
     )
+    perpendicular = np.abs(signed_perpendicular)
     mask = (
         np.all(np.isfinite(points_xyz), axis=1)
         & (along >= 0.0)
@@ -597,20 +695,246 @@ def _horizontal_connection_coverage(
 
     expected_bins = max(1, int(math.ceil(distance / parameters.horizontal_connection_bin_m)))
     if not np.any(mask):
-        return _HorizontalConnection(0, expected_bins, 0.0)
+        return _HorizontalConnection(
+            0,
+            expected_bins,
+            0.0,
+            0,
+            0,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            False,
+        )
+    connection_along = along[mask]
+    connection_perpendicular = signed_perpendicular[mask]
+    connection_height = points_xyz[mask, 2] - float(sign_xyz[2])
     bin_ids = np.minimum(
         expected_bins - 1,
-        np.floor(along[mask] / parameters.horizontal_connection_bin_m).astype(np.int64),
+        np.floor(
+            connection_along / parameters.horizontal_connection_bin_m
+        ).astype(np.int64),
     )
     counts = np.bincount(bin_ids, minlength=expected_bins)
     occupied_bins = int(
         np.count_nonzero(counts >= parameters.horizontal_connection_min_points_per_bin)
     )
+
+    # Exclude one along-distance bin at each endpoint so dense sign-head and
+    # shaft returns cannot masquerade as a strong arm.  A real mast arm forms
+    # a dense, near-horizontal height ridge; thin overhead wires may achieve
+    # the same binary coverage but contribute far fewer returns per metre.
+    endpoint_margin = min(
+        parameters.horizontal_connection_bin_m,
+        max(0.0, distance * 0.2),
+    )
+    interior = (
+        (connection_along >= endpoint_margin)
+        & (connection_along <= distance - endpoint_margin)
+    )
+    if not np.any(interior):
+        interior = np.ones(connection_along.shape, dtype=bool)
+        interior_length = max(distance, parameters.horizontal_connection_bin_m)
+    else:
+        interior_length = max(
+            parameters.horizontal_connection_bin_m,
+            distance - (2.0 * endpoint_margin),
+        )
+    if expected_bins <= 4:
+        coherent_bin_count = occupied_bins
+        coherent_coverage = float(occupied_bins / expected_bins)
+        coherent_ratio = 1.0 if occupied_bins else 0.0
+        coherent_point_fraction = 1.0 if connection_along.size else 0.0
+        endpoint_anchored = bool(occupied_bins)
+        coherent_tube = np.ones(connection_along.shape, dtype=bool)
+    else:
+        mode_cell = max(
+            0.02,
+            parameters.horizontal_connection_coherence_radius_m * 0.60,
+        )
+
+        def endpoint_modes(endpoint: np.ndarray) -> list[tuple[float, ...]]:
+            endpoint_indices = np.flatnonzero(endpoint)
+            if endpoint_indices.size == 0:
+                return []
+            mode_values = np.column_stack(
+                (
+                    connection_perpendicular[endpoint_indices],
+                    connection_height[endpoint_indices],
+                )
+            )
+            mode_cells = np.floor(mode_values / mode_cell).astype(np.int64)
+            _, inverse, mode_counts = _group_integer_xy_cells(mode_cells)
+            modes: list[tuple[float, ...]] = []
+            for mode_index, mode_count in enumerate(mode_counts):
+                if (
+                    int(mode_count)
+                    < parameters.horizontal_connection_min_points_per_bin
+                ):
+                    continue
+                members = endpoint_indices[inverse == mode_index]
+                modes.append(
+                    (
+                        float(np.median(connection_along[members])),
+                        float(np.median(connection_perpendicular[members])),
+                        float(np.median(connection_height[members])),
+                        float(mode_count),
+                    )
+                )
+            modes.sort(
+                key=lambda item: (
+                    -item[3],
+                    abs(item[2]),
+                    abs(item[1]),
+                    item[0],
+                )
+            )
+            # Endpoint slabs contain at most a small cross-section for a real
+            # arm.  Bounding the mode count prevents vegetation from creating
+            # a quadratic explosion of implausible line pairs.
+            return modes[:32]
+
+        start_modes = endpoint_modes(bin_ids <= 1)
+        end_modes = endpoint_modes(bin_ids >= expected_bins - 2)
+        best_key: tuple[float, ...] | None = None
+        best_counts = np.zeros(expected_bins, dtype=np.int64)
+        best_tube = np.zeros(connection_along.shape, dtype=bool)
+        best_anchored = False
+        interior_points = (
+            (bin_ids >= 2)
+            & (bin_ids <= expected_bins - 3)
+        )
+        interior_point_count = int(np.count_nonzero(interior_points))
+        max_lateral_slope = math.tan(math.radians(15.0))
+        max_vertical_slope = math.tan(math.radians(35.0))
+        for start_mode in start_modes:
+            for end_mode in end_modes:
+                delta_s = end_mode[0] - start_mode[0]
+                if delta_s < 0.5 * distance:
+                    continue
+                lateral_slope = (end_mode[1] - start_mode[1]) / delta_s
+                vertical_slope = (end_mode[2] - start_mode[2]) / delta_s
+                if (
+                    abs(lateral_slope) > max_lateral_slope
+                    or abs(vertical_slope) > max_vertical_slope
+                ):
+                    continue
+                predicted_perpendicular = start_mode[1] + (
+                    (connection_along - start_mode[0]) * lateral_slope
+                )
+                predicted_height = start_mode[2] + (
+                    (connection_along - start_mode[0]) * vertical_slope
+                )
+                residual = np.hypot(
+                    connection_perpendicular - predicted_perpendicular,
+                    connection_height - predicted_height,
+                )
+                tube = (
+                    residual
+                    <= parameters.horizontal_connection_coherence_radius_m
+                )
+                tube_counts = np.bincount(
+                    bin_ids[tube],
+                    minlength=expected_bins,
+                )
+                coherent_bins = (
+                    tube_counts
+                    >= parameters.horizontal_connection_min_points_per_bin
+                )
+                anchored = bool(
+                    np.any(coherent_bins[:2])
+                    and np.any(coherent_bins[-2:])
+                )
+                coherent_bin_total = int(np.count_nonzero(coherent_bins))
+                interior_tube_points = int(
+                    np.count_nonzero(tube & interior_points)
+                )
+                median_residual = (
+                    float(np.median(residual[tube]))
+                    if np.any(tube)
+                    else math.inf
+                )
+                # Pick one physical centreline independently of the acceptance
+                # thresholds below.  Otherwise changing a gate can switch the
+                # reported line from the longest coherent arm to a shorter,
+                # denser fragment and make the measured ratios discontinuous.
+                key = (
+                    1.0 if anchored else 0.0,
+                    float(coherent_bin_total),
+                    float(interior_tube_points),
+                    -median_residual,
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_counts = tube_counts
+                    best_tube = tube
+                    best_anchored = anchored
+
+        coherent_bins = (
+            best_counts
+            >= parameters.horizontal_connection_min_points_per_bin
+        )
+        coherent_bin_count = int(np.count_nonzero(coherent_bins))
+        coherent_coverage = float(coherent_bin_count / expected_bins)
+        coherent_ratio = float(
+            coherent_bin_count / max(1, occupied_bins)
+        )
+        coherent_point_fraction = float(
+            np.count_nonzero(best_tube & interior_points)
+            / max(1, interior_point_count)
+        )
+        endpoint_anchored = best_anchored
+        coherent_tube = best_tube
+    # Count returns around the fitted 3-D centreline, not inside a fixed
+    # absolute-Z slab.  This preserves the physical density of a gently
+    # rising mast arm and prevents a flat wire from gaining an artificial
+    # ranking advantage solely because its height is constant.
+    ridge_count = int(np.count_nonzero(coherent_tube & interior))
     return _HorizontalConnection(
         occupied_bin_count=occupied_bins,
         expected_bin_count=expected_bins,
         coverage_ratio=float(occupied_bins / expected_bins),
+        point_count=int(connection_along.size),
+        ridge_point_count=ridge_count,
+        ridge_density_points_per_m=float(ridge_count / interior_length),
+        coherent_bin_count=coherent_bin_count,
+        coherent_coverage_ratio=coherent_coverage,
+        coherent_ratio=coherent_ratio,
+        coherent_point_fraction=coherent_point_fraction,
+        endpoint_anchored=endpoint_anchored,
     )
+
+
+def _required_horizontal_connection_point_fraction(
+    association_distance: float,
+    connection: _HorizontalConnection,
+    parameters: PoleSearchParameters,
+) -> float:
+    """Return the point-fraction gate for one measured remote arm.
+
+    A short mast arm can share its small capsule with the signal head, shaft,
+    and nearby street furniture.  Permit a narrowly bounded relaxation only
+    when its raw and coherent occupancy are both essentially complete.  Long
+    arms and incomplete short structures retain the normal global threshold.
+    """
+
+    required = parameters.min_horizontal_connection_coherent_point_fraction
+    short_remote_limit = 4.0 * parameters.direct_max_axis_sign_distance_m
+    if not (
+        parameters.direct_max_axis_sign_distance_m
+        < association_distance
+        <= short_remote_limit
+        and connection.endpoint_anchored
+        and connection.coverage_ratio >= 0.95
+        and connection.coherent_coverage_ratio >= 0.95
+        and connection.coherent_ratio >= 0.95
+        and connection.ridge_density_points_per_m >= 20.0
+    ):
+        return required
+    relaxed = max(0.10, required / 3.0)
+    return min(required, relaxed)
 
 
 def _stable_axis_bin_indices(
@@ -736,6 +1060,96 @@ def _robust_bin_axis_coefficients(
     return coefficients, z_reference, keep
 
 
+def _plumb_axis_from_endpoint_centres(
+    bin_medians: np.ndarray,
+    kept_bins: np.ndarray,
+    coefficients: np.ndarray,
+    z_reference: float,
+    parameters: PoleSearchParameters,
+) -> tuple[np.ndarray, bool, float | None, float | None]:
+    """Stabilize a nearly vertical shaft from equal-weight upper/lower centres.
+
+    Raw point means are deliberately avoided because a dense mast arm or
+    foreground object can dominate one height range.  Each Z-bin contributes
+    one robust median, then small endpoint slabs define the observed shaft
+    drift.  Structural poles whose endpoint drift is consistent with a nearly
+    plumb shaft are represented by a vertical line through the midpoint of the
+    two slab centres.  Clearly tilted shafts retain the robust Theil-Sen fit.
+    """
+
+    selected = np.asarray(bin_medians[np.asarray(kept_bins, dtype=bool)])
+    if selected.shape[0] < max(4, parameters.min_vertical_bins):
+        return coefficients, False, None, None
+    selected = selected[np.argsort(selected[:, 2], kind="stable")]
+
+    # Avoid the outermost bin when enough height samples exist.  The highest
+    # bin is where a horizontal arm most often enters the shaft cluster, while
+    # the lowest can contain curb/vehicle contamination.
+    edge_trim = 1 if selected.shape[0] >= 10 else 0
+    core = selected[
+        edge_trim : selected.shape[0] - edge_trim
+        if edge_trim
+        else selected.shape[0]
+    ]
+    if core.shape[0] < 4:
+        core = selected
+    slab_count = max(
+        2,
+        int(math.ceil(core.shape[0] * parameters.axis_plumb_endpoint_fraction)),
+    )
+    slab_count = min(slab_count, max(1, core.shape[0] // 2))
+    lower_centre = np.mean(core[:slab_count], axis=0)
+    upper_centre = np.mean(core[-slab_count:], axis=0)
+    height = float(upper_centre[2] - lower_centre[2])
+    if height <= 1e-9:
+        return coefficients, False, None, None
+
+    endpoint_drift = float(
+        np.linalg.norm(upper_centre[:2] - lower_centre[:2])
+    )
+    endpoint_tilt = math.degrees(math.atan2(endpoint_drift, height))
+    if endpoint_tilt >= parameters.axis_plumb_max_tilt_deg:
+        return coefficients, False, endpoint_tilt, endpoint_drift
+
+    midpoint_z = 0.5 * float(lower_centre[2] + upper_centre[2])
+    midpoint_xy = 0.5 * (lower_centre[:2] + upper_centre[:2])
+    original_midpoint = (
+        np.asarray([midpoint_z - z_reference, 1.0], dtype=np.float64)
+        @ coefficients
+    )
+    # Keep the endpoint construction robust while preventing one slab from
+    # shifting the whole line outside the already validated fitted shaft.
+    maximum_shift = max(0.02, parameters.xy_voxel_m * 0.5)
+    shift = midpoint_xy - original_midpoint
+    shift_norm = float(np.linalg.norm(shift))
+    if shift_norm > maximum_shift:
+        midpoint_xy = original_midpoint + (shift * (maximum_shift / shift_norm))
+
+    full_tilt = parameters.axis_plumb_full_tilt_deg
+    transition_width = parameters.axis_plumb_max_tilt_deg - full_tilt
+    if endpoint_tilt <= full_tilt or transition_width <= 1e-9:
+        retained_slope = 0.0
+    else:
+        transition = float(
+            np.clip((endpoint_tilt - full_tilt) / transition_width, 0.0, 1.0)
+        )
+        # Smoothstep has zero derivative at both ends.  This avoids a several
+        # decimetre base jump when otherwise identical fits straddle the
+        # plumb threshold in adjacent frames.
+        retained_slope = transition * transition * (3.0 - (2.0 * transition))
+    correction_strength = 1.0 - retained_slope
+    anchored_midpoint = (
+        original_midpoint
+        + (correction_strength * (midpoint_xy - original_midpoint))
+    )
+    slope = np.asarray(coefficients[0], dtype=np.float64) * retained_slope
+    intercept = anchored_midpoint - (
+        (midpoint_z - z_reference) * slope
+    )
+    adjusted = np.vstack((slope, intercept))
+    return adjusted, correction_strength > 1e-9, endpoint_tilt, endpoint_drift
+
+
 def _robust_axis_fit(
     points_xyz: np.ndarray,
     source_indices: np.ndarray,
@@ -771,6 +1185,19 @@ def _robust_axis_fit(
     tilt_deg = math.degrees(math.atan(float(np.linalg.norm(slope_xy))))
     if tilt_deg > parameters.max_axis_tilt_deg:
         return None
+    (
+        coefficients,
+        plumb_adjusted,
+        endpoint_tilt_deg,
+        endpoint_drift_m,
+    ) = _plumb_axis_from_endpoint_centres(
+        bin_medians,
+        kept_bins,
+        coefficients,
+        z_reference,
+        parameters,
+    )
+    slope_xy = coefficients[0]
 
     design_points = np.column_stack(
         (points_xyz[:, 2] - z_reference, np.ones(points_xyz.shape[0], dtype=np.float64))
@@ -815,9 +1242,13 @@ def _robust_axis_fit(
         stabilized=bool(
             stable_indices.size < bin_medians.shape[0]
             or int(kept_bins.sum()) < bin_medians.shape[0]
+            or plumb_adjusted
         ),
         bin_inlier_count=int(kept_bins.sum()),
         bin_count=int(bin_medians.shape[0]),
+        plumb_adjusted=plumb_adjusted,
+        endpoint_tilt_deg=endpoint_tilt_deg,
+        endpoint_drift_m=endpoint_drift_m,
     )
 
 
@@ -1277,6 +1708,114 @@ def _discover_axis_fits(
     return fits
 
 
+def _bounded_unit(value: Any, *, default: float = 0.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    if not math.isfinite(numeric):
+        numeric = default
+    return float(np.clip(numeric, 0.0, 1.0))
+
+
+def pole_connection_coverage(item: Any) -> float:
+    """Return coherent 3-D arm coverage, falling back for legacy candidates."""
+
+    coherent = getattr(
+        item,
+        "horizontal_connection_coherent_coverage_ratio",
+        None,
+    )
+    if coherent is not None:
+        return _bounded_unit(coherent)
+    return _bounded_unit(
+        getattr(item, "horizontal_connection_coverage_ratio", 0.0)
+    )
+
+
+def remote_pole_junction_cost(item: Any) -> float:
+    """Return a bounded distance-equivalent cost for a verified remote axis.
+
+    Physical arm and shaft gates run before this comparison.  General quality
+    affects at most one metre of effective distance.  Arm density is handled
+    separately by ``select_pole_candidate`` and only for a close, opposite-side
+    tie, so dense long-range clutter cannot gain a global ranking advantage.
+    """
+
+    distance = float(getattr(item, "association_distance_m", math.inf))
+    if not math.isfinite(distance):
+        return math.inf
+    coverage = pole_connection_coverage(item)
+    completeness = _bounded_unit(getattr(item, "completeness_ratio", 0.0))
+    multi_return = _bounded_unit(
+        getattr(item, "multi_return_fraction", 0.0),
+        default=0.0,
+    )
+    quality = (
+        (0.45 * coverage)
+        + (0.45 * completeness)
+        + (0.10 * (1.0 - multi_return))
+    )
+    return distance + (1.0 - quality)
+
+
+def _long_remote_gate_requirements(
+    association_distance: float,
+    parameters: PoleSearchParameters,
+    *,
+    geometry_only: bool,
+) -> tuple[float, float, float] | None:
+    """Interpolate long-range evidence requirements without an 8 m cliff."""
+
+    transition = (
+        (association_distance - parameters.long_remote_distance_m)
+        / parameters.long_remote_transition_m
+    )
+    if transition <= 0.0:
+        return None
+    transition = float(np.clip(transition, 0.0, 1.0))
+    weight = transition * transition * (3.0 - (2.0 * transition))
+    base_completeness = (
+        parameters.geometry_remote_min_completeness_ratio
+        if geometry_only
+        else 0.0
+    )
+    required_span = (
+        parameters.min_vertical_span_m
+        + (
+            max(
+                parameters.min_vertical_span_m,
+                parameters.long_remote_min_vertical_span_m,
+            )
+            - parameters.min_vertical_span_m
+        )
+        * weight
+    )
+    required_completeness = (
+        base_completeness
+        + (
+            max(
+                base_completeness,
+                parameters.long_remote_min_completeness_ratio,
+            )
+            - base_completeness
+        )
+        * weight
+    )
+    required_connection = (
+        parameters.min_horizontal_connection_coverage
+        + (
+            max(
+                parameters.min_horizontal_connection_coverage,
+                parameters.long_remote_min_connection_coverage_ratio,
+            )
+            - parameters.min_horizontal_connection_coverage
+        )
+        * weight
+    )
+    return required_span, required_completeness, required_connection
+
+
 def pole_candidate_rank_key(
     item: PoleAxisCandidate,
     parameters: PoleSearchParameters,
@@ -1290,19 +1829,7 @@ def pole_candidate_rank_key(
     direct = (
         association_distance <= parameters.direct_max_axis_sign_distance_m
     )
-    connection_coverage = float(
-        getattr(item, "horizontal_connection_coverage_ratio", 0.0) or 0.0
-    )
-    connection_expected_bins = int(
-        getattr(item, "horizontal_connection_expected_bin_count", 0) or 0
-    )
-    # A 4/4 connection immediately beside a sign is much easier to obtain by
-    # chance than a 15/26 arm across several metres.  Weight coverage by the
-    # square root of tested length so short fragments do not outrank a real
-    # cantilever, while coverage still dominates very long incomplete clutter.
-    connection_strength = connection_coverage * math.sqrt(
-        max(1, connection_expected_bins)
-    )
+    connection_coverage = pole_connection_coverage(item)
     radial_rmse = float(getattr(item, "radial_rmse_m", math.inf))
     multi_return_fraction = float(
         getattr(item, "multi_return_fraction", 0.0) or 0.0
@@ -1329,16 +1856,17 @@ def pole_candidate_rank_key(
             -float(getattr(item, "point_count", 0)),
         )
 
-    remote_evidence = (
-        connection_strength
-        + (2.0 * completeness)
-        - (6.0 * radial_rmse)
-        - multi_return_fraction
-        - (0.05 * association_distance)
-    )
+    # Every remote candidate has already passed the physical arm-coverage
+    # gate.  The first complete vertical junction reached by that arm is the
+    # most plausible support.  Rewarding sqrt(connection length), as the old
+    # order did, systematically preferred a farther utility pole, tree, or
+    # building edge when wires happened to fill the intervening bins.  The
+    # bounded quality terms still resolve close candidates without allowing
+    # dense long-range clutter to erase a large physical separation.
     return (
         *common,
-        -remote_evidence,
+        remote_pole_junction_cost(item),
+        -connection_coverage,
         -completeness,
         radial_rmse,
         multi_return_fraction,
@@ -1346,6 +1874,163 @@ def pole_candidate_rank_key(
         -score,
         -float(getattr(item, "point_count", 0)),
     )
+
+
+def select_pole_candidate(
+    candidates: Iterable[PoleAxisCandidate],
+    parameters: PoleSearchParameters,
+    *,
+    rank_key: Callable[[PoleAxisCandidate], tuple[float, ...]] | None = None,
+) -> PoleAxisCandidate:
+    """Select one support, allowing only strong near-tie arm density to flip side."""
+
+    effective_rank_key = (
+        (lambda item: pole_candidate_rank_key(item, parameters))
+        if rank_key is None
+        else rank_key
+    )
+    ordered = sorted(
+        candidates,
+        key=effective_rank_key,
+    )
+    if not ordered:
+        raise ValueError("select_pole_candidate requires at least one candidate")
+    initial = ordered[0]
+    if (
+        float(initial.association_distance_m)
+        <= parameters.direct_max_axis_sign_distance_m
+    ):
+        return initial
+
+    preferred_min_completeness = float(
+        getattr(parameters, "preferred_min_completeness_ratio", 0.75)
+    )
+    initial_complete = (
+        float(getattr(initial, "completeness_ratio", 0.0) or 0.0)
+        >= preferred_min_completeness
+    )
+    nearest_distance = min(
+        float(item.association_distance_m)
+        for item in ordered
+        if (
+            float(item.association_distance_m)
+            > parameters.direct_max_axis_sign_distance_m
+            and (
+                float(getattr(item, "completeness_ratio", 0.0) or 0.0)
+                >= preferred_min_completeness
+            )
+            == initial_complete
+        )
+    )
+    near_ties = [
+        item
+        for item in ordered
+        if (
+            float(item.association_distance_m)
+            > parameters.direct_max_axis_sign_distance_m
+            and (
+                float(getattr(item, "completeness_ratio", 0.0) or 0.0)
+                >= preferred_min_completeness
+            )
+            == initial_complete
+            and float(item.association_distance_m) <= nearest_distance + 0.75
+            and abs(
+                float(getattr(item, "completeness_ratio", 0.0) or 0.0)
+                - float(
+                    getattr(initial, "completeness_ratio", 0.0) or 0.0
+                )
+            )
+            <= 0.10
+            and abs(
+                pole_connection_coverage(item)
+                - pole_connection_coverage(initial)
+            )
+            <= 0.10
+            and getattr(
+                item,
+                "horizontal_connection_ridge_density_points_per_m",
+                None,
+            )
+            is not None
+        )
+    ]
+    if len(near_ties) < 2:
+        return initial
+    initial_side = getattr(initial, "support_side", None)
+    initial_density = getattr(
+        initial,
+        "horizontal_connection_ridge_density_points_per_m",
+        None,
+    )
+    lateral_sides = {"LEFT_OF_TRAVEL", "RIGHT_OF_TRAVEL"}
+    if (
+        initial_side not in lateral_sides
+        or initial_density is None
+        or getattr(initial, "horizontal_connection_point_count", None)
+        is None
+    ):
+        return initial
+    opposite_side = (
+        "RIGHT_OF_TRAVEL"
+        if initial_side == "LEFT_OF_TRAVEL"
+        else "LEFT_OF_TRAVEL"
+    )
+    opposite_side_candidates = [
+        item
+        for item in near_ties
+        if (
+            getattr(item, "support_side", None) == opposite_side
+            and getattr(item, "horizontal_connection_point_count", None)
+            is not None
+        )
+    ]
+    if not opposite_side_candidates:
+        return initial
+    strongest_opposite = min(
+        opposite_side_candidates,
+        key=lambda item: (
+            -float(
+                item.horizontal_connection_ridge_density_points_per_m or 0.0
+            ),
+            effective_rank_key(item),
+        ),
+    )
+    strongest_opposite_density = max(
+        0.0,
+        float(
+            strongest_opposite.horizontal_connection_ridge_density_points_per_m
+            or 0.0
+        ),
+    )
+    initial_density = max(0.0, float(initial_density or 0.0))
+    initial_raw_arm_density = float(
+        getattr(initial, "horizontal_connection_point_count", 0) or 0
+    ) / max(0.25, float(initial.association_distance_m))
+    opposite_raw_arm_density = float(
+        getattr(
+            strongest_opposite,
+            "horizontal_connection_point_count",
+            0,
+        )
+        or 0
+    ) / max(
+        0.25,
+        float(strongest_opposite.association_distance_m),
+    )
+    shaft_support_ratio = float(
+        getattr(strongest_opposite, "point_count", 0) or 0
+    ) / max(
+        1.0,
+        float(getattr(initial, "point_count", 0) or 0),
+    )
+    if (
+        strongest_opposite_density >= 2.5 * max(initial_density, 1e-9)
+        and opposite_raw_arm_density
+        >= 2.0 * max(initial_raw_arm_density, 1e-9)
+        and shaft_support_ratio >= 1.5
+    ):
+        return strongest_opposite
+    return initial
 
 
 def _axis_ground_intersection(
@@ -1388,6 +2073,9 @@ def find_pole_bases(
     *,
     workspace: PoleSearchWorkspace | None = None,
     ground_classifications: np.ndarray | None = None,
+    travel_forward_xy: np.ndarray | None = None,
+    travel_right_xy: np.ndarray | None = None,
+    rejected_support_hypotheses: list[dict[str, Any]] | None = None,
 ) -> PoleSearchResult | None:
     """Find vertical pole axes and place their representative point on local ground.
 
@@ -1407,6 +2095,24 @@ def find_pole_bases(
         raise ValueError("corridor_mask must have one value per neighborhood point")
     if sign.shape != (3,) or not np.all(np.isfinite(sign)):
         raise ValueError("sign_xyz must be a finite three-vector")
+    travel_forward: np.ndarray | None = None
+    travel_right: np.ndarray | None = None
+    for name, value in (
+        ("travel_forward_xy", travel_forward_xy),
+        ("travel_right_xy", travel_right_xy),
+    ):
+        if value is None:
+            continue
+        vector = np.asarray(value, dtype=np.float64)
+        if vector.shape != (2,) or not np.all(np.isfinite(vector)):
+            raise ValueError(f"{name} must be a finite two-vector")
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-9:
+            raise ValueError(f"{name} cannot be a zero vector")
+        if name == "travel_forward_xy":
+            travel_forward = vector / norm
+        else:
+            travel_right = vector / norm
     search_workspace = workspace or PoleSearchWorkspace(points)
     search_workspace._check_points(points)
     classes = None
@@ -1536,6 +2242,14 @@ def find_pole_bases(
         horizontal_connection_bins: int | None = None
         horizontal_connection_expected_bins: int | None = None
         horizontal_connection_coverage: float | None = None
+        horizontal_connection_point_count: int | None = None
+        horizontal_connection_ridge_point_count: int | None = None
+        horizontal_connection_ridge_density: float | None = None
+        horizontal_connection_coherent_bins: int | None = None
+        horizontal_connection_coherent_coverage: float | None = None
+        horizontal_connection_coherent_ratio: float | None = None
+        horizontal_connection_coherent_point_fraction: float | None = None
+        horizontal_connection_endpoint_anchored: bool | None = None
         if is_remote:
             connection_indices = search_workspace.query_connection_capsule(
                 points,
@@ -1557,10 +2271,93 @@ def find_pole_bases(
             horizontal_connection_bins = connection.occupied_bin_count
             horizontal_connection_expected_bins = connection.expected_bin_count
             horizontal_connection_coverage = connection.coverage_ratio
+            horizontal_connection_point_count = connection.point_count
+            horizontal_connection_ridge_point_count = (
+                connection.ridge_point_count
+            )
+            horizontal_connection_ridge_density = (
+                connection.ridge_density_points_per_m
+            )
+            horizontal_connection_coherent_bins = (
+                connection.coherent_bin_count
+            )
+            horizontal_connection_coherent_coverage = (
+                connection.coherent_coverage_ratio
+            )
+            horizontal_connection_coherent_ratio = connection.coherent_ratio
+            horizontal_connection_coherent_point_fraction = (
+                connection.coherent_point_fraction
+            )
+            horizontal_connection_endpoint_anchored = (
+                connection.endpoint_anchored
+            )
+            required_connection_point_fraction = (
+                _required_horizontal_connection_point_fraction(
+                    association_distance,
+                    connection,
+                    parameters,
+                )
+            )
+            connection_failure_reason: str | None = None
             if (
                 horizontal_connection_coverage
                 < parameters.min_horizontal_connection_coverage
             ):
+                connection_failure_reason = "raw_coverage"
+            elif connection.expected_bin_count > 4 and (
+                not connection.endpoint_anchored
+                or connection.coherent_coverage_ratio
+                < parameters.min_horizontal_connection_coverage
+                or connection.coherent_ratio
+                < parameters.min_horizontal_connection_coherent_ratio
+                or connection.coherent_point_fraction
+                < required_connection_point_fraction
+            ):
+                connection_failure_reason = "coherent_arm"
+            elif (
+                fit.endpoint_tilt_deg is not None
+                and fit.endpoint_tilt_deg
+                > parameters.remote_max_endpoint_tilt_deg
+            ):
+                connection_failure_reason = "endpoint_tilt"
+            if connection_failure_reason is not None:
+                if (
+                    rejected_support_hypotheses is not None
+                    and connection_failure_reason != "endpoint_tilt"
+                    and (
+                        fit.endpoint_tilt_deg is None
+                        or fit.endpoint_tilt_deg
+                        <= parameters.remote_max_endpoint_tilt_deg
+                    )
+                ):
+                    rejected_support_hypotheses.append(
+                        {
+                            "axis_x": float(attachment_xy[0]),
+                            "axis_y": float(attachment_xy[1]),
+                            "association_distance_m": association_distance,
+                            "vertical_span_m": float(
+                                np.ptp(inlier_points[:, 2])
+                            ),
+                            "axis_rmse_m": radial_rmse,
+                            "axis_endpoint_tilt_deg": fit.endpoint_tilt_deg,
+                            "rejection_reason": connection_failure_reason,
+                            "horizontal_connection_coverage_ratio": (
+                                connection.coverage_ratio
+                            ),
+                            "horizontal_connection_coherent_coverage_ratio": (
+                                connection.coherent_coverage_ratio
+                            ),
+                            "horizontal_connection_coherent_ratio": (
+                                connection.coherent_ratio
+                            ),
+                            "horizontal_connection_coherent_point_fraction": (
+                                connection.coherent_point_fraction
+                            ),
+                            "horizontal_connection_endpoint_anchored": (
+                                connection.endpoint_anchored
+                            ),
+                        }
+                    )
                 continue
 
         lowest_observed_z = float(np.quantile(inlier_points[:, 2], 0.02))
@@ -1698,6 +2495,30 @@ def find_pole_bases(
                     )
                 ):
                     continue
+            long_requirements = _long_remote_gate_requirements(
+                association_distance,
+                parameters,
+                geometry_only=classes is None,
+            )
+            if long_requirements is not None:
+                (
+                    required_span,
+                    required_completeness,
+                    required_connection,
+                ) = long_requirements
+                if (
+                    vertical_span < required_span
+                    or (
+                        ground is not None
+                        and float(completeness_ratio or 0.0)
+                        < required_completeness
+                    )
+                    or float(
+                        horizontal_connection_coherent_coverage or 0.0
+                    )
+                    < required_connection
+                ):
+                    continue
         elif (
             classes is None
             and radial_rmse > parameters.geometry_remote_max_axis_rmse_m
@@ -1750,6 +2571,39 @@ def find_pole_bases(
             and dominant_class_fraction > parameters.max_ground_class_fraction
         ):
             continue
+        support_delta_xy = attachment_xy - sign[:2]
+        travel_longitudinal_offset = (
+            None
+            if travel_forward is None
+            else float(np.dot(support_delta_xy, travel_forward))
+        )
+        travel_lateral_offset = (
+            None
+            if travel_right is None
+            else float(np.dot(support_delta_xy, travel_right))
+        )
+        crossroad_alignment_ratio = (
+            None
+            if travel_lateral_offset is None or association_distance <= 1e-9
+            else float(
+                min(
+                    1.0,
+                    abs(travel_lateral_offset) / association_distance,
+                )
+            )
+        )
+        support_side = (
+            None
+            if travel_lateral_offset is None
+            else "ALONG_TRAVEL"
+            if (
+                abs(travel_lateral_offset) < 0.15
+                or float(crossroad_alignment_ratio or 0.0) < 0.50
+            )
+            else "RIGHT_OF_TRAVEL"
+            if travel_lateral_offset > 0.0
+            else "LEFT_OF_TRAVEL"
+        )
         candidates.append(
             PoleAxisCandidate(
                 base_xyz=base_xyz,
@@ -1795,6 +2649,37 @@ def find_pole_bases(
                 axis_bin_inlier_count=fit.bin_inlier_count,
                 axis_bin_count=fit.bin_count,
                 ground_support_distance_m=ground_support_distance,
+                axis_plumb_adjusted=fit.plumb_adjusted,
+                axis_endpoint_tilt_deg=fit.endpoint_tilt_deg,
+                axis_endpoint_drift_m=fit.endpoint_drift_m,
+                horizontal_connection_point_count=(
+                    horizontal_connection_point_count
+                ),
+                horizontal_connection_ridge_point_count=(
+                    horizontal_connection_ridge_point_count
+                ),
+                horizontal_connection_ridge_density_points_per_m=(
+                    horizontal_connection_ridge_density
+                ),
+                horizontal_connection_coherent_bin_count=(
+                    horizontal_connection_coherent_bins
+                ),
+                horizontal_connection_coherent_coverage_ratio=(
+                    horizontal_connection_coherent_coverage
+                ),
+                horizontal_connection_coherent_ratio=(
+                    horizontal_connection_coherent_ratio
+                ),
+                horizontal_connection_coherent_point_fraction=(
+                    horizontal_connection_coherent_point_fraction
+                ),
+                horizontal_connection_endpoint_anchored=(
+                    horizontal_connection_endpoint_anchored
+                ),
+                travel_longitudinal_offset_m=travel_longitudinal_offset,
+                travel_lateral_offset_m=travel_lateral_offset,
+                support_side=support_side,
+                crossroad_alignment_ratio=crossroad_alignment_ratio,
             )
         )
 
@@ -1804,8 +2689,7 @@ def find_pole_bases(
     # appendage that happens to be closer to the sign centre.  Direct supports
     # still beat verified remote supports at the same completeness tier; a
     # remote axis can only enter the ranking after the 3-D arm gate above.
-    candidates.sort(key=lambda item: pole_candidate_rank_key(item, parameters))
-    selected = candidates[0]
+    selected = select_pole_candidate(candidates, parameters)
     return PoleSearchResult(
         representative_xyz=selected.base_xyz,
         candidates=(selected,),
@@ -2087,6 +2971,25 @@ def cluster_pole_observations(
             for member in members:
                 relation = dict(member)
                 relation.update(aggregate)
+                if member.get("support_reconciled"):
+                    relation["pole_method"] = str(
+                        member.get("pole_method")
+                        or "MULTI_FRAME_DIRECT_ANCHOR"
+                    )
+                    relation["pole_status"] = "REVIEW"
+                    relation["pole_search_mode"] = str(
+                        member.get("pole_search_mode")
+                        or "multi_frame_direct_anchor"
+                    )
+                elif any(
+                    item.get("support_reconciled") for item in members
+                ):
+                    # A REVIEW-only inferred relation must not downgrade the
+                    # directly observed anchor rows that established the
+                    # support coordinate.
+                    relation["pole_status"] = str(
+                        member.get("pole_status") or relation["pole_status"]
+                    )
                 merged.append(relation)
     merged.sort(
         key=lambda item: (

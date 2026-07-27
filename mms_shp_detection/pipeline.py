@@ -68,7 +68,9 @@ from .pole import (
     blocks_intersecting_bounds,
     cluster_pole_observations,
     find_pole_bases,
-    pole_candidate_rank_key,
+    pole_connection_coverage,
+    remote_pole_junction_cost,
+    select_pole_candidate,
 )
 from .shp_writer import (
     collect_detection_records,
@@ -80,7 +82,7 @@ from .shp_writer import (
 )
 
 
-RESULT_SCHEMA_VERSION = 14
+RESULT_SCHEMA_VERSION = 17
 DATASET_SIGNATURE_VERSION = 1
 PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION = 1
 PANORAMA_ALIGNMENT_QA_CACHE_VERSION = 1
@@ -1000,6 +1002,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pole-min-points", type=int, default=18)
     parser.add_argument("--pole-max-axis-tilt-deg", type=float, default=15.0)
+    parser.add_argument(
+        "--pole-axis-plumb-max-tilt-deg",
+        type=float,
+        default=4.0,
+        help=(
+            "Represent shafts this close to vertical with a plumb line through "
+            "robust upper/lower Z-bin centres."
+        ),
+    )
+    parser.add_argument(
+        "--pole-axis-plumb-full-tilt-deg",
+        type=float,
+        default=2.0,
+        help=(
+            "Fully plumb axes up to this endpoint tilt, then smoothly retain "
+            "the measured tilt up to --pole-axis-plumb-max-tilt-deg."
+        ),
+    )
+    parser.add_argument(
+        "--pole-axis-plumb-endpoint-fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of robust shaft Z-bins used in each endpoint centre.",
+    )
     parser.add_argument("--pole-direct-max-axis-sign-distance-m", type=float, default=0.75)
     parser.add_argument("--pole-max-axis-sign-distance-m", type=float, default=8.0)
     parser.add_argument("--pole-horizontal-connection-radius-m", type=float, default=0.25)
@@ -1023,9 +1049,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
     )
     parser.add_argument(
+        "--pole-horizontal-connection-coherence-radius-m",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
         "--pole-min-horizontal-connection-coverage",
         type=float,
         default=0.50,
+    )
+    parser.add_argument(
+        "--pole-min-horizontal-connection-coherent-ratio",
+        type=float,
+        default=0.65,
+    )
+    parser.add_argument(
+        "--pole-min-horizontal-connection-coherent-point-fraction",
+        type=float,
+        default=0.30,
+    )
+    parser.add_argument(
+        "--pole-remote-max-endpoint-tilt-deg",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument("--pole-long-remote-distance-m", type=float, default=8.0)
+    parser.add_argument("--pole-long-remote-transition-m", type=float, default=2.0)
+    parser.add_argument(
+        "--pole-long-remote-min-vertical-span-m",
+        type=float,
+        default=3.5,
+    )
+    parser.add_argument(
+        "--pole-long-remote-min-completeness-ratio",
+        type=float,
+        default=0.85,
+    )
+    parser.add_argument(
+        "--pole-long-remote-min-connection-coverage-ratio",
+        type=float,
+        default=0.85,
     )
     parser.add_argument("--pole-max-ground-class-fraction", type=float, default=0.35)
     parser.add_argument("--pole-min-ground-drop-m", type=float, default=1.8)
@@ -2001,6 +2064,434 @@ def attach_support_ids_to_detection_records(
         )
 
 
+def reconcile_remote_supports_from_direct_anchors(
+    detection_records: list[dict[str, Any]],
+    pole_observations: list[dict[str, Any]],
+    *,
+    direct_distance_m: float = 0.75,
+    anchor_cluster_radius_m: float = 0.15,
+    anchor_max_spread_m: float = 0.15,
+    anchor_max_z_spread_m: float = 0.20,
+    max_frame_gap: int = 2,
+    max_link_distance_m: float = 12.0,
+    uniqueness_margin_m: float = 1.0,
+    hypothesis_anchor_radius_m: float = 0.30,
+) -> list[dict[str, Any]]:
+    """Add REVIEW relations for signals supported by repeated direct anchors.
+
+    This is deliberately a final, multi-frame fallback.  It never changes an
+    AUTO relation or a direct support.  A missing or REVIEW relation is changed
+    only when the target frame contains a shaft-valid/arm-rejected hypothesis
+    at the same position and the physical pole is observed directly in two
+    nearby frames.
+    """
+
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def optional_integer(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        number = finite_number(value)
+        if number is None or not number.is_integer():
+            return None
+        return int(number)
+
+    def has_direct_association(item: dict[str, Any]) -> bool:
+        association_distance = finite_number(
+            item.get("association_distance_m")
+        )
+        return (
+            association_distance is not None
+            and 0.0 <= association_distance <= direct_distance_m
+        )
+
+    usable_observations: list[dict[str, Any]] = []
+    for item in pole_observations:
+        if not isinstance(item, dict):
+            continue
+        pole_xyz = tuple(
+            finite_number(item.get(key))
+            for key in ("pole_x", "pole_y", "pole_z")
+        )
+        if any(value is None for value in pole_xyz):
+            continue
+        association_value = item.get("association_distance_m")
+        association_distance = (
+            None
+            if association_value is None
+            else finite_number(association_value)
+        )
+        if (
+            association_value is not None
+            and (
+                association_distance is None
+                or association_distance < 0.0
+            )
+        ):
+            continue
+        normalized = dict(item)
+        normalized.update(
+            {
+                "pole_x": pole_xyz[0],
+                "pole_y": pole_xyz[1],
+                "pole_z": pole_xyz[2],
+            }
+        )
+        if "association_distance_m" in item:
+            normalized["association_distance_m"] = association_distance
+        for key in ("pole_quality", "confidence"):
+            if key in item:
+                normalized[key] = finite_number(item.get(key))
+        for key in ("class_id", "detection_index"):
+            if key in item:
+                normalized[key] = optional_integer(item.get(key))
+        usable_observations.append(normalized)
+
+    existing_by_detection: dict[str, list[dict[str, Any]]] = {}
+    for item in usable_observations:
+        detection_id = str(item.get("detection_id") or "")
+        if detection_id:
+            existing_by_detection.setdefault(detection_id, []).append(item)
+    direct: list[dict[str, Any]] = []
+    for item in usable_observations:
+        association_distance = item.get("association_distance_m")
+        pose_row = optional_integer(item.get("pose_row_number"))
+        if (
+            str(item.get("pole_status") or "") != "AUTO"
+            or association_distance is None
+            or association_distance > direct_distance_m
+            or pose_row is None
+        ):
+            continue
+        normalized = dict(item)
+        normalized["pose_row_number"] = pose_row
+        direct.append(normalized)
+    if len(direct) < 2:
+        return list(usable_observations)
+    clustered = cluster_pole_observations(
+        [dict(item) for item in direct],
+        radius_m=anchor_cluster_radius_m,
+    )
+    by_support: dict[str, list[dict[str, Any]]] = {}
+    for item in clustered:
+        by_support.setdefault(str(item.get("support_id") or ""), []).append(item)
+
+    anchors: list[dict[str, Any]] = []
+    for support_id, members in by_support.items():
+        if not support_id or not members:
+            continue
+        representative = members[0]
+        consensus_outlier_count = optional_integer(
+            representative.get("consensus_outlier_count")
+        )
+        if (
+            str(representative.get("pole_status") or "") != "AUTO"
+            or consensus_outlier_count != 0
+        ):
+            continue
+        frame_rows = sorted(
+            {
+                int(item["pose_row_number"])
+                for item in members
+                if item.get("pose_row_number") is not None
+            }
+        )
+        source_detection_ids = sorted(
+            {
+                str(item.get("detection_id") or "")
+                for item in members
+                if str(item.get("detection_id") or "")
+            }
+        )
+        if (
+            int(representative.get("obs_count") or 0) < 2
+            or len(frame_rows) < 2
+            or representative.get("xy_spread_m") is None
+            or float(representative["xy_spread_m"]) > anchor_max_spread_m
+            or representative.get("z_spread_m") is None
+            or float(representative["z_spread_m"]) > anchor_max_z_spread_m
+        ):
+            continue
+        anchors.append(
+            {
+                "record_name": str(representative.get("record_name") or ""),
+                "pole_x": float(representative["pole_x"]),
+                "pole_y": float(representative["pole_y"]),
+                "pole_z": float(representative["pole_z"]),
+                "pose_rows": frame_rows,
+                "source_detection_ids": source_detection_ids,
+                "xy_spread_m": float(representative["xy_spread_m"]),
+                "z_spread_m": float(representative["z_spread_m"]),
+                "template": representative,
+            }
+        )
+
+    reconciled = list(usable_observations)
+    for detection in detection_records:
+        if not isinstance(detection, dict):
+            continue
+        detection_id = str(detection.get("detection_id") or "")
+        if (
+            not detection_id
+            or str(detection.get("model_object_type") or "")
+            != "traffic_signal"
+        ):
+            continue
+        existing_relations = existing_by_detection.get(detection_id, [])
+        if any(has_direct_association(item) for item in existing_relations):
+            continue
+        if existing_relations and any(
+            str(item.get("pole_status") or "") != "REVIEW"
+            for item in existing_relations
+        ):
+            continue
+        pole_payload = detection.get("pole")
+        if not isinstance(pole_payload, dict):
+            continue
+        raw_hypotheses = pole_payload.get("support_hypotheses") or []
+        hypotheses: list[tuple[np.ndarray, dict[str, Any]]] = []
+        for hypothesis in raw_hypotheses:
+            if not isinstance(hypothesis, dict):
+                continue
+            try:
+                raw_coverage = float(
+                    hypothesis[
+                        "horizontal_connection_coverage_ratio"
+                    ]
+                )
+                coherent_coverage = float(
+                    hypothesis[
+                        "horizontal_connection_coherent_coverage_ratio"
+                    ]
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if (
+                str(hypothesis.get("rejection_reason") or "")
+                not in {"raw_coverage", "coherent_arm"}
+                or not math.isfinite(raw_coverage)
+                or raw_coverage < 0.20
+                or not math.isfinite(coherent_coverage)
+                or coherent_coverage < 0.075
+                or hypothesis.get(
+                    "horizontal_connection_endpoint_anchored"
+                )
+                is not True
+            ):
+                continue
+            try:
+                hypothesis_xy = np.asarray(
+                    [
+                        float(hypothesis["axis_x"]),
+                        float(hypothesis["axis_y"]),
+                    ],
+                    dtype=np.float64,
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if np.all(np.isfinite(hypothesis_xy)):
+                hypotheses.append(
+                    (
+                        hypothesis_xy,
+                        {
+                            "axis_x": float(hypothesis_xy[0]),
+                            "axis_y": float(hypothesis_xy[1]),
+                            "rejection_reason": str(
+                                hypothesis.get("rejection_reason") or ""
+                            ),
+                            "horizontal_connection_coverage_ratio": (
+                                raw_coverage
+                            ),
+                            "horizontal_connection_coherent_coverage_ratio": (
+                                coherent_coverage
+                            ),
+                            "horizontal_connection_coherent_ratio": (
+                                finite_number(
+                                    hypothesis.get(
+                                        "horizontal_connection_coherent_ratio"
+                                    )
+                                )
+                            ),
+                            "horizontal_connection_coherent_point_fraction": (
+                                finite_number(
+                                    hypothesis.get(
+                                        "horizontal_connection_coherent_point_fraction"
+                                    )
+                                )
+                            ),
+                            "horizontal_connection_endpoint_anchored": True,
+                        },
+                    )
+                )
+        if not hypotheses:
+            continue
+        values = [
+            detection.get("x"),
+            detection.get("y"),
+            detection.get("z"),
+            detection.get("pose_row_number"),
+        ]
+        try:
+            sign_x, sign_y, sign_z = (float(value) for value in values[:3])
+            pose_row = int(values[3])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(value) for value in (sign_x, sign_y, sign_z)):
+            continue
+
+        matches: list[
+            tuple[float, float, dict[str, Any], dict[str, Any]]
+        ] = []
+        for anchor in anchors:
+            if anchor["record_name"] != str(detection.get("record_name") or ""):
+                continue
+            nearby_anchor_rows = {
+                row
+                for row in anchor["pose_rows"]
+                if abs(pose_row - row) <= max_frame_gap
+            }
+            if len(nearby_anchor_rows) < 2:
+                continue
+            distance = math.hypot(
+                anchor["pole_x"] - sign_x,
+                anchor["pole_y"] - sign_y,
+            )
+            if not direct_distance_m < distance <= max_link_distance_m:
+                continue
+            if sign_z - anchor["pole_z"] < 1.8:
+                continue
+            anchor_xy = np.asarray(
+                [anchor["pole_x"], anchor["pole_y"]],
+                dtype=np.float64,
+            )
+            hypothesis_distance, matched_hypothesis = min(
+                (
+                    (
+                        float(np.linalg.norm(hypothesis_xy - anchor_xy)),
+                        evidence,
+                    )
+                    for hypothesis_xy, evidence in hypotheses
+                ),
+                key=lambda item: item[0],
+            )
+            if hypothesis_distance > hypothesis_anchor_radius_m:
+                continue
+            matches.append(
+                (
+                    hypothesis_distance,
+                    distance,
+                    anchor,
+                    matched_hypothesis,
+                )
+            )
+        matches.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2]["pole_x"],
+                item[2]["pole_y"],
+                item[2]["pole_z"],
+            )
+        )
+        if not matches:
+            continue
+        if (
+            len(matches) > 1
+            and matches[1][0] - matches[0][0]
+            < min(uniqueness_margin_m, hypothesis_anchor_radius_m / 3.0)
+        ):
+            continue
+
+        hypothesis_distance, distance, anchor, matched_hypothesis = matches[0]
+        template = dict(anchor["template"])
+        template.update(
+            {
+                "record_name": detection.get("record_name"),
+                "detection_index": detection.get("detection_index"),
+                "detection_id": detection_id,
+                "class_id": detection.get("class_id"),
+                "class_name": detection.get("class_name"),
+                "confidence": detection.get("confidence"),
+                "image_name": detection.get("image_name"),
+                "timestamp_iso": detection.get("timestamp_iso"),
+                "pose_row_number": pose_row,
+                "sign_x": sign_x,
+                "sign_y": sign_y,
+                "sign_z": sign_z,
+                "pole_x": anchor["pole_x"],
+                "pole_y": anchor["pole_y"],
+                "pole_z": anchor["pole_z"],
+                "pole_type": "SINGLE",
+                "pole_method": "MULTI_FRAME_DIRECT_ANCHOR",
+                "pole_status": "REVIEW",
+                "pole_occluded": None,
+                "pole_occlusion_status": "UNKNOWN",
+                "pole_quality": 0.0,
+                "association_distance_m": distance,
+                "horizontal_connection_coverage_ratio": (
+                    matched_hypothesis[
+                        "horizontal_connection_coverage_ratio"
+                    ]
+                ),
+                "horizontal_connection_coherent_coverage_ratio": (
+                    matched_hypothesis[
+                        "horizontal_connection_coherent_coverage_ratio"
+                    ]
+                ),
+                "horizontal_connection_coherent_ratio": matched_hypothesis[
+                    "horizontal_connection_coherent_ratio"
+                ],
+                "horizontal_connection_coherent_point_fraction": (
+                    matched_hypothesis[
+                        "horizontal_connection_coherent_point_fraction"
+                    ]
+                ),
+                "horizontal_connection_endpoint_anchored": (
+                    matched_hypothesis[
+                        "horizontal_connection_endpoint_anchored"
+                    ]
+                ),
+                "pole_search_mode": "multi_frame_direct_anchor",
+                "pole_fallback_attempted": False,
+                "pole_fallback_used": False,
+                "pole_point_crop_path": None,
+                "pole_debug_image_path": None,
+                "support_reconciled": True,
+                "support_hypothesis_distance_m": hypothesis_distance,
+                "support_hypothesis_axis_x": matched_hypothesis["axis_x"],
+                "support_hypothesis_axis_y": matched_hypothesis["axis_y"],
+                "support_hypothesis_rejection_reason": matched_hypothesis[
+                    "rejection_reason"
+                ],
+                "support_anchor_pose_rows": list(anchor["pose_rows"]),
+                "support_anchor_source_detection_ids": list(
+                    anchor["source_detection_ids"]
+                ),
+                "support_anchor_xy_spread_m": anchor["xy_spread_m"],
+                "support_anchor_z_spread_m": anchor["z_spread_m"],
+                "support_reconciled_replaced_remote": bool(
+                    existing_relations
+                ),
+            }
+        )
+        if existing_relations:
+            reconciled = [
+                item
+                for item in reconciled
+                if str(item.get("detection_id") or "") != detection_id
+            ]
+        reconciled.append(template)
+        existing_by_detection[detection_id] = [template]
+    return reconciled
+
+
 def refresh_shapefile_from_txt(
     txt_dir: Path,
     shp_path: Path,
@@ -2024,6 +2515,10 @@ def refresh_shapefile_from_txt(
             txt_dir,
             logger=logger,
             run_fingerprint=run_fingerprint,
+        )
+        pole_observations = reconcile_remote_supports_from_direct_anchors(
+            records,
+            pole_observations,
         )
         pole_relations = (
             cluster_pole_observations(pole_observations, radius_m=pole_merge_radius_m)
@@ -3636,6 +4131,15 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         ),
         min_points=int(runtime["pole_min_points"]),
         max_axis_tilt_deg=float(runtime["pole_max_axis_tilt_deg"]),
+        axis_plumb_max_tilt_deg=float(
+            runtime["pole_axis_plumb_max_tilt_deg"]
+        ),
+        axis_plumb_full_tilt_deg=float(
+            runtime["pole_axis_plumb_full_tilt_deg"]
+        ),
+        axis_plumb_endpoint_fraction=float(
+            runtime["pole_axis_plumb_endpoint_fraction"]
+        ),
         direct_max_axis_sign_distance_m=float(
             runtime["pole_direct_max_axis_sign_distance_m"]
         ),
@@ -3655,8 +4159,33 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         horizontal_connection_min_points_per_bin=int(
             runtime["pole_horizontal_connection_min_points_per_bin"]
         ),
+        horizontal_connection_coherence_radius_m=float(
+            runtime["pole_horizontal_connection_coherence_radius_m"]
+        ),
         min_horizontal_connection_coverage=float(
             runtime["pole_min_horizontal_connection_coverage"]
+        ),
+        min_horizontal_connection_coherent_ratio=float(
+            runtime["pole_min_horizontal_connection_coherent_ratio"]
+        ),
+        min_horizontal_connection_coherent_point_fraction=float(
+            runtime[
+                "pole_min_horizontal_connection_coherent_point_fraction"
+            ]
+        ),
+        remote_max_endpoint_tilt_deg=float(
+            runtime["pole_remote_max_endpoint_tilt_deg"]
+        ),
+        long_remote_distance_m=float(runtime["pole_long_remote_distance_m"]),
+        long_remote_transition_m=float(runtime["pole_long_remote_transition_m"]),
+        long_remote_min_vertical_span_m=float(
+            runtime["pole_long_remote_min_vertical_span_m"]
+        ),
+        long_remote_min_completeness_ratio=float(
+            runtime["pole_long_remote_min_completeness_ratio"]
+        ),
+        long_remote_min_connection_coverage_ratio=float(
+            runtime["pole_long_remote_min_connection_coverage_ratio"]
         ),
         max_ground_class_fraction=float(runtime["pole_max_ground_class_fraction"]),
         min_ground_drop_m=float(runtime["pole_min_ground_drop_m"]),
@@ -3788,14 +4317,7 @@ def pole_cross_profile_candidate_key(
     connection_coverage = (
         1.0
         if direct
-        else float(
-            getattr(
-                candidate,
-                "horizontal_connection_coverage_ratio",
-                0.0,
-            )
-            or 0.0
-        )
+        else pole_connection_coverage(candidate)
     )
     axis_rmse = float(getattr(candidate, "radial_rmse_m", math.inf))
     ground_rmse_value = getattr(candidate, "ground_rmse_m", None)
@@ -3806,18 +4328,68 @@ def pole_cross_profile_candidate_key(
     )
     has_ground = getattr(candidate, "ground_z", None) is not None
     status = str(getattr(candidate, "status", "REVIEW") or "REVIEW")
-    return (
+    common = (
         0.0
         if completeness >= preferred_min_completeness_ratio
         else 1.0,
         0.0 if has_ground else 1.0,
         0.0 if status == "AUTO" else 1.0,
-        -completeness,
+        0.0 if direct else 1.0,
+    )
+    if direct:
+        return (
+            *common,
+            -completeness,
+            axis_rmse,
+            ground_rmse,
+            association_distance,
+            -float(getattr(candidate, "point_count", 0) or 0),
+        )
+    return (
+        *common,
+        remote_pole_junction_cost(candidate),
         -connection_coverage,
+        -completeness,
         axis_rmse,
         ground_rmse,
         association_distance,
         -float(getattr(candidate, "point_count", 0) or 0),
+    )
+
+
+def select_cross_profile_pole_candidate(
+    candidates: tuple[Any, ...],
+    parameters: PoleSearchParameters,
+) -> Any:
+    """Select across strict/fallback envelopes without bypassing side tie-breaks."""
+
+    if not candidates:
+        raise ValueError(
+            "select_cross_profile_pole_candidate requires at least one candidate"
+        )
+
+    def rank_key(candidate: Any) -> tuple[float, ...]:
+        return pole_cross_profile_candidate_key(
+            candidate,
+            preferred_min_completeness_ratio=(
+                parameters.preferred_min_completeness_ratio
+            ),
+            direct_max_axis_sign_distance_m=(
+                parameters.direct_max_axis_sign_distance_m
+            ),
+        )
+
+    ordered = sorted(candidates, key=rank_key)
+    initial_tier = rank_key(ordered[0])[:4]
+    same_tier = tuple(
+        candidate
+        for candidate in ordered
+        if rank_key(candidate)[:4] == initial_tier
+    )
+    return select_pole_candidate(
+        same_tier,
+        parameters,
+        rank_key=rank_key,
     )
 
 
@@ -3972,6 +4544,9 @@ def find_pole_bases_with_corridor_fallback(
     *,
     workspace: PoleSearchWorkspace | None = None,
     ground_classifications: np.ndarray | None = None,
+    travel_forward_xy: np.ndarray | None = None,
+    travel_right_xy: np.ndarray | None = None,
+    rejected_support_hypotheses: list[dict[str, Any]] | None = None,
 ) -> tuple[Any | None, np.ndarray, str, int, int]:
     """Search the strict sign corridor, then retry connected remote supports."""
 
@@ -3994,6 +4569,9 @@ def find_pole_bases_with_corridor_fallback(
         number_of_returns,
         workspace=search_workspace,
         ground_classifications=ground_classifications,
+        travel_forward_xy=travel_forward_xy,
+        travel_right_xy=travel_right_xy,
+        rejected_support_hypotheses=rejected_support_hypotheses,
     )
     mode = "strict"
     searched_mask = strict_mask
@@ -4020,16 +4598,23 @@ def find_pole_bases_with_corridor_fallback(
             number_of_returns,
             workspace=search_workspace,
             ground_classifications=ground_classifications,
+            travel_forward_xy=travel_forward_xy,
+            travel_right_xy=travel_right_xy,
+            rejected_support_hypotheses=rejected_support_hypotheses,
         )
-        if expanded_result is not None and (
-            result is None
-            or pole_candidate_rank_key(
-                expanded_result.candidates[0],
-                parameters,
-            )
-            < pole_candidate_rank_key(result.candidates[0], parameters)
-        ):
-            result = expanded_result
+        if expanded_result is not None:
+            if result is None:
+                result = expanded_result
+            else:
+                preferred = select_pole_candidate(
+                    (
+                        result.candidates[0],
+                        expanded_result.candidates[0],
+                    ),
+                    parameters,
+                )
+                if preferred is expanded_result.candidates[0]:
+                    result = expanded_result
     return (
         result,
         searched_mask,
@@ -4313,6 +4898,11 @@ def save_pole_debug_image(
             shaft_summary = (
                 f"complete={completeness:.2f} span={candidate.vertical_span_m:.2f}m"
             )
+            if candidate.axis_endpoint_tilt_deg is not None:
+                shaft_summary += (
+                    f" end-tilt={candidate.axis_endpoint_tilt_deg:.2f}deg"
+                    f" plumb={int(candidate.axis_plumb_adjusted)}"
+                )
             if candidate.multi_return_fraction is not None:
                 shaft_summary += (
                     f" multi-return={candidate.multi_return_fraction:.2f}"
@@ -4333,6 +4923,26 @@ def save_pole_debug_image(
                     f"assoc={association_distance:.3f}m "
                     + shaft_summary
                 )
+                if (
+                    candidate.horizontal_connection_ridge_density_points_per_m
+                    is not None
+                ):
+                    connection_info_lines.append(
+                        f"arm{candidate_index}-ridge="
+                        f"{candidate.horizontal_connection_ridge_point_count or 0}pts "
+                        f"{candidate.horizontal_connection_ridge_density_points_per_m:.1f}pts/m "
+                        f"side={candidate.support_side or 'UNKNOWN'}"
+                    )
+                if candidate.horizontal_connection_coherent_ratio is not None:
+                    connection_info_lines.append(
+                        f"arm{candidate_index}-3d="
+                        f"{candidate.horizontal_connection_coherent_bin_count or 0}/"
+                        f"{expected_bins} "
+                        f"raw-ratio={candidate.horizontal_connection_coherent_ratio:.2f} "
+                        f"point-frac="
+                        f"{candidate.horizontal_connection_coherent_point_fraction or 0.0:.2f} "
+                        f"anchored={int(bool(candidate.horizontal_connection_endpoint_anchored))}"
+                    )
                 if sign_points_xyz.size and abs(float(candidate.axis_direction[2])) > 1e-9:
                     sign_anchor = np.median(sign_points_xyz, axis=0)
                     axis_distance = (
@@ -4630,6 +5240,7 @@ def extract_pole_for_detection(
             origin_xyz,
             rectified_view,
         )
+        support_hypotheses: list[dict[str, Any]] = []
         (
             selected_result,
             selected_corridor_mask,
@@ -4651,6 +5262,15 @@ def extract_pole_for_detection(
             ),
             workspace=pole_workspace,
             ground_classifications=selected_algorithm_classes,
+            travel_forward_xy=np.asarray(
+                rectified_view["raw_forward_vec"][:2],
+                dtype=np.float64,
+            ),
+            travel_right_xy=np.asarray(
+                rectified_view["raw_right_vec"][:2],
+                dtype=np.float64,
+            ),
+            rejected_support_hypotheses=support_hypotheses,
         )
         return {
             "records": selected_records,
@@ -4662,11 +5282,17 @@ def extract_pole_for_detection(
             "expanded_count": selected_expanded_count,
             "used_files": selected_files,
             "used_block_count": len(selected_blocks),
+            "support_hypotheses": support_hypotheses,
         }
 
     strict_state = load_and_search(parameters)
     selected_state = strict_state
     result = strict_state["result"] if strict_state is not None else None
+    all_support_hypotheses = (
+        list(strict_state["support_hypotheses"])
+        if strict_state is not None
+        else []
+    )
     strict_corridor_point_count = (
         int(strict_state["strict_count"]) if strict_state is not None else 0
     )
@@ -4684,6 +5310,9 @@ def extract_pole_for_detection(
         pole_fallback_attempted = True
         fallback_state = load_and_search(fallback_parameters)
         if fallback_state is not None:
+            all_support_hypotheses.extend(
+                fallback_state["support_hypotheses"]
+            )
             fallback_strict_corridor_point_count = int(
                 fallback_state["strict_count"]
             )
@@ -4710,30 +5339,59 @@ def extract_pole_for_detection(
             )
             fallback_is_better = (
                 result is None
-                or pole_cross_profile_candidate_key(
-                    fallback_result.candidates[0],
-                    preferred_min_completeness_ratio=(
-                        parameters.preferred_min_completeness_ratio
+                or select_cross_profile_pole_candidate(
+                    (
+                        result.candidates[0],
+                        fallback_result.candidates[0],
                     ),
-                    direct_max_axis_sign_distance_m=(
-                        parameters.direct_max_axis_sign_distance_m
-                    ),
+                    parameters,
                 )
-                < pole_cross_profile_candidate_key(
-                    result.candidates[0],
-                    preferred_min_completeness_ratio=(
-                        parameters.preferred_min_completeness_ratio
-                    ),
-                    direct_max_axis_sign_distance_m=(
-                        parameters.direct_max_axis_sign_distance_m
-                    ),
-                )
+                is fallback_result.candidates[0]
             )
             if fallback_is_better:
                 result = reviewed_fallback_result
                 selected_state = fallback_state
                 selected_state["result"] = result
                 pole_fallback_used = True
+
+    ordered_hypotheses = sorted(
+        all_support_hypotheses,
+        key=lambda item: (
+            float(item.get("axis_rmse_m") or math.inf),
+            -float(item.get("vertical_span_m") or 0.0),
+            float(item.get("association_distance_m") or math.inf),
+            float(item.get("axis_x") or 0.0),
+            float(item.get("axis_y") or 0.0),
+        ),
+    )
+    support_hypotheses: list[dict[str, Any]] = []
+    for hypothesis in ordered_hypotheses:
+        try:
+            hypothesis_xy = np.asarray(
+                [float(hypothesis["axis_x"]), float(hypothesis["axis_y"])],
+                dtype=np.float64,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not np.all(np.isfinite(hypothesis_xy)):
+            continue
+        if any(
+            float(
+                np.linalg.norm(
+                    hypothesis_xy
+                    - np.asarray(
+                        [kept["axis_x"], kept["axis_y"]],
+                        dtype=np.float64,
+                    )
+                )
+            )
+            <= 0.15
+            for kept in support_hypotheses
+        ):
+            continue
+        support_hypotheses.append(dict(hypothesis))
+        if len(support_hypotheses) >= 64:
+            break
 
     if selected_state is None:
         empty_records = {
@@ -4778,6 +5436,7 @@ def extract_pole_for_detection(
             "pole_fallback_enabled": fallback_parameters is not None,
             "pole_fallback_attempted": pole_fallback_attempted,
             "pole_fallback_used": False,
+            "support_hypotheses": support_hypotheses,
             "pole_search_attempts": pole_search_attempts,
             "used_pointcloud_files": (
                 pole_search_attempts[-1]["intersected_pointcloud_files"]
@@ -4874,6 +5533,7 @@ def extract_pole_for_detection(
         "pole_fallback_enabled": fallback_parameters is not None,
         "pole_fallback_attempted": pole_fallback_attempted,
         "pole_fallback_used": pole_fallback_used,
+        "support_hypotheses": support_hypotheses,
         "pole_search_attempts": pole_search_attempts,
         "used_pointcloud_files": sorted(used_files),
         "used_block_count": used_block_count,
@@ -4973,6 +5633,52 @@ def extract_pole_for_detection(
                 if item.horizontal_connection_coverage_ratio is None
                 else float(item.horizontal_connection_coverage_ratio)
             ),
+            "horizontal_connection_point_count": (
+                None
+                if item.horizontal_connection_point_count is None
+                else int(item.horizontal_connection_point_count)
+            ),
+            "horizontal_connection_ridge_point_count": (
+                None
+                if item.horizontal_connection_ridge_point_count is None
+                else int(item.horizontal_connection_ridge_point_count)
+            ),
+            "horizontal_connection_ridge_density_points_per_m": (
+                None
+                if item.horizontal_connection_ridge_density_points_per_m is None
+                else float(
+                    item.horizontal_connection_ridge_density_points_per_m
+                )
+            ),
+            "horizontal_connection_coherent_bin_count": (
+                None
+                if item.horizontal_connection_coherent_bin_count is None
+                else int(item.horizontal_connection_coherent_bin_count)
+            ),
+            "horizontal_connection_coherent_coverage_ratio": (
+                None
+                if item.horizontal_connection_coherent_coverage_ratio is None
+                else float(item.horizontal_connection_coherent_coverage_ratio)
+            ),
+            "horizontal_connection_coherent_ratio": (
+                None
+                if item.horizontal_connection_coherent_ratio is None
+                else float(item.horizontal_connection_coherent_ratio)
+            ),
+            "horizontal_connection_coherent_point_fraction": (
+                None
+                if item.horizontal_connection_coherent_point_fraction is None
+                else float(
+                    item.horizontal_connection_coherent_point_fraction
+                )
+            ),
+            "horizontal_connection_endpoint_anchored": (
+                item.horizontal_connection_endpoint_anchored
+            ),
+            "travel_longitudinal_offset_m": item.travel_longitudinal_offset_m,
+            "travel_lateral_offset_m": item.travel_lateral_offset_m,
+            "support_side": item.support_side,
+            "crossroad_alignment_ratio": item.crossroad_alignment_ratio,
             "axis_rmse_m": float(item.radial_rmse_m),
             "axis_stabilized": bool(item.axis_stabilized),
             "axis_bin_inlier_count": (
@@ -4982,6 +5688,17 @@ def extract_pole_for_detection(
             ),
             "axis_bin_count": (
                 None if item.axis_bin_count is None else int(item.axis_bin_count)
+            ),
+            "axis_plumb_adjusted": bool(item.axis_plumb_adjusted),
+            "axis_endpoint_tilt_deg": (
+                None
+                if item.axis_endpoint_tilt_deg is None
+                else float(item.axis_endpoint_tilt_deg)
+            ),
+            "axis_endpoint_drift_m": (
+                None
+                if item.axis_endpoint_drift_m is None
+                else float(item.axis_endpoint_drift_m)
             ),
             "lowest_observed_z": float(item.lowest_observed_z),
             "ground_z": None if item.ground_z is None else float(item.ground_z),
@@ -5049,6 +5766,9 @@ def extract_pole_for_detection(
         "axis_stabilized": bool(primary.axis_stabilized),
         "axis_bin_inlier_count": primary.axis_bin_inlier_count,
         "axis_bin_count": primary.axis_bin_count,
+        "axis_plumb_adjusted": bool(primary.axis_plumb_adjusted),
+        "axis_endpoint_tilt_deg": primary.axis_endpoint_tilt_deg,
+        "axis_endpoint_drift_m": primary.axis_endpoint_drift_m,
         "bottom_gap_m": primary.bottom_gap_m,
         "ground_support_distance_m": primary.ground_support_distance_m,
         "dominant_class_id": primary.dominant_class_id,
@@ -5060,6 +5780,34 @@ def extract_pole_for_detection(
             if primary.horizontal_connection_coverage_ratio is None
             else float(primary.horizontal_connection_coverage_ratio)
         ),
+        "horizontal_connection_point_count": (
+            primary.horizontal_connection_point_count
+        ),
+        "horizontal_connection_ridge_point_count": (
+            primary.horizontal_connection_ridge_point_count
+        ),
+        "horizontal_connection_ridge_density_points_per_m": (
+            primary.horizontal_connection_ridge_density_points_per_m
+        ),
+        "horizontal_connection_coherent_bin_count": (
+            primary.horizontal_connection_coherent_bin_count
+        ),
+        "horizontal_connection_coherent_coverage_ratio": (
+            primary.horizontal_connection_coherent_coverage_ratio
+        ),
+        "horizontal_connection_coherent_ratio": (
+            primary.horizontal_connection_coherent_ratio
+        ),
+        "horizontal_connection_coherent_point_fraction": (
+            primary.horizontal_connection_coherent_point_fraction
+        ),
+        "horizontal_connection_endpoint_anchored": (
+            primary.horizontal_connection_endpoint_anchored
+        ),
+        "travel_longitudinal_offset_m": primary.travel_longitudinal_offset_m,
+        "travel_lateral_offset_m": primary.travel_lateral_offset_m,
+        "support_side": primary.support_side,
+        "crossroad_alignment_ratio": primary.crossroad_alignment_ratio,
         "completeness_ratio": (
             None
             if primary.completeness_ratio is None
@@ -6742,6 +7490,17 @@ def finalize_prepared_model_run(
             logger=logger,
             run_fingerprint=run_fingerprint,
         )
+        pole_observations = reconcile_remote_supports_from_direct_anchors(
+            records,
+            pole_observations,
+            direct_distance_m=float(
+                runtime["pole_direct_max_axis_sign_distance_m"]
+            ),
+            max_link_distance_m=max(
+                float(runtime["pole_max_axis_sign_distance_m"]),
+                float(runtime["pole_fallback_max_axis_sign_distance_m"]),
+            ),
+        )
         merged_poles = (
             cluster_pole_observations(
                 pole_observations,
@@ -7149,6 +7908,15 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "pole_min_points": int(args.pole_min_points),
         "pole_max_axis_tilt_deg": float(args.pole_max_axis_tilt_deg),
+        "pole_axis_plumb_max_tilt_deg": float(
+            args.pole_axis_plumb_max_tilt_deg
+        ),
+        "pole_axis_plumb_full_tilt_deg": float(
+            args.pole_axis_plumb_full_tilt_deg
+        ),
+        "pole_axis_plumb_endpoint_fraction": float(
+            args.pole_axis_plumb_endpoint_fraction
+        ),
         "pole_direct_max_axis_sign_distance_m": float(
             args.pole_direct_max_axis_sign_distance_m
         ),
@@ -7168,8 +7936,35 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "pole_horizontal_connection_min_points_per_bin": int(
             args.pole_horizontal_connection_min_points_per_bin
         ),
+        "pole_horizontal_connection_coherence_radius_m": float(
+            args.pole_horizontal_connection_coherence_radius_m
+        ),
         "pole_min_horizontal_connection_coverage": float(
             args.pole_min_horizontal_connection_coverage
+        ),
+        "pole_min_horizontal_connection_coherent_ratio": float(
+            args.pole_min_horizontal_connection_coherent_ratio
+        ),
+        "pole_min_horizontal_connection_coherent_point_fraction": float(
+            args.pole_min_horizontal_connection_coherent_point_fraction
+        ),
+        "pole_remote_max_endpoint_tilt_deg": float(
+            args.pole_remote_max_endpoint_tilt_deg
+        ),
+        "pole_long_remote_distance_m": float(
+            args.pole_long_remote_distance_m
+        ),
+        "pole_long_remote_transition_m": float(
+            args.pole_long_remote_transition_m
+        ),
+        "pole_long_remote_min_vertical_span_m": float(
+            args.pole_long_remote_min_vertical_span_m
+        ),
+        "pole_long_remote_min_completeness_ratio": float(
+            args.pole_long_remote_min_completeness_ratio
+        ),
+        "pole_long_remote_min_connection_coverage_ratio": float(
+            args.pole_long_remote_min_connection_coverage_ratio
         ),
         "pole_max_ground_class_fraction": float(args.pole_max_ground_class_fraction),
         "pole_min_ground_drop_m": float(args.pole_min_ground_drop_m),
@@ -7185,6 +7980,12 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             args.pole_ground_geometry_preference_margin_m
         ),
         "pole_occlusion_gap_m": float(args.pole_occlusion_gap_m),
+        "pole_max_ground_penetration_m": float(
+            args.pole_max_ground_penetration_m
+        ),
+        "pole_max_ground_support_distance_m": float(
+            args.pole_max_ground_support_distance_m
+        ),
         "pole_ground_class_ids": tuple(args.pole_ground_class_ids),
         "pole_class_ids": tuple(args.pole_class_ids),
         "pole_excluded_pole_class_ids": tuple(args.pole_excluded_pole_class_ids),
