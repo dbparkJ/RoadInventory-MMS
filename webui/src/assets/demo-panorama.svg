@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="900" viewBox="0 0 2400 900">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5e89a4"/>
+      <stop offset=".55" stop-color="#a8c5d0"/>
+      <stop offset="1" stop-color="#d9ded4"/>
+    </linearGradient>
+    <linearGradient id="road" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#657074"/>
+      <stop offset="1" stop-color="#283338"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#b9d7dc"/>
+      <stop offset=".5" stop-color="#718f9a"/>
+      <stop offset="1" stop-color="#d4e1df"/>
+    </linearGradient>
+    <filter id="soft"><feGaussianBlur stdDeviation="14"/></filter>
+  </defs>
+  <rect width="2400" height="900" fill="url(#sky)"/>
+  <ellipse cx="1880" cy="170" rx="260" ry="50" fill="#fff" opacity=".2" filter="url(#soft)"/>
+  <ellipse cx="630" cy="140" rx="300" ry="45" fill="#fff" opacity=".18" filter="url(#soft)"/>
+  <g fill="#43575e" opacity=".5">
+    <path d="M0 390h95V188h154v202h80V245h131v145h90V162h198v228h92V278h127v112h90V225h176v165h90V170h144v220h84V242h160v148h94V205h151v185h99v-173h162v173h93V260h120v130h100v-188h132v188h126v510H0z"/>
+  </g>
+  <g>
+    <path d="M0 382h390v208H0z" fill="#263b40"/>
+    <path d="M50 417h104v128H50zm140 0h153v128H190z" fill="url(#glass)"/>
+    <path d="M1960 371h440v219h-440z" fill="#384b50"/>
+    <path d="M2010 408h150v135h-150zm185 0h155v135h-155z" fill="url(#glass)"/>
+    <path d="M420 334h245v258H420z" fill="#4b5c60"/>
+    <path d="M454 368h74v66h-74zm101 0h74v66h-74zm-101 94h74v66h-74zm101 0h74v66h-74z" fill="#93aeb2"/>
+    <path d="M1700 316h230v276h-230z" fill="#536568"/>
+    <path d="M1730 352h74v65h-74zm99 0h72v65h-72zm-99 92h74v65h-74zm99 0h72v65h-72z" fill="#a6bdbe"/>
+  </g>
+  <g fill="#3d6456">
+    <circle cx="330" cy="478" r="96"/><circle cx="715" cy="470" r="92"/>
+    <circle cx="1630" cy="466" r="95"/><circle cx="2075" cy="474" r="96"/>
+  </g>
+  <g fill="#547b65">
+    <circle cx="278" cy="448" r="50"/><circle cx="386" cy="443" r="58"/>
+    <circle cx="665" cy="440" r="53"/><circle cx="765" cy="441" r="55"/>
+    <circle cx="1580" cy="439" r="56"/><circle cx="1681" cy="438" r="53"/>
+    <circle cx="2025" cy="442" r="56"/><circle cx="2130" cy="440" r="55"/>
+  </g>
+  <path d="M0 568h2400v332H0z" fill="url(#road)"/>
+  <path d="M0 574h2400v21H0z" fill="#b5b7af"/>
+  <path d="M1040 900l102-306h117l112 306z" fill="#737b78" opacity=".4"/>
+  <g fill="#e9e4bd" opacity=".9">
+    <path d="M1182 629h34l9 74h-52z"/>
+    <path d="M1158 755h84l22 145h-144z"/>
+    <path d="M460 705h278v11H460zm1207 0h278v11h-278z"/>
+  </g>
+  <g>
+    <path d="M286 604h230l43 67v71H248v-73z" fill="#d9e0dc"/>
+    <path d="M322 616h158l29 48H294z" fill="#8ca6ad"/>
+    <circle cx="317" cy="742" r="32" fill="#182326"/><circle cx="496" cy="742" r="32" fill="#182326"/>
+    <path d="M1820 615h244l55 58v72h-330v-74z" fill="#69777d"/>
+    <path d="M1852 627h173l39 42h-243z" fill="#9fb4b8"/>
+    <circle cx="1852" cy="745" r="32" fill="#182326"/><circle cx="2053" cy="745" r="32" fill="#182326"/>
+  </g>
+  <g stroke="#1d2b2e" stroke-width="9">
+    <path d="M835 540V260m733 280V248"/>
+  </g>
+  <g fill="#203336">
+    <rect x="790" y="256" width="92" height="134" rx="12"/>
+    <rect x="1522" y="244" width="92" height="134" rx="12"/>
+  </g>
+  <g>
+    <circle cx="836" cy="287" r="18" fill="#34484b"/><circle cx="836" cy="324" r="18" fill="#ddbb56"/>
+    <circle cx="1568" cy="275" r="18" fill="#34484b"/><circle cx="1568" cy="312" r="18" fill="#50c08e"/>
+  </g>
+  <g fill="#23373a">
+    <rect x="936" y="485" width="160" height="67" rx="5"/>
+    <rect x="1318" y="478" width="156" height="67" rx="5"/>
+  </g>
+  <g fill="#d6e7e4" font-family="sans-serif" font-size="21" text-anchor="middle">
+    <text x="1016" y="527">세 종 대 로</text><text x="1396" y="520">을 지 로</text>
+  </g>
+  <rect y="566" width="2400" height="5" fill="#38d7af" opacity=".22"/>
+</svg>

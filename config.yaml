@@ -104,6 +104,16 @@ model_filters:
       pole_fallback_min_horizontal_connection_coverage: 0.45
 
 input:
+  # 작업할 레코드 이름을 정확히 지정합니다. 여러 값은 YAML 목록으로 쓰며 null이면 모두 포함합니다.
+  include_record_names: null
+  # 작업할 Job 폴더 이름을 정확히 지정합니다. 이름 비교는 대소문자를 구분하지 않습니다.
+  include_job_names: null
+  # 작업할 Track 폴더 이름을 정확히 지정합니다. legacy처럼 track이 없는 입력은 값 지정 시 제외됩니다.
+  include_track_names: null
+  # 확장자를 제외한 이미지 stem의 자연 정렬 기준 시작값(양끝 포함)입니다. null이면 하한이 없습니다.
+  frame_id_from: null
+  # 확장자를 제외한 이미지 stem의 자연 정렬 기준 끝값(양끝 포함)입니다. null이면 상한이 없습니다.
+  frame_id_to: null
   # auto는 legacy CAM, Pegasus Sphere, Leica 표준 납품본을 재귀적으로 함께 탐색합니다.
   # 가능한 값: auto, legacy, leica-sphere, leica-delivery
   pose_format: auto

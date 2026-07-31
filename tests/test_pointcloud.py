@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import struct
 import tempfile
@@ -58,6 +59,51 @@ def _write_las(
 
 
 class PointCloudLasTests(unittest.TestCase):
+    def test_web_catalog_mode_checks_every_discovered_source_for_links(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text:
+            root = Path(root_text)
+            source = root / "Job_A_Track01.las"
+            source.write_bytes(b"not-opened")
+            original_is_symlink = Path.is_symlink
+
+            def report_source_as_link(path: Path) -> bool:
+                return path == source or original_is_symlink(path)
+
+            with (
+                mock.patch.object(
+                    Path,
+                    "is_symlink",
+                    autospec=True,
+                    side_effect=report_source_as_link,
+                ),
+                self.assertRaisesRegex(ValueError, "Symbolic links"),
+            ):
+                build_pointcloud_catalog(
+                    root,
+                    root / "catalog.json",
+                    source="las",
+                    reject_symlinks=True,
+                )
+
+    def test_web_catalog_mode_rejects_symlinked_point_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as outside_text:
+            root = Path(root_text)
+            outside = Path(outside_text) / "Job_A_Track01.las"
+            outside.write_bytes(b"not-opened")
+            linked = root / "Job_A_Track01.las"
+            try:
+                os.symlink(outside, linked)
+            except OSError as exc:
+                self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+            with self.assertRaisesRegex(ValueError, "Symbolic links"):
+                build_pointcloud_catalog(
+                    root,
+                    root / "catalog.json",
+                    source="las",
+                    reject_symlinks=True,
+                )
+
     def test_catalog_records_exact_las_classification_histograms(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -572,6 +618,71 @@ class PointCloudDecodedBlockCacheTests(unittest.TestCase):
                     readers.read_block_records(path, block)["xyz"],
                     points_xyz,
                 )
+
+    def test_reindexed_las_version_reopens_reader_and_replaces_decoded_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "replace-in-place.las"
+            block = {"source_type": "las", "start": 0, "count": 1}
+            first_xyz = np.asarray([[300_001.0, 4_100_001.0, 101.0]])
+            second_xyz = np.asarray([[300_099.0, 4_100_099.0, 109.0]])
+            _write_las(path, first_xyz)
+            first_stat = path.stat()
+            first_file = {
+                "path": str(path.resolve()),
+                "source_type": "las",
+                "file_size": int(first_stat.st_size),
+                "mtime_ns": int(first_stat.st_mtime_ns),
+            }
+
+            with PointCloudReaderCache() as readers, mock.patch.object(
+                readers,
+                "_read_las_records",
+                wraps=readers._read_las_records,
+            ) as decode:
+                first = readers.read_block_records(first_file, block)
+                first_again = readers.read_block_records(first_file, block)
+                resolved = str(path.resolve())
+                first_reader = readers._las_readers[resolved][1]
+
+                self.assertEqual(decode.call_count, 1)
+                self.assertIs(first_again["xyz"], first["xyz"])
+                np.testing.assert_allclose(first["xyz"], first_xyz, atol=0.0051)
+
+                # Replace the source at the same path with the same point count,
+                # then force a distinct catalog version even on coarse filesystems.
+                _write_las(path, second_xyz)
+                rewritten_stat = path.stat()
+                os.utime(
+                    path,
+                    ns=(
+                        int(rewritten_stat.st_atime_ns),
+                        max(
+                            int(rewritten_stat.st_mtime_ns),
+                            int(first_stat.st_mtime_ns) + 1_000_000_000,
+                        ),
+                    ),
+                )
+                second_stat = path.stat()
+                second_file = {
+                    "path": str(path.resolve()),
+                    "source_type": "las",
+                    "file_size": int(second_stat.st_size),
+                    "mtime_ns": int(second_stat.st_mtime_ns),
+                }
+                self.assertNotEqual(
+                    (first_file["file_size"], first_file["mtime_ns"]),
+                    (second_file["file_size"], second_file["mtime_ns"]),
+                )
+
+                second = readers.read_block_records(second_file, block)
+                second_again = readers.read_block_records(second_file, block)
+                second_reader = readers._las_readers[resolved][1]
+
+                self.assertEqual(decode.call_count, 2)
+                self.assertIs(second_again["xyz"], second["xyz"])
+                self.assertIsNot(second_reader, first_reader)
+                self.assertEqual(len(readers._decoded_blocks), 1)
+                np.testing.assert_allclose(second["xyz"], second_xyz, atol=0.0051)
 
     def test_pcdb_points_and_records_share_one_decode_across_threads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

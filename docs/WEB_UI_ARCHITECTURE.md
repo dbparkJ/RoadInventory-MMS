@@ -1,0 +1,139 @@
+# MMS 웹 작업실 아키텍처
+
+이 문서는 대용량 MMS 원본을 서버에 보관하면서 작업자가 브라우저에서 구간을 고르고,
+파라미터를 설정하고, 처리 결과를 지도·파노라마·점군으로 검수하기 위한 운영 구조를
+정의합니다.
+
+## 기본 원칙
+
+- 브라우저에는 LAS/PCDB 원본과 7040×3520 파노라마 원본을 첫 화면부터 보내지 않습니다.
+- API 서버 안에서 Torch/YOLO 파이프라인을 직접 실행하지 않습니다. 작업마다 별도
+  subprocess를 만들고 GPU당 한 작업만 실행합니다.
+- 클라이언트에는 서버 절대경로를 노출하지 않고 `dataset_id`, `frame_id`,
+  `artifact_id`만 전달합니다.
+- 지도·파노라마·점군은 같은 `frame_id`를 공유하므로 한 화면에서 선택 상태가
+  동기화됩니다.
+- 전역 `config.yaml`은 수정하지 않습니다. 실행마다 확정된 설정 snapshot과 출력·캐시
+  폴더를 따로 만듭니다.
+
+## 구성
+
+```text
+React/Vite 작업자 UI
+  ├─ MapLibre 지도와 주행 경로
+  ├─ 지연 로딩 360° 파노라마
+  └─ 점 예산 기반 Three.js 점군
+          │ REST + SSE
+FastAPI 제어 서버
+  ├─ 허용된 저장소 루트와 데이터셋 레지스트리
+  ├─ pose 사전 검사와 CRS 변환
+  ├─ 썸네일·점군 preview 파생 캐시
+  ├─ 재개 가능한 chunk 업로드
+  └─ GPU 단일 작업 큐
+          │ isolated subprocess
+기존 scripts/run_pipeline.py
+```
+
+개발 환경에서는 FastAPI가 빌드된 정적 UI도 함께 제공합니다. 실제 서버에서는 정적
+파일과 큰 파생 파일을 Nginx/NAS 또는 object storage/CDN으로 분리하고, API와 GPU
+worker를 독립 프로세스로 배치할 수 있습니다.
+
+## 빠른 로딩 전략
+
+### 첫 화면
+
+첫 요청에는 데이터셋 요약, 트랙별 프레임 수, 단순화된 주행 경로, 최근 작업 상태만
+포함합니다. Three.js와 원본 미디어 요청은 사용자가 해당 뷰를 열 때까지 지연됩니다.
+
+### 파노라마
+
+- 요청 너비를 제한하고 Pillow로 축소한 preview를 fingerprint 기반 디스크 캐시에
+  저장합니다.
+- 동일 파일의 크기와 수정 시각이 바뀌지 않으면 `ETag`와 장기 cache header를
+  재사용합니다.
+- 원본은 다운로드 버튼처럼 명시적인 동작에서만 제공합니다.
+- 운영 규모가 커지면 ingest worker가 WebP preview와 다중 해상도 cubemap/tile을
+  미리 생성하도록 확장합니다.
+
+### 점군
+
+- 프레임 주변의 카탈로그 block만 선택하고 반경과 최대 점 개수를 강제합니다.
+- 한국 UTM처럼 좌표가 큰 데이터는 서버에서 local origin을 빼고 Float32로
+  직렬화합니다. 브라우저 shader에는 상대좌표만 전달하므로 정밀도 손실을 줄입니다.
+- 응답은 작은 `MMSP` binary header, 상대 XYZ, RGB로 구성하고 JSON 좌표 배열을
+  사용하지 않습니다.
+- 동일 dataset/frame/radius/budget 조합은 파생 cache로 재사용합니다.
+- 전체 노선 점군을 연속 탐색하는 운영 버전은 업로드 후 비동기 ingest 단계에서
+  COPC/Potree 계층 LOD를 만들어 제공하는 것이 권장됩니다. 현재 처리 엔진은
+  `.las`와 `.pcdb`를 지원하며 `.laz`/COPC 원본 처리는 아직 지원하지 않습니다.
+
+### 지도
+
+- pose와 결과 좌표는 서버에서 프로젝트 CRS를 EPSG:4326으로 바꾼 후 GeoJSON으로
+  제공합니다.
+- 트랙은 표시 해상도에 맞게 단순화하고, 프레임 목록은 페이지 단위로 받습니다.
+- 지도 타일은 MapLibre style URL로 교체할 수 있습니다. API key는 빌드 산출물에
+  넣지 않고 서버 환경변수로 주입합니다.
+
+## 데이터 등록과 업로드
+
+가장 빠른 운영 방식은 NAS 또는 서버 landing zone에 원래 폴더 계층을 유지한 채
+데이터를 복사하고, UI에서 허용된 루트 아래 폴더를 등록하는 것입니다.
+
+원격 폴더 업로드는 파일을 작은 chunk로 전송하고 서버가 현재 offset을 확인한 뒤
+이어 씁니다. 다음을 지켜야 합니다.
+
+- 상대경로의 `..`, 절대경로, drive 문자, symlink 탈출을 거부합니다.
+- 한 요청의 body 전체를 메모리에 올리지 않습니다.
+- 업로드 완료 전 파일은 incoming 영역에 두고, 크기가 모두 일치할 때만 데이터
+  폴더로 원자적으로 이동합니다.
+- 인터넷을 통한 수십~수백 GB 배포에서는 API 업로드 대신 S3 multipart/tus와
+  checksum 검증을 사용하는 것이 좋습니다.
+
+## 파라미터 모드
+
+### 수치 입력
+
+작업자가 자주 조정하는 confidence, IoU, 입력 크기, 탐색 거리, 최소 점 개수, worker
+수만 기본 화면에 노출합니다. 값은 기존 argparse type, 선택지, 수치 범위와 동일한
+검증을 거쳐 작업별 YAML로 저장합니다. 나머지 옵션은 고급 설정으로 둡니다.
+
+### 자동 설정
+
+현재 자동 모드는 라벨 정답을 이용한 범용 정확도 최적화기가 아닙니다. 데이터 등록
+단계에서 형식과 CRS를 검증하고, 실행 단계에서는 GPU 메모리·CPU 수와 작업자가 고른
+자원 프로필을 이용해 입력 크기, batch, worker 수를 확정합니다. 기존 모델별
+confidence와 기하·점군 품질 기준은 바꾸지 않습니다. 파노라마 정렬 QA의 권고값은
+별도로 보여 주며 작업자가 승인한 경우에만 적용합니다.
+
+완전 자동 정확도 최적화를 추가하려면 독립 ground truth, precision/recall,
+XY/Z 오차, REVIEW 비율을 목적함수로 사용하는 trial runner가 필요합니다.
+
+## 작업 상태와 복구
+
+작업은 `queued → preparing → running → completed | failed | cancelled` 상태를
+가집니다. 상태와 확정 설정은 캐시 폴더에 지속적으로 기록합니다. 서버가 다시 시작될
+때 종료되지 않은 `running` 작업은 `interrupted`로 복구하며 자동으로 중복 실행하지
+않습니다. 진행 화면은 SSE로 상태와 새 로그만 받습니다.
+
+작업 취소는 해당 subprocess만 종료합니다. 원본 데이터는 건드리지 않으며 이미 생성된
+부분 산출물은 고유 output 폴더에 남겨 원인 분석에 사용할 수 있습니다.
+
+## 서버 배포 체크리스트
+
+- 앱에는 자체 로그인이 없으므로 API는 loopback에 바인딩하고 TLS·사용자 인증을
+  적용한 reverse proxy만 외부에 노출
+- 비-loopback 바인딩은 방화벽으로 앱 포트의 직접 접근을 차단한 환경에서만
+  `--allow-remote-bind`로 명시적으로 허용
+- 하나의 `state_dir`에는 ASGI worker를 정확히 1개만 실행. 두 번째 worker는 GPU
+  작업 중복과 재시작 복구 경합을 막기 위해 OS lock에서 시작을 거부
+- `MMS_WEB_STORAGE_ROOTS`, upload/cache/output root를 전용 volume으로 분리
+- 등록이 끝난 원본 root는 스캔·preview·pipeline 실행 중 변경하지 않고 API/worker에
+  읽기 전용으로 mount. 비신뢰 사용자나 별도 ingest 프로세스에 rename/write 권한을
+  함께 주지 않음. 새 데이터는 분리된 incoming에서 검증한 뒤 원자적으로 이동
+- API 프로세스는 비권한 사용자로 실행하고 허용 root 밖 접근 차단
+- GPU당 활성 pipeline 작업 1개, preview 작업에는 별도 CPU/메모리 한도 적용
+- 정적/파생 파일은 immutable cache, API JSON은 gzip 또는 Brotli 적용
+- upload/output volume의 quota와 보존 정책 설정
+- 수직 datum이 확정되지 않은 데이터는 UI와 결과 metadata에 경고 유지
+- 작업 설정, 모델 SHA-256, dataset fingerprint, 실행 로그 백업

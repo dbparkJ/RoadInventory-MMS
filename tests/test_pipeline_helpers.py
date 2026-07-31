@@ -48,6 +48,7 @@ from mms_shp_detection.pipeline import (
     missing_result_artifacts,
     pole_cross_profile_candidate_key,
     pole_classifications_for_policy,
+    prepare_shared_pipeline_context,
     reconcile_remote_supports_from_direct_anchors,
     resolve_matched_crs_wkt,
     resolve_num_workers,
@@ -61,6 +62,7 @@ from mms_shp_detection.pipeline import (
     safely_refresh_shapefile_from_txt,
     save_debug_crop,
     select_cross_profile_pole_candidate,
+    _scoped_pointcloud_catalog_path,
     unwrap_panorama_x_coordinates,
     validate_crs_wkt,
     validate_panorama_image,
@@ -1296,11 +1298,21 @@ class DatasetFingerprintTests(unittest.TestCase):
                 **common_args,
                 start_index=0,
                 limit_images=443,
+                include_record_names=("Record_A", "Record_B"),
+                include_job_names=("Job_A", "Job_B"),
+                include_track_names=("Track01",),
+                frame_id_from="frame2",
+                frame_id_to="frame10",
             )
             second_slice = argparse.Namespace(
                 **common_args,
                 start_index=443,
                 limit_images=359,
+                include_record_names=("record_b", "record_a"),
+                include_job_names=("job_b", "job_a", "unused_job"),
+                include_track_names=("track01",),
+                frame_id_from=" frame2 ",
+                frame_id_to="frame10 ",
             )
             pointcloud_catalog = {
                 "selected_source_type": "las",
@@ -2818,6 +2830,230 @@ class MultiModelExecutionTests(unittest.TestCase):
 
 
 class PipelineInputScopeTests(unittest.TestCase):
+    def test_scoped_catalog_path_is_stable_and_seeded_from_full_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_path = root / "pointcloud_catalog.json"
+            base_payload = b'{"catalog_version":5,"files":[]}'
+            base_path.write_bytes(base_payload)
+            all_tasks = [
+                {"pose_format": "leica-sphere", "job_name": "Job_B"},
+                {"pose_format": "leica-sphere", "job_name": "Job_A"},
+            ]
+            selected_tasks = [
+                {"pose_format": "leica-sphere", "job_name": "job_a"},
+            ]
+
+            scoped, jobs = _scoped_pointcloud_catalog_path(
+                base_path,
+                all_image_tasks=all_tasks,
+                selected_image_tasks=selected_tasks,
+            )
+            repeated, repeated_jobs = _scoped_pointcloud_catalog_path(
+                base_path,
+                all_image_tasks=list(reversed(all_tasks)),
+                selected_image_tasks=selected_tasks,
+            )
+
+            self.assertNotEqual(scoped, base_path)
+            self.assertEqual(scoped, repeated)
+            self.assertEqual(jobs, ("job_a",))
+            self.assertEqual(repeated_jobs, jobs)
+            self.assertEqual(scoped.read_bytes(), base_payload)
+            self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_stable_work_scope_filters_precede_shared_inputs_and_las_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = build_arg_parser().parse_args(
+                [
+                    "--data-root",
+                    str(root),
+                    "--pointcloud-cache-path",
+                    str(root / "catalog.json"),
+                    "--include-record-names",
+                    "record_a,RECORD_B",
+                    "--include-job-names",
+                    "Job_A,job_b",
+                    "--include-track-names",
+                    "track01",
+                    "--frame-id-from",
+                    "frame2",
+                    "--frame-id-to",
+                    "frame10",
+                ]
+            )
+
+            def task(
+                frame_id: str,
+                *,
+                record_name: str,
+                job_name: str,
+                track_name: str,
+                second: int,
+            ) -> dict:
+                return {
+                    "timestamp_iso": f"2025-03-11T00:00:{second:02d}+00:00",
+                    "image_path": str(root / f"{frame_id}.jpg"),
+                    "image_name": f"{frame_id}.jpg",
+                    "image_stem": frame_id,
+                    "record_name": record_name,
+                    "job_name": job_name,
+                    "track_name": track_name,
+                    "pose_format": "leica-sphere",
+                }
+
+            tasks = [
+                task(
+                    "frame1",
+                    record_name="Record_A",
+                    job_name="Job_A",
+                    track_name="Track01",
+                    second=1,
+                ),
+                task(
+                    "frame2",
+                    record_name="Record_A",
+                    job_name="Job_A",
+                    track_name="Track01",
+                    second=2,
+                ),
+                task(
+                    "frame5",
+                    record_name="Record_A",
+                    job_name="Job_A",
+                    track_name="Track02",
+                    second=5,
+                ),
+                task(
+                    "frame6",
+                    record_name="Record_C",
+                    job_name="Job_A",
+                    track_name="Track01",
+                    second=6,
+                ),
+                task(
+                    "frame7",
+                    record_name="Record_A",
+                    job_name="Job_C",
+                    track_name="Track01",
+                    second=7,
+                ),
+                task(
+                    "frame10",
+                    record_name="Record_B",
+                    job_name="Job_B",
+                    track_name="Track01",
+                    second=10,
+                ),
+                task(
+                    "frame11",
+                    record_name="Record_B",
+                    job_name="Job_B",
+                    track_name="Track01",
+                    second=11,
+                ),
+            ]
+            dataset_signature = {"sha256": "a" * 64}
+            catalog = {
+                "selected_source_type": "las",
+                "signature": {"source_files": []},
+                "files": [],
+            }
+            calibration_bundle = {"sha256": "b" * 64}
+            logger = mock.Mock()
+
+            with (
+                mock.patch(
+                    "mms_shp_detection.pipeline.scan_image_tasks",
+                    return_value=tasks,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.attach_calibration_metadata",
+                    return_value=calibration_bundle,
+                ) as calibration_mock,
+                mock.patch(
+                    "mms_shp_detection.pipeline.build_dataset_signature",
+                    return_value=dataset_signature,
+                ) as signature_mock,
+                mock.patch(
+                    "mms_shp_detection.pipeline.build_pointcloud_catalog",
+                    return_value=catalog,
+                ) as catalog_mock,
+                mock.patch(
+                    "mms_shp_detection.pipeline.resolve_matched_crs_wkt",
+                    return_value='PROJCS["fixture"]',
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.validate_pose_pointcloud_proximity",
+                    return_value=0.0,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.run_panorama_alignment_qa",
+                    return_value={"status": "disabled"},
+                ),
+            ):
+                context = prepare_shared_pipeline_context(
+                    args,
+                    alignment_report_path=root / "alignment.json",
+                    logger=logger,
+                )
+
+            selected_tasks = calibration_mock.call_args.args[0]
+            self.assertEqual(
+                [item["image_stem"] for item in selected_tasks],
+                ["frame2", "frame10"],
+            )
+            self.assertIs(signature_mock.call_args.args[0], selected_tasks)
+            self.assertEqual(
+                catalog_mock.call_args.kwargs["include_jobs"],
+                ("Job_A", "Job_B"),
+            )
+            self.assertIs(context["image_tasks"], selected_tasks)
+            self.assertIs(context["calibration_bundle"], calibration_bundle)
+            logger.info.assert_called()
+
+    def test_empty_work_scope_fails_before_calibration_or_catalog(self) -> None:
+        args = build_arg_parser().parse_args(
+            ["--include-job-names", "Missing_Job"]
+        )
+        tasks = [
+            {
+                "timestamp_iso": "2025-03-11T00:00:01+00:00",
+                "image_path": "frame1.jpg",
+                "image_stem": "frame1",
+                "record_name": "Record_A",
+                "job_name": "Job_A",
+                "track_name": "Track01",
+                "pose_format": "leica-sphere",
+            }
+        ]
+
+        with (
+            mock.patch(
+                "mms_shp_detection.pipeline.scan_image_tasks",
+                return_value=tasks,
+            ),
+            mock.patch(
+                "mms_shp_detection.pipeline.attach_calibration_metadata",
+            ) as calibration_mock,
+            mock.patch(
+                "mms_shp_detection.pipeline.build_pointcloud_catalog",
+            ) as catalog_mock,
+            self.assertRaisesRegex(
+                ValueError,
+                "Work-scope selection contains no MMS image tasks.*include_job_names",
+            ),
+        ):
+            prepare_shared_pipeline_context(
+                args,
+                alignment_report_path=Path("alignment.json"),
+                logger=mock.Mock(),
+            )
+
+        calibration_mock.assert_not_called()
+        catalog_mock.assert_not_called()
+
     def test_catalog_and_dataset_signature_use_all_jobs_before_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2922,7 +3158,7 @@ class PipelineInputScopeTests(unittest.TestCase):
                 run_pipeline(args)
 
             self.assertEqual(len(signature_mock.call_args.args[0]), 2)
-            self.assertEqual(catalog_mock.call_args.kwargs["include_jobs"], {"Job_A", "Job_B"})
+            self.assertEqual(catalog_mock.call_args.kwargs["include_jobs"], ("Job_A", "Job_B"))
             processed_tasks = worker_mock.call_args.args[0]
             self.assertEqual(len(processed_tasks), 1)
             self.assertEqual(processed_tasks[0]["job_name"], "Job_B")

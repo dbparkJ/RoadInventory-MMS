@@ -1,0 +1,388 @@
+import type {
+  BootstrapResponse,
+  DatasetDetail,
+  FramePage,
+  RouteResponse,
+  RunEvent,
+  RunRecord,
+  RunRequest,
+  StorageRoot,
+  StorageTreeResponse,
+  UploadManifestFile,
+  UploadSession,
+} from '../types'
+
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+const DEFAULT_TIMEOUT = 15_000
+
+export class ApiError extends Error {
+  readonly status: number
+  readonly code?: string
+  readonly details?: unknown
+
+  constructor(message: string, status = 0, code?: string, details?: unknown) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.details = details
+  }
+}
+
+interface RequestOptions extends RequestInit {
+  timeout?: number
+  retries?: number
+}
+
+export function buildApiUrl(path: string, query?: Record<string, string | number | undefined>): string {
+  if (/^https?:\/\//.test(path) || (API_BASE && path.startsWith(`${API_BASE}/`))) {
+    return path
+  }
+  const normalized = path.startsWith('/') ? path : `/${path}`
+  const params = new URLSearchParams()
+  Object.entries(query ?? {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  })
+  const suffix = params.size ? `?${params.toString()}` : ''
+  return `${API_BASE}${normalized}${suffix}`
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function mergeSignals(signal: AbortSignal | null | undefined, timeout: number): {
+  signal: AbortSignal
+  cleanup: () => void
+} {
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), timeout)
+  const abort = () => controller.abort(signal?.reason)
+  signal?.addEventListener('abort', abort, { once: true })
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      window.clearTimeout(timeoutId)
+      signal?.removeEventListener('abort', abort)
+    },
+  }
+}
+
+export function errorMessageFromPayload(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object') return fallback
+  const record = payload as Record<string, unknown>
+  if (typeof record.message === 'string' && record.message.trim()) return record.message
+  if (typeof record.detail === 'string' && record.detail.trim()) return record.detail
+  if (Array.isArray(record.detail)) {
+    const messages = record.detail
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return ''
+        const issue = entry as Record<string, unknown>
+        if (typeof issue.msg !== 'string' || !issue.msg.trim()) return ''
+        const location = Array.isArray(issue.loc)
+          ? issue.loc
+              .filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+              .filter((part) => part !== 'body')
+              .join('.')
+          : ''
+        return location ? `${location}: ${issue.msg}` : issue.msg
+      })
+      .filter(Boolean)
+    if (messages.length) return messages.join(' · ')
+  }
+  if (
+    record.detail &&
+    typeof record.detail === 'object' &&
+    typeof (record.detail as Record<string, unknown>).message === 'string'
+  ) {
+    return (record.detail as Record<string, string>).message
+  }
+  return fallback
+}
+
+async function parseError(response: Response): Promise<ApiError> {
+  const fallback = `요청을 처리하지 못했습니다. (${response.status})`
+  try {
+    const payload = (await response.json()) as unknown
+    const code =
+      payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).code === 'string'
+        ? ((payload as Record<string, unknown>).code as string)
+        : undefined
+    return new ApiError(errorMessageFromPayload(payload, fallback), response.status, code, payload)
+  } catch {
+    return new ApiError(fallback, response.status)
+  }
+}
+
+async function request(path: string, options: RequestOptions = {}): Promise<Response> {
+  const method = options.method?.toUpperCase() ?? 'GET'
+  const retries = options.retries ?? (method === 'GET' || method === 'HEAD' ? 2 : 0)
+  let latestError: unknown
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const merged = mergeSignals(options.signal, options.timeout ?? DEFAULT_TIMEOUT)
+    try {
+      const response = await fetch(buildApiUrl(path), {
+        ...options,
+        headers: {
+          Accept: 'application/json',
+          ...options.headers,
+        },
+        signal: merged.signal,
+      })
+      if (!response.ok) {
+        const error = await parseError(response)
+        if (response.status >= 500 && attempt < retries) {
+          latestError = error
+          await sleep(300 * 2 ** attempt)
+          continue
+        }
+        throw error
+      }
+      return response
+    } catch (error) {
+      latestError = error
+      const canRetry =
+        attempt < retries &&
+        !(error instanceof ApiError && error.status > 0 && error.status < 500) &&
+        !options.signal?.aborted
+      if (!canRetry) {
+        if (error instanceof ApiError) throw error
+        if (error instanceof DOMException && error.name === 'AbortError') throw error
+        throw new ApiError(
+          error instanceof DOMException && error.name === 'TimeoutError'
+            ? '서버 응답 시간이 초과되었습니다.'
+            : '서버에 연결할 수 없습니다.',
+          0,
+          'NETWORK_ERROR',
+          error,
+        )
+      }
+      await sleep(300 * 2 ** attempt)
+    } finally {
+      merged.cleanup()
+    }
+  }
+
+  throw latestError
+}
+
+async function json<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const response = await request(path, options)
+  if (response.status === 204) return undefined as T
+  return response.json() as Promise<T>
+}
+
+function jsonBody(value: unknown): Pick<RequestInit, 'body' | 'headers'> {
+  return {
+    body: JSON.stringify(value),
+    headers: { 'Content-Type': 'application/json' },
+  }
+}
+
+export const api = {
+  bootstrap(signal?: AbortSignal) {
+    return json<BootstrapResponse>('/api/bootstrap', { signal })
+  },
+
+  storage(signal?: AbortSignal) {
+    return json<{ roots: StorageRoot[] }>('/api/storage', { signal })
+  },
+
+  storageTree(rootId: string, relativePath: string, signal?: AbortSignal) {
+    return json<StorageTreeResponse>(
+      buildApiUrl(`/api/storage/${encodeURIComponent(rootId)}/tree`, { path: relativePath }),
+      { signal },
+    )
+  },
+
+  scanDataset(rootId: string, relativePath: string, crs: string) {
+    return json<DatasetDetail>('/api/datasets/scan', {
+      method: 'POST',
+      ...jsonBody({ root_id: rootId, relative_path: relativePath, crs }),
+      timeout: 60_000,
+    })
+  },
+
+  dataset(id: string, signal?: AbortSignal) {
+    return json<DatasetDetail>(`/api/datasets/${encodeURIComponent(id)}`, { signal })
+  },
+
+  route(id: string, signal?: AbortSignal) {
+    return json<RouteResponse>(`/api/datasets/${encodeURIComponent(id)}/route`, {
+      signal,
+      timeout: 30_000,
+    })
+  },
+
+  frames(id: string, offset: number, limit: number, track?: string, signal?: AbortSignal) {
+    return json<FramePage>(
+      buildApiUrl(`/api/datasets/${encodeURIComponent(id)}/frames`, {
+        offset,
+        limit,
+        track,
+      }),
+      { signal },
+    )
+  },
+
+  async panorama(id: string, frameId: string, width: number, signal?: AbortSignal) {
+    const response = await request(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(id)}/panoramas/${encodeURIComponent(frameId)}`,
+        { width },
+      ),
+      { signal, timeout: 30_000 },
+    )
+    if (response.headers.get('content-type')?.includes('application/json')) {
+      const payload = (await response.json()) as { url: string }
+      return { kind: 'url' as const, value: payload.url }
+    }
+    return { kind: 'blob' as const, value: await response.blob() }
+  },
+
+  async points(
+    id: string,
+    frameId: string,
+    budget: number,
+    radius: number,
+    signal?: AbortSignal,
+  ) {
+    const response = await request(
+      buildApiUrl(`/api/datasets/${encodeURIComponent(id)}/points/${encodeURIComponent(frameId)}`, {
+        budget,
+        radius,
+      }),
+      {
+        signal,
+        timeout: 45_000,
+        headers: { Accept: 'application/vnd.mmsp, application/octet-stream' },
+      },
+    )
+    if (response.status === 202) {
+      let message = '포인트 미리보기를 준비하고 있습니다.'
+      try {
+        const payload = (await response.json()) as { message?: string; detail?: string }
+        message = payload.message ?? payload.detail ?? message
+      } catch {
+        // Keep the useful default.
+      }
+      throw new ApiError(message, 202, 'INDEXING')
+    }
+    return response.arrayBuffer()
+  },
+
+  optimize(payload: RunRequest, signal?: AbortSignal) {
+    return json<{
+      parameters: RunRequest['parameters']
+    }>('/api/optimize', {
+      method: 'POST',
+      ...jsonBody(payload),
+      signal,
+      timeout: 120_000,
+    })
+  },
+
+  runs(signal?: AbortSignal) {
+    return json<{ items: RunRecord[] }>('/api/runs', { signal })
+  },
+
+  createRun(payload: RunRequest) {
+    return json<RunRecord>('/api/runs', {
+      method: 'POST',
+      ...jsonBody(payload),
+      timeout: 30_000,
+    })
+  },
+
+  cancelRun(runId: string) {
+    return json<RunRecord>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+      ...jsonBody({}),
+    })
+  },
+
+  subscribeToRun(
+    runId: string,
+    onEvent: (event: RunEvent) => void,
+    onConnectionError?: () => void,
+  ) {
+    const source = new EventSource(buildApiUrl(`/api/runs/${encodeURIComponent(runId)}/events`))
+    source.onmessage = (event) => {
+      try {
+        onEvent(JSON.parse(event.data) as RunEvent)
+      } catch {
+        // Ignore heartbeat or malformed server messages and keep the stream alive.
+      }
+    }
+    source.addEventListener('run', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as
+          | RunRecord
+          | { run: RunRecord }
+        onEvent({
+          type: 'snapshot',
+          run: 'run' in payload ? payload.run : payload,
+        })
+      } catch {
+        // A later snapshot or status event will reconcile state.
+      }
+    })
+    ;['progress', 'stage', 'completed', 'failed', 'cancelled'].forEach((type) => {
+      source.addEventListener(type, (event) => {
+        try {
+          onEvent({ ...(JSON.parse((event as MessageEvent<string>).data) as RunEvent), type } as RunEvent)
+        } catch {
+          // The next snapshot will reconcile state.
+        }
+      })
+    })
+    source.onerror = () => onConnectionError?.()
+    return () => source.close()
+  },
+
+  createUpload(name: string, files: UploadManifestFile[], rootId?: string) {
+    return json<UploadSession>('/api/uploads', {
+      method: 'POST',
+      ...jsonBody({ name, files, root_id: rootId }),
+      timeout: 30_000,
+    })
+  },
+
+  async uploadedBytes(sessionId: string, fileId: string): Promise<number> {
+    const response = await request(
+      `/api/uploads/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(fileId)}`,
+      { method: 'HEAD', retries: 1 },
+    )
+    return Number(response.headers.get('Upload-Offset') ?? response.headers.get('X-Uploaded-Bytes') ?? 0)
+  },
+
+  async uploadChunk(
+    sessionId: string,
+    fileId: string,
+    path: string,
+    chunk: Blob,
+    start: number,
+    total: number,
+    signal?: AbortSignal,
+  ) {
+    await request(`/api/uploads/${encodeURIComponent(sessionId)}/files/${encodeURIComponent(fileId)}`, {
+      method: 'PUT',
+      body: chunk,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Range': `bytes ${start}-${start + chunk.size - 1}/${total}`,
+        'X-Relative-Path': encodeURIComponent(path),
+      },
+      signal,
+      timeout: 120_000,
+    })
+  },
+
+  completeUpload(sessionId: string) {
+    return json<{ root_id: string; relative_path: string; upload_id: string }>(
+      `/api/uploads/${encodeURIComponent(sessionId)}/complete`,
+      { method: 'POST', ...jsonBody({}), timeout: 60_000 },
+    )
+  },
+}

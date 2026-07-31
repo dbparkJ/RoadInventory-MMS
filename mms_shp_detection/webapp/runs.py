@@ -1,0 +1,916 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, AsyncIterator
+from urllib.parse import quote
+
+import yaml
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from .datasets import require_ready_dataset, utc_now
+from .datasets import catalog_path as dataset_catalog_path
+from .datasets import seed_catalog_cache
+from .optimizer import resolve_run_parameters
+from .security import UnsafePath, normalize_relative_path, resolve_under_root
+
+
+router = APIRouter(prefix="/api", tags=["runs"])
+
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+PUBLIC_STATUS = {
+    "interrupted": "failed",
+    "error": "failed",
+}
+PATH_OPTION_NAMES = {
+    "data_root",
+    "calibration_path",
+    "model_path",
+    "model_dir",
+    "output_dir",
+    "pointcloud_cache_path",
+    "pcdb_cache_path",
+    "crs_wkt_path",
+}
+SAFE_RESULT_SUFFIXES = {
+    ".shp",
+    ".shx",
+    ".dbf",
+    ".prj",
+    ".cpg",
+    ".qpj",
+    ".json",
+    ".csv",
+    ".txt",
+    ".log",
+    ".las",
+    ".laz",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+}
+
+
+class RunRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    dataset_id: str
+    track_ids: list[str] = Field(default_factory=list)
+    frame_range: tuple[int, int] | list[int] | None = None
+    frame_from: int | None = None
+    frame_to: int | None = None
+    mode: str | None = None
+    parameter_mode: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    auto: dict[str, Any] = Field(default_factory=dict)
+    profile: str | None = None
+
+
+def _set_config_value(
+    document: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    include_model_filters: bool = False,
+) -> None:
+    matches: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], *, inside_model_filters: bool = False) -> None:
+        for child_key, child in node.items():
+            normalized = child_key.replace("-", "_")
+            child_inside_filters = inside_model_filters or normalized == "model_filters"
+            if normalized == key and (include_model_filters or not inside_model_filters):
+                matches.append(node)
+            if isinstance(child, dict) and (include_model_filters or not child_inside_filters):
+                visit(child, inside_model_filters=child_inside_filters)
+
+    visit(document)
+    if matches:
+        for parent in matches:
+            for existing in list(parent):
+                if existing.replace("-", "_") == key:
+                    parent[existing] = value
+        return
+    overrides = document.setdefault("web_run", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("Base configuration has an incompatible web_run section.")
+    overrides[key] = value
+
+
+def _absolutize_config_paths(document: dict[str, Any], config_dir: Path) -> None:
+    def visit(node: dict[str, Any]) -> None:
+        for key, value in list(node.items()):
+            normalized = key.replace("-", "_")
+            if isinstance(value, dict):
+                visit(value)
+            elif normalized in PATH_OPTION_NAMES and value not in {None, ""}:
+                path = Path(str(value)).expanduser()
+                if not path.is_absolute():
+                    path = config_dir / path
+                node[key] = str(path.resolve(strict=False))
+
+    visit(document)
+
+
+def _dataset_root(app: Any, dataset: dict[str, Any]) -> Path:
+    root = app.state.storage_roots_by_id.get(dataset["root_id"])
+    if root is None:
+        raise ValueError("Dataset storage is no longer configured.")
+    return resolve_under_root(
+        root.path,
+        dataset["relative_path"],
+        must_exist=True,
+        expect_directory=True,
+    )
+
+
+def _frame_selection(
+    dataset: dict[str, Any],
+    frames: list[dict[str, Any]],
+    payload: RunRequest,
+) -> tuple[list[str], tuple[int, int], int, int]:
+    known_tracks = {track["id"]: track for track in dataset.get("tracks", [])}
+    unknown = sorted(set(payload.track_ids) - set(known_tracks))
+    if unknown:
+        raise ValueError("One or more selected tracks do not belong to this dataset.")
+    track_ids = list(dict.fromkeys(payload.track_ids))
+
+    if payload.frame_range is not None:
+        if len(payload.frame_range) != 2:
+            raise ValueError("frame_range must contain [first, last].")
+        first, last = int(payload.frame_range[0]), int(payload.frame_range[1])
+    else:
+        first = int(payload.frame_from) if payload.frame_from is not None else 0
+        last = (
+            int(payload.frame_to)
+            if payload.frame_to is not None
+            else max(0, len(frames) - 1)
+        )
+    if not frames or first < 0 or last < first or last >= len(frames):
+        raise ValueError("Frame range is outside this dataset.")
+
+    selected_by_track = (
+        [frame for frame in frames if frame["track_id"] in set(track_ids)]
+        if track_ids
+        else frames
+    )
+    selected = [
+        frame
+        for frame in selected_by_track
+        if first <= int(frame["ordinal"]) <= last
+    ]
+    if not selected:
+        raise ValueError("Track and frame selections contain no frames.")
+    selected_positions = [
+        index
+        for index, frame in enumerate(selected_by_track)
+        if first <= int(frame["ordinal"]) <= last
+    ]
+    start_index = selected_positions[0]
+    limit_images = selected_positions[-1] - selected_positions[0] + 1
+    if limit_images != len(selected):
+        raise ValueError("Frame selection is not contiguous after applying track filters.")
+    return track_ids, (first, last), start_index, limit_images
+
+
+def _build_job_config(
+    app: Any,
+    *,
+    run_id: str,
+    dataset: dict[str, Any],
+    frames: list[dict[str, Any]],
+    payload: RunRequest,
+    core_parameters: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    base_path = app.state.config.pipeline_config_path
+    if base_path.is_file():
+        from mms_shp_detection.config import _Yaml12SafeLoader
+
+        document = yaml.load(
+            base_path.read_text(encoding="utf-8-sig"),
+            Loader=_Yaml12SafeLoader,
+        ) or {}
+        if not isinstance(document, dict):
+            raise ValueError("Pipeline configuration root must be an object.")
+        _absolutize_config_paths(document, base_path.parent)
+    else:
+        document = {"config_version": 1}
+
+    work_dir = app.state.config.state_dir / "runs" / run_id
+    output_dir = work_dir / "output"
+    cache_file = work_dir / "cache" / "pointcloud_catalog.json"
+    work_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        output_dir.mkdir(parents=True)
+        cache_file.parent.mkdir(parents=True)
+
+        dataset_root = _dataset_root(app, dataset)
+        track_ids, frame_range, start_index, limit_images = _frame_selection(
+            dataset, frames, payload
+        )
+        selected_track_set = set(track_ids)
+        selected_tracks = [
+            track
+            for track in dataset.get("tracks", [])
+            if track["id"] in selected_track_set
+        ]
+        track_names = [str(track["name"]) for track in selected_tracks]
+        record_names = [
+            str(track["record_name"])
+            for track in selected_tracks
+            if track.get("record_name")
+        ]
+        job_names = [
+            str(track["job_name"])
+            for track in selected_tracks
+            if track.get("job_name")
+        ]
+        cache_seed = seed_catalog_cache(
+            app,
+            dataset_root,
+            cache_file,
+            preferred=dataset_catalog_path(app, dataset["id"]),
+        )
+
+        _set_config_value(document, "data_root", str(dataset_root))
+        _set_config_value(document, "output_dir", str(output_dir))
+        _set_config_value(document, "pointcloud_cache_path", str(cache_file))
+        _set_config_value(document, "disable_console_progress", True)
+        # A server-side base config may itself be scoped for a previous batch.
+        # Clear every persistent selector before applying this request's opaque
+        # track selection, otherwise the two independent scopes are intersected.
+        for selector_name in (
+            "include_record_names",
+            "include_job_names",
+            "include_track_names",
+            "frame_id_from",
+            "frame_id_to",
+        ):
+            _set_config_value(document, selector_name, None)
+        if selected_tracks:
+            if record_names:
+                _set_config_value(document, "include_record_names", record_names)
+        # Numeric UI bounds are global ordinals.  Apply them only after the
+        # exact record filter, where start/limit remains unambiguous even when
+        # image stems repeat in multiple tracks.
+        filtered_count = sum(
+            not selected_track_set or frame["track_id"] in selected_track_set
+            for frame in frames
+        )
+        if start_index != 0 or limit_images != filtered_count:
+            _set_config_value(document, "start_index", start_index)
+            _set_config_value(document, "limit_images", limit_images)
+        else:
+            _set_config_value(document, "start_index", 0)
+            _set_config_value(document, "limit_images", 0)
+        manual_mode = str(payload.mode or payload.parameter_mode or "").casefold() in {
+            "manual",
+            "numeric",
+            "number",
+        }
+        for key, value in core_parameters.items():
+            _set_config_value(
+                document,
+                key,
+                value,
+                include_model_filters=manual_mode,
+            )
+
+        config_path = work_dir / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        resolved = {
+            "track_ids": track_ids,
+            "track_names": track_names,
+            "record_names": record_names,
+            "job_names": job_names,
+            "frame_range": list(frame_range),
+            "start_index": start_index,
+            "limit_images": limit_images,
+            "parameters": core_parameters,
+            "config_file": "config.yaml",
+            "output_directory": "output",
+            "cache_file": "cache/pointcloud_catalog.json",
+            "cache_seed": cache_seed,
+        }
+        return config_path, resolved
+    except BaseException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+
+def _run_work_dir(app: Any, run: dict[str, Any]) -> Path:
+    runs_root = app.state.config.state_dir / "runs"
+    return resolve_under_root(
+        runs_root,
+        run["work_relative"],
+        must_exist=True,
+        expect_directory=True,
+        reject_symlinks=True,
+    )
+
+
+def _redact(app: Any, value: str, run: dict[str, Any] | None = None) -> str:
+    text = value
+    sensitive = [
+        app.state.config.project_root,
+        app.state.config.state_dir,
+        *(root.path for root in app.state.storage_roots),
+    ]
+    if run is not None:
+        try:
+            sensitive.append(_run_work_dir(app, run))
+        except Exception:
+            pass
+    for path in sensitive:
+        raw = str(path.resolve(strict=False))
+        text = text.replace(raw, "<server>")
+        text = text.replace(raw.replace("\\", "/"), "<server>")
+    return text
+
+
+def _tail(path: Path, max_bytes: int = 32_768) -> str:
+    if not path.is_file():
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        length = handle.tell()
+        handle.seek(max(0, length - max_bytes))
+        payload = handle.read(max_bytes)
+    return payload.decode("utf-8", errors="replace")
+
+
+def _runtime_log_text(app: Any, item: dict[str, Any]) -> str:
+    try:
+        work = _run_work_dir(app, item)
+    except Exception:
+        return ""
+    paths = [work / "logs" / "process.log", work / "output" / "logs" / "run.log"]
+    try:
+        paths.extend(sorted((work / "output").glob("*/logs/run.log"))[:8])
+    except OSError:
+        pass
+    return "\n".join(_tail(path, max_bytes=16_384) for path in paths if path.is_file())
+
+
+def _progress_from_log(status_value: str, log_text: str) -> float:
+    if status_value == "completed":
+        return 100.0
+    if status_value in {"queued", "preparing"}:
+        return 0.0
+    matches = re.findall(r"(?<!\d)(\d{1,9})\s*/\s*(\d{1,9})(?!\d)", log_text)
+    ratios = [
+        int(current) / int(total)
+        for current, total in matches
+        if int(total) > 0 and int(current) <= int(total)
+    ]
+    return max(ratios, default=0.0) * 100.0
+
+
+def _bounded_result_files(
+    output: Path,
+    *,
+    max_files: int,
+) -> tuple[list[Path], bool]:
+    """Collect a bounded set of real result files without materializing a tree."""
+
+    files: list[Path] = []
+    pending = [output]
+    # Unsupported files and nested directories must not defeat the response
+    # bound. This is deliberately a scan budget, not an assertion about how
+    # many files the pipeline is allowed to write.
+    max_entries = max(10_000, max_files * 20)
+    visited_entries = 0
+    truncated = False
+
+    while pending and len(files) < max_files and visited_entries < max_entries:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    visited_entries += 1
+                    if visited_entries > max_entries or len(files) >= max_files:
+                        truncated = True
+                        break
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    path = Path(entry.path)
+                    if path.suffix.casefold() in SAFE_RESULT_SUFFIXES:
+                        files.append(path)
+        except OSError:
+            continue
+
+    if pending or visited_entries >= max_entries or len(files) >= max_files:
+        truncated = True
+    return files, truncated
+
+
+def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        output = _run_work_dir(app, run) / "output"
+    except Exception:
+        return None
+    if not output.is_dir() or output.is_symlink():
+        return None
+    result_paths, truncated = _bounded_result_files(
+        output,
+        max_files=app.state.config.max_result_files,
+    )
+    result_paths.sort(
+        key=lambda path: path.relative_to(output).as_posix().casefold()
+    )
+    files: list[dict[str, Any]] = []
+    for path in result_paths:
+        try:
+            relative = path.relative_to(output).as_posix()
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        files.append(
+            {
+                "path": relative,
+                "name": path.name,
+                "size": int(stat.st_size),
+                "type": path.suffix.casefold().lstrip("."),
+                "url": (
+                    f"/api/runs/{run['id']}/artifacts?"
+                    f"path={quote(relative, safe='')}"
+                ),
+            }
+        )
+    summary: dict[str, Any] = {
+        "files": files,
+        "file_count": len(files),
+        "truncated": truncated,
+    }
+    manifests = [
+        path
+        for path in result_paths
+        if path.name.casefold() == "run_manifest.json"
+    ]
+    for manifest in manifests:
+        try:
+            if manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 5_000_000:
+                value = json.loads(manifest.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    for key in ("feature_counts", "status"):
+                        if key in value:
+                            summary[key] = value[key]
+                    break
+        except (OSError, json.JSONDecodeError):
+            continue
+    return summary
+
+
+def public_run(
+    app: Any,
+    item: dict[str, Any],
+    *,
+    include_log: bool = False,
+    include_results: bool = False,
+) -> dict[str, Any]:
+    log_text = _runtime_log_text(app, item)
+    public_status = PUBLIC_STATUS.get(item["status"], item["status"])
+    dataset = app.state.store.get_dataset(item["dataset_id"])
+    result = {
+        "id": item["id"],
+        "dataset_id": item["dataset_id"],
+        "dataset_name": dataset["name"] if dataset is not None else None,
+        "status": public_status,
+        "progress": _progress_from_log(item["status"], log_text),
+        "request": item["request"],
+        "resolved": item["resolved"],
+        "created_at": item["created_at"],
+        "started_at": item.get("started_at"),
+        "finished_at": item.get("finished_at"),
+        "updated_at": item["updated_at"],
+        "cancel_requested": bool(item.get("cancel_requested")),
+        "return_code": item.get("return_code"),
+        "stage": public_status,
+    }
+    if public_status == "completed":
+        result["result_url"] = f"/api/runs/{item['id']}/results"
+    if item.get("error"):
+        result["error"] = _redact(app, str(item["error"]), item)
+    if include_results:
+        summary = _result_summary(app, item)
+        if summary is not None:
+            result["results"] = summary
+    if include_log:
+        result["log_tail"] = _redact(app, log_text, item)
+    return result
+
+
+class RunManager:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self._wake = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._worker: asyncio.Task[None] | None = None
+        self._active_run_id: str | None = None
+        self._active_process: asyncio.subprocess.Process | None = None
+
+    def start(self) -> None:
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._loop(), name="mms-single-gpu-runner")
+            self._wake.set()
+
+    async def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._active_process is not None and self._active_process.returncode is None:
+            if self._active_run_id is not None:
+                now = utc_now()
+                self.app.state.store.update_run(
+                    self._active_run_id,
+                    now,
+                    status="interrupted",
+                    error="Server stopped while this run was active.",
+                    finished_at=now,
+                )
+            await self._terminate(self._active_process)
+        if self._worker is not None:
+            try:
+                await asyncio.wait_for(self._worker, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._worker.cancel()
+
+    def notify(self) -> None:
+        self._wake.set()
+
+    async def cancel(self, run_id: str) -> dict[str, Any]:
+        run = self.app.state.store.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run["status"] in TERMINAL_STATUSES:
+            return run
+        now = utc_now()
+        if run["status"] in {"queued", "preparing", "starting"}:
+            self.app.state.store.update_run(
+                run_id,
+                now,
+                status="cancelled",
+                cancel_requested=1,
+                finished_at=now,
+            )
+        else:
+            self.app.state.store.update_run(
+                run_id, now, status="cancelling", cancel_requested=1
+            )
+            if self._active_run_id == run_id and self._active_process is not None:
+                await self._terminate(self._active_process)
+        self._wake.set()
+        return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            if os.name == "nt":
+                pid = int(process.pid)
+                if pid <= 0:
+                    raise ProcessLookupError("Invalid child process ID.")
+                tree_kill = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(pid),
+                    "/T",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await tree_kill.wait()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            if process.returncode is None:
+                try:
+                    if os.name == "nt":
+                        pid = int(process.pid)
+                        if pid <= 0:
+                            raise ProcessLookupError("Invalid child process ID.")
+                        force_kill = await asyncio.create_subprocess_exec(
+                            "taskkill",
+                            "/PID",
+                            str(pid),
+                            "/T",
+                            "/F",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await force_kill.wait()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+
+    async def _loop(self) -> None:
+        while not self._stop.is_set():
+            run = self.app.state.store.claim_next_queued_run(utc_now())
+            if run is None:
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            await self._execute(run)
+
+    async def _execute(self, run: dict[str, Any]) -> None:
+        run_id = run["id"]
+        latest_before_start = self.app.state.store.get_run(run_id)
+        if (
+            latest_before_start is None
+            or latest_before_start.get("cancel_requested")
+            or latest_before_start.get("status") == "cancelled"
+        ):
+            return
+        try:
+            work_dir = _run_work_dir(self.app, run)
+            config_path = work_dir / "config.yaml"
+            log_dir = work_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "process.log"
+            command = [
+                sys.executable,
+                str(self.app.state.config.project_root / "scripts" / "run_pipeline.py"),
+                "--config",
+                str(config_path),
+            ]
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            if not self.app.state.store.begin_run_start(run_id, utc_now()):
+                return
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self.app.state.config.project_root),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                **kwargs,
+            )
+            self._active_run_id = run_id
+            self._active_process = process
+            started = utc_now()
+            if not self.app.state.store.mark_run_running(
+                run_id,
+                pid=process.pid,
+                started_at=started,
+            ):
+                await self._terminate(process)
+                return
+            with log_path.open("a", encoding="utf-8", buffering=1) as log:
+                if process.stdout is not None:
+                    while True:
+                        chunk = await process.stdout.read(64 * 1024)
+                        if not chunk:
+                            break
+                        log.write(chunk.decode("utf-8", errors="replace"))
+            return_code = await process.wait()
+            latest = self.app.state.store.get_run(run_id) or run
+            finished = utc_now()
+            if latest.get("status") == "interrupted":
+                final_status = "interrupted"
+                error = latest.get("error") or "Server stopped while this run was active."
+            elif latest.get("cancel_requested") or latest.get("status") == "cancelling":
+                final_status = "cancelled"
+                error = None
+            elif return_code == 0:
+                final_status = "completed"
+                error = None
+            else:
+                final_status = "failed"
+                error = f"Pipeline process exited with code {return_code}."
+            self.app.state.store.update_run(
+                run_id,
+                finished,
+                status=final_status,
+                return_code=return_code,
+                error=error,
+                finished_at=finished,
+            )
+        except BaseException as exc:
+            self.app.state.logger.exception("Run %s failed before completion", run_id)
+            finished = utc_now()
+            latest = self.app.state.store.get_run(run_id)
+            final_status = (
+                "cancelled"
+                if latest and latest.get("cancel_requested")
+                else "failed"
+            )
+            self.app.state.store.update_run(
+                run_id,
+                finished,
+                status=final_status,
+                error=_redact(self.app, str(exc) or type(exc).__name__, run),
+                finished_at=finished,
+            )
+        finally:
+            self._active_run_id = None
+            self._active_process = None
+
+
+@router.post("/runs", status_code=status.HTTP_201_CREATED)
+async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
+    dataset = require_ready_dataset(request, payload.dataset_id)
+    mode = payload.mode or payload.parameter_mode or "automatic"
+    preset = (
+        payload.auto.get("preset")
+        if isinstance(payload.auto, dict) and payload.auto.get("preset")
+        else payload.profile or "balanced"
+    )
+    try:
+        ui_parameters, core_parameters, selected_profile = resolve_run_parameters(
+            mode=mode,
+            parameters=payload.parameters,
+            preset=str(preset),
+        )
+        frames = request.app.state.store.all_frames(payload.dataset_id)
+        run_id = f"run_{uuid.uuid4().hex}"
+        config_path, selection = _build_job_config(
+            request.app,
+            run_id=run_id,
+            dataset=dataset,
+            frames=frames,
+            payload=payload,
+            core_parameters=core_parameters,
+        )
+    except (ValueError, UnsafePath, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    frame_range = selection["frame_range"]
+    safe_request = {
+        "dataset_id": payload.dataset_id,
+        "track_ids": selection["track_ids"],
+        "frame_range": frame_range,
+        "mode": "manual" if selected_profile == "manual" else "automatic",
+        "parameters": ui_parameters,
+        **(
+            {"auto": {**payload.auto, "preset": selected_profile}}
+            if selected_profile != "manual"
+            else {}
+        ),
+    }
+    resolved = {
+        **selection,
+        "profile": selected_profile,
+        "ui_parameters": ui_parameters,
+        "core_parameters": core_parameters,
+    }
+    now = utc_now()
+    run = {
+        "id": run_id,
+        "dataset_id": payload.dataset_id,
+        "request": safe_request,
+        "resolved": resolved,
+        "work_relative": run_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        request.app.state.store.create_run(run)
+    except BaseException:
+        # The generated work directory contains only this new job.
+        import shutil
+
+        shutil.rmtree(config_path.parent, ignore_errors=True)
+        raise
+    request.app.state.run_manager.notify()
+    stored = request.app.state.store.get_run(run_id)
+    return public_run(request.app, stored, include_log=False)  # type: ignore[arg-type]
+
+
+@router.get("/runs")
+async def list_runs(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    items = [
+        public_run(request.app, item, include_log=False)
+        for item in request.app.state.store.list_runs(limit=limit)
+    ]
+    return {"items": items, "runs": items}
+
+
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str, request: Request) -> dict[str, Any]:
+    run = request.app.state.store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return public_run(
+        request.app,
+        run,
+        include_log=True,
+        include_results=run["status"] in TERMINAL_STATUSES,
+    )
+
+
+@router.get("/runs/{run_id}/results")
+async def get_results(run_id: str, request: Request) -> dict[str, Any]:
+    run = request.app.state.store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return _result_summary(request.app, run) or {"files": [], "file_count": 0}
+
+
+@router.get("/runs/{run_id}/artifacts")
+async def get_artifact(run_id: str, path: str, request: Request) -> FileResponse:
+    run = request.app.state.store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    try:
+        relative = normalize_relative_path(path, allow_empty=False)
+        output = _run_work_dir(request.app, run) / "output"
+        artifact = resolve_under_root(
+            output,
+            relative,
+            must_exist=True,
+            expect_directory=False,
+            reject_symlinks=True,
+        )
+        if artifact.suffix.casefold() not in SAFE_RESULT_SUFFIXES:
+            raise UnsafePath("This artifact type is not downloadable.")
+    except (UnsafePath, OSError) as exc:
+        raise HTTPException(status_code=404, detail="Artifact not found.") from exc
+    return FileResponse(
+        artifact,
+        filename=artifact.name,
+        headers={"Cache-Control": "private, no-cache", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+async def _event_stream(request: Request, run_id: str) -> AsyncIterator[str]:
+    last_payload = ""
+    while True:
+        if await request.is_disconnected():
+            return
+        run = request.app.state.store.get_run(run_id)
+        if run is None:
+            yield 'event: error\ndata: {"detail":"Run not found."}\n\n'
+            return
+        public = public_run(request.app, run, include_log=True)
+        payload = json.dumps(
+            {"type": "snapshot", "run": public},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if payload != last_payload:
+            # Default MessageEvent keeps EventSource.onmessage clients live.
+            yield f"data: {payload}\n\n"
+            last_payload = payload
+        else:
+            yield ": keep-alive\n\n"
+        if run["status"] in TERMINAL_STATUSES:
+            return
+        await asyncio.sleep(1.0)
+
+
+@router.get("/runs/{run_id}/events")
+async def run_events(run_id: str, request: Request) -> StreamingResponse:
+    if request.app.state.store.get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return StreamingResponse(
+        _event_stream(request, run_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
+    try:
+        run = await request.app.state.run_manager.cancel(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Run not found.") from exc
+    return public_run(request.app, run, include_log=False)

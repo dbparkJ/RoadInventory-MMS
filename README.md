@@ -18,6 +18,8 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 - 표지·지주 분리 `POINTZ` SHP, CRS sidecar, JSON, QA 이미지, LAS crop 생성
 - 콘솔 상태바/처리율/ETA 표시와 전체 파일 로그 저장
 - Windows/Linux 공용 가상환경 자동 구성 및 PyTorch/CUDA smoke test
+- 서버 폴더·재개 가능한 업로드, 작업 구간, 수치 입력/자동 설정을 묶은 웹 작업실
+- MapLibre 지도, 360° 파노라마, 점 예산 기반 3D 점군의 동기화된 검수 화면
 
 수집업체에 전달할 입력 데이터 요구사항은 [docs/MMS_DATA_SPEC.md](docs/MMS_DATA_SPEC.md)에 정리되어 있습니다. 환경 구성 세부사항은 [ENV_SETUP.md](ENV_SETUP.md)를 참고하십시오.
 
@@ -32,11 +34,83 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 | `scripts/export_calibration_values.py` | 보정 snapshot에서 숫자·단위만 JSON/CSV로 내보내기 |
 | `calibration_values.yaml` | 값 전용 보정 내보내기 입력·출력 설정 |
 | `scripts/setup.ps1`, `scripts/setup.sh` | OS별 Python 3.12 자동 탐색과 환경 구성 시작 |
+| `scripts/setup_web.ps1`, `scripts/setup_web.sh` | Python 의존성 설치와 웹 UI 패키지 설치·빌드 |
+| `scripts/run_web.py` | FastAPI API와 빌드된 웹 작업실 실행 |
 | `scripts/bootstrap_environment.py` | `.venv` 생성, 고정 패키지 설치, GPU/CUDA 사전 검사 |
 | `scripts/verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
 | `mms_shp_detection/` | 데이터 탐색, 투영, 점군, 지주, SHP 구현 |
+| `mms_shp_detection/webapp/` | 데이터 등록·preview·업로드·GPU 작업 큐 API |
+| `webui/` | React/MapLibre/Three.js 작업자 UI |
 | `tests/` | 설정·투영·점군·지주·SHP 회귀 테스트 |
 | `docs/MMS_DATA_SPEC.md` | MMS 수집업체 전달용 데이터 명세 |
+| `docs/WEB_UI_ARCHITECTURE.md` | 대용량 로딩, 서버 배치, 보안·운영 설계 |
+
+## 웹 작업실 빠른 시작
+
+웹용 setup은 기존 Python/CUDA 환경을 구성한 뒤 잠긴 npm 패키지를 설치하고 배포용
+정적 UI까지 빌드합니다.
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1
+.\.venv\Scripts\python.exe .\scripts\run_web.py
+```
+
+Linux:
+
+```bash
+bash scripts/setup_web.sh
+./.venv/bin/python scripts/run_web.py
+```
+
+설치 후 브라우저에서 `http://127.0.0.1:8000`을 엽니다. 설치 예정 항목만 확인할 때는
+기존과 동일하게 `--dry-run`을 전달합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1 --dry-run
+```
+
+기본 저장소는 프로젝트의 `data` 폴더입니다. 서버/NAS 폴더를 노출할 때는 허용할
+루트만 반복 지정하며, UI와 API에는 이 루트 바깥의 절대경로가 공개되지 않습니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_web.py `
+  --storage-root D:\MMS\incoming `
+  --storage-root \\nas\MMS\archive
+```
+
+지도 스타일은 `MMS_MAP_STYLE_URL`, 허용 저장소는 운영체제의 경로 구분자로 나눈
+`MMS_WEB_STORAGE_ROOTS` 환경변수로도 설정할 수 있습니다. 이 앱에는 자체 로그인
+기능이 없으므로 기본 실행기는 loopback 주소만 허용합니다. 외부 접속 운영 시에는
+API를 `127.0.0.1`에 유지하고, TLS와 사용자 인증을 적용한 reverse proxy만 외부에
+노출하십시오. 방화벽과 인증 proxy로 포트 접근을 이미 제한한 별도 컨테이너 구성에서만
+위험을 이해하고 `--allow-remote-bind`를 사용하십시오.
+
+GPU 작업 큐와 재시작 복구의 단일 소유권을 보장하기 위해 하나의 `--state-dir`에는
+ASGI worker를 1개만 실행합니다. 같은 상태 폴더를 쓰는 두 번째 worker는 시작 단계의
+OS lock에서 거부됩니다. 수평 확장은 API/worker와 상태 저장소를 분리하는 후속 서버
+구성에서 진행하십시오.
+
+등록을 마친 원본 폴더는 scan·preview·pipeline 실행 중에는 변경하지 말고, 운영
+서버에서는 가능하면 API/worker에 읽기 전용으로 mount하십시오. 새 업로드는 incoming
+영역에서 완료·검증한 뒤 등록 폴더로 이동하는 흐름을 사용합니다. 공유 NAS를 쓸 때도
+등록 root의 rename/write 권한을 비신뢰 사용자나 별도 프로세스와 동시에 공유하지
+마십시오.
+
+작업 순서는 다음과 같습니다.
+
+1. 허용된 서버 저장소에서 MMS 폴더를 등록하거나 폴더를 chunk 단위로 업로드합니다.
+2. Survey/Track과 프레임 구간을 지도에서 확인하고 작업 범위를 선택합니다.
+3. 자주 쓰는 값을 직접 넣는 **수치 입력** 또는 장비 사양과 선택한 자원 프로필로
+   worker·batch를 정하는 **자동 설정**을 선택합니다.
+4. 실행 큐에서 준비·실행·완료 상태와 로그를 확인합니다.
+5. 동일한 프레임을 지도·360° 파노라마·3D 점군으로 전환하며 결과를 검수합니다.
+
+초기 화면은 경로와 요약만 받고, 파노라마와 점군은 선택 시 축소본과 제한된 점 예산으로
+지연 로딩합니다. 원본 7040×3520 JPEG나 LAS 전체를 브라우저로 직접 전송하지 않습니다.
+대용량 운영 구조와 향후 NAS/object storage 배치 방법은
+[웹 작업실 아키텍처](docs/WEB_UI_ARCHITECTURE.md)를 참고하십시오.
 
 ## 지원 입력
 

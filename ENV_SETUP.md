@@ -13,6 +13,40 @@ bootstrap은 `nvidia-smi`가 보고한 driver 지원 최대 CUDA를 기준으로
 
 setup launcher는 Python이나 운영체제 패키지를 자동 설치하지 않습니다. 설치 여부를 임의로 바꾸거나 관리자 권한을 요구하는 대신, 찾을 수 있는 Python 명령을 검사하고 필요한 조치를 설명하는 오류로 종료합니다.
 
+## 웹 작업실까지 자동 구성
+
+웹 API용 Python 패키지는 `requirements.txt`에 고정되어 있습니다. 다음 launcher는 기존
+Python/CUDA setup을 먼저 실행하고, Node.js/npm을 찾을 수 있으면 `npm ci`와 배포용
+UI build까지 비대화형으로 이어서 실행합니다.
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1
+```
+
+Linux:
+
+```bash
+bash scripts/setup_web.sh
+```
+
+저장소에 빌드된 `webui/dist`가 포함된 운영 배포본은 웹 서버 실행에 Node.js가
+필요하지 않습니다. 소스 UI를 다시 빌드해야 하는 개발 환경에서만 Node.js LTS와 npm이
+필요합니다. launcher는 관리자 권한으로 OS 프로그램을 임의 설치하지 않으며, npm과
+빌드 산출물이 모두 없을 때 필요한 조치를 설명하고 종료합니다.
+
+설치 예정 명령만 확인하려면 다음처럼 실행합니다. 이 경우 npm 패키지도 설치하지
+않습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1 --dry-run
+```
+
+```bash
+bash scripts/setup_web.sh --dry-run
+```
+
 ## Windows
 
 PowerShell에서 프로젝트 루트로 이동한 뒤 실행합니다.

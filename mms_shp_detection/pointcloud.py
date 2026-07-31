@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import os
 import re
 import sqlite3
 import struct
@@ -77,13 +78,45 @@ def _log(logger: Any, level: str, message: str, *args: Any) -> None:
         getattr(logger, level)(message, *args)
 
 
-def _source_signature(paths: Iterable[Path], data_root: Path) -> list[dict[str, Any]]:
+def resolve_safe_pointcloud_source(path: Path | str, data_root: Path | str) -> Path:
+    """Resolve one current source without permitting a link/root escape."""
+
+    root = Path(data_root).resolve(strict=True)
+    candidate = Path(path)
+    if candidate.is_symlink() or bool(
+        getattr(candidate, "is_junction", lambda: False)()
+    ):
+        raise ValueError(
+            "Symbolic links and junctions are not allowed in point-cloud data."
+        )
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "A point-cloud source escaped the configured data root."
+        ) from exc
+    return resolved
+
+
+def _source_signature(
+    paths: Iterable[Path],
+    data_root: Path,
+    *,
+    reject_symlinks: bool = False,
+) -> list[dict[str, Any]]:
     signature: list[dict[str, Any]] = []
     for path in sorted(paths, key=lambda item: str(item.resolve()).casefold()):
+        if reject_symlinks:
+            path = resolve_safe_pointcloud_source(path, data_root)
         stat = path.stat()
         try:
             relative_path = str(path.resolve().relative_to(data_root.resolve()))
         except ValueError:
+            if reject_symlinks:
+                raise ValueError(
+                    "A point-cloud source escaped the configured data root."
+                )
             relative_path = path.name
         signature.append(
             {
@@ -96,22 +129,98 @@ def _source_signature(paths: Iterable[Path], data_root: Path) -> list[dict[str, 
     return signature
 
 
-def _discover_sources(data_root: Path) -> tuple[list[Path], list[Path]]:
+def _discover_sources(
+    data_root: Path,
+    *,
+    reject_symlinks: bool = False,
+) -> tuple[list[Path], list[Path]]:
     if not data_root.exists():
         raise FileNotFoundError(f"Point-cloud data root not found: {data_root}")
     if not data_root.is_dir():
         raise NotADirectoryError(f"Point-cloud data root is not a directory: {data_root}")
 
+    resolved_root = data_root.resolve(strict=True)
     pcdb_paths: list[Path] = []
     las_paths: list[Path] = []
-    for path in data_root.rglob("*"):
-        if not path.is_file():
-            continue
-        suffix = path.suffix.casefold()
-        if suffix == ".pcdb":
-            pcdb_paths.append(path)
-        elif suffix == ".las":
-            las_paths.append(path)
+    if reject_symlinks:
+        # ``Path.rglob`` plus ``resolve`` on every panorama/image made a cached
+        # point catalog take tens of seconds to reopen on large deliveries.
+        # Traverse with scandir instead: inspect every link boundary, but only
+        # resolve directories and actual point-cloud sources.
+        pending = [resolved_root]
+        while pending:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        path = Path(entry.path)
+                        if entry.is_symlink():
+                            raise ValueError(
+                                "Symbolic links and junctions are not allowed "
+                                "in point-cloud data."
+                            )
+                        try:
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            if is_directory:
+                                is_junction = bool(
+                                    getattr(path, "is_junction", lambda: False)()
+                                )
+                                if is_junction:
+                                    raise ValueError(
+                                        "Symbolic links and junctions are not allowed "
+                                        "in point-cloud data."
+                                    )
+                                resolved_directory = path.resolve(strict=True)
+                                try:
+                                    resolved_directory.relative_to(resolved_root)
+                                except ValueError as exc:
+                                    raise ValueError(
+                                        "A point-cloud source escaped the configured "
+                                        "data root."
+                                    ) from exc
+                                pending.append(resolved_directory)
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                        except OSError as exc:
+                            raise ValueError(
+                                "A point-cloud source could not be inspected safely."
+                            ) from exc
+                        suffix = path.suffix.casefold()
+                        if suffix not in {".pcdb", ".las"}:
+                            continue
+                        # Recheck the actual source through pathlib as a
+                        # defense against a directory-entry race.
+                        if path.is_symlink():
+                            raise ValueError(
+                                "Symbolic links and junctions are not allowed "
+                                "in point-cloud data."
+                            )
+                        try:
+                            path.resolve(strict=True).relative_to(resolved_root)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "A point-cloud source escaped the configured data root."
+                            ) from exc
+                        if suffix == ".pcdb":
+                            pcdb_paths.append(path)
+                        else:
+                            las_paths.append(path)
+            except ValueError:
+                raise
+            except OSError as exc:
+                raise ValueError(
+                    "A point-cloud folder could not be inspected safely."
+                ) from exc
+    else:
+        for path in data_root.rglob("*"):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.casefold()
+            if suffix == ".pcdb":
+                pcdb_paths.append(path)
+            elif suffix == ".las":
+                las_paths.append(path)
     sort_key = lambda item: str(item.resolve()).casefold()
     return sorted(pcdb_paths, key=sort_key), sorted(las_paths, key=sort_key)
 
@@ -463,10 +572,17 @@ def _associated_crs_sidecar(path: Path, data_root: Path) -> Path | None:
         current = current.parent
 
 
-def _sidecar_crs_wkt(path: Path, data_root: Path) -> tuple[str | None, Path | None]:
+def _sidecar_crs_wkt(
+    path: Path,
+    data_root: Path,
+    *,
+    reject_symlinks: bool = False,
+) -> tuple[str | None, Path | None]:
     sidecar = _associated_crs_sidecar(path, data_root)
     if sidecar is None:
         return None, None
+    if reject_symlinks:
+        sidecar = resolve_safe_pointcloud_source(sidecar, data_root)
     try:
         value = sidecar.read_text(encoding="utf-8-sig").replace("\x00", "").strip()
     except (OSError, UnicodeError):
@@ -494,7 +610,11 @@ def _index_single_las(
     data_root: Path,
     chunk_size: int,
     selection_provenance: dict[str, Any],
+    *,
+    reject_symlinks: bool = False,
 ) -> dict[str, Any]:
+    if reject_symlinks:
+        path = resolve_safe_pointcloud_source(path, data_root)
     stat = path.stat()
     identity = _parse_las_identity(path)
     blocks: list[dict[str, Any]] = []
@@ -546,7 +666,11 @@ def _index_single_las(
         crs_sidecar_path: Path | None = None
         crs_source = "las_header" if crs_wkt else None
         if not crs_wkt:
-            crs_wkt, crs_sidecar_path = _sidecar_crs_wkt(path, data_root)
+            crs_wkt, crs_sidecar_path = _sidecar_crs_wkt(
+                path,
+                data_root,
+                reject_symlinks=reject_symlinks,
+            )
             if crs_wkt:
                 crs_source = "nearest_delivery_prj"
         scales = [float(value) for value in header.scales]
@@ -572,6 +696,10 @@ def _index_single_las(
     try:
         relative_path = str(path.resolve().relative_to(data_root.resolve()))
     except ValueError:
+        if reject_symlinks:
+            raise ValueError(
+                "A point-cloud source escaped the configured data root."
+            )
         relative_path = path.name
     provenance = {
         "source_type": "las",
@@ -674,7 +802,14 @@ def _generic_pcdb_index(path: Path) -> dict[str, Any]:
     return {"file_min": file_min, "file_max": file_max, "blocks": blocks}
 
 
-def _index_single_pcdb(path: Path, data_root: Path) -> dict[str, Any]:
+def _index_single_pcdb(
+    path: Path,
+    data_root: Path,
+    *,
+    reject_symlinks: bool = False,
+) -> dict[str, Any]:
+    if reject_symlinks:
+        path = resolve_safe_pointcloud_source(path, data_root)
     try:
         indexed = _legacy_index_single_pcdb(path)
     except (ValueError, IndexError):
@@ -695,6 +830,10 @@ def _index_single_pcdb(path: Path, data_root: Path) -> dict[str, Any]:
     try:
         relative_path = str(path.resolve().relative_to(data_root.resolve()))
     except ValueError:
+        if reject_symlinks:
+            raise ValueError(
+                "A point-cloud source escaped the configured data root."
+            )
         relative_path = path.name
     blocks = indexed.get("blocks", [])
     for block in blocks:
@@ -803,7 +942,11 @@ def _same_file_signature(
     cached_file: dict[str, Any],
     path: Path,
     data_root: Path,
+    *,
+    reject_symlinks: bool = False,
 ) -> bool:
+    if reject_symlinks:
+        path = resolve_safe_pointcloud_source(path, data_root)
     stat = path.stat()
     if not (
         cached_file.get("file_size") == int(stat.st_size)
@@ -819,6 +962,8 @@ def _same_file_signature(
     sidecar = _associated_crs_sidecar(path, data_root)
     if sidecar is None:
         return provenance.get("crs_sidecar_path") is None
+    if reject_symlinks:
+        sidecar = resolve_safe_pointcloud_source(sidecar, data_root)
     sidecar_stat = sidecar.stat()
     return (
         provenance.get("crs_sidecar_path") == str(sidecar.resolve())
@@ -845,6 +990,7 @@ def build_pointcloud_catalog(
     source: str = "auto",
     las_chunk_size: int = DEFAULT_LAS_CHUNK_SIZE,
     include_jobs: Iterable[str] | str | None = None,
+    reject_symlinks: bool = False,
 ) -> dict[str, Any]:
     """Discover point clouds and build or load their persistent spatial catalog.
 
@@ -865,7 +1011,10 @@ def build_pointcloud_catalog(
     las_chunk_size = int(las_chunk_size)
     include_job_names, include_job_keys = _normalize_include_jobs(include_jobs)
 
-    pcdb_paths, all_las_paths = _discover_sources(data_root)
+    pcdb_paths, all_las_paths = _discover_sources(
+        data_root,
+        reject_symlinks=reject_symlinks,
+    )
     if source_mode == "auto":
         selected_source_type = (
             "mixed"
@@ -958,8 +1107,16 @@ def build_pointcloud_catalog(
         "selected_source_type": selected_source_type,
         "las_chunk_size": las_chunk_size,
         "include_job_keys": effective_include_job_keys,
-        "source_files": _source_signature(discovered_paths, data_root),
-        "crs_sidecars": _source_signature(crs_sidecars, data_root),
+        "source_files": _source_signature(
+            discovered_paths,
+            data_root,
+            reject_symlinks=reject_symlinks,
+        ),
+        "crs_sidecars": _source_signature(
+            crs_sidecars,
+            data_root,
+            reject_symlinks=reject_symlinks,
+        ),
     }
     cached: dict[str, Any] | None = None
     if cache_path.exists():
@@ -991,7 +1148,12 @@ def build_pointcloud_catalog(
     for index, path in enumerate(selected_paths, start=1):
         path_text = str(path.resolve())
         cached_file = cached_files.get(path_text)
-        if cached_file is not None and _same_file_signature(cached_file, path, data_root):
+        if cached_file is not None and _same_file_signature(
+            cached_file,
+            path,
+            data_root,
+            reject_symlinks=reject_symlinks,
+        ):
             # Selection provenance can change without source bytes changing.
             if path.suffix.casefold() == ".las":
                 cached_file = dict(cached_file)
@@ -1006,13 +1168,18 @@ def build_pointcloud_catalog(
         file_started_at = time.perf_counter()
         _log(logger, "info", "Indexing point cloud %d/%d: %s", index, len(selected_paths), path.name)
         if path.suffix.casefold() == ".pcdb":
-            indexed = _index_single_pcdb(path, data_root)
+            indexed = _index_single_pcdb(
+                path,
+                data_root,
+                reject_symlinks=reject_symlinks,
+            )
         else:
             indexed = _index_single_las(
                 path,
                 data_root,
                 las_chunk_size,
                 selection_provenance.get(path_text, {"selection_policy": "standalone"}),
+                reject_symlinks=reject_symlinks,
             )
         files.append(indexed)
         _log(
@@ -1044,11 +1211,16 @@ def build_pointcloud_catalog(
         "job_filtered_files": job_filtered_files,
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = cache_path.with_name(f"{cache_path.name}.tmp")
-    temporary_path.write_text(
-        json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8"
+    temporary_path = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
     )
-    temporary_path.replace(cache_path)
+    try:
+        temporary_path.write_text(
+            json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary_path.replace(cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     _log(
         logger,
         "info",
@@ -1309,17 +1481,23 @@ class PointCloudReaderCache:
         self._state_lock = threading.RLock()
         self._source_locks: dict[tuple[str, str], threading.RLock] = {}
         self._closed = False
-        self._pcdb_connections: dict[str, sqlite3.Connection] = {}
-        self._las_readers: dict[str, laspy.LasReader] = {}
+        self._pcdb_connections: dict[
+            str,
+            tuple[tuple[int, int], sqlite3.Connection],
+        ] = {}
+        self._las_readers: dict[
+            str,
+            tuple[tuple[int, int], laspy.LasReader],
+        ] = {}
         self._decoded_cache_max_entries = int(decoded_cache_max_entries)
         self._decoded_cache_max_bytes = int(decoded_cache_max_bytes)
         self._decoded_cache_bytes = 0
         self._decoded_blocks: OrderedDict[
-            tuple[str, str, str | int, int | None],
+            tuple[str, str, tuple[int, int], str | int, int | None],
             tuple[dict[str, np.ndarray], int],
         ] = OrderedDict()
         self._inflight_decodes: dict[
-            tuple[str, str, str | int, int | None],
+            tuple[str, str, tuple[int, int], str | int, int | None],
             Future[dict[str, np.ndarray]],
         ] = {}
 
@@ -1334,27 +1512,94 @@ class PointCloudReaderCache:
                 self._source_locks[key] = lock
             return lock
 
-    def _pcdb_connection(self, path: str) -> sqlite3.Connection:
+    @staticmethod
+    def _source_version(
+        pointcloud: str | Path | dict[str, Any],
+        resolved_path: str,
+    ) -> tuple[int, int]:
+        """Return the catalog or filesystem version of one point-cloud source."""
+
+        if isinstance(pointcloud, dict):
+            file_size = pointcloud.get("file_size")
+            mtime_ns = pointcloud.get("mtime_ns")
+            if (
+                isinstance(file_size, int)
+                and not isinstance(file_size, bool)
+                and file_size >= 0
+                and isinstance(mtime_ns, int)
+                and not isinstance(mtime_ns, bool)
+                and mtime_ns >= 0
+            ):
+                return int(file_size), int(mtime_ns)
+        stat = Path(resolved_path).stat()
+        return int(stat.st_size), int(stat.st_mtime_ns)
+
+    def _discard_stale_decoded_blocks(
+        self,
+        source_type: str,
+        resolved_path: str,
+        source_version: tuple[int, int],
+    ) -> None:
+        """Drop decoded blocks retained for older content at the same path."""
+
+        with self._state_lock:
+            stale_keys = [
+                key
+                for key in self._decoded_blocks
+                if key[0] == source_type
+                and key[1] == resolved_path
+                and key[2] != source_version
+            ]
+            for key in stale_keys:
+                _records, byte_size = self._decoded_blocks.pop(key)
+                self._decoded_cache_bytes -= byte_size
+
+    def _pcdb_connection(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+    ) -> sqlite3.Connection:
         resolved = str(Path(path).resolve())
-        connection = self._pcdb_connections.get(resolved)
-        if connection is None:
+        cached = self._pcdb_connections.get(resolved)
+        if cached is not None and cached[0] != source_version:
+            cached[1].close()
+            self._pcdb_connections.pop(resolved, None)
+            self._discard_stale_decoded_blocks("pcdb", resolved, source_version)
+            cached = None
+        if cached is None:
             # The enclosing re-entrant lock serializes use of a connection.
             # Disabling SQLite's creator-thread check lets later worker threads
             # safely reuse that same serialized connection.
             connection = sqlite3.connect(resolved, check_same_thread=False)
-            self._pcdb_connections[resolved] = connection
-        return connection
+            self._pcdb_connections[resolved] = (source_version, connection)
+            return connection
+        return cached[1]
 
-    def _las_reader(self, path: str) -> laspy.LasReader:
+    def _las_reader(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+    ) -> laspy.LasReader:
         resolved = str(Path(path).resolve())
-        reader = self._las_readers.get(resolved)
-        if reader is None:
+        cached = self._las_readers.get(resolved)
+        if cached is not None and cached[0] != source_version:
+            cached[1].close()
+            self._las_readers.pop(resolved, None)
+            self._discard_stale_decoded_blocks("las", resolved, source_version)
+            cached = None
+        if cached is None:
             reader = laspy.open(resolved)
-            self._las_readers[resolved] = reader
-        return reader
+            self._las_readers[resolved] = (source_version, reader)
+            return reader
+        return cached[1]
 
-    def _read_pcdb(self, path: str, block_name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        row = self._pcdb_connection(path).execute(
+    def _read_pcdb(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        block_name: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        row = self._pcdb_connection(path, source_version).execute(
             "SELECT DATA FROM CRYSTAL_CUBE WHERE NAME = ?", (block_name,)
         ).fetchone()
         if row is None:
@@ -1383,12 +1628,18 @@ class PointCloudReaderCache:
         xyz = raw["offset"].astype(np.float64) + block_center[None, :]
         return xyz, raw["rgb"].copy(), raw["intensity"].copy()
 
-    def _read_las(self, path: str, start: int, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _read_las(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        start: int,
+        count: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if start < 0 or count < 0:
             raise ValueError("LAS block start and count must be non-negative")
         if count == 0:
             return _empty_points()
-        reader = self._las_reader(path)
+        reader = self._las_reader(path, source_version)
         reader.seek(start)
         points = reader.read_points(count)
         xyz = _xyz_from_las_points(points)
@@ -1403,7 +1654,13 @@ class PointCloudReaderCache:
         )
         return xyz, rgb, intensity
 
-    def _read_las_records(self, path: str, start: int, count: int) -> dict[str, np.ndarray]:
+    def _read_las_records(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        start: int,
+        count: int,
+    ) -> dict[str, np.ndarray]:
         if start < 0 or count < 0:
             raise ValueError("LAS block start and count must be non-negative")
         if count == 0:
@@ -1419,7 +1676,7 @@ class PointCloudReaderCache:
                 "number_of_returns": np.empty((0,), dtype=np.uint8),
                 "source_index": np.empty((0,), dtype=np.int64),
             }
-        reader = self._las_reader(path)
+        reader = self._las_reader(path, source_version)
         reader.seek(start)
         points = reader.read_points(count)
         xyz = _xyz_from_las_points(points)
@@ -1471,8 +1728,13 @@ class PointCloudReaderCache:
             "source_index": np.arange(start, start + len(points), dtype=np.int64),
         }
 
-    def _read_pcdb_records(self, path: str, block_name: str) -> dict[str, np.ndarray]:
-        xyz, rgb, intensity = self._read_pcdb(path, block_name)
+    def _read_pcdb_records(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        block_name: str,
+    ) -> dict[str, np.ndarray]:
+        xyz, rgb, intensity = self._read_pcdb(path, source_version, block_name)
         count = xyz.shape[0]
         return {
             "xyz": xyz,
@@ -1507,7 +1769,7 @@ class PointCloudReaderCache:
 
     def _cached_records(
         self,
-        key: tuple[str, str, str | int, int | None],
+        key: tuple[str, str, tuple[int, int], str | int, int | None],
         source_lock: threading.RLock,
         decode: Callable[[], dict[str, np.ndarray]],
     ) -> dict[str, np.ndarray]:
@@ -1576,30 +1838,41 @@ class PointCloudReaderCache:
     def _cached_pcdb_records(
         self,
         path: str,
+        source_version: tuple[int, int],
         block_name: str,
     ) -> dict[str, np.ndarray]:
         resolved = str(Path(path).resolve())
         source_lock = self._source_lock("pcdb", resolved)
-        key = ("pcdb", resolved, block_name, None)
+        key = ("pcdb", resolved, source_version, block_name, None)
         return self._cached_records(
             key,
             source_lock,
-            lambda: self._read_pcdb_records(resolved, block_name),
+            lambda: self._read_pcdb_records(
+                resolved,
+                source_version,
+                block_name,
+            ),
         )
 
     def _cached_las_records(
         self,
         path: str,
+        source_version: tuple[int, int],
         start: int,
         count: int,
     ) -> dict[str, np.ndarray]:
         resolved = str(Path(path).resolve())
         source_lock = self._source_lock("las", resolved)
-        key = ("las", resolved, start, count)
+        key = ("las", resolved, source_version, start, count)
         return self._cached_records(
             key,
             source_lock,
-            lambda: self._read_las_records(resolved, start, count),
+            lambda: self._read_las_records(
+                resolved,
+                source_version,
+                start,
+                count,
+            ),
         )
 
     def read_block_points(
@@ -1621,6 +1894,7 @@ class PointCloudReaderCache:
         else:
             path = str(pointcloud)
             source_type = Path(path).suffix.casefold().lstrip(".")
+        resolved_path = str(Path(path).resolve())
 
         if isinstance(block, dict):
             block_name = str(block.get("name", ""))
@@ -1633,12 +1907,23 @@ class PointCloudReaderCache:
             count = None
 
         if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
-            records = self._cached_pcdb_records(path, block_name)
+            source_version = self._source_version(pointcloud, resolved_path)
+            records = self._cached_pcdb_records(
+                resolved_path,
+                source_version,
+                block_name,
+            )
             return records["xyz"], records["rgb"], records["intensity"]
         if source_type == "las" or Path(path).suffix.casefold() == ".las":
             if start is None or count is None:
                 start, count = _parse_las_block_name(block_name)
-            records = self._cached_las_records(path, int(start), int(count))
+            source_version = self._source_version(pointcloud, resolved_path)
+            records = self._cached_las_records(
+                resolved_path,
+                source_version,
+                int(start),
+                int(count),
+            )
             return records["xyz"], records["rgb"], records["intensity"]
         raise ValueError(f"Unsupported point-cloud source type for {path}")
 
@@ -1662,6 +1947,7 @@ class PointCloudReaderCache:
         else:
             path = str(pointcloud)
             source_type = Path(path).suffix.casefold().lstrip(".")
+        resolved_path = str(Path(path).resolve())
 
         if isinstance(block, dict):
             block_name = str(block.get("name", ""))
@@ -1674,11 +1960,26 @@ class PointCloudReaderCache:
             count = None
 
         if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
-            return dict(self._cached_pcdb_records(path, block_name))
+            source_version = self._source_version(pointcloud, resolved_path)
+            return dict(
+                self._cached_pcdb_records(
+                    resolved_path,
+                    source_version,
+                    block_name,
+                )
+            )
         if source_type == "las" or Path(path).suffix.casefold() == ".las":
             if start is None or count is None:
                 start, count = _parse_las_block_name(block_name)
-            return dict(self._cached_las_records(path, int(start), int(count)))
+            source_version = self._source_version(pointcloud, resolved_path)
+            return dict(
+                self._cached_las_records(
+                    resolved_path,
+                    source_version,
+                    int(start),
+                    int(count),
+                )
+            )
         raise ValueError(f"Unsupported point-cloud source type for {path}")
 
     def close(self) -> None:
@@ -1689,10 +1990,10 @@ class PointCloudReaderCache:
         for source_lock in source_locks:
             source_lock.acquire()
         try:
-            for connection in self._pcdb_connections.values():
+            for _source_version, connection in self._pcdb_connections.values():
                 connection.close()
             self._pcdb_connections.clear()
-            for reader in self._las_readers.values():
+            for _source_version, reader in self._las_readers.values():
                 reader.close()
             self._las_readers.clear()
             with self._state_lock:

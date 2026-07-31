@@ -1,0 +1,704 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _loads(value: str | None, default: Any) -> Any:
+    if value is None:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+class WebStore:
+    """Small persistent registry with one short-lived SQLite connection per call."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = threading.RLock()
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.path), timeout=30.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    @contextmanager
+    def connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+        lock = self._write_lock if write else _NullLock()
+        with lock:
+            connection = self._connect()
+            try:
+                yield connection
+                if write:
+                    connection.commit()
+            except BaseException:
+                if write:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def _initialize(self) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS datasets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    root_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    crs TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    frame_count INTEGER NOT NULL DEFAULT 0,
+                    tracks_json TEXT NOT NULL DEFAULT '[]',
+                    bbox_json TEXT,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    catalog_status TEXT NOT NULL DEFAULT 'missing',
+                    catalog_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(root_id, relative_path, crs)
+                );
+                CREATE TABLE IF NOT EXISTS frames (
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    track_id TEXT NOT NULL,
+                    task_json TEXT NOT NULL,
+                    longitude REAL,
+                    latitude REAL,
+                    altitude REAL,
+                    heading REAL,
+                    PRIMARY KEY(dataset_id, id),
+                    UNIQUE(dataset_id, ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS frames_dataset_track
+                    ON frames(dataset_id, track_id, ordinal);
+                CREATE TABLE IF NOT EXISTS uploads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    safe_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    root_id TEXT NOT NULL,
+                    destination_relative_path TEXT,
+                    error TEXT,
+                    total_size INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS upload_files (
+                    upload_id TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+                    id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    offset INTEGER NOT NULL DEFAULT 0,
+                    last_modified INTEGER,
+                    PRIMARY KEY(upload_id, id),
+                    UNIQUE(upload_id, relative_path)
+                );
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY,
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    resolved_json TEXT NOT NULL,
+                    work_relative TEXT NOT NULL,
+                    pid INTEGER,
+                    return_code INTEGER,
+                    error TEXT,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS runs_status_created
+                    ON runs(status, created_at);
+                """
+            )
+
+    @staticmethod
+    def dataset_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["tracks"] = _loads(item.pop("tracks_json", None), [])
+        item["bbox"] = _loads(item.pop("bbox_json", None), None)
+        item["warnings"] = _loads(item.pop("warnings_json", None), [])
+        return item
+
+    def get_dataset(self, dataset_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM datasets WHERE id = ?", (dataset_id,)
+            ).fetchone()
+        return self.dataset_from_row(row)
+
+    def find_dataset(self, root_id: str, relative_path: str, crs: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM datasets WHERE root_id=? AND relative_path=? AND crs=?",
+                (root_id, relative_path, crs),
+            ).fetchone()
+        return self.dataset_from_row(row)
+
+    def list_datasets(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM datasets ORDER BY updated_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [self.dataset_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def upsert_scanning_dataset(
+        self,
+        *,
+        dataset_id: str,
+        name: str,
+        root_id: str,
+        relative_path: str,
+        crs: str,
+        now: str,
+    ) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO datasets(
+                    id,name,root_id,relative_path,crs,status,error,created_at,updated_at
+                ) VALUES(?,?,?,?,?,'scanning',NULL,?,?)
+                ON CONFLICT(root_id,relative_path,crs) DO UPDATE SET
+                    name=excluded.name,status='scanning',error=NULL,
+                    catalog_status='missing',catalog_error=NULL,
+                    updated_at=excluded.updated_at
+                """,
+                (dataset_id, name, root_id, relative_path, crs, now, now),
+            )
+
+    def finish_dataset_scan(
+        self,
+        dataset_id: str,
+        *,
+        frames: list[dict[str, Any]],
+        tracks: list[dict[str, Any]],
+        bbox: list[float] | None,
+        warnings: list[str],
+        now: str,
+    ) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute("DELETE FROM frames WHERE dataset_id=?", (dataset_id,))
+            connection.executemany(
+                """
+                INSERT INTO frames(
+                    dataset_id,id,ordinal,track_id,task_json,
+                    longitude,latitude,altitude,heading
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        dataset_id,
+                        frame["id"],
+                        frame["ordinal"],
+                        frame["track_id"],
+                        _json(frame["task"]),
+                        frame.get("longitude"),
+                        frame.get("latitude"),
+                        frame.get("altitude"),
+                        frame.get("heading"),
+                    )
+                    for frame in frames
+                ],
+            )
+            connection.execute(
+                """
+                UPDATE datasets SET status='ready',error=NULL,frame_count=?,
+                    tracks_json=?,bbox_json=?,warnings_json=?,updated_at=?
+                WHERE id=?
+                """,
+                (
+                    len(frames),
+                    _json(tracks),
+                    _json(bbox) if bbox is not None else None,
+                    _json(warnings),
+                    now,
+                    dataset_id,
+                ),
+            )
+
+    def fail_dataset_scan(self, dataset_id: str, error: str, now: str) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                "UPDATE datasets SET status='error',error=?,updated_at=? WHERE id=?",
+                (error, now, dataset_id),
+            )
+
+    def set_catalog_status(
+        self, dataset_id: str, status: str, *, error: str | None, now: str
+    ) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                "UPDATE datasets SET catalog_status=?,catalog_error=?,updated_at=? WHERE id=?",
+                (status, error, now, dataset_id),
+            )
+
+    @staticmethod
+    def frame_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["task"] = _loads(item.pop("task_json", None), {})
+        return item
+
+    def get_frame(self, dataset_id: str, frame_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM frames WHERE dataset_id=? AND id=?",
+                (dataset_id, frame_id),
+            ).fetchone()
+        return self.frame_from_row(row)
+
+    def list_frames(
+        self,
+        dataset_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 200,
+        track_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where = "dataset_id=?"
+        params: list[Any] = [dataset_id]
+        if track_id:
+            where += " AND track_id=?"
+            params.append(track_id)
+        with self.connection() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM frames WHERE {where}", params
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"SELECT * FROM frames WHERE {where} ORDER BY ordinal LIMIT ? OFFSET ?",
+                (*params, int(limit), int(offset)),
+            ).fetchall()
+        return [
+            self.frame_from_row(row) for row in rows if row is not None  # type: ignore[misc]
+        ], total
+
+    def all_frames(self, dataset_id: str) -> list[dict[str, Any]]:
+        return self.list_frames(dataset_id, offset=0, limit=2_000_000)[0]
+
+    def sample_route_frames(
+        self,
+        dataset_id: str,
+        *,
+        track_ids: Iterable[str],
+        max_points: int,
+    ) -> list[dict[str, Any]]:
+        """Stream an evenly distributed, memory-bounded route sample.
+
+        Route rendering needs only seven scalar columns.  In particular, it
+        must not materialize every frame's potentially large ``task_json``.
+        The first count query lets us precompute exact sample ordinals while
+        the indexed cursor streams all coordinate rows with O(max_points)
+        retained memory.
+        """
+
+        ordered_track_ids = list(dict.fromkeys(str(value) for value in track_ids))
+        if not ordered_track_ids or max_points <= 0:
+            return []
+        with self.connection() as connection:
+            # Keep the count and streaming sample on one WAL read snapshot if
+            # an operator starts a rescan concurrently with this request.
+            connection.execute("BEGIN")
+            count_rows = connection.execute(
+                """
+                SELECT track_id, COUNT(*) AS frame_count
+                FROM frames
+                WHERE dataset_id=?
+                  AND longitude IS NOT NULL
+                  AND latitude IS NOT NULL
+                GROUP BY track_id
+                """,
+                (dataset_id,),
+            ).fetchall()
+            counts = {
+                str(row["track_id"]): int(row["frame_count"])
+                for row in count_rows
+                if int(row["frame_count"]) > 0
+            }
+            active = [track_id for track_id in ordered_track_ids if track_id in counts]
+            # At least one point per retained track.  A pathological delivery
+            # with more tracks than the response budget remains strictly
+            # bounded and deterministic.
+            active = active[: int(max_points)]
+            if not active:
+                return []
+
+            quotas = {track_id: 0 for track_id in active}
+            remaining = int(max_points)
+            while remaining:
+                progressed = False
+                for track_id in active:
+                    if quotas[track_id] >= counts[track_id]:
+                        continue
+                    quotas[track_id] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining == 0:
+                        break
+                if not progressed:
+                    break
+
+            wanted: dict[str, set[int]] = {}
+            for track_id in active:
+                count = counts[track_id]
+                quota = quotas[track_id]
+                if quota >= count:
+                    wanted[track_id] = set(range(count))
+                elif quota == 1:
+                    wanted[track_id] = {0}
+                else:
+                    wanted[track_id] = {
+                        round(index * (count - 1) / (quota - 1))
+                        for index in range(quota)
+                    }
+
+            grouped: dict[str, list[dict[str, Any]]] = {
+                track_id: [] for track_id in active
+            }
+            seen = {track_id: 0 for track_id in active}
+            cursor = connection.execute(
+                """
+                SELECT id, ordinal, track_id, longitude, latitude, altitude, heading
+                FROM frames
+                WHERE dataset_id=?
+                  AND longitude IS NOT NULL
+                  AND latitude IS NOT NULL
+                ORDER BY track_id, ordinal
+                """,
+                (dataset_id,),
+            )
+            for row in cursor:
+                track_id = str(row["track_id"])
+                if track_id not in wanted:
+                    continue
+                index = seen[track_id]
+                seen[track_id] = index + 1
+                if index in wanted[track_id]:
+                    grouped[track_id].append(dict(row))
+        return [item for track_id in active for item in grouped[track_id]]
+
+    def create_upload(
+        self,
+        upload: dict[str, Any],
+        files: Iterable[dict[str, Any]],
+    ) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO uploads(
+                    id,name,safe_name,status,root_id,total_size,created_at,updated_at
+                ) VALUES(?,?,?,'uploading',?,?,?,?)
+                """,
+                (
+                    upload["id"],
+                    upload["name"],
+                    upload["safe_name"],
+                    upload["root_id"],
+                    upload["total_size"],
+                    upload["created_at"],
+                    upload["updated_at"],
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO upload_files(
+                    upload_id,id,relative_path,size,offset,last_modified
+                ) VALUES(?,?,?,?,0,?)
+                """,
+                [
+                    (
+                        upload["id"],
+                        item["id"],
+                        item["relative_path"],
+                        item["size"],
+                        item.get("last_modified"),
+                    )
+                    for item in files
+                ],
+            )
+
+    def get_upload(self, upload_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM uploads WHERE id=?", (upload_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_upload_files(self, upload_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM upload_files WHERE upload_id=? ORDER BY relative_path",
+                (upload_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_upload_file(self, upload_id: str, file_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM upload_files WHERE upload_id=? AND id=?",
+                (upload_id, file_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_upload_offset(
+        self, upload_id: str, file_id: str, expected_offset: int, new_offset: int, now: str
+    ) -> bool:
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE upload_files SET offset=? WHERE upload_id=? AND id=? AND offset=?
+                """,
+                (new_offset, upload_id, file_id, expected_offset),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE uploads SET updated_at=? WHERE id=?", (now, upload_id)
+                )
+            return bool(cursor.rowcount)
+
+    def complete_upload(
+        self, upload_id: str, destination_relative_path: str, now: str
+    ) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                UPDATE uploads SET status='complete',destination_relative_path=?,
+                    error=NULL,updated_at=? WHERE id=?
+                """,
+                (destination_relative_path, now, upload_id),
+            )
+
+    @staticmethod
+    def run_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["request"] = _loads(item.pop("request_json", None), {})
+        item["resolved"] = _loads(item.pop("resolved_json", None), {})
+        item["cancel_requested"] = bool(item["cancel_requested"])
+        return item
+
+    def create_run(self, run: dict[str, Any]) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO runs(
+                    id,dataset_id,status,request_json,resolved_json,work_relative,
+                    created_at,updated_at
+                ) VALUES(?,?,'queued',?,?,?,?,?)
+                """,
+                (
+                    run["id"],
+                    run["dataset_id"],
+                    _json(run["request"]),
+                    _json(run["resolved"]),
+                    run["work_relative"],
+                    run["created_at"],
+                    run["updated_at"],
+                ),
+            )
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return self.run_from_row(row)
+
+    def list_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def next_queued_run(self) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM runs WHERE status='queued' AND cancel_requested=0
+                ORDER BY created_at LIMIT 1
+                """
+            ).fetchone()
+        return self.run_from_row(row)
+
+    def claim_next_queued_run(self, now: str) -> dict[str, Any] | None:
+        """Atomically claim one queued run across possible ASGI processes."""
+
+        with self.connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE status IN ('preparing','starting','running','cancelling')
+                LIMIT 1
+                """
+            ).fetchone()
+            if active is not None:
+                return None
+            row = connection.execute(
+                """
+                SELECT * FROM runs WHERE status='queued' AND cancel_requested=0
+                ORDER BY created_at LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE runs SET status='preparing',updated_at=?
+                WHERE id=? AND status='queued' AND cancel_requested=0
+                """,
+                (now, row["id"]),
+            )
+            if not cursor.rowcount:
+                return None
+            claimed = dict(row)
+            claimed["status"] = "preparing"
+            claimed["updated_at"] = now
+            return self.run_from_row(_MappingRow(claimed))
+
+    def begin_run_start(self, run_id: str, now: str) -> bool:
+        """Atomically reserve the final pre-spawn transition for one run."""
+
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs SET status='starting',updated_at=?
+                WHERE id=? AND status='preparing' AND cancel_requested=0
+                """,
+                (now, run_id),
+            )
+            return bool(cursor.rowcount)
+
+    def mark_run_running(
+        self,
+        run_id: str,
+        *,
+        pid: int,
+        started_at: str,
+    ) -> bool:
+        """Publish a spawned process only if cancellation did not win the race."""
+
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs SET status='running',pid=?,started_at=?,updated_at=?
+                WHERE id=? AND status='starting' AND cancel_requested=0
+                """,
+                (int(pid), started_at, started_at, run_id),
+            )
+            return bool(cursor.rowcount)
+
+    def update_run(self, run_id: str, now: str, **fields: Any) -> None:
+        allowed = {
+            "status",
+            "pid",
+            "return_code",
+            "error",
+            "cancel_requested",
+            "started_at",
+            "finished_at",
+        }
+        selected = {key: value for key, value in fields.items() if key in allowed}
+        selected["updated_at"] = now
+        assignments = ", ".join(f"{key}=?" for key in selected)
+        with self.connection(write=True) as connection:
+            connection.execute(
+                f"UPDATE runs SET {assignments} WHERE id=?",
+                (*selected.values(), run_id),
+            )
+
+    def recover_after_restart(self, now: str) -> int:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                UPDATE runs SET status='queued',pid=NULL,updated_at=?
+                WHERE status IN ('preparing','starting') AND cancel_requested=0
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE runs SET status='cancelled',finished_at=?,updated_at=?
+                WHERE status IN ('preparing','starting') AND cancel_requested=1
+                """,
+                (now, now),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE runs SET status='interrupted',
+                    error='Server restarted while this run was active.',
+                    finished_at=?,updated_at=?
+                WHERE status IN ('running','cancelling')
+                """,
+                (now, now),
+            )
+            connection.execute(
+                """
+                UPDATE datasets SET status='error',
+                    error='Server restarted before dataset scanning completed.',
+                    updated_at=? WHERE status='scanning'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE datasets SET catalog_status='missing',catalog_error=NULL,
+                    updated_at=? WHERE catalog_status='building'
+                """,
+                (now,),
+            )
+            return int(cursor.rowcount)
+
+    def ping(self) -> bool:
+        with self.connection() as connection:
+            return connection.execute("SELECT 1").fetchone()[0] == 1
+
+
+class _NullLock:
+    def __enter__(self) -> "_NullLock":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _MappingRow:
+    """Minimal sqlite.Row-compatible adapter used for an atomically claimed row."""
+
+    def __init__(self, value: dict[str, Any]) -> None:
+        self._value = value
+
+    def __iter__(self):
+        return iter(self._value)
+
+    def keys(self):
+        return self._value.keys()
+
+    def __getitem__(self, key: str) -> Any:
+        return self._value[key]

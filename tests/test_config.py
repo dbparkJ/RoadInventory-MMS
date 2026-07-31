@@ -91,6 +91,11 @@ class PipelineConfigTests(unittest.TestCase):
             set(configured["model_filters"]),
             {"traffic_sign_best.pt", "traffic_light_best.pt"},
         )
+        self.assertIsNone(configured["include_record_names"])
+        self.assertIsNone(configured["include_job_names"])
+        self.assertIsNone(configured["include_track_names"])
+        self.assertIsNone(configured["frame_id_from"])
+        self.assertIsNone(configured["frame_id_to"])
 
     def test_no_argument_loads_default_yaml_and_cli_can_override_it(self) -> None:
         parser = build_arg_parser()
@@ -126,12 +131,46 @@ class PipelineConfigTests(unittest.TestCase):
             self.assertEqual(args.data_root, (root / "sample_data").resolve())
             self.assertEqual(args.conf, 0.4)
 
+    def test_work_scope_names_accept_yaml_lists_and_comma_separated_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "scope.yaml"
+            config_path.write_text(
+                "config_version: 1\n"
+                "input:\n"
+                "  include_record_names:\n"
+                "    - Record_A\n"
+                "    - Record_B\n"
+                "  include_track_names: [Track01, Track02]\n"
+                "  frame_id_from: frame2\n"
+                "  frame_id_to: frame10\n",
+                encoding="utf-8",
+            )
+            args = parse_args_with_config(
+                build_arg_parser(),
+                [
+                    str(config_path),
+                    "--include-job-names",
+                    " Job_A,Job_B,job_a ",
+                ],
+            )
+
+        self.assertEqual(args.include_record_names, ("Record_A", "Record_B"))
+        self.assertEqual(args.include_job_names, ("Job_A", "Job_B"))
+        self.assertEqual(args.include_track_names, ("Track01", "Track02"))
+        self.assertEqual(args.frame_id_from, "frame2")
+        self.assertEqual(args.frame_id_to, "frame10")
+        self.assertIn("include_job_names", args._cli_override_dests)
+
     def test_unknown_duplicate_and_invalid_values_are_rejected(self) -> None:
         fixtures = {
             "unknown.yaml": "config_version: 1\nyolo:\n  confidence: 0.5\n",
             "duplicate.yaml": "config_version: 1\na:\n  conf: 0.2\nb:\n  conf: 0.3\n",
             "range.yaml": "config_version: 1\nyolo:\n  conf: 1.1\n",
             "boolean.yaml": "config_version: 1\ninput:\n  require_calibration: 'false'\n",
+            "scope.yaml": (
+                "config_version: 1\ninput:\n"
+                "  include_job_names: [Job_A, 42]\n"
+            ),
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

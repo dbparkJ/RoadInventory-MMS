@@ -287,6 +287,35 @@ def parse_class_id_list(value: Any) -> tuple[int, ...]:
     return parsed
 
 
+def parse_name_list(value: Any) -> tuple[str, ...]:
+    """Parse YAML lists or comma-separated CLI text into unique names."""
+
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise argparse.ArgumentTypeError(
+            "names must be a YAML list or comma-separated text"
+        )
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for value_item in values:
+        if not isinstance(value_item, str):
+            raise argparse.ArgumentTypeError("every included name must be a string")
+        name = value_item.strip()
+        if not name:
+            raise argparse.ArgumentTypeError("included names cannot be empty")
+        folded = name.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            parsed.append(name)
+    return tuple(parsed)
+
+
 def parse_model_filters(value: Any) -> dict[str, dict[str, Any]]:
     """Parse the per-model filter map from YAML or a JSON CLI value."""
 
@@ -478,6 +507,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data"),
         help="Parent folder recursively containing legacy or Leica MMS deliveries.",
+    )
+    parser.add_argument(
+        "--include-record-names",
+        type=parse_name_list,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Process only exact record names (case-insensitive). "
+            "YAML accepts a list; CLI accepts comma-separated names."
+        ),
+    )
+    parser.add_argument(
+        "--include-job-names",
+        type=parse_name_list,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Process only exact job names (case-insensitive). "
+            "YAML accepts a list; CLI accepts comma-separated names."
+        ),
+    )
+    parser.add_argument(
+        "--include-track-names",
+        type=parse_name_list,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Process only exact track names (case-insensitive). "
+            "YAML accepts a list; CLI accepts comma-separated names."
+        ),
+    )
+    parser.add_argument(
+        "--frame-id-from",
+        type=str,
+        default=None,
+        metavar="IMAGE_STEM",
+        help=(
+            "Inclusive lower image-stem bound using case-insensitive natural order."
+        ),
+    )
+    parser.add_argument(
+        "--frame-id-to",
+        type=str,
+        default=None,
+        metavar="IMAGE_STEM",
+        help=(
+            "Inclusive upper image-stem bound using case-insensitive natural order."
+        ),
     )
     parser.add_argument(
         "--pose-format",
@@ -1792,6 +1869,11 @@ def build_run_fingerprint(
         "disable_intermediate_shp",
         "start_index",
         "limit_images",
+        "include_record_names",
+        "include_job_names",
+        "include_track_names",
+        "frame_id_from",
+        "frame_id_to",
         "alignment_qa_enabled",
         "alignment_qa_sample_images",
         "alignment_qa_max_points_per_image",
@@ -7369,6 +7451,223 @@ def run_panorama_alignment_qa(
     return report
 
 
+def _natural_frame_id_key(value: str) -> tuple[tuple[int, Any], ...]:
+    """Return a deterministic, case-insensitive natural-order image-stem key."""
+
+    return tuple(
+        (1, int(part)) if part.isdecimal() else (0, part.casefold())
+        for part in re.split(r"([0-9]+)", value)
+        if part
+    )
+
+
+def select_image_tasks_for_scope(
+    image_tasks: list[dict[str, Any]],
+    args: argparse.Namespace,
+    *,
+    logger=None,
+) -> list[dict[str, Any]]:
+    """Apply stable record/job/track and inclusive image-stem work bounds."""
+
+    name_filters: dict[str, tuple[str, ...] | None] = {}
+    for option_name in (
+        "include_record_names",
+        "include_job_names",
+        "include_track_names",
+    ):
+        raw_value = getattr(args, option_name, None)
+        if raw_value is None:
+            name_filters[option_name] = None
+            continue
+        try:
+            name_filters[option_name] = parse_name_list(raw_value)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"Invalid {option_name}: {exc}") from exc
+
+    frame_bounds: dict[str, str | None] = {}
+    for option_name in ("frame_id_from", "frame_id_to"):
+        raw_value = getattr(args, option_name, None)
+        if raw_value is None:
+            frame_bounds[option_name] = None
+            continue
+        value = str(raw_value).strip()
+        if not value:
+            raise ValueError(f"{option_name} must be a non-empty image stem")
+        frame_bounds[option_name] = value
+
+    frame_from = frame_bounds["frame_id_from"]
+    frame_to = frame_bounds["frame_id_to"]
+    frame_from_key = _natural_frame_id_key(frame_from) if frame_from is not None else None
+    frame_to_key = _natural_frame_id_key(frame_to) if frame_to is not None else None
+    if (
+        frame_from_key is not None
+        and frame_to_key is not None
+        and frame_from_key > frame_to_key
+    ):
+        raise ValueError(
+            "frame_id_from must not sort after frame_id_to in natural image-stem order "
+            f"({frame_from!r} > {frame_to!r})"
+        )
+
+    metadata_fields = {
+        "include_record_names": "record_name",
+        "include_job_names": "job_name",
+        "include_track_names": "track_name",
+    }
+    folded_filters = {
+        option_name: (
+            {name.casefold() for name in names}
+            if names is not None
+            else None
+        )
+        for option_name, names in name_filters.items()
+    }
+
+    selected: list[dict[str, Any]] = []
+    for task in image_tasks:
+        if any(
+            allowed_names is not None
+            and (
+                task.get(metadata_fields[option_name]) is None
+                or str(task[metadata_fields[option_name]]).casefold()
+                not in allowed_names
+            )
+            for option_name, allowed_names in folded_filters.items()
+        ):
+            continue
+
+        if frame_from_key is not None or frame_to_key is not None:
+            raw_stem = task.get("image_stem")
+            if raw_stem is None:
+                raw_stem = Path(
+                    str(task.get("image_name") or task.get("image_path") or "")
+                ).stem
+            stem_key = _natural_frame_id_key(str(raw_stem))
+            if frame_from_key is not None and stem_key < frame_from_key:
+                continue
+            if frame_to_key is not None and stem_key > frame_to_key:
+                continue
+        selected.append(task)
+
+    active_scope = {
+        **{
+            option_name: list(names)
+            for option_name, names in name_filters.items()
+            if names is not None
+        },
+        **{
+            option_name: value
+            for option_name, value in frame_bounds.items()
+            if value is not None
+        },
+    }
+    if not selected:
+        scope_description = (
+            ", ".join(
+                f"{option_name}={value!r}"
+                for option_name, value in active_scope.items()
+            )
+            or "no explicit filters"
+        )
+        raise ValueError(
+            "Work-scope selection contains no MMS image tasks; "
+            f"check {scope_description}."
+        )
+
+    if active_scope and logger is not None:
+        logger.info(
+            "Work-scope filters selected %d/%d MMS image tasks: %s",
+            len(selected),
+            len(image_tasks),
+            ", ".join(
+                f"{option_name}={value!r}"
+                for option_name, value in active_scope.items()
+            ),
+        )
+    return selected
+
+
+def _leica_catalog_job_names(
+    image_tasks: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return the canonical display names that bound LAS discovery."""
+
+    names_by_key: dict[str, str] = {}
+    for task in image_tasks:
+        if task.get("pose_format") not in {"leica-sphere", "leica-delivery"}:
+            continue
+        raw_name = task.get("job_name")
+        if raw_name is None:
+            continue
+        name = str(raw_name).strip()
+        if name:
+            names_by_key.setdefault(name.casefold(), name)
+    return tuple(names_by_key[key] for key in sorted(names_by_key))
+
+
+def _scoped_pointcloud_catalog_path(
+    base_path: Path,
+    *,
+    all_image_tasks: list[dict[str, Any]],
+    selected_image_tasks: list[dict[str, Any]],
+    logger=None,
+) -> tuple[Path, tuple[str, ...]]:
+    """Keep different selected Leica job sets in stable, reusable cache files.
+
+    The unfiltered path remains unchanged for backward compatibility.  A new
+    scoped cache is seeded from that full cache when available: the catalog
+    builder can then reuse unchanged per-file block indexes instead of reading
+    the selected LAS files again.
+    """
+
+    all_jobs = _leica_catalog_job_names(all_image_tasks)
+    selected_jobs = _leica_catalog_job_names(selected_image_tasks)
+    if {name.casefold() for name in selected_jobs} == {
+        name.casefold() for name in all_jobs
+    }:
+        return base_path, selected_jobs
+
+    canonical = json.dumps(
+        sorted(name.casefold() for name in selected_jobs),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    suffix = base_path.suffix or ".json"
+    stem = base_path.name[: -len(base_path.suffix)] if base_path.suffix else base_path.name
+    scoped_path = base_path.with_name(f"{stem}.jobs-{digest}{suffix}")
+
+    if not scoped_path.exists() and base_path.is_file():
+        temporary_path = scoped_path.with_name(
+            f".{scoped_path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            scoped_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_bytes(base_path.read_bytes())
+            try:
+                # A hard link publishes without overwriting a cache another
+                # process may have completed while this seed was being copied.
+                os.link(temporary_path, scoped_path)
+            except FileExistsError:
+                pass
+            if logger is not None:
+                logger.info(
+                    "Seeded scoped point-cloud catalog from %s: %s",
+                    base_path,
+                    scoped_path,
+                )
+        except OSError as exc:
+            if logger is not None:
+                logger.warning(
+                    "Could not seed scoped point-cloud catalog %s: %s",
+                    scoped_path,
+                    exc,
+                )
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    return scoped_path, selected_jobs
+
+
 def prepare_shared_pipeline_context(
     args: argparse.Namespace,
     *,
@@ -7377,12 +7676,17 @@ def prepare_shared_pipeline_context(
 ) -> dict[str, Any]:
     """Prepare immutable dataset/catalog inputs once for every model."""
 
-    image_tasks = scan_image_tasks(
+    all_image_tasks = scan_image_tasks(
         args.data_root,
         logger,
         pose_format=args.pose_format,
         gps_week=args.gps_week,
         gps_utc_offset_seconds=args.gps_utc_offset_seconds,
+    )
+    image_tasks = select_image_tasks_for_scope(
+        all_image_tasks,
+        args,
+        logger=logger,
     )
     calibration_bundle = attach_calibration_metadata(
         image_tasks,
@@ -7392,20 +7696,21 @@ def prepare_shared_pipeline_context(
     )
     image_tasks.sort(key=lambda item: (item["timestamp_iso"], item["image_path"]))
     dataset_signature = build_dataset_signature(image_tasks)
-    catalog_path = args.pointcloud_cache_path
+    catalog_path, included_leica_jobs = _scoped_pointcloud_catalog_path(
+        Path(args.pointcloud_cache_path),
+        all_image_tasks=all_image_tasks,
+        selected_image_tasks=image_tasks,
+        logger=logger,
+    )
+    args.pointcloud_cache_path = catalog_path
     pointcloud_catalog = build_pointcloud_catalog(
         args.data_root,
         catalog_path,
         logger,
         source=args.point_source,
         las_chunk_size=max(10_000, args.las_index_chunk_points),
-        include_jobs={
-            str(task["job_name"])
-            for task in image_tasks
-            if task.get("pose_format") in {"leica-sphere", "leica-delivery"}
-            and task.get("job_name")
-        }
-        or None,
+        # An empty tuple intentionally excludes LAS for legacy-only scopes.
+        include_jobs=included_leica_jobs,
     )
     crs_wkt = (
         validate_crs_wkt(

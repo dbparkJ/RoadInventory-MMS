@@ -1,0 +1,556 @@
+import {
+  Bell,
+  CircleHelp,
+  CloudOff,
+  Database,
+  ListChecks,
+  Menu,
+  Plus,
+  Server,
+} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Brand } from './components/Brand'
+import { DatasetPanel } from './components/DatasetPanel'
+import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
+import { RunQueue } from './components/RunQueue'
+import { StorageDialog } from './components/StorageDialog'
+import { ToastRegion, type Toast } from './components/ToastRegion'
+import { Workspace } from './components/Workspace'
+import { api } from './lib/api'
+import {
+  createDemoRun,
+  demoBootstrap,
+  demoDataset,
+  demoRoute,
+  getDemoFrames,
+} from './lib/demo'
+import type {
+  BootstrapResponse,
+  DatasetDetail,
+  DatasetSummary,
+  Frame,
+  FrameRange,
+  ManualParameters,
+  RoutePoint,
+  RunEvent,
+  RunRecord,
+  RunRequest,
+  ViewMode,
+} from './types'
+
+function App() {
+  const [boot, setBoot] = useState<BootstrapResponse | null>(null)
+  const [booting, setBooting] = useState(true)
+  const [demoMode, setDemoMode] = useState(false)
+  const [connectionIssue, setConnectionIssue] = useState<string | null>(null)
+  const [datasets, setDatasets] = useState<DatasetSummary[]>([])
+  const [datasetId, setDatasetId] = useState('')
+  const [trackId, setTrackId] = useState('')
+  const [frames, setFrames] = useState<Frame[]>([])
+  const [selectedFrame, setSelectedFrame] = useState<Frame | null>(null)
+  const [frameRange, setFrameRange] = useState<FrameRange | null>(null)
+  const [framesLoading, setFramesLoading] = useState(false)
+  const [framesLoadingMore, setFramesLoadingMore] = useState(false)
+  const [frameNextOffset, setFrameNextOffset] = useState<number | null>(null)
+  const [frameTotal, setFrameTotal] = useState(0)
+  const [route, setRoute] = useState<RoutePoint[]>([])
+  const [routeLoading, setRouteLoading] = useState(false)
+  const [view, setView] = useState<ViewMode>('map')
+  const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [sourceOpen, setSourceOpen] = useState(false)
+  const [queueOpen, setQueueOpen] = useState(false)
+  const [runs, setRuns] = useState<RunRecord[]>([])
+  const [submitting, setSubmitting] = useState(false)
+  const [toasts, setToasts] = useState<Toast[]>([])
+  const frameScopeRef = useRef('')
+  frameScopeRef.current = `${datasetId}::${trackId}`
+
+  const selectedDataset = datasets.find((dataset) => dataset.id === datasetId) ?? null
+  const activeRuns = runs.filter((run) =>
+    ['queued', 'preparing', 'running', 'cancelling'].includes(run.status),
+  )
+
+  const toast = useCallback((entry: Omit<Toast, 'id'>) => {
+    setToasts((current) => [
+      ...current,
+      { ...entry, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` },
+    ])
+  }, [])
+  const dismissToast = useCallback((id: string) => {
+    setToasts((current) => current.filter((toastItem) => toastItem.id !== id))
+  }, [])
+
+  const useDemo = useCallback(() => {
+    setBoot(demoBootstrap)
+    setDemoMode(true)
+    setDatasets([demoDataset])
+    setDatasetId(demoDataset.id)
+    setTrackId('')
+    setFrameRange(null)
+    setRuns(demoBootstrap.recent_runs ?? [])
+    setConnectionIssue((current) => current ?? '데모 모드에서는 서버 데이터가 변경되지 않습니다.')
+  }, [])
+
+  useEffect(() => {
+    setFrameRange(null)
+  }, [datasetId, trackId])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setBooting(true)
+    void api
+      .bootstrap(controller.signal)
+      .then((response) => {
+        setBoot(response)
+        setDatasets(response.datasets ?? [])
+        setDatasetId(response.datasets?.[0]?.id ?? '')
+        setRuns(response.recent_runs ?? [])
+        setDemoMode(false)
+        setConnectionIssue(null)
+        if (!response.datasets?.length) setSourceOpen(true)
+      })
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted) return
+        setConnectionIssue(
+          reason instanceof Error
+            ? `서버에 연결하지 못했습니다: ${reason.message}`
+            : '서버에 연결하지 못했습니다.',
+        )
+        useDemo()
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBooting(false)
+      })
+    return () => controller.abort()
+  }, [useDemo])
+
+  useEffect(() => {
+    if (!datasetId || selectedDataset?.status !== 'ready') {
+      setFrames([])
+      setSelectedFrame(null)
+      setFrameNextOffset(null)
+      setFrameTotal(0)
+      return
+    }
+    const controller = new AbortController()
+    setFrames([])
+    setSelectedFrame(null)
+    setFrameNextOffset(null)
+    setFrameTotal(0)
+    setFramesLoadingMore(false)
+    setFramesLoading(true)
+    const frameRequest = demoMode
+      ? Promise.resolve(getDemoFrames(0, 240, trackId || undefined))
+      : api.frames(datasetId, 0, 240, trackId || undefined, controller.signal)
+    void frameRequest
+      .then((page) => {
+        setFrames(page.items)
+        setFrameTotal(page.total)
+        setFrameNextOffset(resolveNextOffset(page))
+        setSelectedFrame((current) => {
+          if (current && page.items.some((frame) => frame.id === current.id)) return current
+          return page.items[0] ?? null
+        })
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setFrames([])
+          setSelectedFrame(null)
+          toast({
+            tone: 'error',
+            title: '프레임 목록을 불러오지 못했습니다',
+            message: reason instanceof Error ? reason.message : undefined,
+          })
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setFramesLoading(false)
+      })
+    return () => controller.abort()
+  }, [datasetId, demoMode, selectedDataset?.status, toast, trackId])
+
+  const loadMoreFrames = useCallback(async () => {
+    if (!datasetId || frameNextOffset === null || framesLoadingMore) return
+    const scope = `${datasetId}::${trackId}`
+    const offset = frameNextOffset
+    const controller = new AbortController()
+    setFramesLoadingMore(true)
+    try {
+      const page = demoMode
+        ? getDemoFrames(offset, 240, trackId || undefined)
+        : await api.frames(datasetId, offset, 240, trackId || undefined, controller.signal)
+      if (frameScopeRef.current !== scope) return
+      setFrames((current) => {
+        const byId = new Map(current.map((frame) => [frame.id, frame]))
+        page.items.forEach((frame) => byId.set(frame.id, frame))
+        return [...byId.values()]
+      })
+      setFrameTotal(page.total)
+      setFrameNextOffset(resolveNextOffset(page))
+    } catch (reason) {
+      if (!controller.signal.aborted && frameScopeRef.current === scope) {
+        toast({
+          tone: 'error',
+          title: '추가 프레임을 불러오지 못했습니다',
+          message: reason instanceof Error ? reason.message : undefined,
+        })
+      }
+    } finally {
+      if (frameScopeRef.current === scope) setFramesLoadingMore(false)
+    }
+  }, [datasetId, demoMode, frameNextOffset, framesLoadingMore, toast, trackId])
+
+  useEffect(() => {
+    if (!datasetId || selectedDataset?.status !== 'ready') {
+      setRoute([])
+      return
+    }
+    const controller = new AbortController()
+    setRouteLoading(true)
+    const request = demoMode ? Promise.resolve(demoRoute) : api.route(datasetId, controller.signal)
+    void request
+      .then((response) => setRoute(response.points ?? []))
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setRoute([])
+          toast({
+            tone: 'error',
+            title: '주행 경로를 표시하지 못했습니다',
+            message: reason instanceof Error ? reason.message : undefined,
+          })
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setRouteLoading(false)
+      })
+    return () => controller.abort()
+  }, [datasetId, demoMode, selectedDataset?.status, toast])
+
+  useEffect(() => {
+    if (demoMode || !boot) return
+    const controller = new AbortController()
+    void api
+      .runs(controller.signal)
+      .then((response) => setRuns(response.items))
+      .catch(() => {
+        // Bootstrap history remains useful when this optional refresh fails.
+      })
+    return () => controller.abort()
+  }, [boot, demoMode])
+
+  const activeRunKey = useMemo(
+    () => activeRuns.map((run) => run.id).sort().join(','),
+    [activeRuns],
+  )
+  useEffect(() => {
+    if (demoMode || !activeRunKey) return
+    const closeStreams = activeRunKey.split(',').map((runId) =>
+      api.subscribeToRun(runId, (event) => {
+        setRuns((current) => updateRunFromEvent(current, runId, event))
+      }),
+    )
+    return () => closeStreams.forEach((close) => close())
+  }, [activeRunKey, demoMode])
+
+  useEffect(() => {
+    if (!demoMode || !activeRuns.length) return
+    const timer = window.setInterval(() => {
+      setRuns((current) =>
+        current.map((run) => {
+          if (!run.id.startsWith('local-demo-') || run.status !== 'running') return run
+          const nextProgress = Math.min(100, run.progress + 3 + Math.random() * 5)
+          const stages =
+            nextProgress < 24
+              ? '데이터 준비'
+              : nextProgress < 58
+                ? '객체 후보 검출'
+                : nextProgress < 88
+                  ? '공간 군집 최적화'
+                  : '결과 패키징'
+          return {
+            ...run,
+            progress: nextProgress,
+            stage: stages,
+            message: stages,
+            eta_seconds: Math.max(0, Math.round((100 - nextProgress) * 0.9)),
+            ...(nextProgress >= 100
+              ? {
+                  status: 'completed' as const,
+                  finished_at: new Date().toISOString(),
+                  result_url: '#demo-result',
+                }
+              : {}),
+          }
+        }),
+      )
+    }, 1_400)
+    return () => window.clearInterval(timer)
+  }, [activeRunKey, activeRuns.length, demoMode])
+
+  const startRun = async (request: RunRequest) => {
+    setSubmitting(true)
+    try {
+      const run = demoMode ? createDemoRun(runs.length + 1) : await api.createRun(request)
+      setRuns((current) => [run, ...current.filter((entry) => entry.id !== run.id)])
+      setQueueOpen(true)
+      toast({
+        tone: 'success',
+        title: '작업이 실행 큐에 등록되었습니다',
+        message: demoMode ? '데모 진행률을 실시간으로 표시합니다.' : '창을 닫아도 서버에서 계속 처리됩니다.',
+      })
+    } catch (reason) {
+      toast({
+        tone: 'error',
+        title: '작업을 시작하지 못했습니다',
+        message: reason instanceof Error ? reason.message : undefined,
+      })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const optimize = async (request: RunRequest): Promise<ManualParameters | undefined> => {
+    try {
+      if (demoMode) {
+        await new Promise((resolve) => window.setTimeout(resolve, 850))
+        toast({
+          tone: 'success',
+          title: '자동 설정을 확인했습니다',
+          message: '검증된 알고리즘 기준은 유지하고 처리 자원만 조정합니다.',
+        })
+        return { ...DEFAULT_PARAMETERS }
+      }
+      const response = await api.optimize(request)
+      toast({
+        tone: 'success',
+        title: '자동 설정을 확인했습니다',
+        message: '서버가 작업 규모에 맞는 처리 자원 프로필을 준비했습니다.',
+      })
+      return response.parameters
+    } catch (reason) {
+      toast({
+        tone: 'error',
+        title: '자동 설정을 확인하지 못했습니다',
+        message: reason instanceof Error ? reason.message : undefined,
+      })
+      return undefined
+    }
+  }
+
+  const cancelRun = async (id: string) => {
+    setRuns((current) =>
+      current.map((run) => (run.id === id ? { ...run, status: 'cancelling' } : run)),
+    )
+    try {
+      const updated = demoMode
+        ? ({ ...runs.find((run) => run.id === id)!, status: 'cancelled', progress: 0 } as RunRecord)
+        : await api.cancelRun(id)
+      setRuns((current) => current.map((run) => (run.id === id ? updated : run)))
+      toast({ tone: 'info', title: '작업을 취소했습니다' })
+    } catch (reason) {
+      toast({
+        tone: 'error',
+        title: '작업을 취소하지 못했습니다',
+        message: reason instanceof Error ? reason.message : undefined,
+      })
+    }
+  }
+
+  const acceptDataset = (dataset: DatasetDetail) => {
+    setDemoMode(false)
+    setConnectionIssue(null)
+    setDatasets((current) => [dataset, ...current.filter((entry) => entry.id !== dataset.id)])
+    setFrameRange(null)
+    setDatasetId(dataset.id)
+    setTrackId('')
+    setView('map')
+    toast({
+      tone: 'success',
+      title: '데이터셋 준비가 완료되었습니다',
+      message: `${dataset.name} · ${dataset.frame_count.toLocaleString('ko-KR')} 프레임`,
+    })
+  }
+
+  if (booting) return <BootScreen />
+
+  return (
+    <div className={`app-shell ${inspectorOpen ? '' : 'inspector-collapsed'}`}>
+      <header className="topbar">
+        <div className="topbar-left">
+          <button type="button" className="icon-button mobile-menu">
+            <Menu size={18} />
+          </button>
+          <Brand />
+          <span className="topbar-separator" />
+          <div className={`server-state ${connectionIssue ? 'offline' : ''}`}>
+            {connectionIssue ? <CloudOff size={14} /> : <Server size={14} />}
+            <span>
+              <strong>{connectionIssue ? '데모 세션' : boot?.server_name ?? 'MMS Server'}</strong>
+              <small>{connectionIssue ? '서버 미연결' : `API ${boot?.api_version ?? '—'}`}</small>
+            </span>
+          </div>
+        </div>
+        <div className="topbar-actions">
+          <button type="button" className="icon-button" title="도움말">
+            <CircleHelp size={17} />
+          </button>
+          <button type="button" className="icon-button notification-button" title="알림">
+            <Bell size={17} />
+            {activeRuns.length > 0 && <i />}
+          </button>
+          <button type="button" className="queue-button" onClick={() => setQueueOpen(true)}>
+            <ListChecks size={16} />
+            실행 큐
+            {activeRuns.length > 0 && <em>{activeRuns.length}</em>}
+          </button>
+          <button type="button" className="button primary compact" onClick={() => setSourceOpen(true)}>
+            <Plus size={16} />
+            데이터 추가
+          </button>
+        </div>
+      </header>
+
+      {connectionIssue && (
+        <div className="offline-banner">
+          <CloudOff size={14} />
+          <span>
+            서버 응답이 없어 <strong>읽기 전용 데모 데이터</strong>를 표시하고 있습니다.
+          </span>
+          <button type="button" onClick={() => setSourceOpen(true)}>
+            서버 데이터 다시 연결
+          </button>
+        </div>
+      )}
+
+      <div className="app-grid">
+        <DatasetPanel
+          datasets={datasets}
+          selectedDataset={selectedDataset}
+          selectedTrack={trackId}
+          frames={frames}
+          selectedFrame={selectedFrame}
+          framesLoading={framesLoading}
+          framesLoadingMore={framesLoadingMore}
+          frameTotal={frameTotal}
+          hasMoreFrames={frameNextOffset !== null}
+          frameRange={frameRange}
+          onDatasetChange={(id) => {
+            setFrameRange(null)
+            setDatasetId(id)
+            setTrackId('')
+          }}
+          onTrackChange={(id) => {
+            setFrameRange(null)
+            setTrackId(id)
+          }}
+          onFrameChange={setSelectedFrame}
+          onSetFrameRangeStart={(ordinal) =>
+            setFrameRange((current) => [
+              ordinal,
+              current && current[1] >= ordinal ? current[1] : ordinal,
+            ])
+          }
+          onSetFrameRangeEnd={(ordinal) =>
+            setFrameRange((current) => [
+              current && current[0] <= ordinal ? current[0] : ordinal,
+              ordinal,
+            ])
+          }
+          onClearFrameRange={() => setFrameRange(null)}
+          onLoadMoreFrames={() => void loadMoreFrames()}
+          onOpenSource={() => setSourceOpen(true)}
+        />
+        <Workspace
+          dataset={selectedDataset}
+          frames={frames}
+          frame={selectedFrame}
+          route={route}
+          routeLoading={routeLoading}
+          mapStyleUrl={boot?.map_style_url}
+          demoMode={demoMode}
+          view={view}
+          inspectorOpen={inspectorOpen}
+          onViewChange={setView}
+          onFrameChange={setSelectedFrame}
+          onToggleInspector={() => setInspectorOpen((value) => !value)}
+          onOpenSource={() => setSourceOpen(true)}
+          onUseDemo={useDemo}
+        />
+        {inspectorOpen && (
+          <OptimizationPanel
+            dataset={selectedDataset}
+            selectedTrack={trackId}
+            frameRange={frameRange}
+            busy={submitting}
+            onStart={startRun}
+            onOptimize={optimize}
+          />
+        )}
+      </div>
+
+      <StorageDialog
+        open={sourceOpen}
+        demoMode={demoMode}
+        onClose={() => setSourceOpen(false)}
+        onDatasetReady={acceptDataset}
+        onUseDemo={useDemo}
+      />
+      <RunQueue runs={runs} open={queueOpen} onClose={() => setQueueOpen(false)} onCancel={cancelRun} />
+      <ToastRegion toasts={toasts} dismiss={dismissToast} />
+    </div>
+  )
+}
+
+function updateRunFromEvent(current: RunRecord[], runId: string, event: RunEvent): RunRecord[] {
+  if (event.run) {
+    return [event.run, ...current.filter((run) => run.id !== event.run!.id)]
+  }
+  return current.map((run) => {
+    if (run.id !== runId) return run
+    const terminalStatus =
+      event.type === 'completed'
+        ? 'completed'
+        : event.type === 'failed'
+          ? 'failed'
+          : event.type === 'cancelled'
+            ? 'cancelled'
+            : run.status
+    return {
+      ...run,
+      status: terminalStatus,
+      progress: event.progress ?? (event.type === 'completed' ? 100 : run.progress),
+      stage: event.stage ?? run.stage,
+      message: event.message ?? run.message,
+      result_url: event.result_url ?? run.result_url,
+      ...(['completed', 'failed', 'cancelled'].includes(terminalStatus)
+        ? { finished_at: new Date().toISOString() }
+        : {}),
+    }
+  })
+}
+
+function resolveNextOffset(page: {
+  offset: number
+  items: Frame[]
+  total: number
+  next_offset?: number | null
+}): number | null {
+  if (page.next_offset !== undefined) return page.next_offset
+  const next = page.offset + page.items.length
+  return next < page.total ? next : null
+}
+
+function BootScreen() {
+  return (
+    <div className="boot-screen">
+      <Brand />
+      <span className="boot-orbit">
+        <i />
+      </span>
+      <strong>작업 공간 준비 중</strong>
+      <small>서버 기능과 데이터 인덱스를 확인하고 있습니다.</small>
+    </div>
+  )
+}
+
+export default App
