@@ -3,6 +3,8 @@ import type { FeatureCollection } from 'geojson'
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap, type StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
+import { resolveMapTrackScope } from '../lib/mapScope'
 import {
   buildRouteFeatureCollection,
   buildRouteRangeFeatureCollection,
@@ -69,26 +71,51 @@ export function MapView({
   const selectedFrameRef = useRef<string | null>(null)
   const [ready, setReady] = useState(false)
   const [satellite, setSatellite] = useState(false)
+  const overlay = useOptionalOverlayWorkspace()
+  const overlayRef = useRef(overlay)
 
   onSelectRef.current = onSelectFrame
   framesRef.current = frames
+  overlayRef.current = overlay
+
+  const overlayGeoJson = useMemo<FeatureCollection>(
+    () => ({
+      type: 'FeatureCollection',
+      features: (overlay?.mapFeatures ?? []) as FeatureCollection['features'],
+    }),
+    [overlay?.mapFeatures],
+  )
+  const overlayMapTotal = (overlay?.layers ?? []).reduce(
+    (sum, layer) =>
+      overlay?.visibleLayerIds.has(layer.id)
+        ? sum + (overlay.features[layer.id]?.wgs84?.total ?? layer.feature_count)
+        : sum,
+    0,
+  )
+  const overlayErrorCount = (overlay?.layers ?? []).filter(
+    (layer) => overlay?.visibleLayerIds.has(layer.id) && overlay.features[layer.id]?.errorWgs84,
+  ).length
 
   const trackColors = useMemo(() => buildTrackColorMap(route), [route])
-  const effectiveTrackId =
-    activeTrackId || selectedFrame?.track_id || route.find((point) => point.track_id)?.track_id
+  const { effectiveTrackId, showAllTracks: displayAllTracks } = resolveMapTrackScope(
+    activeTrackId,
+    selectedFrame?.track_id,
+    route.find((point) => point.track_id)?.track_id,
+    showAllTracks,
+  )
   const visibleRoute = useMemo(
     () =>
-      showAllTracks || !effectiveTrackId
+      displayAllTracks || !effectiveTrackId
         ? route
         : route.filter((point) => point.track_id === effectiveTrackId),
-    [effectiveTrackId, route, showAllTracks],
+    [displayAllTracks, effectiveTrackId, route],
   )
   const visibleFrames = useMemo(
     () =>
-      showAllTracks || !effectiveTrackId
+      displayAllTracks || !effectiveTrackId
         ? frames
         : frames.filter((frame) => frame.track_id === effectiveTrackId),
-    [effectiveTrackId, frames, showAllTracks],
+    [displayAllTracks, effectiveTrackId, frames],
   )
   const frameIndexes = useMemo(
     () => new Map(frames.map((frame) => [frame.id, frame.index])),
@@ -120,24 +147,24 @@ export function MapView({
 
   const routeGeoJson = useMemo(() => {
     const collection = buildRouteFeatureCollection(route)
-    if (showAllTracks || !effectiveTrackId) return collection
+    if (displayAllTracks || !effectiveTrackId) return collection
     return {
       ...collection,
       features: collection.features.filter(
         (feature) => feature.properties.track_id === effectiveTrackId,
       ),
     }
-  }, [effectiveTrackId, route, showAllTracks])
+  }, [displayAllTracks, effectiveTrackId, route])
   const routeRangeGeoJson = useMemo(() => {
     const collection = buildRouteRangeFeatureCollection(route, frameIndexes, frameRange)
-    if (showAllTracks || !effectiveTrackId) return collection
+    if (displayAllTracks || !effectiveTrackId) return collection
     return {
       ...collection,
       features: collection.features.filter(
         (feature) => feature.properties.track_id === effectiveTrackId,
       ),
     }
-  }, [effectiveTrackId, frameIndexes, frameRange, route, showAllTracks])
+  }, [displayAllTracks, effectiveTrackId, frameIndexes, frameRange, route])
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -236,6 +263,81 @@ export function MapView({
         const frame = framesRef.current.find((candidate) => candidate.id === id)
         if (frame) onSelectRef.current(frame)
       })
+      map.addSource('mms-overlay-features', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      })
+      map.addLayer({
+        id: 'mms-overlay-polygons',
+        type: 'fill',
+        source: 'mms-overlay-features',
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: {
+          'fill-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
+          'fill-opacity': ['case', ['==', ['get', '__overlay_selected'], 1], 0.45, 0.2],
+          'fill-outline-color': '#ffffff',
+        },
+      })
+      map.addLayer({
+        id: 'mms-overlay-lines',
+        type: 'line',
+        source: 'mms-overlay-features',
+        filter: ['==', ['geometry-type'], 'LineString'],
+        paint: {
+          'line-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
+          'line-width': ['case', ['==', ['get', '__overlay_selected'], 1], 6, 3],
+          'line-opacity': 0.95,
+        },
+      })
+      map.addLayer({
+        id: 'mms-overlay-points-halo',
+        type: 'circle',
+        source: 'mms-overlay-features',
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: {
+          'circle-radius': ['case', ['==', ['get', '__overlay_selected'], 1], 11, 8],
+          'circle-color': '#07111f',
+          'circle-opacity': 0.82,
+        },
+      })
+      map.addLayer({
+        id: 'mms-overlay-points',
+        type: 'circle',
+        source: 'mms-overlay-features',
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: {
+          'circle-radius': ['case', ['==', ['get', '__overlay_selected'], 1], 7, 5],
+          'circle-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
+          'circle-stroke-width': ['case', ['==', ['get', '__overlay_selected'], 1], 3, 1],
+          'circle-stroke-color': '#ffffff',
+          'circle-opacity': 0.96,
+        },
+      })
+      const overlayLayerIds = ['mms-overlay-points', 'mms-overlay-lines', 'mms-overlay-polygons']
+      overlayLayerIds.forEach((layerId) => {
+        map.on('mouseenter', layerId, () => {
+          map.getCanvas().style.cursor = 'pointer'
+        })
+        map.on('mouseleave', layerId, () => {
+          map.getCanvas().style.cursor = ''
+        })
+      })
+      map.on('click', (event) => {
+        const current = overlayRef.current
+        if (!current) return
+        const hits = map.queryRenderedFeatures(event.point, { layers: overlayLayerIds })
+        const properties = hits[0]?.properties
+        if (properties?.__overlay_layer_id && properties?.__overlay_feature_id !== undefined) {
+          current.selectFeature({
+            layerId: String(properties.__overlay_layer_id),
+            featureId: String(properties.__overlay_feature_id),
+          })
+          return
+        }
+        if (current.pickMode) {
+          void current.applyPickedCoordinate([event.lngLat.lng, event.lngLat.lat], 'wgs84')
+        }
+      })
       setReady(true)
     })
 
@@ -253,7 +355,7 @@ export function MapView({
     if (!map || !ready) return
     ;(map.getSource('mms-route') as GeoJSONSource | undefined)?.setData(routeGeoJson)
     if (visibleRoute.length > 1) {
-      const routeKey = `${effectiveTrackId ?? 'all'}:${showAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
+      const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
       const bounds = visibleRoute.reduce(
         (result, point) => result.extend([point.lon, point.lat]),
         new maplibregl.LngLatBounds(
@@ -268,7 +370,7 @@ export function MapView({
       })
       fittedRouteRef.current = routeKey
     }
-  }, [effectiveTrackId, ready, routeGeoJson, showAllTracks, visibleRoute])
+  }, [displayAllTracks, effectiveTrackId, ready, routeGeoJson, visibleRoute])
 
   useEffect(() => {
     const map = mapRef.current
@@ -281,6 +383,12 @@ export function MapView({
     if (!map || !ready) return
     ;(map.getSource('mms-frames') as GeoJSONSource | undefined)?.setData(frameGeoJson)
   }, [frameGeoJson, ready])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !ready) return
+    ;(map.getSource('mms-overlay-features') as GeoJSONSource | undefined)?.setData(overlayGeoJson)
+  }, [overlayGeoJson, ready])
 
   useEffect(() => {
     const map = mapRef.current
@@ -315,8 +423,9 @@ export function MapView({
   return (
     <div
       className={`map-view ${satellite ? 'satellite-mode' : ''}`}
-      data-track-scope={showAllTracks ? 'all' : effectiveTrackId ?? 'none'}
+      data-track-scope={displayAllTracks ? 'all' : effectiveTrackId ?? 'none'}
       data-route-feature-count={routeGeoJson.features.length}
+      data-overlay-feature-count={overlayGeoJson.features.length}
     >
       <div ref={containerRef} className="map-container" />
       {loading && (
@@ -340,17 +449,30 @@ export function MapView({
           <i
             className="legend-route"
             style={
-              !showAllTracks && effectiveTrackId
+              !displayAllTracks && effectiveTrackId
                 ? { background: trackColors.get(effectiveTrackId) ?? TRACK_COLORS[0] }
                 : undefined
             }
           />
-          {showAllTracks ? '전체 트랙' : '활성 트랙'}
+          {displayAllTracks ? '전체 트랙' : '활성 트랙'}
         </span>
         <span>
           <i className="legend-frame" />
           MMS 프레임
         </span>
+        {overlayGeoJson.features.length > 0 && (
+          <span title={overlayMapTotal > overlayGeoJson.features.length ? '속성표에서 다음 피처를 불러오면 지도 표시도 확장됩니다.' : '표시 중인 SHP 피처'}>
+            SHP {overlayGeoJson.features.length.toLocaleString('ko-KR')}
+            {overlayMapTotal > overlayGeoJson.features.length
+              ? ` / ${overlayMapTotal.toLocaleString('ko-KR')} 미리보기`
+              : ''}
+          </span>
+        )}
+        {overlayErrorCount > 0 && (
+          <span className="map-overlay-error" title="SHP 검수 패널에서 다시 불러올 수 있습니다.">
+            SHP 로드 오류 {overlayErrorCount}개
+          </span>
+        )}
         {selectedFrame && (
           <span className="map-bearing">
             <Navigation2 size={13} style={{ rotate: `${selectedFrame.heading ?? 0}deg` }} />

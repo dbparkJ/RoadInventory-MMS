@@ -12,7 +12,7 @@ describe('GeneralSettingsPanel', () => {
 
     render(
       <GeneralSettingsPanel
-        settings={{ ...DEFAULT_USER_SETTINGS }}
+        settings={{ ...DEFAULT_USER_SETTINGS, panoramaPointOverlayEnabled: true }}
         onChange={onChange}
         onReset={onReset}
       />,
@@ -22,6 +22,9 @@ describe('GeneralSettingsPanel', () => {
       target: { value: '7.5' },
     })
     fireEvent.click(screen.getByRole('checkbox', { name: '파노라마 포인트 오버레이 표시' }))
+    fireEvent.change(screen.getByRole('slider', { name: '파노라마 영상 투명도' }), {
+      target: { value: '0.35' },
+    })
     fireEvent.change(screen.getByRole('combobox', { name: '파노라마 기본 화질' }), {
       target: { value: 'ultra' },
     })
@@ -29,9 +32,10 @@ describe('GeneralSettingsPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: '기본 설정으로 복원' }))
 
     expect(onChange).toHaveBeenNthCalledWith(1, { panoramaForwardOffsetDeg: 7.5 })
-    expect(onChange).toHaveBeenNthCalledWith(2, { panoramaPointOverlayEnabled: true })
-    expect(onChange).toHaveBeenNthCalledWith(3, { panoramaDefaultQuality: 'ultra' })
-    expect(onChange).toHaveBeenNthCalledWith(4, { showAllMapTracks: true })
+    expect(onChange).toHaveBeenNthCalledWith(2, { panoramaPointOverlayEnabled: false })
+    expect(onChange).toHaveBeenNthCalledWith(3, { panoramaImageOpacity: 0.35 })
+    expect(onChange).toHaveBeenNthCalledWith(4, { panoramaDefaultQuality: 'ultra' })
+    expect(onChange).toHaveBeenNthCalledWith(5, { showAllMapTracks: true })
     expect(onReset).toHaveBeenCalledTimes(1)
   })
 
@@ -44,7 +48,8 @@ describe('GeneralSettingsPanel', () => {
       />,
     )
 
-    expect(screen.getByRole('slider', { name: '파노라마 포인트 투명도' })).toBeDisabled()
+    expect(screen.getByRole('slider', { name: '파노라마 영상 투명도' })).toBeDisabled()
+    expect(screen.getByText('포인트는 선명하게 유지하고 배경 영상만 흐리게 조절합니다.')).toBeInTheDocument()
     expect(screen.getByText('활성 트랙만 색상으로 표시합니다.')).toBeInTheDocument()
   })
 })

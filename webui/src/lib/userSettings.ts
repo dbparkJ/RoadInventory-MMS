@@ -5,7 +5,7 @@ export type PanoramaQuality = 'fast' | 'high' | 'ultra'
 export interface UserSettings {
   panoramaForwardOffsetDeg: number
   panoramaPointOverlayEnabled: boolean
-  panoramaPointOverlayOpacity: number
+  panoramaImageOpacity: number
   panoramaDefaultQuality: PanoramaQuality
   showAllMapTracks: boolean
 }
@@ -17,7 +17,9 @@ export const USER_SETTINGS_STORAGE_KEY = 'mms-operator-console:user-settings:v1'
 export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = Object.freeze({
   panoramaForwardOffsetDeg: 0,
   panoramaPointOverlayEnabled: false,
-  panoramaPointOverlayOpacity: 0.65,
+  // When points are overlaid, slightly fading the camera image keeps the
+  // measurements legible without hiding either source.
+  panoramaImageOpacity: 0.65,
   panoramaDefaultQuality: 'high',
   // A dense delivery can contain many overlapping routes. Keep only the
   // active track visible until an operator explicitly asks for all tracks.
@@ -50,9 +52,9 @@ export function sanitizeUserSettings(value: unknown): UserSettings {
       typeof candidate.panoramaPointOverlayEnabled === 'boolean'
         ? candidate.panoramaPointOverlayEnabled
         : DEFAULT_USER_SETTINGS.panoramaPointOverlayEnabled,
-    panoramaPointOverlayOpacity: finiteNumber(
-      candidate.panoramaPointOverlayOpacity,
-      DEFAULT_USER_SETTINGS.panoramaPointOverlayOpacity,
+    panoramaImageOpacity: finiteNumber(
+      candidate.panoramaImageOpacity ?? candidate.panoramaPointOverlayOpacity,
+      DEFAULT_USER_SETTINGS.panoramaImageOpacity,
       0,
       1,
     ),

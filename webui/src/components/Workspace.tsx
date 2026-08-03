@@ -13,9 +13,10 @@ import {
   X,
 } from 'lucide-react'
 import { lazy, Suspense, useEffect, useRef, type ReactNode } from 'react'
+import { frameNavigationDirection } from '../lib/frameNavigation'
 import { DEFAULT_USER_SETTINGS, type UserSettings, type UserSettingsPatch } from '../lib/userSettings'
 import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
-import { DetachablePanel } from './DetachablePanel'
+import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 
 const MapView = lazy(() =>
   import('../views/MapView').then((module) => ({ default: module.MapView })),
@@ -64,7 +65,6 @@ export function Workspace({
   pointCloudOpen,
   hasMoreFrames,
   inspectorOpen,
-  detached = false,
   settings = DEFAULT_USER_SETTINGS,
   externalAction,
   onTogglePanorama,
@@ -76,48 +76,48 @@ export function Workspace({
   onUseDemo,
   onSettingsChange,
 }: WorkspaceProps) {
-  const workspaceRef = useRef<HTMLElement>(null)
+  const panoramaPanelRef = useRef<DetachablePanelHandle>(null)
+  const pointCloudPanelRef = useRef<DetachablePanelHandle>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
   const canMovePrevious = currentIndex > 0
   const canMoveNext = currentIndex >= 0 && (currentIndex < frames.length - 1 || hasMoreFrames)
-  const overlayCount = Number(panoramaOpen) + Number(pointCloudOpen)
 
   useEffect(() => {
-    const ownerWindow = workspaceRef.current?.ownerDocument.defaultView ?? window
     const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.altKey ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.shiftKey
-      ) {
-        return
-      }
-      const target = event.target as HTMLElement | null
-      if (
-        target &&
-        (target.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName))
-      ) {
-        return
-      }
-
-      const previous = event.key === 'ArrowLeft' || event.code === 'KeyA'
-      const next = event.key === 'ArrowRight' || event.code === 'KeyD'
-      if (previous && canMovePrevious) {
+      const direction = frameNavigationDirection(event)
+      if (direction === -1 && canMovePrevious) {
         event.preventDefault()
         onMoveFrame(-1)
-      } else if (next && canMoveNext) {
+      } else if (direction === 1 && canMoveNext) {
         event.preventDefault()
         onMoveFrame(1)
       }
     }
-    ownerWindow.addEventListener('keydown', onKeyDown)
-    return () => ownerWindow.removeEventListener('keydown', onKeyDown)
-  }, [canMoveNext, canMovePrevious, detached, onMoveFrame])
+    // Keep the canonical listener in the application window. DetachablePanel
+    // relays the same keys from every child popup, including nested popouts.
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [canMoveNext, canMovePrevious, onMoveFrame])
+
+  const togglePanoramaPopup = () => {
+    if (panoramaOpen) {
+      panoramaPanelRef.current?.returnToMain()
+      return
+    }
+    // window.open must run synchronously in this click to avoid popup blockers.
+    if (panoramaPanelRef.current?.detach()) onTogglePanorama()
+  }
+
+  const togglePointCloudPopup = () => {
+    if (pointCloudOpen) {
+      pointCloudPanelRef.current?.returnToMain()
+      return
+    }
+    if (pointCloudPanelRef.current?.detach()) onTogglePointCloud()
+  }
 
   return (
-    <main className="workspace" ref={workspaceRef}>
+    <main className="workspace">
       <header className="workspace-bar">
         <nav className="view-tabs layer-toggles" aria-label="표시 데이터 선택">
           <button type="button" className="active base-layer" aria-pressed="true" title="기본 지도는 항상 표시됩니다.">
@@ -128,8 +128,8 @@ export function Workspace({
             type="button"
             className={panoramaOpen ? 'active' : ''}
             aria-pressed={panoramaOpen}
-            onClick={onTogglePanorama}
-            title="파노라마 오버레이 켜기/끄기"
+            onClick={togglePanoramaPopup}
+            title={panoramaOpen ? '파노라마 팝업 닫기' : '파노라마 팝업 열기'}
           >
             <Image size={15} />
             파노라마
@@ -138,8 +138,8 @@ export function Workspace({
             type="button"
             className={pointCloudOpen ? 'active' : ''}
             aria-pressed={pointCloudOpen}
-            onClick={onTogglePointCloud}
-            title="3D 포인트 오버레이 켜기/끄기"
+            onClick={togglePointCloudPopup}
+            title={pointCloudOpen ? '3D 포인트 팝업 닫기' : '3D 포인트 팝업 열기'}
           >
             <Layers3 size={15} />
             3D 포인트
@@ -209,83 +209,97 @@ export function Workspace({
               />
             </Suspense>
 
-            {overlayCount > 0 && (
-              <div className={`viewer-overlay-stack count-${overlayCount}`}>
-                {panoramaOpen && (
-                  <DetachablePanel
-                    id={`panorama-${dataset.id}`}
-                    title="파노라마 뷰어"
-                    placeholderClassName="viewer-pane-slot"
-                  >
-                    {({ action }) => (
-                      <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 오버레이">
-                        <header className="viewer-pane-header">
-                          <span><Image size={14} /> 파노라마</span>
-                          <div className="viewer-pane-actions">
-                            {action}
-                            <button type="button" onClick={onTogglePanorama} aria-label="파노라마 닫기" title="파노라마 닫기">
-                              <X size={14} />
-                            </button>
-                          </div>
-                        </header>
-                        <div className="viewer-pane-content">
-                          <Suspense fallback={<ViewerLoading label="파노라마 엔진 준비 중" />}>
-                            <PanoramaView
-                              datasetId={dataset.id}
-                              frame={frame}
-                              demoMode={demoMode}
-                              forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
-                              quality={settings.panoramaDefaultQuality}
-                              pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
-                              pointOverlayOpacity={settings.panoramaPointOverlayOpacity}
-                              onQualityChange={(quality) =>
-                                onSettingsChange?.({ panoramaDefaultQuality: quality })
-                              }
-                              onPointOverlayEnabledChange={(enabled) =>
-                                onSettingsChange?.({ panoramaPointOverlayEnabled: enabled })
-                              }
-                              onPointOverlayOpacityChange={(opacity) =>
-                                onSettingsChange?.({ panoramaPointOverlayOpacity: opacity })
-                              }
-                              onPreviousFrame={() => onMoveFrame(-1)}
-                              onNextFrame={() => onMoveFrame(1)}
-                              hasPreviousFrame={canMovePrevious}
-                              hasNextFrame={canMoveNext}
-                            />
-                          </Suspense>
-                        </div>
-                      </section>
-                    )}
-                  </DetachablePanel>
-                )}
-                {pointCloudOpen && (
-                  <DetachablePanel
-                    id={`pointcloud-${dataset.id}`}
-                    title="3D 포인트 뷰어"
-                    placeholderClassName="viewer-pane-slot"
-                  >
-                    {({ action }) => (
-                      <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 오버레이">
-                        <header className="viewer-pane-header">
-                          <span><Layers3 size={14} /> 3D 포인트</span>
-                          <div className="viewer-pane-actions">
-                            {action}
-                            <button type="button" onClick={onTogglePointCloud} aria-label="3D 포인트 닫기" title="3D 포인트 닫기">
-                              <X size={14} />
-                            </button>
-                          </div>
-                        </header>
-                        <div className="viewer-pane-content">
-                          <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
-                            <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
-                          </Suspense>
-                        </div>
-                      </section>
-                    )}
-                  </DetachablePanel>
-                )}
-              </div>
-            )}
+            <DetachablePanel
+              ref={panoramaPanelRef}
+              id={`panorama-${dataset.id}`}
+              title="파노라마 뷰어"
+              placeholderClassName="viewer-pane-slot"
+              hostHidden
+              onDetachedChange={(isDetached) => {
+                if (!isDetached && panoramaOpen) onTogglePanorama()
+              }}
+            >
+              {() =>
+                panoramaOpen ? (
+                  <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 팝업">
+                    <header className="viewer-pane-header">
+                      <span><Image size={14} /> 파노라마</span>
+                      <div className="viewer-pane-actions">
+                        <button
+                          type="button"
+                          onClick={() => panoramaPanelRef.current?.returnToMain()}
+                          aria-label="파노라마 닫기"
+                          title="파노라마 닫기"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </header>
+                    <div className="viewer-pane-content">
+                      <Suspense fallback={<ViewerLoading label="파노라마 엔진 준비 중" />}>
+                        <PanoramaView
+                          datasetId={dataset.id}
+                          frame={frame}
+                          demoMode={demoMode}
+                          forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
+                          quality={settings.panoramaDefaultQuality}
+                          pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
+                          panoramaOpacity={settings.panoramaImageOpacity}
+                          onQualityChange={(quality) =>
+                            onSettingsChange?.({ panoramaDefaultQuality: quality })
+                          }
+                          onPointOverlayEnabledChange={(enabled) =>
+                            onSettingsChange?.({ panoramaPointOverlayEnabled: enabled })
+                          }
+                          onPanoramaOpacityChange={(opacity) =>
+                            onSettingsChange?.({ panoramaImageOpacity: opacity })
+                          }
+                          onPreviousFrame={() => onMoveFrame(-1)}
+                          onNextFrame={() => onMoveFrame(1)}
+                          hasPreviousFrame={canMovePrevious}
+                          hasNextFrame={canMoveNext}
+                        />
+                      </Suspense>
+                    </div>
+                  </section>
+                ) : null
+              }
+            </DetachablePanel>
+            <DetachablePanel
+              ref={pointCloudPanelRef}
+              id={`pointcloud-${dataset.id}`}
+              title="3D 포인트 뷰어"
+              placeholderClassName="viewer-pane-slot"
+              hostHidden
+              onDetachedChange={(isDetached) => {
+                if (!isDetached && pointCloudOpen) onTogglePointCloud()
+              }}
+            >
+              {() =>
+                pointCloudOpen ? (
+                  <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 팝업">
+                    <header className="viewer-pane-header">
+                      <span><Layers3 size={14} /> 3D 포인트</span>
+                      <div className="viewer-pane-actions">
+                        <button
+                          type="button"
+                          onClick={() => pointCloudPanelRef.current?.returnToMain()}
+                          aria-label="3D 포인트 닫기"
+                          title="3D 포인트 닫기"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </header>
+                    <div className="viewer-pane-content">
+                      <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
+                        <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
+                      </Suspense>
+                    </div>
+                  </section>
+                ) : null
+              }
+            </DetachablePanel>
           </>
         )}
 

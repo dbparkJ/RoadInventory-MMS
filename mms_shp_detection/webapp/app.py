@@ -23,6 +23,7 @@ from .datasets import public_dataset, utc_now
 from .datasets import router as datasets_router
 from .media import router as media_router
 from .optimizer import router as optimizer_router
+from .overlays import router as overlays_router
 from .runs import RunManager, public_run
 from .runs import router as runs_router
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
@@ -85,9 +86,17 @@ class WebAppConfig:
     max_upload_chunk_bytes: int = 512 * 1024**2
     max_tree_entries: int = 1_000
     max_result_files: int = 2_000
+    max_result_shapefiles: int = 256
+    max_result_shapefile_files: int = 2_048
+    max_result_priority_entries: int = 10_000
     max_route_points: int = 10_000
     max_panorama_previews: int = 2
     max_point_previews: int = 1
+    max_overlay_upload_files: int = 32
+    max_overlay_file_bytes: int = 512 * 1024**2
+    max_overlay_total_bytes: int = 1024**3
+    max_overlay_features: int = 500_000
+    max_overlay_response_features: int = 10_000
     enable_run_worker: bool = True
     static_dir: Path | None = None
 
@@ -126,11 +135,23 @@ class WebAppConfig:
             self.max_upload_chunk_bytes,
             self.max_tree_entries,
             self.max_result_files,
+            self.max_result_shapefiles,
+            self.max_result_shapefile_files,
+            self.max_result_priority_entries,
             self.max_route_points,
             self.max_panorama_previews,
             self.max_point_previews,
+            self.max_overlay_upload_files,
+            self.max_overlay_file_bytes,
+            self.max_overlay_total_bytes,
+            self.max_overlay_features,
+            self.max_overlay_response_features,
         ) <= 0:
             raise ValueError("Web server limits must be positive.")
+        if self.max_result_shapefile_files < self.max_result_shapefiles:
+            raise ValueError(
+                "max_result_shapefile_files must allow at least one file per SHP bundle."
+            )
 
 
 def _make_storage_roots(config: WebAppConfig) -> list[StorageRoot]:
@@ -440,6 +461,7 @@ def create_app(
     # Fingerprint/file locks disappear once no request references them, so a
     # long-running server does not retain one lock per preview or upload chunk.
     app.state.media_locks = weakref.WeakValueDictionary()
+    app.state.overlay_locks = weakref.WeakValueDictionary()
     app.state.upload_locks = weakref.WeakValueDictionary()
     app.state.upload_coordinators = weakref.WeakValueDictionary()
     app.state.upload_owner_tasks = set()
@@ -467,6 +489,7 @@ def create_app(
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.include_router(datasets_router)
     app.include_router(media_router)
+    app.include_router(overlays_router)
     app.include_router(optimizer_router)
     app.include_router(uploads_router)
     app.include_router(runs_router)
@@ -542,6 +565,9 @@ def create_app(
                 "panorama_preview": True,
                 "point_preview": app.state.point_preview_available,
                 "panorama_point_overlay": app.state.point_preview_available,
+                "shp_overlays": True,
+                "shp_feature_editing": True,
+                "shp_result_download": True,
                 "automatic_parameters": True,
                 "run_sse": True,
                 "single_gpu_queue": True,
@@ -550,6 +576,8 @@ def create_app(
                 "max_panorama_width": 8192,
                 "max_point_budget": 250_000,
                 "upload_chunk_bytes": config.max_upload_chunk_bytes,
+                "max_overlay_upload_bytes": config.max_overlay_total_bytes,
+                "max_overlay_features": config.max_overlay_features,
             },
         }
 

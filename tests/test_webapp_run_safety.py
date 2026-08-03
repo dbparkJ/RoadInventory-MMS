@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import tempfile
@@ -16,10 +17,11 @@ from mms_shp_detection.webapp.runs import (
     _process_failure_message,
     _progress_from_log,
     _result_summary,
+    get_results,
+    get_run,
     public_run,
 )
 from mms_shp_detection.webapp.store import WebStore
-
 
 NOW = "2026-07-31T00:00:00+00:00"
 
@@ -152,6 +154,77 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 explicit = client.get("/api/runs/run-complete/results")
                 self.assertEqual(explicit.status_code, 200)
                 self.assertEqual(explicit.json()["file_count"], 2)
+
+    def test_shapefile_and_manifest_discovery_bypasses_artifact_page_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            state = Path(state_text)
+            config = WebAppConfig(
+                project_root=Path(__file__).resolve().parents[1],
+                state_dir=state,
+                allowed_roots=[root],
+                enable_run_worker=False,
+                max_result_files=2,
+                max_result_priority_entries=1,
+            )
+            app = create_app(config)
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-priority")
+            output = state / "runs" / "run-priority" / "output"
+            shp_dir = output / "shp"
+            shp_dir.mkdir(parents=True)
+            ordinary = []
+            for name in ("first.txt", "second.json"):
+                path = output / name
+                path.write_text(name, encoding="utf-8")
+                ordinary.append(path)
+            for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+                (shp_dir / f"detected_signs{suffix}").write_bytes(suffix.encode("ascii"))
+            model_shp = output / "model_a" / "shp"
+            model_shp.mkdir(parents=True)
+            for suffix in (".shp", ".shx", ".dbf"):
+                (model_shp / f"pole_bottoms{suffix}").write_bytes(suffix.encode("ascii"))
+            (output / "run_manifest.json").write_text(
+                '{"status":"completed","feature_counts":{"detections":7}}',
+                encoding="utf-8",
+            )
+            (output / "models_manifest.json").write_text(
+                '{"models":[{"model_key":"C:"},{"model_key":"model_a"}]}',
+                encoding="utf-8",
+            )
+            app.state.store.update_run(
+                "run-priority",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+            run = app.state.store.get_run("run-priority")
+
+            # Simulate the ordinary artifact walker consuming its entire page
+            # before it ever visits output/shp or the manifest.
+            with mock.patch(
+                "mms_shp_detection.webapp.runs._bounded_result_files",
+                return_value=(ordinary, True),
+            ):
+                summary = _result_summary(app, run)  # type: ignore[arg-type]
+            self.assertIsNotNone(summary)
+            assert summary is not None
+            self.assertEqual(summary["feature_counts"], {"detections": 7})
+            self.assertEqual(len(summary["shapefiles"]), 2)
+            shapes = {shape["name"]: shape for shape in summary["shapefiles"]}
+            shape = shapes["detected_signs"]
+            self.assertEqual(shape["path"], "shp/detected_signs.shp")
+            self.assertEqual(len(shape["files"]), 5)
+            self.assertIn("/shapefile?path=", shape["download_url"])
+            self.assertEqual(
+                shapes["pole_bottoms"]["path"], "model_a/shp/pole_bottoms.shp"
+            )
+
+            # Result tree scans run in FastAPI's worker thread pool, not the
+            # event loop that serves panorama/map requests.
+            self.assertFalse(inspect.iscoroutinefunction(get_run))
+            self.assertFalse(inspect.iscoroutinefunction(get_results))
 
     def test_claim_refuses_second_run_while_any_run_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as state_text:

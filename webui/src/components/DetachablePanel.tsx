@@ -1,6 +1,16 @@
 import { ExternalLink, PanelTopClose } from 'lucide-react'
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { createPortal } from 'react-dom'
+import { frameNavigationDirection, isTextEntryTarget } from '../lib/frameNavigation'
 
 interface DetachablePanelControls {
   detached: boolean
@@ -17,16 +27,27 @@ interface DetachablePanelProps {
   children: (controls: DetachablePanelControls) => ReactNode
 }
 
-export function DetachablePanel({
-  id,
-  title,
-  placeholderClassName = '',
-  hostHidden = false,
-  onDetachedChange,
-  children,
-}: DetachablePanelProps) {
+export interface DetachablePanelHandle {
+  detach: () => boolean
+  focus: () => void
+  returnToMain: () => void
+}
+
+export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanelProps>(function DetachablePanel(
+  {
+    id,
+    title,
+    placeholderClassName = '',
+    hostHidden = false,
+    onDetachedChange,
+    children,
+  },
+  forwardedRef,
+) {
   const popupRef = useRef<Window | null>(null)
   const mountRef = useRef<HTMLDivElement>(null)
+  const onDetachedChangeRef = useRef(onDetachedChange)
+  onDetachedChangeRef.current = onDetachedChange
   const [panelHost] = useState(() => {
     const host = document.createElement('div')
     host.className = 'popout-panel'
@@ -49,14 +70,14 @@ export function DetachablePanel({
     popupRef.current = null
     moveHome()
     setPortalRoot(null)
-    onDetachedChange?.(false)
+    onDetachedChangeRef.current?.(false)
     if (popup && !popup.closed) popup.close()
-  }, [moveHome, onDetachedChange])
+  }, [moveHome])
 
   const detach = useCallback(() => {
     if (popupRef.current && !popupRef.current.closed) {
       popupRef.current.focus()
-      return
+      return true
     }
 
     const sourceDocument = mountRef.current?.ownerDocument ?? document
@@ -66,7 +87,7 @@ export function DetachablePanel({
       `mms-${id}`,
       'popup=yes,width=1180,height=760,left=80,top=80,resizable=yes,scrollbars=no',
     )
-    if (!popup) return
+    if (!popup) return false
 
     popup.document.head.replaceChildren()
     const base = popup.document.createElement('base')
@@ -86,25 +107,67 @@ export function DetachablePanel({
     popup.document.body.appendChild(root)
     root.appendChild(panelHost)
 
+    // React portals keep their event tree, but native keyboard events do not cross
+    // Window boundaries. Relay only frame-navigation keys back through the opener
+    // chain so one global handler can serve every detached panel.
+    const relayFrameNavigation = (event: KeyboardEvent) => {
+      const globalOverlayKey =
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.shiftKey &&
+        !isTextEntryTarget(event.target) &&
+        (event.code === 'KeyP' || event.key === 'Escape')
+      if (!frameNavigationDirection(event) && !globalOverlayKey) return
+      event.preventDefault()
+      sourceWindow.dispatchEvent(
+        new sourceWindow.KeyboardEvent('keydown', {
+          key: event.key,
+          code: event.code,
+          repeat: event.repeat,
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    }
+    popup.addEventListener('keydown', relayFrameNavigation)
+
     const onClose = () => {
       if (popupRef.current !== popup) return
       popupRef.current = null
       moveHome()
       setPortalRoot(null)
-      onDetachedChange?.(false)
+      onDetachedChangeRef.current?.(false)
     }
     popup.addEventListener('beforeunload', onClose, { once: true })
     popupRef.current = popup
     setPortalRoot(root)
-    onDetachedChange?.(true)
+    onDetachedChangeRef.current?.(true)
     popup.focus()
-  }, [id, moveHome, onDetachedChange, panelHost, title])
+    return true
+  }, [id, moveHome, panelHost, title])
 
-  useEffect(() => () => {
-    const popup = popupRef.current
-    popupRef.current = null
-    if (popup && !popup.closed) popup.close()
-  }, [])
+  useImperativeHandle(
+    forwardedRef,
+    () => ({
+      detach,
+      focus: () => popupRef.current?.focus(),
+      returnToMain: attach,
+    }),
+    [attach, detach],
+  )
+
+  useEffect(
+    () => () => {
+      const popup = popupRef.current
+      popupRef.current = null
+      if (popup && !popup.closed) {
+        popup.close()
+        onDetachedChangeRef.current?.(false)
+      }
+    },
+    [],
+  )
 
   const attachedAction = (
     <button
@@ -162,4 +225,4 @@ export function DetachablePanel({
       )}
     </>
   )
-}
+})

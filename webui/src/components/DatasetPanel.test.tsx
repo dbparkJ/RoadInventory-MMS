@@ -107,4 +107,34 @@ describe('DatasetPanel frame range selection', () => {
     expect(onFrameRangeChange).toHaveBeenCalledWith([10, 30])
     expect(onFrameChange).toHaveBeenCalledWith(FRAMES[2])
   })
+
+  it('minimizes and restores the frame component without losing the panel', () => {
+    renderPanel()
+
+    fireEvent.click(screen.getByRole('button', { name: '프레임 컴포넌트 최소화' }))
+    expect(screen.queryByRole('spinbutton', { name: '실행 시작 프레임 번호' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '프레임 컴포넌트 복원' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '프레임 컴포넌트 복원' }))
+    expect(screen.getByRole('spinbutton', { name: '실행 시작 프레임 번호' })).toBeInTheDocument()
+  })
+
+  it('offers a compact data explorer rail controlled by the parent layout', () => {
+    const onToggleCollapsed = vi.fn()
+    const { rerender, props } = renderPanel({ onToggleCollapsed })
+
+    fireEvent.click(screen.getByRole('button', { name: '작업 데이터 패널 최소화' }))
+    expect(onToggleCollapsed).toHaveBeenCalledOnce()
+
+    rerender(<DatasetPanel {...props} collapsed onToggleCollapsed={onToggleCollapsed} />)
+    expect(screen.getByRole('complementary', { name: '데이터 탐색기' })).toHaveAttribute(
+      'data-collapsed',
+      'true',
+    )
+    expect(screen.getByRole('button', { name: '작업 데이터 패널 복원' })).toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: '데이터셋 선택' })).not.toBeInTheDocument()
+  })
 })

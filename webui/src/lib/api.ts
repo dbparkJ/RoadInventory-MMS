@@ -2,10 +2,18 @@ import type {
   BootstrapResponse,
   DatasetDetail,
   FramePage,
+  OverlayCoordinateSpace,
+  OverlayEncoding,
+  OverlayFeature,
+  OverlayFeatureCollection,
+  OverlayFeatureDetail,
+  OverlayLayer,
+  PanoramaOverlayFeature,
   RouteResponse,
   RunEvent,
   RunRecord,
   RunRequest,
+  RunResults,
   StorageRoot,
   StorageTreeResponse,
   UploadManifestFile,
@@ -236,6 +244,171 @@ export const api = {
     )
   },
 
+  overlays(id: string, signal?: AbortSignal) {
+    return json<{ items: OverlayLayer[] }>(`/api/datasets/${encodeURIComponent(id)}/overlays`, {
+      signal,
+      timeout: 30_000,
+    })
+  },
+
+  uploadOverlay(
+    id: string,
+    files: File[],
+    name?: string,
+    crs?: string,
+    encoding: OverlayEncoding = 'auto',
+  ) {
+    const body = new FormData()
+    files.forEach((file) => body.append('files', file, file.name))
+    if (name?.trim()) body.append('name', name.trim())
+    if (crs?.trim()) body.append('crs', crs.trim())
+    body.append('encoding', encoding)
+    return json<{ layer: OverlayLayer }>(`/api/datasets/${encodeURIComponent(id)}/overlays`, {
+      method: 'POST',
+      body,
+      timeout: 120_000,
+    })
+  },
+
+  overlayFeatures(
+    datasetId: string,
+    layerId: string,
+    coordinateSpace: OverlayCoordinateSpace,
+    offset = 0,
+    limit = 5_000,
+    signal?: AbortSignal,
+  ) {
+    return json<OverlayFeatureCollection>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features`,
+        { coordinate_space: coordinateSpace, offset, limit },
+      ),
+      { signal, timeout: 45_000 },
+    )
+  },
+
+  overlaySpatialFeatures(
+    datasetId: string,
+    layerId: string,
+    center: [number, number],
+    radius: number,
+    limit = 5_000,
+    signal?: AbortSignal,
+  ) {
+    return json<OverlayFeatureCollection>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features`,
+        {
+          coordinate_space: 'dataset',
+          center_x: center[0],
+          center_y: center[1],
+          radius,
+          offset: 0,
+          limit,
+        },
+      ),
+      { signal, timeout: 45_000 },
+    )
+  },
+
+  overlayFeature(
+    datasetId: string,
+    layerId: string,
+    featureId: string | number,
+    coordinateSpace: OverlayCoordinateSpace,
+    signal?: AbortSignal,
+  ) {
+    return json<OverlayFeatureDetail>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features/${encodeURIComponent(String(featureId))}`,
+        { coordinate_space: coordinateSpace },
+      ),
+      { signal, timeout: 30_000 },
+    )
+  },
+
+  patchOverlayFeature(
+    datasetId: string,
+    layerId: string,
+    featureId: string | number,
+    payload: {
+      geometry?: { type: 'Point'; coordinates: [number, number, number?] }
+      coordinate_space?: OverlayCoordinateSpace
+      properties?: Record<string, unknown>
+      expected_revision?: number
+    },
+  ) {
+    return json<{ feature: OverlayFeature; revision: number; coordinate_space: OverlayCoordinateSpace }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features/${encodeURIComponent(String(featureId))}`,
+      { method: 'PATCH', ...jsonBody(payload), timeout: 30_000 },
+    )
+  },
+
+  deleteOverlayFeature(
+    datasetId: string,
+    layerId: string,
+    featureId: string | number,
+    expectedRevision?: number,
+  ) {
+    return json<{ id: string | number; deleted: boolean; revision: number; source_preserved: boolean }>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features/${encodeURIComponent(String(featureId))}`,
+        { expected_revision: expectedRevision },
+      ),
+      { method: 'DELETE', timeout: 30_000 },
+    )
+  },
+
+  deleteOverlay(datasetId: string, layerId: string) {
+    return json<{ deleted: boolean }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}`,
+      { method: 'DELETE', timeout: 30_000 },
+    )
+  },
+
+  overlayDownloadUrl(datasetId: string, layerId: string) {
+    return buildApiUrl(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/download`,
+    )
+  },
+
+  panoramaOverlayProjection(
+    datasetId: string,
+    layerId: string,
+    frameId: string,
+    signal?: AbortSignal,
+  ) {
+    return json<{
+      layer_id: string
+      frame_id: string
+      coordinate_space: 'normalized_equirectangular'
+      dataset_crs: string
+      revision: number
+      items: PanoramaOverlayFeature[]
+      count: number
+      yaw_offset_deg: number
+      pitch_offset_deg: number
+    }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/project/${encodeURIComponent(frameId)}`,
+      { signal, timeout: 30_000 },
+    )
+  },
+
+  panoramaPick(
+    datasetId: string,
+    frameId: string,
+    sample: { u: number; v: number; depth: number },
+  ) {
+    return json<{
+      dataset_position: [number, number, number]
+      wgs84?: { lon: number; lat: number; altitude?: number }
+    }>(`/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/panorama-pick`, {
+      method: 'POST',
+      ...jsonBody(sample),
+      timeout: 30_000,
+    })
+  },
+
   async panorama(id: string, frameId: string, width: number, signal?: AbortSignal) {
     const response = await request(
       buildApiUrl(
@@ -326,6 +499,26 @@ export const api = {
 
   runs(signal?: AbortSignal) {
     return json<{ items: RunRecord[] }>('/api/runs', { signal })
+  },
+
+  runResults(runId: string, signal?: AbortSignal) {
+    return json<RunResults>(`/api/runs/${encodeURIComponent(runId)}/results`, {
+      signal,
+      timeout: 30_000,
+    })
+  },
+
+  importRunShapefile(
+    runId: string,
+    path: string,
+    name?: string,
+    encoding: OverlayEncoding = 'auto',
+  ) {
+    return json<{ layer: OverlayLayer }>(`/api/runs/${encodeURIComponent(runId)}/shapefile/import`, {
+      method: 'POST',
+      ...jsonBody({ path, name, encoding }),
+      timeout: 60_000,
+    })
   },
 
   createRun(payload: RunRequest) {

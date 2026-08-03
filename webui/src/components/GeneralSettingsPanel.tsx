@@ -122,21 +122,22 @@ export function GeneralSettingsPanel({
 
           <label className="general-settings-slider">
             <span>
-              <strong>포인트 투명도</strong>
-              <output>{Math.round(settings.panoramaPointOverlayOpacity * 100)}%</output>
+              <strong>파노라마 영상 투명도</strong>
+              <output>{Math.round(settings.panoramaImageOpacity * 100)}%</output>
             </span>
             <input
               type="range"
-              aria-label="파노라마 포인트 투명도"
+              aria-label="파노라마 영상 투명도"
               min={0}
               max={1}
               step={0.05}
-              value={settings.panoramaPointOverlayOpacity}
+              value={settings.panoramaImageOpacity}
               disabled={!settings.panoramaPointOverlayEnabled}
               onChange={(event) =>
-                onChange({ panoramaPointOverlayOpacity: Number(event.target.value) })
+                onChange({ panoramaImageOpacity: Number(event.target.value) })
               }
             />
+            <small>포인트는 선명하게 유지하고 배경 영상만 흐리게 조절합니다.</small>
           </label>
         </section>
 

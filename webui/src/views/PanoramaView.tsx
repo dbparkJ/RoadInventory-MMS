@@ -1,22 +1,25 @@
 import {
   ChevronLeft,
   ChevronRight,
+  Crosshair,
   Expand,
   LoaderCircle,
   Maximize2,
+  MapPin,
   Minus,
   MousePointer2,
   Plus,
   RefreshCcw,
   ScanLine,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import demoPanorama from '../assets/demo-panorama.svg'
+import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
 import type { PanoramaQuality } from '../lib/userSettings'
-import type { Frame, PanoramaPointPayload } from '../types'
+import type { Frame, PanoramaOverlayFeature, PanoramaPointPayload } from '../types'
 
 export type { PanoramaQuality } from '../lib/userSettings'
 
@@ -98,8 +101,84 @@ function createPanoramaPointTexture(
   return texture
 }
 
+interface RenderPanoramaOverlayPoint extends PanoramaOverlayFeature {
+  layerId: string
+  color: string
+  selected: boolean
+}
+
+function createPanoramaOverlayTexture(
+  ownerDocument: Document,
+  points: RenderPanoramaOverlayPoint[],
+): THREE.CanvasTexture {
+  const width = 2048
+  const height = 1024
+  const canvas = ownerDocument.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('SHP 오버레이 캔버스를 만들 수 없습니다.')
+
+  points.forEach((point) => {
+    const x = (((point.u % 1) + 1) % 1) * width
+    const y = Math.min(1, Math.max(0, point.v)) * height
+    const radius = point.selected ? 11 : point.depth < 20 ? 8 : 6
+    context.beginPath()
+    context.arc(x, y, radius + 3, 0, Math.PI * 2)
+    context.fillStyle = point.selected ? '#ffffff' : 'rgba(7, 17, 31, 0.9)'
+    context.fill()
+    context.beginPath()
+    context.arc(x, y, radius, 0, Math.PI * 2)
+    context.fillStyle = point.color
+    context.fill()
+    context.lineWidth = 2
+    context.strokeStyle = '#ffffff'
+    context.stroke()
+  })
+
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.colorSpace = THREE.SRGBColorSpace
+  texture.wrapS = THREE.RepeatWrapping
+  texture.minFilter = THREE.LinearFilter
+  texture.magFilter = THREE.LinearFilter
+  texture.needsUpdate = true
+  return texture
+}
+
+function wrappedUVDistanceSquared(u: number, v: number, targetU: number, targetV: number): number {
+  const directU = Math.abs(u - targetU)
+  const wrappedU = Math.min(directU, 1 - Math.min(1, directU))
+  return wrappedU * wrappedU + (v - targetV) * (v - targetV)
+}
+
+export function nearestPanoramaPointIndex(
+  u: number,
+  v: number,
+  coordinates: Float32Array,
+  pointCount: number,
+  maximumDistance = 0.03,
+): number | null {
+  let nearestIndex: number | null = null
+  let nearestDistance = maximumDistance * maximumDistance
+  for (let index = 0; index < pointCount; index += 1) {
+    const offset = index * 3
+    const candidateU = coordinates[offset]
+    const candidateV = coordinates[offset + 1]
+    if (!Number.isFinite(candidateU) || !Number.isFinite(candidateV)) continue
+    const distance = wrappedUVDistanceSquared(u, v, candidateU, candidateV)
+    if (distance <= nearestDistance) {
+      nearestDistance = distance
+      nearestIndex = index
+    }
+  }
+  return nearestIndex
+}
+
 interface PanoramaRuntime {
   scene: THREE.Scene
+  camera: THREE.PerspectiveCamera
+  renderer: THREE.WebGLRenderer
+  panoramaMesh: THREE.Mesh
   panoramaMaterial: THREE.MeshBasicMaterial
 }
 
@@ -115,9 +194,9 @@ export default function PanoramaView({
   quality: controlledQuality,
   onQualityChange,
   pointOverlayEnabled: controlledPointOverlayEnabled,
-  pointOverlayOpacity: controlledPointOverlayOpacity,
+  panoramaOpacity: controlledPanoramaOpacity,
   onPointOverlayEnabledChange,
-  onPointOverlayOpacityChange,
+  onPanoramaOpacityChange,
 }: {
   datasetId: string
   frame: Frame | null
@@ -130,10 +209,11 @@ export default function PanoramaView({
   quality?: PanoramaQuality
   onQualityChange?: (quality: PanoramaQuality) => void
   pointOverlayEnabled?: boolean
-  pointOverlayOpacity?: number
+  panoramaOpacity?: number
   onPointOverlayEnabledChange?: (enabled: boolean) => void
-  onPointOverlayOpacityChange?: (opacity: number) => void
+  onPanoramaOpacityChange?: (opacity: number) => void
 }) {
+  const overlay = useOptionalOverlayWorkspace()
   const stageRef = useRef<HTMLDivElement>(null)
   const [source, setSource] = useState<string | null>(demoMode ? demoPanorama : null)
   const [loading, setLoading] = useState(!demoMode)
@@ -143,23 +223,55 @@ export default function PanoramaView({
   const [pitch, setPitch] = useState(0)
   const [localQuality, setLocalQuality] = useState<PanoramaQuality>('high')
   const [localPointOverlayEnabled, setLocalPointOverlayEnabled] = useState(false)
-  const [localPointOverlayOpacity, setLocalPointOverlayOpacity] = useState(0.65)
+  const [localPanoramaOpacity, setLocalPanoramaOpacity] = useState(0.65)
   const [pointPayload, setPointPayload] = useState<PanoramaPointPayload | null>(null)
   const [pointLoading, setPointLoading] = useState(false)
   const [pointIndexing, setPointIndexing] = useState(false)
   const [pointError, setPointError] = useState<string | null>(null)
   const [pointReloadKey, setPointReloadKey] = useState(0)
+  const [overlayProjection, setOverlayProjection] = useState<RenderPanoramaOverlayPoint[]>([])
+  const [overlayLoading, setOverlayLoading] = useState(false)
+  const [pickFeedback, setPickFeedback] = useState<string | null>(null)
   const runtimeRef = useRef<PanoramaRuntime | null>(null)
-  const overlayMaterialRef = useRef<THREE.MeshBasicMaterial | null>(null)
   const quality = controlledQuality ?? localQuality
   const pointOverlayEnabled = controlledPointOverlayEnabled ?? localPointOverlayEnabled
-  const pointOverlayOpacity = controlledPointOverlayOpacity ?? localPointOverlayOpacity
+  const panoramaOpacity = controlledPanoramaOpacity ?? localPanoramaOpacity
+  const pointPayloadRequired = pointOverlayEnabled || Boolean(overlay?.pickMode)
+  const hasVisualOverlay = pointOverlayEnabled || overlayProjection.length > 0
+  const effectivePanoramaOpacity = hasVisualOverlay ? panoramaOpacity : 1
+  const panoramaOpacityRef = useRef(effectivePanoramaOpacity)
+  panoramaOpacityRef.current = effectivePanoramaOpacity
   const viewRef = useRef({ fov, yaw, pitch })
   viewRef.current = { fov, yaw, pitch }
   const [dragStart, setDragStart] = useState<{ x: number; y: number; yaw: number; pitch: number } | null>(
     null,
   )
   const [reloadKey, setReloadKey] = useState(0)
+  const overlayActionsRef = useRef({
+    pickMode: false,
+    selectFeature: (_selection: { layerId: string; featureId: string | number } | null) => {},
+    applyPickedCoordinate: async (
+      _coordinates: [number, number, number?],
+      _coordinateSpace: 'dataset',
+    ) => {},
+  })
+  overlayActionsRef.current = {
+    pickMode: overlay?.pickMode ?? false,
+    selectFeature: overlay?.selectFeature ?? (() => {}),
+    applyPickedCoordinate: overlay?.applyPickedCoordinate ?? (async () => {}),
+  }
+  const visibleOverlayLayers = useMemo(
+    () =>
+      (overlay?.layers ?? []).filter((layer) => overlay?.visibleLayerIds.has(layer.id)),
+    [overlay?.layers, overlay?.visibleLayerIds],
+  )
+  const selectedOverlayKey = overlay?.selected
+    ? `${overlay.selected.layerId}:${overlay.selected.featureId}`
+    : ''
+  const overlayLayerColor = overlay?.layerColor
+  const overlayProjectionRevisionKey = visibleOverlayLayers
+    .map((layer) => `${layer.id}:${overlay?.features[layer.id]?.dataset?.revision ?? layer.revision}`)
+    .join('|')
 
   useEffect(() => {
     setFov(72)
@@ -195,10 +307,15 @@ export default function PanoramaView({
 
     const panoramaGeometry = new THREE.SphereGeometry(10, 64, 40)
     panoramaGeometry.scale(-1, 1, 1)
-    const panoramaMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff })
+    const panoramaMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: panoramaOpacityRef.current,
+    })
     panoramaMaterial.visible = false
-    scene.add(new THREE.Mesh(panoramaGeometry, panoramaMaterial))
-    runtimeRef.current = { scene, panoramaMaterial }
+    const panoramaMesh = new THREE.Mesh(panoramaGeometry, panoramaMaterial)
+    scene.add(panoramaMesh)
+    runtimeRef.current = { scene, camera, renderer, panoramaMesh, panoramaMaterial }
 
     let raf = 0
     const draw = () => {
@@ -331,7 +448,111 @@ export default function PanoramaView({
   }, [source])
 
   useEffect(() => {
-    if (!frame || !pointOverlayEnabled) {
+    if (!frame || demoMode || !visibleOverlayLayers.length) {
+      setOverlayProjection([])
+      setOverlayLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setOverlayProjection([])
+    setPickFeedback(null)
+    setOverlayLoading(true)
+    const loadProjection = async () => {
+      const groups: RenderPanoramaOverlayPoint[][] = []
+      const errors: unknown[] = []
+      let nextIndex = 0
+      const worker = async () => {
+        while (!controller.signal.aborted) {
+          const index = nextIndex
+          nextIndex += 1
+          const layer = visibleOverlayLayers[index]
+          if (!layer) return
+          try {
+            const response = await api.panoramaOverlayProjection(
+              datasetId,
+              layer.id,
+              frame.id,
+              controller.signal,
+            )
+            const color = overlayLayerColor?.(layer.id) ?? '#ffb84d'
+            groups[index] = response.items.map((item) => ({
+              ...item,
+              layerId: layer.id,
+              color,
+              selected: false,
+            }))
+          } catch (reason) {
+            if (!controller.signal.aborted) errors.push(reason)
+            groups[index] = []
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(4, visibleOverlayLayers.length) }, () => worker()),
+      )
+      if (controller.signal.aborted) return
+      setOverlayProjection(groups.flat())
+      if (errors.length) {
+        setPickFeedback(
+          errors.length === visibleOverlayLayers.length
+            ? errors[0] instanceof Error
+              ? errors[0].message
+              : '파노라마 SHP 위치를 불러오지 못했습니다.'
+            : `일부 SHP 레이어(${errors.length}개)를 파노라마에 맞추지 못했습니다.`,
+        )
+      }
+    }
+    void loadProjection()
+      .finally(() => {
+        if (!controller.signal.aborted) setOverlayLoading(false)
+      })
+    return () => controller.abort()
+  }, [
+    datasetId,
+    demoMode,
+    frame,
+    overlayLayerColor,
+    overlayProjectionRevisionKey,
+    visibleOverlayLayers,
+  ])
+
+  const renderedOverlayProjection = useMemo(
+    () =>
+      overlayProjection.map((point) => ({
+        ...point,
+        selected: `${point.layerId}:${point.feature_id}` === selectedOverlayKey,
+      })),
+    [overlayProjection, selectedOverlayKey],
+  )
+
+  useEffect(() => {
+    const runtime = runtimeRef.current
+    const host = stageRef.current
+    if (!runtime || !host || !renderedOverlayProjection.length) return
+    const geometry = new THREE.SphereGeometry(9.92, 64, 40)
+    geometry.scale(-1, 1, 1)
+    const texture = createPanoramaOverlayTexture(host.ownerDocument, renderedOverlayProjection)
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      opacity: 1,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    })
+    const mesh = new THREE.Mesh(geometry, material)
+    mesh.renderOrder = 3
+    runtime.scene.add(mesh)
+    return () => {
+      runtime.scene.remove(mesh)
+      geometry.dispose()
+      material.dispose()
+      texture.dispose()
+    }
+  }, [renderedOverlayProjection])
+
+  useEffect(() => {
+    if (!frame || !pointPayloadRequired) {
       setPointPayload(null)
       setPointLoading(false)
       setPointIndexing(false)
@@ -382,7 +603,7 @@ export default function PanoramaView({
       controller.abort()
       if (retryTimer) window.clearTimeout(retryTimer)
     }
-  }, [datasetId, demoMode, frame, pointOverlayEnabled, pointReloadKey])
+  }, [datasetId, demoMode, frame, pointPayloadRequired, pointReloadKey])
 
   useEffect(() => {
     const runtime = runtimeRef.current
@@ -395,12 +616,11 @@ export default function PanoramaView({
     const overlayMaterial = new THREE.MeshBasicMaterial({
       map: overlayTexture,
       transparent: true,
-      opacity: pointOverlayOpacity,
+      opacity: 1,
       depthTest: false,
       depthWrite: false,
       toneMapped: false,
     })
-    overlayMaterialRef.current = overlayMaterial
     const overlay = new THREE.Mesh(overlayGeometry, overlayMaterial)
     overlay.renderOrder = 2
     runtime.scene.add(overlay)
@@ -410,14 +630,14 @@ export default function PanoramaView({
       overlayGeometry.dispose()
       overlayMaterial.dispose()
       overlayTexture.dispose()
-      if (overlayMaterialRef.current === overlayMaterial) overlayMaterialRef.current = null
     }
-    // Opacity is updated in place below so slider input never rebuilds the texture.
   }, [pointOverlayEnabled, pointPayload])
 
   useEffect(() => {
-    if (overlayMaterialRef.current) overlayMaterialRef.current.opacity = pointOverlayOpacity
-  }, [pointOverlayOpacity])
+    if (!runtimeRef.current) return
+    runtimeRef.current.panoramaMaterial.opacity = effectivePanoramaOpacity
+    runtimeRef.current.panoramaMaterial.needsUpdate = true
+  }, [effectivePanoramaOpacity])
 
   const changeZoom = (delta: number) => {
     setFov((current) => Math.min(95, Math.max(28, current + delta)))
@@ -451,9 +671,74 @@ export default function PanoramaView({
     onPointOverlayEnabledChange?.(enabled)
   }
 
-  const changePointOpacity = (opacity: number) => {
-    if (controlledPointOverlayOpacity === undefined) setLocalPointOverlayOpacity(opacity)
-    onPointOverlayOpacityChange?.(opacity)
+  const changePanoramaOpacity = (opacity: number) => {
+    if (controlledPanoramaOpacity === undefined) setLocalPanoramaOpacity(opacity)
+    onPanoramaOpacityChange?.(opacity)
+  }
+
+  const selectAtPointer = async (clientX: number, clientY: number) => {
+    const runtime = runtimeRef.current
+    if (!runtime || !frame) return
+    const bounds = runtime.renderer.domElement.getBoundingClientRect()
+    if (!bounds.width || !bounds.height) return
+    const pointer = new THREE.Vector2(
+      ((clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((clientY - bounds.top) / bounds.height) * 2 + 1,
+    )
+    const raycaster = new THREE.Raycaster()
+    raycaster.setFromCamera(pointer, runtime.camera)
+    const intersection = raycaster.intersectObject(runtime.panoramaMesh, false)[0]
+    if (!intersection?.uv) return
+    const u = ((intersection.uv.x % 1) + 1) % 1
+    const v = 1 - intersection.uv.y
+    const actions = overlayActionsRef.current
+
+    if (actions.pickMode) {
+      if (!pointPayload) {
+        setPickFeedback('좌표 선택용 MMS 포인트를 아직 불러오는 중입니다.')
+        return
+      }
+      const index = nearestPanoramaPointIndex(
+        u,
+        v,
+        pointPayload.coordinates,
+        pointPayload.pointCount,
+      )
+      if (index === null) {
+        setPickFeedback('클릭한 위치 가까이에 깊이 포인트가 없습니다. 포인트가 보이는 곳을 선택해 주세요.')
+        return
+      }
+      const offset = index * 3
+      setPickFeedback('선택한 MMS 포인트의 실제 좌표를 계산하고 있습니다.')
+      try {
+        const result = await api.panoramaPick(datasetId, frame.id, {
+          u: pointPayload.coordinates[offset],
+          v: pointPayload.coordinates[offset + 1],
+          depth: pointPayload.coordinates[offset + 2],
+        })
+        await actions.applyPickedCoordinate(result.dataset_position, 'dataset')
+        setPickFeedback(null)
+      } catch (reason) {
+        setPickFeedback(reason instanceof Error ? reason.message : '선택 좌표를 적용하지 못했습니다.')
+      }
+      return
+    }
+
+    let nearest: RenderPanoramaOverlayPoint | null = null
+    let nearestDistance = 0.025 ** 2
+    renderedOverlayProjection.forEach((point) => {
+      const distance = wrappedUVDistanceSquared(u, v, point.u, point.v)
+      if (distance <= nearestDistance) {
+        nearestDistance = distance
+        nearest = point
+      }
+    })
+    if (nearest) {
+      actions.selectFeature({
+        layerId: (nearest as RenderPanoramaOverlayPoint).layerId,
+        featureId: (nearest as RenderPanoramaOverlayPoint).feature_id,
+      })
+    }
   }
 
   return (
@@ -467,23 +752,8 @@ export default function PanoramaView({
       data-yaw={yaw}
       data-forward-offset={forwardOffsetDeg}
       data-point-count={pointPayload?.pointCount ?? 0}
-      onKeyDown={(event) => {
-        if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return
-        const target = event.target as HTMLElement | null
-        if (
-          target &&
-          (target.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName))
-        ) {
-          return
-        }
-        if (event.key === 'ArrowLeft' && canGoPrevious) {
-          event.preventDefault()
-          goToPreviousFrame()
-        } else if (event.key === 'ArrowRight' && canGoNext) {
-          event.preventDefault()
-          goToNextFrame()
-        }
-      }}
+      data-shp-point-count={renderedOverlayProjection.length}
+      data-panorama-opacity={effectivePanoramaOpacity}
       onPointerDown={(event) => {
         if (!source) return
         event.currentTarget.focus({ preventScroll: true })
@@ -497,7 +767,13 @@ export default function PanoramaView({
           Math.max(-78, Math.min(78, dragStart.pitch + (event.clientY - dragStart.y) * 0.1)),
         )
       }}
-      onPointerUp={() => setDragStart(null)}
+      onPointerUp={(event) => {
+        const clicked = Boolean(
+          dragStart && Math.hypot(event.clientX - dragStart.x, event.clientY - dragStart.y) <= 5,
+        )
+        setDragStart(null)
+        if (clicked) void selectAtPointer(event.clientX, event.clientY)
+      }}
       onPointerCancel={() => setDragStart(null)}
       onWheel={(event) => {
         event.preventDefault()
@@ -556,7 +832,7 @@ export default function PanoramaView({
           <p>왼쪽 목록에서 파노라마가 있는 프레임을 선택하세요.</p>
         </div>
       )}
-      {pointOverlayEnabled && (pointLoading || pointError) && (
+      {pointPayloadRequired && (pointLoading || pointError) && (
         <div className={`panorama-point-status ${pointError ? 'error' : ''}`}>
           {pointLoading ? <LoaderCircle size={13} className="spin" /> : <ScanLine size={13} />}
           <span>
@@ -575,6 +851,12 @@ export default function PanoramaView({
               재시도
             </button>
           )}
+        </div>
+      )}
+      {(overlayLoading || pickFeedback) && (
+        <div className={`panorama-point-status shp-status ${pickFeedback ? 'error' : ''}`}>
+          {overlayLoading ? <LoaderCircle size={13} className="spin" /> : <Crosshair size={13} />}
+          <span>{pickFeedback ?? 'SHP 포인트를 파노라마에 맞추는 중'}</span>
         </div>
       )}
       <div
@@ -609,18 +891,28 @@ export default function PanoramaView({
           포인트
         </label>
         <label className="panorama-opacity-control">
-          <span>투명도</span>
+          <span>영상 투명도</span>
           <input
             type="range"
             min={0}
             max={1}
             step={0.05}
-            value={pointOverlayOpacity}
-            disabled={!pointOverlayEnabled}
-            aria-label="파노라마 포인트 투명도"
-            onChange={(event) => changePointOpacity(Number(event.target.value))}
+            value={panoramaOpacity}
+            disabled={!hasVisualOverlay}
+            aria-label="파노라마 영상 투명도"
+            onChange={(event) => changePanoramaOpacity(Number(event.target.value))}
           />
         </label>
+        {renderedOverlayProjection.length > 0 && (
+          <span title="현재 파노라마에 투영된 SHP 포인트">
+            <MapPin size={14} /> SHP {renderedOverlayProjection.length.toLocaleString('ko-KR')}
+          </span>
+        )}
+        {overlay?.pickMode && (
+          <strong className="viewer-pick-indicator">
+            <Crosshair size={14} /> 포인트를 클릭해 좌표 적용
+          </strong>
+        )}
         <button type="button" onClick={() => changeZoom(6)} aria-label="축소">
           <Minus size={15} />
         </button>

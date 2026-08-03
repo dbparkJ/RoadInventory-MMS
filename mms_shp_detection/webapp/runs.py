@@ -47,6 +47,7 @@ SAFE_RESULT_SUFFIXES = {
     ".prj",
     ".cpg",
     ".qpj",
+    ".wkt2",
     ".json",
     ".csv",
     ".txt",
@@ -58,6 +59,16 @@ SAFE_RESULT_SUFFIXES = {
     ".png",
     ".webp",
 }
+SHAPEFILE_BUNDLE_SUFFIXES = {
+    ".shp",
+    ".shx",
+    ".dbf",
+    ".prj",
+    ".cpg",
+    ".qpj",
+    ".wkt2",
+}
+RESULT_MANIFEST_NAMES = {"run_manifest.json", "models_manifest.json"}
 
 
 class RunRequest(BaseModel):
@@ -453,6 +464,192 @@ def _bounded_result_files(
     return files, truncated
 
 
+def _priority_result_files(
+    output: Path,
+    *,
+    max_shapefiles: int,
+    max_bundle_files: int,
+    max_entries: int,
+) -> tuple[list[Path], bool]:
+    """Find delivery-critical SHP bundles independently of artifact pagination.
+
+    Pipeline output has a stable shallow layout: a single-model run writes
+    ``output/shp`` and a multi-model run writes ``output/{model}/shp``. We do
+    not recurse into image, point-crop, or log trees, so thousands of ordinary
+    artifacts cannot consume the SHP/result-manifest discovery budget.
+    """
+
+    found: dict[str, Path] = {}
+    shp_directories: dict[str, Path] = {}
+    inspected = 0
+    truncated = False
+
+    def real_file(path: Path) -> bool:
+        try:
+            is_junction = bool(getattr(path, "is_junction", lambda: False)())
+            return path.is_file() and not path.is_symlink() and not is_junction
+        except OSError:
+            return False
+
+    def real_directory(path: Path) -> bool:
+        try:
+            is_junction = bool(getattr(path, "is_junction", lambda: False)())
+            return path.is_dir() and not path.is_symlink() and not is_junction
+        except OSError:
+            return False
+
+    def add_file(path: Path) -> None:
+        nonlocal truncated
+        if not real_file(path):
+            return
+        try:
+            key = path.relative_to(output).as_posix().casefold()
+        except ValueError:
+            return
+        if key in found:
+            return
+        if len(found) >= max_bundle_files:
+            truncated = True
+            return
+        found[key] = path
+
+    direct_shp = output / "shp"
+    if real_directory(direct_shp):
+        shp_directories[str(direct_shp).casefold()] = direct_shp
+    for name in RESULT_MANIFEST_NAMES:
+        add_file(output / name)
+
+    # Multi-model manifests name each shallow model directory. Reading only
+    # those opaque keys avoids depending on root directory enumeration order
+    # when a run also has thousands of root-level artifacts.
+    models_manifest = output / "models_manifest.json"
+    if real_file(models_manifest):
+        document: Any = None
+        try:
+            if models_manifest.stat().st_size <= 5_000_000:
+                document = json.loads(models_manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            document = None
+        models = document.get("models", []) if isinstance(document, dict) else []
+        if isinstance(models, list):
+            for model in models[: max_shapefiles * 4]:
+                if not isinstance(model, dict):
+                    continue
+                model_key = str(model.get("model_key") or "")
+                if (
+                    not model_key
+                    or model_key != model_key.strip()
+                    or "/" in model_key
+                    or "\\" in model_key
+                    or model_key in {".", ".."}
+                ):
+                    continue
+                try:
+                    normalized_model_key = normalize_relative_path(
+                        model_key, allow_empty=False
+                    )
+                    model_directory = resolve_under_root(
+                        output,
+                        normalized_model_key,
+                        must_exist=True,
+                        expect_directory=True,
+                        reject_symlinks=True,
+                    )
+                except (UnsafePath, FileNotFoundError, NotADirectoryError):
+                    continue
+                candidate = model_directory / "shp"
+                if real_directory(candidate):
+                    shp_directories[str(candidate).casefold()] = candidate
+
+    try:
+        with os.scandir(output) as entries:
+            for entry in entries:
+                inspected += 1
+                if inspected > max_entries:
+                    truncated = True
+                    break
+                try:
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                child = Path(entry.path)
+                try:
+                    is_junction = bool(
+                        getattr(child, "is_junction", lambda: False)()
+                    )
+                except OSError:
+                    continue
+                if is_junction:
+                    continue
+                candidate = child / "shp"
+                if real_directory(candidate):
+                    shp_directories[str(candidate).casefold()] = candidate
+                for name in RESULT_MANIFEST_NAMES:
+                    add_file(child / name)
+    except OSError:
+        pass
+
+    primary_count = 0
+    for shp_directory in shp_directories.values():
+        candidates: list[Path] = []
+        # Pipeline-standard names remain discoverable even if an unexpected
+        # directory contains enough unrelated files to exhaust the scan bound.
+        for stem in ("detected_signs", "pole_bottoms"):
+            for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qpj", ".wkt2"):
+                candidate = shp_directory / f"{stem}{suffix}"
+                if real_file(candidate):
+                    candidates.append(candidate)
+        try:
+            with os.scandir(shp_directory) as entries:
+                for entry in entries:
+                    inspected += 1
+                    if inspected > max_entries:
+                        truncated = True
+                        break
+                    try:
+                        if (
+                            entry.is_symlink()
+                            or not entry.is_file(follow_symlinks=False)
+                        ):
+                            continue
+                    except OSError:
+                        continue
+                    candidate = Path(entry.path)
+                    if candidate.suffix.casefold() in SHAPEFILE_BUNDLE_SUFFIXES:
+                        candidates.append(candidate)
+        except OSError:
+            continue
+
+        unique_candidates = {
+            (path.stem.casefold(), path.suffix.casefold()): path
+            for path in candidates
+        }
+        primary_stems = sorted(
+            stem for stem, suffix in unique_candidates if suffix == ".shp"
+        )
+        for stem in primary_stems:
+            if primary_count >= max_shapefiles:
+                truncated = True
+                break
+            primary = unique_candidates[(stem, ".shp")]
+            before = len(found)
+            add_file(primary)
+            if len(found) == before and not any(
+                path == primary for path in found.values()
+            ):
+                continue
+            primary_count += 1
+            for suffix in sorted(SHAPEFILE_BUNDLE_SUFFIXES - {".shp"}):
+                sidecar = unique_candidates.get((stem, suffix))
+                if sidecar is not None:
+                    add_file(sidecar)
+
+    return sorted(
+        found.values(), key=lambda path: path.relative_to(output).as_posix().casefold()
+    ), truncated
+
+
 def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
     try:
         output = _run_work_dir(app, run) / "output"
@@ -460,10 +657,23 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not output.is_dir() or output.is_symlink():
         return None
-    result_paths, truncated = _bounded_result_files(
+    ordinary_paths, truncated = _bounded_result_files(
         output,
         max_files=app.state.config.max_result_files,
     )
+    priority_paths, priority_truncated = _priority_result_files(
+        output,
+        max_shapefiles=app.state.config.max_result_shapefiles,
+        max_bundle_files=app.state.config.max_result_shapefile_files,
+        max_entries=app.state.config.max_result_priority_entries,
+    )
+    result_paths = list(
+        {
+            path.relative_to(output).as_posix().casefold(): path
+            for path in (*priority_paths, *ordinary_paths)
+        }.values()
+    )
+    truncated = truncated or priority_truncated
     result_paths.sort(
         key=lambda path: path.relative_to(output).as_posix().casefold()
     )
@@ -490,21 +700,67 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
         "files": files,
         "file_count": len(files),
         "truncated": truncated,
+        # Never expose an absolute server path. This stable logical location
+        # tells the UI where the worker wrote the run and which API owns it.
+        "output_location": {
+            "kind": "server_managed",
+            "relative_path": f"runs/{run['id']}/output",
+            "results_url": f"/api/runs/{run['id']}/results",
+        },
     }
+    shapefiles: list[dict[str, Any]] = []
+    completed_primaries = (
+        (path for path in result_paths if path.suffix.casefold() == ".shp")
+        if run.get("status") == "completed"
+        else ()
+    )
+    for primary in completed_primaries:
+        try:
+            relative = primary.relative_to(output).as_posix()
+        except ValueError:
+            continue
+        sidecars = [
+            path.relative_to(output).as_posix()
+            for path in result_paths
+            if path.parent == primary.parent
+            and path.stem.casefold() == primary.stem.casefold()
+        ]
+        shapefiles.append(
+            {
+                "name": primary.stem,
+                "path": relative,
+                "files": sorted(sidecars),
+                "download_url": (
+                    f"/api/runs/{run['id']}/shapefile?"
+                    f"path={quote(relative, safe='')}"
+                ),
+                "import_url": f"/api/runs/{run['id']}/shapefile/import",
+            }
+        )
+    summary["shapefiles"] = shapefiles
     manifests = [
         path
         for path in result_paths
-        if path.name.casefold() == "run_manifest.json"
+        if path.name.casefold() in RESULT_MANIFEST_NAMES
     ]
+    manifests.sort(
+        key=lambda path: (
+            path.name.casefold() != "run_manifest.json",
+            path.relative_to(output).as_posix().casefold(),
+        )
+    )
     for manifest in manifests:
         try:
             if manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 5_000_000:
                 value = json.loads(manifest.read_text(encoding="utf-8"))
                 if isinstance(value, dict):
+                    copied = False
                     for key in ("feature_counts", "status"):
                         if key in value:
                             summary[key] = value[key]
-                    break
+                            copied = True
+                    if copied:
+                        break
         except (OSError, json.JSONDecodeError):
             continue
     return summary
@@ -848,7 +1104,7 @@ async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
 
 
 @router.get("/runs")
-async def list_runs(
+def list_runs(
     request: Request,
     limit: int = Query(50, ge=1, le=200),
 ) -> dict[str, Any]:
@@ -860,7 +1116,7 @@ async def list_runs(
 
 
 @router.get("/runs/{run_id}")
-async def get_run(run_id: str, request: Request) -> dict[str, Any]:
+def get_run(run_id: str, request: Request) -> dict[str, Any]:
     run = request.app.state.store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -873,7 +1129,7 @@ async def get_run(run_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.get("/runs/{run_id}/results")
-async def get_results(run_id: str, request: Request) -> dict[str, Any]:
+def get_results(run_id: str, request: Request) -> dict[str, Any]:
     run = request.app.state.store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")

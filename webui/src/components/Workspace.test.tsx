@@ -1,6 +1,6 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ComponentProps } from 'react'
+import { useState, type ComponentProps } from 'react'
 import type { DatasetSummary, Frame } from '../types'
 import { Workspace } from './Workspace'
 
@@ -49,8 +49,8 @@ function renderWorkspace(overrides: Partial<ComponentProps<typeof Workspace>> = 
     route: [],
     routeLoading: false,
     demoMode: false,
-    panoramaOpen: true,
-    pointCloudOpen: true,
+    panoramaOpen: false,
+    pointCloudOpen: false,
     hasMoreFrames: false,
     inspectorOpen: true,
     onTogglePanorama: vi.fn(),
@@ -66,17 +66,84 @@ function renderWorkspace(overrides: Partial<ComponentProps<typeof Workspace>> = 
   return { ...render(<Workspace {...props} />), props }
 }
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
-describe('Workspace layered viewers', () => {
-  it('renders panorama and 3D point data together over the map', async () => {
-    renderWorkspace()
+function fakePopup() {
+  const events = new EventTarget()
+  const popupDocument = document.implementation.createHTMLDocument('')
+  const popup = {
+    document: popupDocument,
+    closed: false,
+    KeyboardEvent: window.KeyboardEvent,
+    addEventListener: events.addEventListener.bind(events),
+    removeEventListener: events.removeEventListener.bind(events),
+    dispatchEvent: events.dispatchEvent.bind(events),
+    focus: vi.fn(),
+    close: vi.fn(),
+  }
+  return popup as unknown as Window
+}
+
+function ControlledWorkspace({ onMoveFrame = vi.fn() }: { onMoveFrame?: (direction: -1 | 1) => void }) {
+  const [panoramaOpen, setPanoramaOpen] = useState(false)
+  const [pointCloudOpen, setPointCloudOpen] = useState(false)
+  return (
+    <Workspace
+      dataset={DATASET}
+      frames={FRAMES}
+      frame={FRAMES[1]}
+      frameRange={null}
+      route={[]}
+      routeLoading={false}
+      demoMode={false}
+      panoramaOpen={panoramaOpen}
+      pointCloudOpen={pointCloudOpen}
+      hasMoreFrames={false}
+      inspectorOpen
+      onTogglePanorama={() => setPanoramaOpen((value) => !value)}
+      onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
+      onFrameChange={vi.fn()}
+      onMoveFrame={onMoveFrame}
+      onToggleInspector={vi.fn()}
+      onOpenSource={vi.fn()}
+      onUseDemo={vi.fn()}
+    />
+  )
+}
+
+describe('Workspace popup viewers', () => {
+  it('opens panorama and 3D points directly in independent windows', async () => {
+    const panoramaPopup = fakePopup()
+    const pointPopup = fakePopup()
+    const open = vi
+      .spyOn(window, 'open')
+      .mockReturnValueOnce(panoramaPopup)
+      .mockReturnValueOnce(pointPopup)
+    const onMoveFrame = vi.fn()
+    render(<ControlledWorkspace onMoveFrame={onMoveFrame} />)
 
     expect(await screen.findByTestId('map-view')).toBeInTheDocument()
-    expect(await screen.findByTestId('panorama-view')).toBeInTheDocument()
-    expect(await screen.findByTestId('point-cloud-view')).toBeInTheDocument()
-    expect(screen.getByRole('region', { name: '파노라마 오버레이' })).toBeInTheDocument()
-    expect(screen.getByRole('region', { name: '3D 포인트 오버레이' })).toBeInTheDocument()
+    expect(screen.queryByTestId('panorama-view')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('point-cloud-view')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '파노라마' }))
+    fireEvent.click(screen.getByRole('button', { name: '3D 포인트' }))
+
+    expect(open).toHaveBeenCalledTimes(2)
+    await waitFor(() => {
+      expect(panoramaPopup.document.querySelector('[data-testid="panorama-view"]')).not.toBeNull()
+      expect(pointPopup.document.querySelector('[data-testid="point-cloud-view"]')).not.toBeNull()
+    })
+    expect(document.querySelector('[aria-label="파노라마 팝업"]')).toBeNull()
+    expect(document.querySelector('[aria-label="3D 포인트 팝업"]')).toBeNull()
+
+    panoramaPopup.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', cancelable: true }),
+    )
+    expect(onMoveFrame).toHaveBeenCalledWith(1)
   })
 })
 
@@ -92,5 +159,19 @@ describe('Workspace frame shortcuts', () => {
     fireEvent.keyDown(window, { key: 'd', code: 'KeyD' })
 
     expect(onMoveFrame.mock.calls).toEqual([[-1], [-1], [1], [1]])
+  })
+
+  it('does not consume navigation keys from editable controls', async () => {
+    const onMoveFrame = vi.fn()
+    renderWorkspace({ onMoveFrame })
+    await screen.findByTestId('map-view')
+    const input = document.createElement('input')
+    document.body.appendChild(input)
+
+    fireEvent.keyDown(input, { key: 'ArrowLeft', code: 'ArrowLeft' })
+    fireEvent.keyDown(input, { key: 'd', code: 'KeyD' })
+
+    expect(onMoveFrame).not.toHaveBeenCalled()
+    input.remove()
   })
 })

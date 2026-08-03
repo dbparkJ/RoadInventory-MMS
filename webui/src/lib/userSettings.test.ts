@@ -23,10 +23,18 @@ describe('user settings', () => {
     ).toEqual({
       panoramaForwardOffsetDeg: 180,
       panoramaPointOverlayEnabled: true,
-      panoramaPointOverlayOpacity: 0,
+      panoramaImageOpacity: 0,
       panoramaDefaultQuality: 'high',
       showAllMapTracks: false,
     })
+  })
+
+  it('migrates the previous point-opacity value to panorama image opacity', () => {
+    expect(sanitizeUserSettings({ panoramaPointOverlayOpacity: 0.4 }).panoramaImageOpacity).toBe(0.4)
+    expect(
+      sanitizeUserSettings({ panoramaPointOverlayOpacity: 0.4, panoramaImageOpacity: 0.8 })
+        .panoramaImageOpacity,
+    ).toBe(0.8)
   })
 
   it('recovers from damaged local storage and defaults to the active track only', () => {

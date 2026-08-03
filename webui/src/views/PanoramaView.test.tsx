@@ -2,7 +2,11 @@ import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../lib/api'
 import type { Frame } from '../types'
-import PanoramaView, { panoramaForwardYaw, panoramaRequestWidth } from './PanoramaView'
+import PanoramaView, {
+  nearestPanoramaPointIndex,
+  panoramaForwardYaw,
+  panoramaRequestWidth,
+} from './PanoramaView'
 
 const threeSpies = vi.hoisted(() => ({
   rendererConstructed: vi.fn(),
@@ -239,8 +243,19 @@ describe('panoramaForwardYaw', () => {
   })
 })
 
+describe('nearestPanoramaPointIndex', () => {
+  it('selects a depth sample across the equirectangular seam', () => {
+    const coordinates = new Float32Array([
+      0.99, 0.5, 12,
+      0.4, 0.5, 8,
+    ])
+    expect(nearestPanoramaPointIndex(0.01, 0.5, coordinates, 2, 0.03)).toBe(0)
+    expect(nearestPanoramaPointIndex(0.2, 0.2, coordinates, 2, 0.03)).toBeNull()
+  })
+})
+
 describe('PanoramaView frame navigation', () => {
-  it('navigates with directional controls and focused-view arrow keys', () => {
+  it('navigates with the directional controls', () => {
     const onPreviousFrame = vi.fn()
     const onNextFrame = vi.fn()
 
@@ -256,12 +271,9 @@ describe('PanoramaView frame navigation', () => {
 
     fireEvent.click(getByRole('button', { name: '이전 프레임으로 이동' }))
     fireEvent.click(getByRole('button', { name: '다음 프레임으로 이동' }))
-    const viewer = getByRole('region', { name: '파노라마 뷰어' })
-    fireEvent.keyDown(viewer, { key: 'ArrowLeft' })
-    fireEvent.keyDown(viewer, { key: 'ArrowRight' })
 
-    expect(onPreviousFrame).toHaveBeenCalledTimes(2)
-    expect(onNextFrame).toHaveBeenCalledTimes(2)
+    expect(onPreviousFrame).toHaveBeenCalledTimes(1)
+    expect(onNextFrame).toHaveBeenCalledTimes(1)
   })
 
   it('uses high quality by default and reloads with the fast quality budget', async () => {
@@ -314,9 +326,6 @@ describe('PanoramaView frame navigation', () => {
     expect(next).toBeDisabled()
     fireEvent.click(previous)
     fireEvent.click(next)
-    const viewer = getByRole('region', { name: '파노라마 뷰어' })
-    fireEvent.keyDown(viewer, { key: 'ArrowLeft' })
-    fireEvent.keyDown(viewer, { key: 'ArrowRight' })
 
     expect(onPreviousFrame).not.toHaveBeenCalled()
     expect(onNextFrame).not.toHaveBeenCalled()
@@ -324,7 +333,7 @@ describe('PanoramaView frame navigation', () => {
 })
 
 describe('PanoramaView media lifecycle', () => {
-  it('keeps one renderer and panorama texture while overlay data and opacity change', async () => {
+  it('keeps one renderer and panorama texture while overlay data and image opacity change', async () => {
     vi.mocked(api.panorama).mockResolvedValue({ kind: 'url', value: '/panorama/frame-12.webp' })
     vi.mocked(api.panoramaPoints).mockResolvedValue(mmsoPayload())
 
@@ -334,7 +343,7 @@ describe('PanoramaView media lifecycle', () => {
         frame={FRAME}
         demoMode={false}
         pointOverlayEnabled
-        pointOverlayOpacity={0.65}
+        panoramaOpacity={0.65}
       />,
     )
 
@@ -351,7 +360,7 @@ describe('PanoramaView media lifecycle', () => {
         frame={FRAME}
         demoMode={false}
         pointOverlayEnabled
-        pointOverlayOpacity={0.2}
+        panoramaOpacity={0.2}
       />,
     )
     rerender(
@@ -360,7 +369,7 @@ describe('PanoramaView media lifecycle', () => {
         frame={FRAME}
         demoMode={false}
         pointOverlayEnabled={false}
-        pointOverlayOpacity={0.2}
+        panoramaOpacity={0.2}
       />,
     )
     rerender(
@@ -369,11 +378,12 @@ describe('PanoramaView media lifecycle', () => {
         frame={FRAME}
         demoMode={false}
         pointOverlayEnabled
-        pointOverlayOpacity={0.2}
+        panoramaOpacity={0.2}
       />,
     )
 
     await waitFor(() => expect(api.panoramaPoints).toHaveBeenCalledTimes(2))
+    expect(container.querySelector('[data-panorama-opacity="0.2"]')).toBeInTheDocument()
     expect(threeSpies.rendererConstructed).toHaveBeenCalledTimes(1)
     expect(threeSpies.textureLoads).toHaveBeenCalledTimes(1)
   })

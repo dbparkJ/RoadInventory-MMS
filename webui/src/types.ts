@@ -60,6 +60,7 @@ export interface Frame {
   has_panorama: boolean
   has_points: boolean
   thumbnail_url?: string
+  dataset_position?: [number, number, number]
 }
 
 export interface RoutePoint extends Coordinate {
@@ -117,6 +118,11 @@ export interface BootstrapResponse {
     point_cloud?: boolean
     auto_optimize?: boolean
     panorama_point_overlay?: boolean
+    shp_overlays?: boolean
+    shp_feature_editing?: boolean
+    shp_result_download?: boolean
+    max_overlay_upload_bytes?: number
+    max_overlay_features?: number
   }
 }
 
@@ -164,6 +170,120 @@ export interface RunRecord {
   finished_at?: string
   eta_seconds?: number
   result_url?: string
+}
+
+export interface RunResultFile {
+  path: string
+  name: string
+  size: number
+  type: string
+  url: string
+}
+
+export interface RunResultShapefile {
+  path: string
+  name: string
+  files?: string[]
+  download_url: string
+  import_url?: string
+}
+
+export interface RunOutputLocation {
+  kind: 'server_managed'
+  relative_path: string
+  results_url: string
+}
+
+export interface RunResults {
+  files: RunResultFile[]
+  file_count: number
+  truncated?: boolean
+  output_location?: RunOutputLocation
+  shapefiles?: RunResultShapefile[]
+  feature_counts?: Record<string, number>
+  status?: string
+}
+
+export type OverlayCoordinateSpace = 'wgs84' | 'dataset'
+export type OverlayEncoding = 'auto' | 'UTF-8' | 'CP949' | 'EUC-KR'
+
+export interface OverlayLayer {
+  id: string
+  dataset_id: string
+  name: string
+  source_kind?: string
+  source_crs?: string
+  dataset_crs?: string
+  map_crs?: string
+  source_encoding?: string
+  edited_download_encoding?: string
+  geometry_type: string
+  shape_type?: number
+  feature_count: number
+  original_feature_count?: number
+  revision: number
+  fields?: OverlayField[]
+  warnings?: string[]
+  features_url?: string
+  project_url_template?: string
+  download_url?: string
+  source_preserved?: boolean
+  created_at?: string
+}
+
+export interface OverlayField {
+  name: string
+  type?: string
+  size?: number
+  decimal?: number
+}
+
+export interface OverlayGeometry {
+  type: string
+  coordinates: unknown
+}
+
+export interface OverlayFeature {
+  type: 'Feature'
+  id: string | number
+  geometry: OverlayGeometry | null
+  properties: Record<string, unknown>
+}
+
+export interface OverlayFeatureCollection {
+  type: 'FeatureCollection'
+  features: OverlayFeature[]
+  fields: OverlayField[]
+  total: number
+  offset: number
+  limit: number
+  crs?: string
+  revision: number
+  next_offset?: number | null
+  spatial_filter?: {
+    coordinate_space: 'dataset'
+    center: [number, number]
+    radius: number
+    geometry_type: 'Point'
+  } | null
+}
+
+export interface OverlayFeatureDetail {
+  feature: OverlayFeature
+  revision: number
+  coordinate_space: OverlayCoordinateSpace
+  crs: string
+  fields: OverlayField[]
+}
+
+export interface PanoramaOverlayFeature {
+  feature_id: string | number
+  u: number
+  v: number
+  depth: number
+  dataset_position: [number, number, number]
+  z_inferred?: boolean
+  properties?: Record<string, unknown>
 }
 
 export interface RunEvent {

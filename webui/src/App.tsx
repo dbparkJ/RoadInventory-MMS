@@ -8,12 +8,16 @@ import {
   Plus,
   Server,
   Settings2,
+  Shapes,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Brand } from './components/Brand'
+import { ActivityPanel, HelpPanel } from './components/ActivityHelpPanels'
 import { DatasetPanel } from './components/DatasetPanel'
 import { DetachablePanel } from './components/DetachablePanel'
 import { GeneralSettingsPanel } from './components/GeneralSettingsPanel'
+import { OverlayProvider } from './components/OverlayContext'
+import { OverlayPanel } from './components/OverlayPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
 import { StorageDialog } from './components/StorageDialog'
@@ -64,12 +68,21 @@ function App() {
   const [inspectorDetached, setInspectorDetached] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDetached, setSettingsDetached] = useState(false)
+  const [overlayOpen, setOverlayOpen] = useState(false)
+  const [overlayDetached, setOverlayDetached] = useState(false)
+  const [overlayFocusLayerId, setOverlayFocusLayerId] = useState('')
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [notificationsDetached, setNotificationsDetached] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [helpDetached, setHelpDetached] = useState(false)
+  const [dataPanelCollapsed, setDataPanelCollapsed] = useState(false)
   const [sourceOpen, setSourceOpen] = useState(false)
   const [queueOpen, setQueueOpen] = useState(false)
   const [runs, setRuns] = useState<RunRecord[]>([])
   const [submitting, setSubmitting] = useState(false)
   const [removingDatasetId, setRemovingDatasetId] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
+  const [notificationLog, setNotificationLog] = useState<Toast[]>([])
   const { settings, updateSettings, resetSettings } = useUserSettings()
   const frameScopeRef = useRef('')
   frameScopeRef.current = `${datasetId}::${trackId}`
@@ -80,10 +93,12 @@ function App() {
   )
 
   const toast = useCallback((entry: Omit<Toast, 'id'>) => {
-    setToasts((current) => [
-      ...current,
-      { ...entry, id: `${Date.now()}-${Math.random().toString(36).slice(2)}` },
-    ])
+    const notification = {
+      ...entry,
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    }
+    setToasts((current) => [...current, notification])
+    setNotificationLog((current) => [notification, ...current].slice(0, 30))
   }, [])
   const dismissToast = useCallback((id: string) => {
     setToasts((current) => current.filter((toastItem) => toastItem.id !== id))
@@ -103,6 +118,29 @@ function App() {
   useEffect(() => {
     setFrameRange(null)
   }, [datasetId, trackId])
+
+  useEffect(() => {
+    const openImportedOverlay = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ open?: boolean; datasetId?: string; layerId?: string }>
+      ).detail
+      if (!detail?.open) return
+      if (detail.datasetId && datasets.some((dataset) => dataset.id === detail.datasetId)) {
+        setDatasetId(detail.datasetId)
+        setTrackId('')
+      }
+      if (detail.layerId) setOverlayFocusLayerId(detail.layerId)
+      setOverlayOpen(true)
+    }
+    window.addEventListener('mms-overlay-changed', openImportedOverlay)
+    return () => window.removeEventListener('mms-overlay-changed', openImportedOverlay)
+  }, [datasets])
+
+  useEffect(() => {
+    const openSelectedOverlay = () => setOverlayOpen(true)
+    window.addEventListener('mms-overlay-selected', openSelectedOverlay)
+    return () => window.removeEventListener('mms-overlay-selected', openSelectedOverlay)
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -445,7 +483,12 @@ function App() {
   if (booting) return <BootScreen />
 
   return (
-    <div className={`app-shell ${inspectorOpen ? '' : 'inspector-collapsed'}`}>
+    <OverlayProvider datasetId={datasetId} demoMode={demoMode} notify={toast}>
+      <div
+        className={`app-shell ${inspectorOpen ? '' : 'inspector-collapsed'} ${
+          dataPanelCollapsed ? 'data-collapsed' : ''
+        }`}
+      >
       <header className="topbar">
         <div className="topbar-left">
           <button type="button" className="icon-button mobile-menu">
@@ -464,6 +507,17 @@ function App() {
         <div className="topbar-actions">
           <button
             type="button"
+            className="queue-button overlay-button"
+            title="SHP 레이어와 검출 결과 검수"
+            aria-label="SHP 검수 열기"
+            aria-expanded={overlayOpen || overlayDetached}
+            onClick={() => setOverlayOpen(true)}
+          >
+            <Shapes size={17} />
+            SHP 검수
+          </button>
+          <button
+            type="button"
             className="queue-button settings-button"
             title="일반 설정"
             aria-label="일반 설정 열기"
@@ -472,10 +526,26 @@ function App() {
             <Settings2 size={17} />
             설정
           </button>
-          <button type="button" className="icon-button" title="도움말">
+          <button
+            type="button"
+            className="icon-button"
+            title="도움말"
+            aria-label="도움말 열기"
+            aria-expanded={helpOpen || helpDetached}
+            aria-controls="help-panel-title"
+            onClick={() => setHelpOpen(true)}
+          >
             <CircleHelp size={17} />
           </button>
-          <button type="button" className="icon-button notification-button" title="알림">
+          <button
+            type="button"
+            className="icon-button notification-button"
+            title="알림"
+            aria-label="알림 열기"
+            aria-expanded={notificationsOpen || notificationsDetached}
+            aria-controls="activity-panel-title"
+            onClick={() => setNotificationsOpen(true)}
+          >
             <Bell size={17} />
             {activeRuns.length > 0 && <i />}
           </button>
@@ -505,7 +575,7 @@ function App() {
 
       <div className="app-grid">
         <DetachablePanel id="data-explorer" title="작업 데이터" placeholderClassName="data-panel-slot">
-          {({ action }) => (
+          {({ action, detached }) => (
             <DatasetPanel
               datasets={datasets}
               selectedDataset={selectedDataset}
@@ -519,6 +589,7 @@ function App() {
               frameRange={frameRange}
               removingDataset={removingDatasetId === selectedDataset?.id}
               externalAction={action}
+              collapsed={detached ? false : dataPanelCollapsed}
               onDatasetChange={(id) => {
                 setFrameRange(null)
                 setDatasetId(id)
@@ -546,6 +617,9 @@ function App() {
               onLoadMoreFrames={() => void loadMoreFrames()}
               onOpenSource={() => setSourceOpen(true)}
               onRemoveDataset={(dataset) => void removeDataset(dataset)}
+              onToggleCollapsed={
+                detached ? undefined : () => setDataPanelCollapsed((value) => !value)
+              }
             />
           )}
         </DetachablePanel>
@@ -635,6 +709,99 @@ function App() {
         </div>
       )}
 
+      {(overlayOpen || overlayDetached) && (
+        <div
+          className="utility-layer overlay-manager-layer"
+          hidden={!overlayOpen || overlayDetached}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setOverlayOpen(false)
+          }}
+        >
+          <DetachablePanel
+            id="shp-overlay-manager"
+            title="SHP 레이어 · 속성표"
+            placeholderClassName="overlay-panel-slot"
+            onDetachedChange={setOverlayDetached}
+          >
+            {({ action, detached, returnToMain }) => (
+                <OverlayPanel
+                  focusLayerId={overlayFocusLayerId}
+                  externalAction={action}
+                onClose={() => {
+                  if (detached) returnToMain()
+                  setOverlayOpen(false)
+                }}
+              />
+            )}
+          </DetachablePanel>
+        </div>
+      )}
+
+      {(notificationsOpen || notificationsDetached) && (
+        <div
+          className="utility-layer"
+          hidden={!notificationsOpen || notificationsDetached}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setNotificationsOpen(false)
+          }}
+        >
+          <DetachablePanel
+            id="activity-center"
+            title="알림"
+            placeholderClassName="utility-panel-slot"
+            onDetachedChange={setNotificationsDetached}
+          >
+            {({ action, detached, returnToMain }) => {
+              const close = () => {
+                if (detached) returnToMain()
+                setNotificationsOpen(false)
+              }
+              return (
+                <ActivityPanel
+                  runs={runs}
+                  alerts={notificationLog}
+                  detached={detached}
+                  externalAction={action}
+                  onClose={close}
+                  onOpenQueue={() => {
+                    close()
+                    setQueueOpen(true)
+                  }}
+                />
+              )
+            }}
+          </DetachablePanel>
+        </div>
+      )}
+
+      {(helpOpen || helpDetached) && (
+        <div
+          className="utility-layer"
+          hidden={!helpOpen || helpDetached}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setHelpOpen(false)
+          }}
+        >
+          <DetachablePanel
+            id="operator-help"
+            title="도움말"
+            placeholderClassName="utility-panel-slot"
+            onDetachedChange={setHelpDetached}
+          >
+            {({ action, detached, returnToMain }) => (
+              <HelpPanel
+                detached={detached}
+                externalAction={action}
+                onClose={() => {
+                  if (detached) returnToMain()
+                  setHelpOpen(false)
+                }}
+              />
+            )}
+          </DetachablePanel>
+        </div>
+      )}
+
       <StorageDialog
         open={sourceOpen}
         demoMode={demoMode}
@@ -644,7 +811,8 @@ function App() {
       />
       <RunQueue runs={runs} open={queueOpen} onClose={() => setQueueOpen(false)} onCancel={cancelRun} />
       <ToastRegion toasts={toasts} dismiss={dismissToast} />
-    </div>
+      </div>
+    </OverlayProvider>
   )
 }
 

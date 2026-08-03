@@ -8,8 +8,10 @@ import {
   LoaderCircle,
   XCircle,
 } from 'lucide-react'
+import { useState } from 'react'
 import type { RunRecord, RunStatus } from '../types'
 import { formatDate, formatDuration } from '../lib/format'
+import { RunResultsDialog } from './RunResultsDialog'
 
 const STATUS: Record<RunStatus, { label: string; icon: typeof Clock3 }> = {
   queued: { label: '대기 중', icon: Clock3 },
@@ -32,6 +34,7 @@ export function RunQueue({
   onClose: () => void
   onCancel: (id: string) => void
 }) {
+  const [resultRun, setResultRun] = useState<RunRecord | null>(null)
   return (
     <>
       {open && <button type="button" className="drawer-scrim" onClick={onClose} aria-label="실행 큐 닫기" />}
@@ -61,7 +64,7 @@ export function RunQueue({
         </div>
         <div className="run-list">
           {runs.map((run) => (
-            <RunCard key={run.id} run={run} onCancel={onCancel} />
+            <RunCard key={run.id} run={run} onCancel={onCancel} onOpenResults={setResultRun} />
           ))}
           {!runs.length && (
             <div className="queue-empty">
@@ -72,11 +75,20 @@ export function RunQueue({
           )}
         </div>
       </aside>
+      <RunResultsDialog run={resultRun} onClose={() => setResultRun(null)} />
     </>
   )
 }
 
-function RunCard({ run, onCancel }: { run: RunRecord; onCancel: (id: string) => void }) {
+function RunCard({
+  run,
+  onCancel,
+  onOpenResults,
+}: {
+  run: RunRecord
+  onCancel: (id: string) => void
+  onOpenResults: (run: RunRecord) => void
+}) {
   const meta = STATUS[run.status]
   const Icon = meta.icon
   const active = ['queued', 'preparing', 'running', 'cancelling'].includes(run.status)
@@ -109,11 +121,11 @@ function RunCard({ run, onCancel }: { run: RunRecord; onCancel: (id: string) => 
             취소
           </button>
         )}
-        {run.status === 'completed' && run.result_url && (
-          <a href={run.result_url} className="result-action">
+        {run.status === 'completed' && (
+          <button type="button" className="result-action" onClick={() => onOpenResults(run)}>
             <Download size={13} />
-            결과 받기
-          </a>
+            결과 보기·받기
+          </button>
         )}
       </footer>
     </article>

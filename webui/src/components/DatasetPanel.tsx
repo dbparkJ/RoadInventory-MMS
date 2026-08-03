@@ -9,6 +9,8 @@ import {
   Layers3,
   LocateFixed,
   LoaderCircle,
+  PanelLeftClose,
+  PanelLeftOpen,
   RotateCcw,
   Search,
   Trash2,
@@ -38,6 +40,7 @@ interface DatasetPanelProps {
   frameRange: FrameRange | null
   removingDataset?: boolean
   externalAction?: ReactNode
+  collapsed?: boolean
   onDatasetChange: (id: string) => void
   onTrackChange: (id: string) => void
   onFrameChange: (frame: Frame) => void
@@ -48,6 +51,7 @@ interface DatasetPanelProps {
   onLoadMoreFrames: () => void
   onOpenSource: () => void
   onRemoveDataset?: (dataset: DatasetSummary) => void
+  onToggleCollapsed?: () => void
 }
 
 export function DatasetPanel({
@@ -63,6 +67,7 @@ export function DatasetPanel({
   frameRange,
   removingDataset = false,
   externalAction,
+  collapsed = false,
   onDatasetChange,
   onTrackChange,
   onFrameChange,
@@ -73,9 +78,12 @@ export function DatasetPanel({
   onLoadMoreFrames,
   onOpenSource,
   onRemoveDataset,
+  onToggleCollapsed,
 }: DatasetPanelProps) {
   const [query, setQuery] = useState('')
   const [rangeDraft, setRangeDraft] = useState<[string, string]>(['', ''])
+  const [framesCollapsed, setFramesCollapsed] = useState(false)
+  const [framesDetached, setFramesDetached] = useState(false)
   const visibleFrames = useMemo(() => {
     const normalized = query.trim().toLowerCase()
     if (!normalized) return frames
@@ -105,9 +113,13 @@ export function DatasetPanel({
   }
 
   return (
-    <aside className="data-panel" aria-label="데이터 탐색기">
+    <aside
+      className={`data-panel ${collapsed ? 'collapsed' : ''}`}
+      aria-label="데이터 탐색기"
+      data-collapsed={collapsed ? 'true' : 'false'}
+    >
       <div className="panel-heading">
-        <div>
+        <div className="panel-heading-copy">
           <span className="eyebrow">DATA EXPLORER</span>
           <h2>작업 데이터</h2>
         </div>
@@ -116,10 +128,22 @@ export function DatasetPanel({
           <button type="button" className="icon-button" onClick={onOpenSource} title="데이터 추가">
             <Cloud size={17} />
           </button>
+          {onToggleCollapsed && (
+            <button
+              type="button"
+              className="icon-button data-collapse-toggle"
+              onClick={onToggleCollapsed}
+              title={collapsed ? '작업 데이터 패널 복원' : '작업 데이터 패널 최소화'}
+              aria-label={collapsed ? '작업 데이터 패널 복원' : '작업 데이터 패널 최소화'}
+              aria-expanded={!collapsed}
+            >
+              {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            </button>
+          )}
         </div>
       </div>
 
-      {selectedDataset ? (
+      {!collapsed && (selectedDataset ? (
         <>
           <div className="dataset-select-row">
             <label className="select-shell dataset-select">
@@ -217,10 +241,15 @@ export function DatasetPanel({
           <DetachablePanel
             id={`frames-${selectedDataset.id}`}
             title="프레임 및 작업 구간"
-            placeholderClassName="frame-panel-slot"
+            placeholderClassName={`frame-panel-slot ${
+              framesCollapsed && !framesDetached ? 'is-collapsed' : ''
+            }`}
+            onDetachedChange={setFramesDetached}
           >
-            {({ action }) => (
-              <section className="frame-section">
+            {({ action, detached }) => {
+              const contentCollapsed = framesCollapsed && !detached
+              return (
+              <section className={`frame-section ${contentCollapsed ? 'collapsed' : ''}`}>
                 <div className="section-label">
                   <span>프레임</span>
                   <span className="section-label-actions">
@@ -228,8 +257,22 @@ export function DatasetPanel({
                       {frames.length.toLocaleString('ko-KR')} / {frameTotal.toLocaleString('ko-KR')} loaded
                     </small>
                     {action}
+                    {!detached && (
+                      <button
+                        type="button"
+                        className="icon-button section-collapse-button"
+                        onClick={() => setFramesCollapsed((value) => !value)}
+                        title={contentCollapsed ? '프레임 컴포넌트 복원' : '프레임 컴포넌트 최소화'}
+                        aria-label={contentCollapsed ? '프레임 컴포넌트 복원' : '프레임 컴포넌트 최소화'}
+                        aria-expanded={!contentCollapsed}
+                      >
+                        {contentCollapsed ? <ChevronDown size={14} /> : <ChevronDown size={14} className="collapse-chevron-open" />}
+                      </button>
+                    )}
                   </span>
                 </div>
+                {!contentCollapsed && (
+                  <>
             <label className="search-box">
               <Search size={14} />
               <input
@@ -407,8 +450,11 @@ export function DatasetPanel({
                 <div className="list-empty">조건에 맞는 프레임이 없습니다.</div>
               )}
                 </div>
+                  </>
+                )}
               </section>
-            )}
+              )
+            }}
           </DetachablePanel>
         </>
       ) : (
@@ -420,7 +466,7 @@ export function DatasetPanel({
             데이터 연결
           </button>
         </div>
-      )}
+      ))}
     </aside>
   )
 }

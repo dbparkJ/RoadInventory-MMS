@@ -606,6 +606,15 @@ def public_dataset(item: dict[str, Any]) -> dict[str, Any]:
 
 def public_frame(item: dict[str, Any]) -> dict[str, Any]:
     task = item["task"]
+    dataset_position = None
+    raw_origin = task.get("origin")
+    if isinstance(raw_origin, (list, tuple)) and len(raw_origin) >= 3:
+        try:
+            candidate = [float(raw_origin[index]) for index in range(3)]
+            if all(math.isfinite(value) for value in candidate):
+                dataset_position = candidate
+        except (TypeError, ValueError):
+            pass
     coordinate = None
     if item.get("longitude") is not None and item.get("latitude") is not None:
         coordinate = {
@@ -625,6 +634,7 @@ def public_frame(item: dict[str, Any]) -> dict[str, Any]:
         "timestamp": task.get("timestamp_iso"),
         "coordinate": coordinate,
         "heading": item.get("heading"),
+        "dataset_position": dataset_position,
         "has_panorama": bool(task.get("image_path")),
         "has_points": True,
         "panorama_url": f"/api/datasets/{item['dataset_id']}/panoramas/{item['id']}",
