@@ -99,6 +99,11 @@ minutes and accepts the dataset only when it becomes `ready`.
 
 `DatasetDetail` adds optional `bounds`, `sensors`, and `indexed_at`.
 
+`DELETE /api/datasets/{id}` unregisters a dataset from the workspace and returns
+`{ "id", "removed": true, "source_deleted": false, "detail" }`. It removes derived frame rows but
+never deletes the source folder. A queued, preparing, starting, running, or cancelling run returns
+`409`; terminal run history remains available.
+
 `GET /api/datasets/{id}/route` returns `{ "points": RoutePoint[] }`, where each point includes
 `lon`, `lat`, optional `altitude`, `frame_id`, `track_id`, and `heading`. The client builds a
 separate LineString for each `track_id`, avoiding false connector lines between tracks.
@@ -134,8 +139,9 @@ panorama/frame list and is omitted only from map markers.
 
 `GET /api/datasets/{id}/panoramas/{frame_id}?width={width}` returns an image body, or JSON
 `{ "url": "signed-or-cache-url" }`. The client requests this only when the panorama tab is opened,
-with a viewport-derived width clamped to 960–2048 px. The original panorama is never requested by
-the operator workspace.
+using a viewport-derived fast preview up to 2048px, a cache-stable 4096px high-quality preview, or
+an explicitly selected 8192px preview. The original panorama is never requested by the operator
+workspace.
 
 `GET /api/datasets/{id}/points/{frame_id}?budget=120000&radius=40` returns
 `application/vnd.mmsp` (or `application/octet-stream`). The browser never requests raw LAS.
@@ -157,6 +163,20 @@ MMSP v1 is little-endian:
 The server may return `202 application/json` with `{ "status": "indexing" }` and `Retry-After`
 while the LAS preview catalog is prepared. The point viewer shows an indexing state and retries
 with bounded backoff (eight attempts); changing frames or tabs aborts the sequence.
+
+`GET /api/datasets/{id}/panorama-points/{frame_id}?budget=30000&radius=30&cell_size_px=3`
+returns `application/vnd.mmso`. Optional `yaw_offset_deg` and `pitch_offset_deg` override the
+pipeline alignment defaults published in `bootstrap.preview_defaults`. Omitting them uses the
+server's validated panorama alignment configuration. The server projects in the frame's original
+pose/point-cloud CRS, keeps the nearest point per screen-space cell on a virtual 4096x2048 sphere,
+and caches the frame derivative. The derived MMSO cache is capped at 512 MiB per dataset and evicts
+the oldest entries first. This avoids shipping raw world coordinates, limits panorama overdraw, and
+prevents an unbounded cache during long review sessions.
+
+MMSO v1 uses the same 40-byte header and 15-byte record stride as MMSP. Its magic is `MMSO`, flags
+bit 0 means RGB and bit 1 means normalized equirectangular coordinates, header bounds are minimum
+and maximum `(u, v, distance_m)`, and each record is `u:f32, v:f32, distance_m:f32, rgb:u8x3`.
+`u` and `v` are normalized to `[0, 1]`.
 
 MapLibre, the spherical panorama renderer, and the point-cloud renderer are lazy-loaded view
 chunks. The shared Three.js dependency is excluded from the initial application bundle.

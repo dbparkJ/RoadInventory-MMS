@@ -4,8 +4,8 @@ import asyncio
 import json
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -18,12 +18,10 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .datasets import require_ready_dataset, utc_now
 from .datasets import catalog_path as dataset_catalog_path
-from .datasets import seed_catalog_cache
+from .datasets import require_ready_dataset, seed_catalog_cache, utc_now
 from .optimizer import resolve_run_parameters
 from .security import UnsafePath, normalize_relative_path, resolve_under_root
-
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
@@ -521,7 +519,12 @@ def public_run(
 ) -> dict[str, Any]:
     log_text = _runtime_log_text(app, item)
     public_status = PUBLIC_STATUS.get(item["status"], item["status"])
-    dataset = app.state.store.get_dataset(item["dataset_id"])
+    # Unregistered datasets remain as small tombstones so completed run
+    # history can still show the delivery name without making that dataset
+    # available for new browsing or processing.
+    dataset = app.state.store.get_dataset(
+        item["dataset_id"], include_unregistered=True
+    )
     result = {
         "id": item["id"],
         "dataset_id": item["dataset_id"],

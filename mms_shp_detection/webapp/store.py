@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+ACTIVE_RUN_STATUSES = ("queued", "preparing", "starting", "running", "cancelling")
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -72,6 +74,7 @@ class WebStore:
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     catalog_status TEXT NOT NULL DEFAULT 'missing',
                     catalog_error TEXT,
+                    registered INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(root_id, relative_path, crs)
@@ -133,6 +136,18 @@ class WebStore:
                     ON runs(status, created_at);
                 """
             )
+            # ``CREATE TABLE IF NOT EXISTS`` does not migrate an existing
+            # registry.  A dataset is retained as a small tombstone when it
+            # has historical runs, while this flag keeps it out of the active
+            # workspace without breaking the runs.dataset_id foreign key.
+            dataset_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(datasets)").fetchall()
+            }
+            if "registered" not in dataset_columns:
+                connection.execute(
+                    "ALTER TABLE datasets ADD COLUMN registered INTEGER NOT NULL DEFAULT 1"
+                )
 
     @staticmethod
     def dataset_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -144,10 +159,16 @@ class WebStore:
         item["warnings"] = _loads(item.pop("warnings_json", None), [])
         return item
 
-    def get_dataset(self, dataset_id: str) -> dict[str, Any] | None:
+    def get_dataset(
+        self,
+        dataset_id: str,
+        *,
+        include_unregistered: bool = False,
+    ) -> dict[str, Any] | None:
+        where = "id = ?" if include_unregistered else "id = ? AND registered = 1"
         with self.connection() as connection:
             row = connection.execute(
-                "SELECT * FROM datasets WHERE id = ?", (dataset_id,)
+                f"SELECT * FROM datasets WHERE {where}", (dataset_id,)
             ).fetchone()
         return self.dataset_from_row(row)
 
@@ -162,7 +183,12 @@ class WebStore:
     def list_datasets(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM datasets ORDER BY updated_at DESC LIMIT ?", (int(limit),)
+                """
+                SELECT * FROM datasets
+                WHERE registered = 1
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (int(limit),),
             ).fetchall()
         return [self.dataset_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
 
@@ -183,7 +209,8 @@ class WebStore:
                     id,name,root_id,relative_path,crs,status,error,created_at,updated_at
                 ) VALUES(?,?,?,?,?,'scanning',NULL,?,?)
                 ON CONFLICT(root_id,relative_path,crs) DO UPDATE SET
-                    name=excluded.name,status='scanning',error=NULL,
+                    name=excluded.name,status='scanning',error=NULL,registered=1,
+                    frame_count=0,tracks_json='[]',bbox_json=NULL,warnings_json='[]',
                     catalog_status='missing',catalog_error=NULL,
                     updated_at=excluded.updated_at
                 """,
@@ -201,6 +228,11 @@ class WebStore:
         now: str,
     ) -> None:
         with self.connection(write=True) as connection:
+            registered = connection.execute(
+                "SELECT registered FROM datasets WHERE id=?", (dataset_id,)
+            ).fetchone()
+            if registered is None or not bool(registered["registered"]):
+                return
             connection.execute("DELETE FROM frames WHERE dataset_id=?", (dataset_id,))
             connection.executemany(
                 """
@@ -243,7 +275,10 @@ class WebStore:
     def fail_dataset_scan(self, dataset_id: str, error: str, now: str) -> None:
         with self.connection(write=True) as connection:
             connection.execute(
-                "UPDATE datasets SET status='error',error=?,updated_at=? WHERE id=?",
+                """
+                UPDATE datasets SET status='error',error=?,updated_at=?
+                WHERE id=? AND registered=1
+                """,
                 (error, now, dataset_id),
             )
 
@@ -252,9 +287,67 @@ class WebStore:
     ) -> None:
         with self.connection(write=True) as connection:
             connection.execute(
-                "UPDATE datasets SET catalog_status=?,catalog_error=?,updated_at=? WHERE id=?",
+                """
+                UPDATE datasets SET catalog_status=?,catalog_error=?,updated_at=?
+                WHERE id=? AND registered=1
+                """,
                 (status, error, now, dataset_id),
             )
+
+    def active_run_for_dataset(self, dataset_id: str) -> dict[str, Any] | None:
+        placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
+        with self.connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT id,status FROM runs
+                WHERE dataset_id=? AND status IN ({placeholders})
+                ORDER BY created_at LIMIT 1
+                """,
+                (dataset_id, *ACTIVE_RUN_STATUSES),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def unregister_dataset(self, dataset_id: str, *, now: str) -> dict[str, Any]:
+        """Hide an indexed dataset without deleting its source delivery.
+
+        Completed run rows keep their dataset foreign-key target.  Active or
+        queued work blocks removal so a worker never loses its indexed frames
+        midway through a job.
+        """
+
+        placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
+        with self.connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            dataset = connection.execute(
+                "SELECT id,registered FROM datasets WHERE id=?", (dataset_id,)
+            ).fetchone()
+            if dataset is None or not bool(dataset["registered"]):
+                return {"status": "not_found"}
+            active_run = connection.execute(
+                f"""
+                SELECT id,status FROM runs
+                WHERE dataset_id=? AND status IN ({placeholders})
+                ORDER BY created_at LIMIT 1
+                """,
+                (dataset_id, *ACTIVE_RUN_STATUSES),
+            ).fetchone()
+            if active_run is not None:
+                return {
+                    "status": "active_run",
+                    "run_id": str(active_run["id"]),
+                    "run_status": str(active_run["status"]),
+                }
+            connection.execute("DELETE FROM frames WHERE dataset_id=?", (dataset_id,))
+            connection.execute(
+                """
+                UPDATE datasets SET registered=0,status='removed',error=NULL,
+                    frame_count=0,tracks_json='[]',bbox_json=NULL,warnings_json='[]',
+                    catalog_status='missing',catalog_error=NULL,updated_at=?
+                WHERE id=?
+                """,
+                (now, dataset_id),
+            )
+            return {"status": "unregistered"}
 
     @staticmethod
     def frame_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:

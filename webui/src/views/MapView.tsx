@@ -15,6 +15,8 @@ interface MapViewProps {
   route: RoutePoint[]
   frames: Frame[]
   selectedFrame: Frame | null
+  activeTrackId?: string
+  showAllTracks?: boolean
   frameRange?: FrameRange | null
   loading: boolean
   mapStyleUrl?: string
@@ -52,6 +54,8 @@ export function MapView({
   route,
   frames,
   selectedFrame,
+  activeTrackId,
+  showAllTracks = false,
   frameRange,
   loading,
   mapStyleUrl,
@@ -70,6 +74,22 @@ export function MapView({
   framesRef.current = frames
 
   const trackColors = useMemo(() => buildTrackColorMap(route), [route])
+  const effectiveTrackId =
+    activeTrackId || selectedFrame?.track_id || route.find((point) => point.track_id)?.track_id
+  const visibleRoute = useMemo(
+    () =>
+      showAllTracks || !effectiveTrackId
+        ? route
+        : route.filter((point) => point.track_id === effectiveTrackId),
+    [effectiveTrackId, route, showAllTracks],
+  )
+  const visibleFrames = useMemo(
+    () =>
+      showAllTracks || !effectiveTrackId
+        ? frames
+        : frames.filter((frame) => frame.track_id === effectiveTrackId),
+    [effectiveTrackId, frames, showAllTracks],
+  )
   const frameIndexes = useMemo(
     () => new Map(frames.map((frame) => [frame.id, frame.index])),
     [frames],
@@ -77,7 +97,7 @@ export function MapView({
   const frameGeoJson = useMemo<FeatureCollection>(
     () => ({
       type: 'FeatureCollection',
-      features: frames
+      features: visibleFrames
         .filter((frame) => frame.coordinate !== null)
         .map((frame) => ({
           type: 'Feature',
@@ -95,14 +115,29 @@ export function MapView({
           },
         })),
     }),
-    [frameRange, frames, selectedFrame, trackColors],
+    [frameRange, selectedFrame, trackColors, visibleFrames],
   )
 
-  const routeGeoJson = useMemo(() => buildRouteFeatureCollection(route), [route])
-  const routeRangeGeoJson = useMemo(
-    () => buildRouteRangeFeatureCollection(route, frameIndexes, frameRange),
-    [frameIndexes, frameRange, route],
-  )
+  const routeGeoJson = useMemo(() => {
+    const collection = buildRouteFeatureCollection(route)
+    if (showAllTracks || !effectiveTrackId) return collection
+    return {
+      ...collection,
+      features: collection.features.filter(
+        (feature) => feature.properties.track_id === effectiveTrackId,
+      ),
+    }
+  }, [effectiveTrackId, route, showAllTracks])
+  const routeRangeGeoJson = useMemo(() => {
+    const collection = buildRouteRangeFeatureCollection(route, frameIndexes, frameRange)
+    if (showAllTracks || !effectiveTrackId) return collection
+    return {
+      ...collection,
+      features: collection.features.filter(
+        (feature) => feature.properties.track_id === effectiveTrackId,
+      ),
+    }
+  }, [effectiveTrackId, frameIndexes, frameRange, route, showAllTracks])
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -217,11 +252,14 @@ export function MapView({
     const map = mapRef.current
     if (!map || !ready) return
     ;(map.getSource('mms-route') as GeoJSONSource | undefined)?.setData(routeGeoJson)
-    if (route.length > 1) {
-      const routeKey = `${route[0]?.frame_id ?? ''}:${route.at(-1)?.frame_id ?? ''}:${route.length}`
-      const bounds = route.reduce(
+    if (visibleRoute.length > 1) {
+      const routeKey = `${effectiveTrackId ?? 'all'}:${showAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
+      const bounds = visibleRoute.reduce(
         (result, point) => result.extend([point.lon, point.lat]),
-        new maplibregl.LngLatBounds([route[0].lon, route[0].lat], [route[0].lon, route[0].lat]),
+        new maplibregl.LngLatBounds(
+          [visibleRoute[0].lon, visibleRoute[0].lat],
+          [visibleRoute[0].lon, visibleRoute[0].lat],
+        ),
       )
       map.fitBounds(bounds, {
         padding: 88,
@@ -230,7 +268,7 @@ export function MapView({
       })
       fittedRouteRef.current = routeKey
     }
-  }, [ready, route, routeGeoJson])
+  }, [effectiveTrackId, ready, routeGeoJson, showAllTracks, visibleRoute])
 
   useEffect(() => {
     const map = mapRef.current
@@ -275,7 +313,11 @@ export function MapView({
   }
 
   return (
-    <div className={`map-view ${satellite ? 'satellite-mode' : ''}`}>
+    <div
+      className={`map-view ${satellite ? 'satellite-mode' : ''}`}
+      data-track-scope={showAllTracks ? 'all' : effectiveTrackId ?? 'none'}
+      data-route-feature-count={routeGeoJson.features.length}
+    >
       <div ref={containerRef} className="map-container" />
       {loading && (
         <div className="map-loading">
@@ -295,8 +337,15 @@ export function MapView({
       </div>
       <div className="map-legend">
         <span>
-          <i className="legend-route" />
-          주행 경로
+          <i
+            className="legend-route"
+            style={
+              !showAllTracks && effectiveTrackId
+                ? { background: trackColors.get(effectiveTrackId) ?? TRACK_COLORS[0] }
+                : undefined
+            }
+          />
+          {showAllTracks ? '전체 트랙' : '활성 트랙'}
         </span>
         <span>
           <i className="legend-frame" />

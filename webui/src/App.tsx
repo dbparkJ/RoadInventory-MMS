@@ -7,17 +7,20 @@ import {
   Menu,
   Plus,
   Server,
+  Settings2,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Brand } from './components/Brand'
 import { DatasetPanel } from './components/DatasetPanel'
 import { DetachablePanel } from './components/DetachablePanel'
+import { GeneralSettingsPanel } from './components/GeneralSettingsPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
 import { StorageDialog } from './components/StorageDialog'
 import { ToastRegion, type Toast } from './components/ToastRegion'
 import { Workspace } from './components/Workspace'
 import { api } from './lib/api'
+import { useUserSettings } from './lib/userSettings'
 import {
   createDemoRun,
   demoBootstrap,
@@ -58,11 +61,16 @@ function App() {
   const [panoramaOpen, setPanoramaOpen] = useState(false)
   const [pointCloudOpen, setPointCloudOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [inspectorDetached, setInspectorDetached] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsDetached, setSettingsDetached] = useState(false)
   const [sourceOpen, setSourceOpen] = useState(false)
   const [queueOpen, setQueueOpen] = useState(false)
   const [runs, setRuns] = useState<RunRecord[]>([])
   const [submitting, setSubmitting] = useState(false)
+  const [removingDatasetId, setRemovingDatasetId] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
+  const { settings, updateSettings, resetSettings } = useUserSettings()
   const frameScopeRef = useRef('')
   frameScopeRef.current = `${datasetId}::${trackId}`
 
@@ -394,6 +402,46 @@ function App() {
     })
   }
 
+  const removeDataset = async (dataset: DatasetSummary) => {
+    const ownerWindow = document.defaultView ?? window
+    const confirmed = ownerWindow.confirm(
+      `${dataset.name}을(를) 작업 목록에서 제거할까요?\n\n서버의 원본 폴더와 파일은 삭제되지 않습니다.`,
+    )
+    if (!confirmed) return
+
+    setRemovingDatasetId(dataset.id)
+    try {
+      const detail = demoMode
+        ? '데모 데이터를 현재 작업 목록에서 제거했습니다.'
+        : (await api.unregisterDataset(dataset.id)).detail
+      const remaining = datasets.filter((entry) => entry.id !== dataset.id)
+      setDatasets(remaining)
+      if (datasetId === dataset.id) {
+        setDatasetId(remaining[0]?.id ?? '')
+        setTrackId('')
+        setFrames([])
+        setSelectedFrame(null)
+        setFrameRange(null)
+        setRoute([])
+        setPanoramaOpen(false)
+        setPointCloudOpen(false)
+      }
+      toast({
+        tone: 'success',
+        title: '작업 데이터 등록을 해제했습니다',
+        message: detail || '원본 데이터는 그대로 보존됩니다.',
+      })
+    } catch (reason) {
+      toast({
+        tone: 'error',
+        title: '작업 데이터를 제거하지 못했습니다',
+        message: reason instanceof Error ? reason.message : undefined,
+      })
+    } finally {
+      setRemovingDatasetId(null)
+    }
+  }
+
   if (booting) return <BootScreen />
 
   return (
@@ -414,6 +462,16 @@ function App() {
           </div>
         </div>
         <div className="topbar-actions">
+          <button
+            type="button"
+            className="queue-button settings-button"
+            title="일반 설정"
+            aria-label="일반 설정 열기"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <Settings2 size={17} />
+            설정
+          </button>
           <button type="button" className="icon-button" title="도움말">
             <CircleHelp size={17} />
           </button>
@@ -459,6 +517,7 @@ function App() {
               frameTotal={frameTotal}
               hasMoreFrames={frameNextOffset !== null}
               frameRange={frameRange}
+              removingDataset={removingDatasetId === selectedDataset?.id}
               externalAction={action}
               onDatasetChange={(id) => {
                 setFrameRange(null)
@@ -486,6 +545,7 @@ function App() {
               onClearFrameRange={() => setFrameRange(null)}
               onLoadMoreFrames={() => void loadMoreFrames()}
               onOpenSource={() => setSourceOpen(true)}
+              onRemoveDataset={(dataset) => void removeDataset(dataset)}
             />
           )}
         </DetachablePanel>
@@ -495,6 +555,7 @@ function App() {
               dataset={selectedDataset}
               frames={frames}
               frame={selectedFrame}
+              selectedTrack={trackId}
               frameRange={frameRange}
               route={route}
               routeLoading={routeLoading}
@@ -505,6 +566,7 @@ function App() {
               hasMoreFrames={frameNextOffset !== null}
               inspectorOpen={inspectorOpen}
               detached={detached}
+              settings={settings}
               externalAction={action}
               onTogglePanorama={() => setPanoramaOpen((value) => !value)}
               onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
@@ -513,11 +575,21 @@ function App() {
               onToggleInspector={() => setInspectorOpen((value) => !value)}
               onOpenSource={() => setSourceOpen(true)}
               onUseDemo={useDemo}
+              onSettingsChange={updateSettings}
             />
           )}
         </DetachablePanel>
-        {inspectorOpen && (
-          <DetachablePanel id="process-setup" title="작업 설정" placeholderClassName="inspector-slot">
+        {(inspectorOpen || inspectorDetached) && (
+          <DetachablePanel
+            id="process-setup"
+            title="작업 설정"
+            placeholderClassName="inspector-slot"
+            hostHidden={!inspectorOpen && inspectorDetached}
+            onDetachedChange={(detached) => {
+              setInspectorDetached(detached)
+              if (!detached) setInspectorOpen(true)
+            }}
+          >
             {({ action }) => (
               <OptimizationPanel
                 dataset={selectedDataset}
@@ -532,6 +604,36 @@ function App() {
           </DetachablePanel>
         )}
       </div>
+
+      {(settingsOpen || settingsDetached) && (
+        <div
+          className="settings-layer"
+          hidden={!settingsOpen || settingsDetached}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSettingsOpen(false)
+          }}
+        >
+          <DetachablePanel
+            id="general-settings"
+            title="일반 설정"
+            placeholderClassName="settings-panel-slot"
+            onDetachedChange={setSettingsDetached}
+          >
+            {({ action, detached, returnToMain }) => (
+              <GeneralSettingsPanel
+                settings={settings}
+                externalAction={action}
+                onChange={updateSettings}
+                onReset={resetSettings}
+                onClose={() => {
+                  if (detached) returnToMain()
+                  setSettingsOpen(false)
+                }}
+              />
+            )}
+          </DetachablePanel>
+        </div>
+      )}
 
       <StorageDialog
         open={sourceOpen}

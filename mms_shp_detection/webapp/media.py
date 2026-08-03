@@ -7,51 +7,80 @@ import math
 import os
 import struct
 import uuid
+from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, Coroutine, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from .datasets import (
-    require_ready_dataset,
-    schedule_catalog,
-)
+from .datasets import require_ready_dataset, schedule_catalog
 from .security import UnsafePath, resolve_under_root
-
 
 router = APIRouter(prefix="/api", tags=["preview"])
 
 MMSP_HEADER = struct.Struct("<4sHHI6fI")
 MMSP_RECORD_BYTES = 15
 MMSP_VERSION = 1
+MMSO_HEADER = struct.Struct("<4sHHI6fI")
+MMSO_RECORD_BYTES = 15
+MMSO_VERSION = 1
 MAX_PREVIEW_BLOCKS = 256
+PANORAMA_POINT_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 T = TypeVar("T")
 
 
 async def _finish_preview_after_request_cancel(
     work: Coroutine[Any, Any, T],
     *,
+    owner_tasks: set[asyncio.Task[Any]],
     logger: Any,
     context: str,
 ) -> T:
-    """Keep the lock/semaphore owner alive until its worker thread finishes."""
+    """Drain non-cancellable worker work before releasing its lock/semaphore.
+
+    Callers acquire their cache lock and concurrency semaphore before entering
+    this helper.  That keeps queued requests normally cancellable, while a
+    request cancelled after ``asyncio.to_thread`` starts still waits for its
+    worker and atomic cache write to finish before the surrounding contexts are
+    released.  Owners are also tracked so application shutdown can drain them
+    before closing the shared point reader.
+    """
 
     task = asyncio.create_task(work)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        def consume_result(completed: asyncio.Task[T]) -> None:
-            try:
-                completed.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("%s failed after its request was cancelled.", context)
+    owner_tasks.add(task)
+    task.add_done_callback(owner_tasks.discard)
+    cancellation_requested = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+        except BaseException as exc:
+            if cancellation_requested:
+                logger.error(
+                    "%s failed after its request was cancelled: %s",
+                    context,
+                    exc,
+                )
+                raise asyncio.CancelledError() from exc
+            raise
 
-        task.add_done_callback(consume_result)
-        raise
+    if task.cancelled():
+        raise asyncio.CancelledError()
+    error = task.exception()
+    if cancellation_requested:
+        if error is not None:
+            logger.error(
+                "%s failed after its request was cancelled: %s",
+                context,
+                error,
+            )
+        raise asyncio.CancelledError() from error
+    if error is not None:
+        raise error
+    return task.result()
 
 
 def _dataset_root(request: Request, dataset: dict[str, Any]) -> Path:
@@ -212,16 +241,15 @@ async def panorama(
                 if cached_path.is_file():
                     return cached_path, media_type
             async with request.app.state.panorama_semaphore:
-                return await asyncio.to_thread(
-                    _resize_panorama, source, output_base, width
+                return await _finish_preview_after_request_cancel(
+                    asyncio.to_thread(_resize_panorama, source, output_base, width),
+                    owner_tasks=request.app.state.media_owner_tasks,
+                    logger=request.app.state.logger,
+                    context=f"Panorama preview {frame_id}",
                 )
 
     try:
-        output_path, media_type = await _finish_preview_after_request_cancel(
-            prepare_panorama(),
-            logger=request.app.state.logger,
-            context=f"Panorama preview {frame_id}",
-        )
+        output_path, media_type = await prepare_panorama()
     except Exception as exc:
         request.app.state.logger.exception("Could not resize panorama %s", frame_id)
         raise HTTPException(
@@ -255,14 +283,40 @@ def _catalog_fingerprint(catalog: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _build_mmsp(
+def _task_point_fingerprint(task: dict[str, Any]) -> str:
+    """Hash pose and matching fields that affect a frame point preview.
+
+    Frame IDs intentionally remain stable across a rescan of the same delivery.
+    Including these fields prevents an old media derivative from surviving a
+    corrected pose, track association, or panorama orientation.
+    """
+
+    serialized = json.dumps(
+        {
+            "origin": task.get("origin"),
+            "direction": task.get("direction"),
+            "up": task.get("up"),
+            "right": task.get("right"),
+            "job_name": task.get("job_name"),
+            "track_name": task.get("track_name"),
+            "record_name": task.get("record_name"),
+            "pointcloud_scope": task.get("pointcloud_scope"),
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _sample_nearby_points(
     task: dict[str, Any],
     catalog: dict[str, Any],
     reader: Any,
     *,
     budget: int,
     radius: float,
-) -> bytes:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from mms_shp_detection.pointcloud import (
         match_nearest_pointcloud_files,
         resolve_safe_pointcloud_source,
@@ -332,12 +386,33 @@ def _build_mmsp(
     if xyz_parts:
         xyz = np.concatenate(xyz_parts, axis=0)
         rgb = np.concatenate(rgb_parts, axis=0)
+    else:
+        xyz = np.empty((0, 3), dtype=np.float64)
+        rgb = np.empty((0, 3), dtype=np.uint8)
+    return xyz, rgb, origin
+
+
+def _build_mmsp(
+    task: dict[str, Any],
+    catalog: dict[str, Any],
+    reader: Any,
+    *,
+    budget: int,
+    radius: float,
+) -> bytes:
+    xyz, rgb, origin = _sample_nearby_points(
+        task,
+        catalog,
+        reader,
+        budget=budget,
+        radius=radius,
+    )
+    if xyz.size:
         relative = np.asarray(xyz - origin[None, :], dtype="<f4")
         minimum = relative.min(axis=0).astype("<f4")
         maximum = relative.max(axis=0).astype("<f4")
     else:
         relative = np.empty((0, 3), dtype="<f4")
-        rgb = np.empty((0, 3), dtype=np.uint8)
         minimum = np.zeros(3, dtype="<f4")
         maximum = np.zeros(3, dtype="<f4")
 
@@ -366,6 +441,170 @@ def _build_mmsp(
     return header + payload
 
 
+def _panorama_axes(
+    task: dict[str, Any],
+    *,
+    yaw_offset_deg: float,
+    pitch_offset_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    from mms_shp_detection.geometry import (
+        apply_panorama_angular_offsets,
+        build_camera_axes,
+    )
+
+    direction = np.asarray(task.get("direction"), dtype=np.float64)
+    up = np.asarray(task.get("up"), dtype=np.float64)
+    if (
+        direction.shape != (3,)
+        or up.shape != (3,)
+        or not np.all(np.isfinite(direction))
+        or not np.all(np.isfinite(up))
+    ):
+        raise ValueError("Frame has no valid panorama orientation axes.")
+    forward_vec, right_vec, up_vec = build_camera_axes(direction, up)
+    return apply_panorama_angular_offsets(
+        forward_vec,
+        right_vec,
+        up_vec,
+        yaw_offset_deg=yaw_offset_deg,
+        pitch_offset_deg=pitch_offset_deg,
+    )
+
+
+def _nearest_per_panorama_cell(
+    u: np.ndarray,
+    v: np.ndarray,
+    distance: np.ndarray,
+    *,
+    cell_size_px: int,
+    reference_width: int = 4096,
+) -> np.ndarray:
+    """Select the nearest sample in each equirectangular screen-space cell."""
+
+    reference_height = reference_width // 2
+    columns = max(1, math.ceil(reference_width / cell_size_px))
+    rows = max(1, math.ceil(reference_height / cell_size_px))
+    cell_x = np.minimum(columns - 1, np.floor(u * columns).astype(np.int64))
+    cell_y = np.minimum(rows - 1, np.floor(v * rows).astype(np.int64))
+    cell_key = (cell_y * columns) + cell_x
+    source_order = np.arange(cell_key.size, dtype=np.int64)
+    # Primary sort by cell, then nearest depth, then stable source order.
+    order = np.lexsort((source_order, distance, cell_key))
+    ordered_keys = cell_key[order]
+    first = np.empty(order.size, dtype=bool)
+    if first.size:
+        first[0] = True
+        first[1:] = ordered_keys[1:] != ordered_keys[:-1]
+    return order[first]
+
+
+def _build_mmso(
+    task: dict[str, Any],
+    catalog: dict[str, Any],
+    reader: Any,
+    *,
+    budget: int,
+    radius: float,
+    cell_size_px: int,
+    yaw_offset_deg: float,
+    pitch_offset_deg: float,
+) -> bytes:
+    """Build a compact panorama-overlay stream with normalized UV and depth.
+
+    MMSO v1 shares MMSP's compact 40-byte header and 15-byte records. Header
+    bounds are ``min/max (u, v, distance_m)`` and every record is normalized
+    ``u, v``, radial distance in metres, and RGB. A virtual 4096x2048 grid keeps
+    only the nearest sample in each cell, greatly reducing browser overdraw.
+    """
+
+    # A modest oversample gives the screen-space reducer enough candidates to
+    # choose useful near-surface points while preserving a strict read ceiling.
+    sample_budget = min(250_000, max(budget, budget * 3))
+    xyz, rgb, origin = _sample_nearby_points(
+        task,
+        catalog,
+        reader,
+        budget=sample_budget,
+        radius=radius,
+    )
+    forward_vec, right_vec, up_vec = _panorama_axes(
+        task,
+        yaw_offset_deg=yaw_offset_deg,
+        pitch_offset_deg=pitch_offset_deg,
+    )
+
+    if xyz.size:
+        from mms_shp_detection.geometry import project_points_equirectangular
+
+        u, v, distance = project_points_equirectangular(
+            xyz,
+            origin,
+            forward_vec,
+            right_vec,
+            up_vec,
+            1,
+            1,
+        )
+        valid = (
+            np.isfinite(u)
+            & np.isfinite(v)
+            & np.isfinite(distance)
+            & (distance > 0.05)
+        )
+        u = np.mod(u[valid], 1.0)
+        v = np.clip(v[valid], 0.0, 1.0)
+        distance = distance[valid]
+        rgb = rgb[valid]
+        selected = _nearest_per_panorama_cell(
+            u,
+            v,
+            distance,
+            cell_size_px=cell_size_px,
+        )
+        if selected.size > budget:
+            # Deterministic even selection retains coverage across the sorted
+            # screen cells instead of returning one contiguous panorama region.
+            selected = selected[
+                np.linspace(0, selected.size - 1, budget, dtype=np.int64)
+            ]
+        coordinates = np.column_stack(
+            (u[selected], v[selected], distance[selected])
+        ).astype("<f4")
+        rgb = np.asarray(rgb[selected], dtype=np.uint8)
+    else:
+        coordinates = np.empty((0, 3), dtype="<f4")
+        rgb = np.empty((0, 3), dtype=np.uint8)
+
+    if coordinates.size:
+        minimum = coordinates.min(axis=0).astype("<f4")
+        maximum = coordinates.max(axis=0).astype("<f4")
+    else:
+        minimum = np.zeros(3, dtype="<f4")
+        maximum = np.zeros(3, dtype="<f4")
+    count = int(coordinates.shape[0])
+    header = MMSO_HEADER.pack(
+        b"MMSO",
+        MMSO_VERSION,
+        3,  # bit 0: RGB, bit 1: normalized equirectangular UV
+        count,
+        *minimum.tolist(),
+        *maximum.tolist(),
+        0,
+    )
+    if count == 0:
+        return header
+    records = np.empty(
+        count,
+        dtype=np.dtype([("uvd", "<f4", (3,)), ("rgb", "u1", (3,))], align=False),
+    )
+    records["uvd"] = coordinates
+    records["rgb"] = rgb
+    payload = records.tobytes(order="C")
+    if len(payload) != count * MMSO_RECORD_BYTES:
+        raise RuntimeError("Unexpected MMSO record alignment.")
+    return header + payload
+
+
 def _write_once(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
@@ -373,6 +612,46 @@ def _write_once(path: Path, payload: bytes) -> None:
     )
     temporary.write_bytes(payload)
     temporary.replace(path)
+
+
+def _enforce_file_cache_quota(
+    directory: Path,
+    *,
+    suffix: str,
+    maximum_bytes: int,
+    keep: Path,
+) -> None:
+    """Bound a derived-file cache without ever touching delivery sources."""
+
+    entries: list[tuple[int, int, Path]] = []
+    total = 0
+    try:
+        candidates = list(directory.glob(f"*{suffix}"))
+    except OSError:
+        return
+    for candidate in candidates:
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        size = int(stat.st_size)
+        total += size
+        entries.append((int(stat.st_mtime_ns), size, candidate))
+    if total <= maximum_bytes:
+        return
+    keep_path = keep.resolve(strict=False)
+    for _mtime, size, candidate in sorted(entries):
+        if total <= maximum_bytes:
+            break
+        if candidate.resolve(strict=False) == keep_path:
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
+        total -= size
 
 
 @router.get("/datasets/{dataset_id}/points/{frame_id}")
@@ -417,8 +696,8 @@ async def points(
         )
 
     fingerprint_payload = (
-        f"mmsp-v1\0{dataset_id}\0{frame_id}\0{budget}\0{radius:.4f}\0"
-        f"{_catalog_fingerprint(catalog)}"
+        f"mmsp-v2\0{dataset_id}\0{frame_id}\0{budget}\0{radius:.4f}\0"
+        f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
     )
     fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
     output_path = (
@@ -443,22 +722,26 @@ async def points(
         async with lock:
             if not output_path.is_file():
                 async with request.app.state.point_preview_semaphore:
-                    payload = await asyncio.to_thread(
-                        _build_mmsp,
-                        frame["task"],
-                        catalog,
-                        request.app.state.point_reader,
-                        budget=budget,
-                        radius=radius,
+                    async def build_and_write() -> None:
+                        payload = await asyncio.to_thread(
+                            _build_mmsp,
+                            frame["task"],
+                            catalog,
+                            request.app.state.point_reader,
+                            budget=budget,
+                            radius=radius,
+                        )
+                        await asyncio.to_thread(_write_once, output_path, payload)
+
+                    await _finish_preview_after_request_cancel(
+                        build_and_write(),
+                        owner_tasks=request.app.state.media_owner_tasks,
+                        logger=request.app.state.logger,
+                        context=f"Point preview {frame_id}",
                     )
-                    await asyncio.to_thread(_write_once, output_path, payload)
 
     try:
-        await _finish_preview_after_request_cancel(
-            prepare_points(),
-            logger=request.app.state.logger,
-            context=f"Point preview {frame_id}",
-        )
+        await prepare_points()
     except Exception as exc:
         request.app.state.logger.exception(
             "Could not build point preview for frame %s", frame_id
@@ -471,5 +754,141 @@ async def points(
         output_path,
         etag_value=fingerprint,
         media_type="application/vnd.mmsp",
+        cache_seconds=3_600,
+    )
+
+
+@router.get("/datasets/{dataset_id}/panorama-points/{frame_id}")
+async def panorama_points(
+    dataset_id: str,
+    frame_id: str,
+    request: Request,
+    budget: int = Query(30_000, ge=1_000, le=100_000),
+    radius: float = Query(30.0, ge=1.0, le=100.0),
+    cell_size_px: int = Query(3, ge=1, le=32),
+    yaw_offset_deg: float | None = Query(None, ge=-180.0, le=180.0),
+    pitch_offset_deg: float | None = Query(None, ge=-45.0, le=45.0),
+) -> Response:
+    """Return frame points projected onto normalized equirectangular UV space."""
+
+    dataset = require_ready_dataset(request, dataset_id)
+    frame = request.app.state.store.get_frame(dataset_id, frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    if request.app.state.point_reader is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Point-cloud preview dependencies are not installed on this server.",
+        )
+    resolved_yaw_offset = (
+        float(request.app.state.panorama_yaw_offset_deg)
+        if yaw_offset_deg is None
+        else yaw_offset_deg
+    )
+    resolved_pitch_offset = (
+        float(request.app.state.panorama_pitch_offset_deg)
+        if pitch_offset_deg is None
+        else pitch_offset_deg
+    )
+    try:
+        _panorama_axes(
+            frame["task"],
+            yaw_offset_deg=resolved_yaw_offset,
+            pitch_offset_deg=resolved_pitch_offset,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    catalog = request.app.state.catalogs.get(dataset_id)
+    if catalog is None:
+        if dataset.get("catalog_status") == "error":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    dataset.get("catalog_error")
+                    or "Point-cloud indexing failed. Rescan the dataset after correcting its source."
+                ),
+            )
+        schedule_catalog(request.app, dataset_id)
+        return JSONResponse(
+            {
+                "status": "indexing",
+                "detail": "Point-cloud index is being prepared. Retry this request shortly.",
+            },
+            status_code=202,
+            headers={"Retry-After": "2", "Cache-Control": "no-store"},
+        )
+
+    fingerprint_payload = (
+        f"mmso-v1\0{dataset_id}\0{frame_id}\0{budget}\0{radius:.4f}\0"
+        f"{cell_size_px}\0{resolved_yaw_offset:.6f}\0{resolved_pitch_offset:.6f}\0"
+        f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
+    )
+    fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
+    output_path = (
+        request.app.state.config.state_dir
+        / "media"
+        / "panorama-points"
+        / dataset_id
+        / f"{fingerprint}.mmso"
+    )
+    if output_path.is_file():
+        return _etag_response(
+            request,
+            output_path,
+            etag_value=fingerprint,
+            media_type="application/vnd.mmso",
+            cache_seconds=3_600,
+        )
+    lock_key = f"panorama-points:{fingerprint}"
+    lock = request.app.state.media_locks.setdefault(lock_key, asyncio.Lock())
+
+    async def prepare_overlay() -> None:
+        async with lock:
+            if not output_path.is_file():
+                async with request.app.state.point_preview_semaphore:
+                    async def build_and_write() -> None:
+                        payload = await asyncio.to_thread(
+                            _build_mmso,
+                            frame["task"],
+                            catalog,
+                            request.app.state.point_reader,
+                            budget=budget,
+                            radius=radius,
+                            cell_size_px=cell_size_px,
+                            yaw_offset_deg=resolved_yaw_offset,
+                            pitch_offset_deg=resolved_pitch_offset,
+                        )
+                        await asyncio.to_thread(_write_once, output_path, payload)
+                        await asyncio.to_thread(
+                            _enforce_file_cache_quota,
+                            output_path.parent,
+                            suffix=".mmso",
+                            maximum_bytes=PANORAMA_POINT_CACHE_LIMIT_BYTES,
+                            keep=output_path,
+                        )
+
+                    await _finish_preview_after_request_cancel(
+                        build_and_write(),
+                        owner_tasks=request.app.state.media_owner_tasks,
+                        logger=request.app.state.logger,
+                        context=f"Panorama point overlay {frame_id}",
+                    )
+
+    try:
+        await prepare_overlay()
+    except Exception as exc:
+        request.app.state.logger.exception(
+            "Could not build panorama point overlay for frame %s", frame_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not prepare panorama point overlay.",
+        ) from exc
+    return _etag_response(
+        request,
+        output_path,
+        etag_value=fingerprint,
+        media_type="application/vnd.mmso",
         cache_seconds=3_600,
     )

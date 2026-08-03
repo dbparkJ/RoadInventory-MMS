@@ -2,31 +2,52 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import weakref
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
+import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from .datasets import public_dataset, router as datasets_router, utc_now
+from .datasets import public_dataset, utc_now
+from .datasets import router as datasets_router
 from .media import router as media_router
 from .optimizer import router as optimizer_router
-from .runs import RunManager, public_run, router as runs_router
+from .runs import RunManager, public_run
+from .runs import router as runs_router
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
 from .store import WebStore
 from .uploads import router as uploads_router
 
-
 API_VERSION = "1"
 SERVER_VERSION = "0.1.0"
+
+
+def _panorama_alignment_defaults(config_path: Path) -> tuple[float, float]:
+    """Read the validated pipeline's residual image-space angular offsets."""
+
+    try:
+        document = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+        section = document.get("panorama_alignment", {})
+        yaw = float(section.get("panorama_yaw_offset_deg", 0.0))
+        pitch = float(section.get("panorama_pitch_offset_deg", 0.0))
+        if not (math.isfinite(yaw) and math.isfinite(pitch)):
+            raise ValueError("non-finite panorama offset")
+        if not (-180.0 <= yaw <= 180.0 and -45.0 <= pitch <= 45.0):
+            raise ValueError("panorama offset outside web preview limits")
+        return yaw, pitch
+    except (AttributeError, OSError, TypeError, ValueError, yaml.YAMLError):
+        return 0.0, 0.0
 
 
 @dataclass(frozen=True)
@@ -379,6 +400,12 @@ def create_app(
                 upload_owners = list(app.state.upload_owner_tasks)
                 if upload_owners:
                     await asyncio.gather(*upload_owners, return_exceptions=True)
+                # Preview worker threads cannot be force-cancelled safely.  Let
+                # active resize/read/atomic-write owners finish before closing
+                # the shared point reader and log handlers.
+                media_owners = list(app.state.media_owner_tasks)
+                if media_owners:
+                    await asyncio.gather(*media_owners, return_exceptions=True)
                 tasks = [
                     *app.state.scan_tasks.values(),
                     *app.state.catalog_tasks.values(),
@@ -416,8 +443,13 @@ def create_app(
     app.state.upload_locks = weakref.WeakValueDictionary()
     app.state.upload_coordinators = weakref.WeakValueDictionary()
     app.state.upload_owner_tasks = set()
+    app.state.media_owner_tasks = set()
     app.state.panorama_semaphore = asyncio.Semaphore(config.max_panorama_previews)
     app.state.point_preview_semaphore = asyncio.Semaphore(config.max_point_previews)
+    (
+        app.state.panorama_yaw_offset_deg,
+        app.state.panorama_pitch_offset_deg,
+    ) = _panorama_alignment_defaults(config.pipeline_config_path)
     app.state.worker_process_lock = WorkerProcessLock(
         config.state_dir / "worker.lock"
     )
@@ -489,6 +521,13 @@ def create_app(
             "server_name": config.server_name,
             "map_style_url": config.map_style_url,
             "map": {"style_url": config.map_style_url},
+            "preview_defaults": {
+                "panorama_point_yaw_offset_deg": app.state.panorama_yaw_offset_deg,
+                "panorama_point_pitch_offset_deg": app.state.panorama_pitch_offset_deg,
+                "panorama_point_budget": 30_000,
+                "panorama_point_radius_m": 30.0,
+                "panorama_point_cell_size_px": 3,
+            },
             "storage_roots": public_roots,
             "datasets": datasets,
             "recent_runs": recent_runs,
@@ -502,6 +541,7 @@ def create_app(
                 "resumable_uploads": True,
                 "panorama_preview": True,
                 "point_preview": app.state.point_preview_available,
+                "panorama_point_overlay": app.state.point_preview_available,
                 "automatic_parameters": True,
                 "run_sse": True,
                 "single_gpu_queue": True,

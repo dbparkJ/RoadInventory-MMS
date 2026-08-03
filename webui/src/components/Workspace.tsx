@@ -13,7 +13,9 @@ import {
   X,
 } from 'lucide-react'
 import { lazy, Suspense, useEffect, useRef, type ReactNode } from 'react'
+import { DEFAULT_USER_SETTINGS, type UserSettings, type UserSettingsPatch } from '../lib/userSettings'
 import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
+import { DetachablePanel } from './DetachablePanel'
 
 const MapView = lazy(() =>
   import('../views/MapView').then((module) => ({ default: module.MapView })),
@@ -25,6 +27,7 @@ interface WorkspaceProps {
   dataset: DatasetSummary | null
   frames: Frame[]
   frame: Frame | null
+  selectedTrack?: string
   frameRange: FrameRange | null
   route: RoutePoint[]
   routeLoading: boolean
@@ -35,6 +38,7 @@ interface WorkspaceProps {
   hasMoreFrames: boolean
   inspectorOpen: boolean
   detached?: boolean
+  settings?: UserSettings
   externalAction?: ReactNode
   onTogglePanorama: () => void
   onTogglePointCloud: () => void
@@ -43,12 +47,14 @@ interface WorkspaceProps {
   onToggleInspector: () => void
   onOpenSource: () => void
   onUseDemo: () => void
+  onSettingsChange?: (patch: UserSettingsPatch) => void
 }
 
 export function Workspace({
   dataset,
   frames,
   frame,
+  selectedTrack,
   frameRange,
   route,
   routeLoading,
@@ -59,6 +65,7 @@ export function Workspace({
   hasMoreFrames,
   inspectorOpen,
   detached = false,
+  settings = DEFAULT_USER_SETTINGS,
   externalAction,
   onTogglePanorama,
   onTogglePointCloud,
@@ -67,6 +74,7 @@ export function Workspace({
   onToggleInspector,
   onOpenSource,
   onUseDemo,
+  onSettingsChange,
 }: WorkspaceProps) {
   const workspaceRef = useRef<HTMLElement>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
@@ -192,6 +200,8 @@ export function Workspace({
                 route={route}
                 frames={frames}
                 selectedFrame={frame}
+                activeTrackId={selectedTrack}
+                showAllTracks={settings.showAllMapTracks}
                 frameRange={frameRange}
                 loading={routeLoading}
                 mapStyleUrl={mapStyleUrl}
@@ -202,42 +212,77 @@ export function Workspace({
             {overlayCount > 0 && (
               <div className={`viewer-overlay-stack count-${overlayCount}`}>
                 {panoramaOpen && (
-                  <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 오버레이">
-                    <header className="viewer-pane-header">
-                      <span><Image size={14} /> 파노라마</span>
-                      <button type="button" onClick={onTogglePanorama} aria-label="파노라마 닫기" title="파노라마 닫기">
-                        <X size={14} />
-                      </button>
-                    </header>
-                    <div className="viewer-pane-content">
-                      <Suspense fallback={<ViewerLoading label="파노라마 엔진 준비 중" />}>
-                        <PanoramaView
-                          datasetId={dataset.id}
-                          frame={frame}
-                          demoMode={demoMode}
-                          onPreviousFrame={() => onMoveFrame(-1)}
-                          onNextFrame={() => onMoveFrame(1)}
-                          hasPreviousFrame={canMovePrevious}
-                          hasNextFrame={canMoveNext}
-                        />
-                      </Suspense>
-                    </div>
-                  </section>
+                  <DetachablePanel
+                    id={`panorama-${dataset.id}`}
+                    title="파노라마 뷰어"
+                    placeholderClassName="viewer-pane-slot"
+                  >
+                    {({ action }) => (
+                      <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 오버레이">
+                        <header className="viewer-pane-header">
+                          <span><Image size={14} /> 파노라마</span>
+                          <div className="viewer-pane-actions">
+                            {action}
+                            <button type="button" onClick={onTogglePanorama} aria-label="파노라마 닫기" title="파노라마 닫기">
+                              <X size={14} />
+                            </button>
+                          </div>
+                        </header>
+                        <div className="viewer-pane-content">
+                          <Suspense fallback={<ViewerLoading label="파노라마 엔진 준비 중" />}>
+                            <PanoramaView
+                              datasetId={dataset.id}
+                              frame={frame}
+                              demoMode={demoMode}
+                              forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
+                              quality={settings.panoramaDefaultQuality}
+                              pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
+                              pointOverlayOpacity={settings.panoramaPointOverlayOpacity}
+                              onQualityChange={(quality) =>
+                                onSettingsChange?.({ panoramaDefaultQuality: quality })
+                              }
+                              onPointOverlayEnabledChange={(enabled) =>
+                                onSettingsChange?.({ panoramaPointOverlayEnabled: enabled })
+                              }
+                              onPointOverlayOpacityChange={(opacity) =>
+                                onSettingsChange?.({ panoramaPointOverlayOpacity: opacity })
+                              }
+                              onPreviousFrame={() => onMoveFrame(-1)}
+                              onNextFrame={() => onMoveFrame(1)}
+                              hasPreviousFrame={canMovePrevious}
+                              hasNextFrame={canMoveNext}
+                            />
+                          </Suspense>
+                        </div>
+                      </section>
+                    )}
+                  </DetachablePanel>
                 )}
                 {pointCloudOpen && (
-                  <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 오버레이">
-                    <header className="viewer-pane-header">
-                      <span><Layers3 size={14} /> 3D 포인트</span>
-                      <button type="button" onClick={onTogglePointCloud} aria-label="3D 포인트 닫기" title="3D 포인트 닫기">
-                        <X size={14} />
-                      </button>
-                    </header>
-                    <div className="viewer-pane-content">
-                      <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
-                        <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
-                      </Suspense>
-                    </div>
-                  </section>
+                  <DetachablePanel
+                    id={`pointcloud-${dataset.id}`}
+                    title="3D 포인트 뷰어"
+                    placeholderClassName="viewer-pane-slot"
+                  >
+                    {({ action }) => (
+                      <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 오버레이">
+                        <header className="viewer-pane-header">
+                          <span><Layers3 size={14} /> 3D 포인트</span>
+                          <div className="viewer-pane-actions">
+                            {action}
+                            <button type="button" onClick={onTogglePointCloud} aria-label="3D 포인트 닫기" title="3D 포인트 닫기">
+                              <X size={14} />
+                            </button>
+                          </div>
+                        </header>
+                        <div className="viewer-pane-content">
+                          <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
+                            <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
+                          </Suspense>
+                        </div>
+                      </section>
+                    )}
+                  </DetachablePanel>
                 )}
               </div>
             )}

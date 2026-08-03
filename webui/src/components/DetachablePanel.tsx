@@ -5,12 +5,15 @@ import { createPortal } from 'react-dom'
 interface DetachablePanelControls {
   detached: boolean
   action: ReactNode
+  returnToMain: () => void
 }
 
 interface DetachablePanelProps {
   id: string
   title: string
   placeholderClassName?: string
+  hostHidden?: boolean
+  onDetachedChange?: (detached: boolean) => void
   children: (controls: DetachablePanelControls) => ReactNode
 }
 
@@ -18,6 +21,8 @@ export function DetachablePanel({
   id,
   title,
   placeholderClassName = '',
+  hostHidden = false,
+  onDetachedChange,
   children,
 }: DetachablePanelProps) {
   const popupRef = useRef<Window | null>(null)
@@ -44,8 +49,9 @@ export function DetachablePanel({
     popupRef.current = null
     moveHome()
     setPortalRoot(null)
+    onDetachedChange?.(false)
     if (popup && !popup.closed) popup.close()
-  }, [moveHome])
+  }, [moveHome, onDetachedChange])
 
   const detach = useCallback(() => {
     if (popupRef.current && !popupRef.current.closed) {
@@ -53,19 +59,23 @@ export function DetachablePanel({
       return
     }
 
-    const popup = window.open(
+    const sourceDocument = mountRef.current?.ownerDocument ?? document
+    const sourceWindow = sourceDocument.defaultView ?? window
+    const popup = sourceWindow.open(
       '',
       `mms-${id}`,
       'popup=yes,width=1180,height=760,left=80,top=80,resizable=yes,scrollbars=no',
     )
     if (!popup) return
 
-    popup.document.title = `MMS · ${title}`
     popup.document.head.replaceChildren()
     const base = popup.document.createElement('base')
-    base.href = document.baseURI
+    base.href = sourceDocument.baseURI
     popup.document.head.appendChild(base)
-    document.head.querySelectorAll('link[rel="stylesheet"], style').forEach((node) => {
+    const popupTitle = popup.document.createElement('title')
+    popupTitle.textContent = `MMS · ${title}`
+    popup.document.head.appendChild(popupTitle)
+    sourceDocument.head.querySelectorAll('link[rel="stylesheet"], style').forEach((node) => {
       popup.document.head.appendChild(node.cloneNode(true))
     })
 
@@ -81,12 +91,14 @@ export function DetachablePanel({
       popupRef.current = null
       moveHome()
       setPortalRoot(null)
+      onDetachedChange?.(false)
     }
     popup.addEventListener('beforeunload', onClose, { once: true })
     popupRef.current = popup
     setPortalRoot(root)
+    onDetachedChange?.(true)
     popup.focus()
-  }, [id, moveHome, panelHost, title])
+  }, [id, moveHome, onDetachedChange, panelHost, title])
 
   useEffect(() => () => {
     const popup = popupRef.current
@@ -119,7 +131,11 @@ export function DetachablePanel({
 
   return (
     <>
-      <div ref={mountRef} className={`detachable-host ${placeholderClassName}`}>
+      <div
+        ref={mountRef}
+        className={`detachable-host ${placeholderClassName}`}
+        hidden={hostHidden}
+      >
         {portalRoot && (
           <section className="detached-placeholder" aria-label={`${title} 분리됨`}>
             <ExternalLink size={24} />
@@ -137,7 +153,11 @@ export function DetachablePanel({
         )}
       </div>
       {createPortal(
-        children({ detached: Boolean(portalRoot), action: portalRoot ? detachedAction : attachedAction }),
+        children({
+          detached: Boolean(portalRoot),
+          action: portalRoot ? detachedAction : attachedAction,
+          returnToMain: attach,
+        }),
         panelHost,
       )}
     </>

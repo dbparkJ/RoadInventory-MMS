@@ -11,11 +11,13 @@ import {
   LoaderCircle,
   RotateCcw,
   Search,
+  Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { DatasetSummary, Frame, FrameRange } from '../types'
 import { formatCount, formatDistance, formatFrameTimestamp } from '../lib/format'
 import { TRACK_COLORS } from '../lib/route'
+import { DetachablePanel } from './DetachablePanel'
 
 const DATASET_STATUS: Record<DatasetSummary['status'], string> = {
   ready: '인덱스 준비됨',
@@ -34,6 +36,7 @@ interface DatasetPanelProps {
   frameTotal: number
   hasMoreFrames: boolean
   frameRange: FrameRange | null
+  removingDataset?: boolean
   externalAction?: ReactNode
   onDatasetChange: (id: string) => void
   onTrackChange: (id: string) => void
@@ -44,6 +47,7 @@ interface DatasetPanelProps {
   onClearFrameRange: () => void
   onLoadMoreFrames: () => void
   onOpenSource: () => void
+  onRemoveDataset?: (dataset: DatasetSummary) => void
 }
 
 export function DatasetPanel({
@@ -57,6 +61,7 @@ export function DatasetPanel({
   frameTotal,
   hasMoreFrames,
   frameRange,
+  removingDataset = false,
   externalAction,
   onDatasetChange,
   onTrackChange,
@@ -67,6 +72,7 @@ export function DatasetPanel({
   onClearFrameRange,
   onLoadMoreFrames,
   onOpenSource,
+  onRemoveDataset,
 }: DatasetPanelProps) {
   const [query, setQuery] = useState('')
   const [rangeDraft, setRangeDraft] = useState<[string, string]>(['', ''])
@@ -115,21 +121,35 @@ export function DatasetPanel({
 
       {selectedDataset ? (
         <>
-          <label className="select-shell dataset-select">
-            <Database size={16} />
-            <select
-              aria-label="데이터셋 선택"
-              value={selectedDataset.id}
-              onChange={(event) => onDatasetChange(event.target.value)}
-            >
-              {datasets.map((dataset) => (
-                <option value={dataset.id} key={dataset.id}>
-                  {dataset.name}
-                </option>
-              ))}
-            </select>
-            <ChevronDown size={15} />
-          </label>
+          <div className="dataset-select-row">
+            <label className="select-shell dataset-select">
+              <Database size={16} />
+              <select
+                aria-label="데이터셋 선택"
+                value={selectedDataset.id}
+                onChange={(event) => onDatasetChange(event.target.value)}
+              >
+                {datasets.map((dataset) => (
+                  <option value={dataset.id} key={dataset.id}>
+                    {dataset.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={15} />
+            </label>
+            {onRemoveDataset && (
+              <button
+                type="button"
+                className="icon-button dataset-remove-button"
+                disabled={removingDataset}
+                aria-label={`${selectedDataset.name} 작업 목록에서 제거`}
+                title="원본 폴더는 보존하고 작업 목록에서만 제거"
+                onClick={() => onRemoveDataset(selectedDataset)}
+              >
+                {removingDataset ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}
+              </button>
+            )}
+          </div>
 
           <div className="dataset-health">
             <div className={`dataset-health-line status-${selectedDataset.status}`}>
@@ -194,13 +214,22 @@ export function DatasetPanel({
             </div>
           </section>
 
-          <section className="frame-section">
-            <div className="section-label">
-              <span>프레임</span>
-              <small>
-                {frames.length.toLocaleString('ko-KR')} / {frameTotal.toLocaleString('ko-KR')} loaded
-              </small>
-            </div>
+          <DetachablePanel
+            id={`frames-${selectedDataset.id}`}
+            title="프레임 및 작업 구간"
+            placeholderClassName="frame-panel-slot"
+          >
+            {({ action }) => (
+              <section className="frame-section">
+                <div className="section-label">
+                  <span>프레임</span>
+                  <span className="section-label-actions">
+                    <small>
+                      {frames.length.toLocaleString('ko-KR')} / {frameTotal.toLocaleString('ko-KR')} loaded
+                    </small>
+                    {action}
+                  </span>
+                </div>
             <label className="search-box">
               <Search size={14} />
               <input
@@ -315,7 +344,7 @@ export function DatasetPanel({
                 </code>
               </div>
             </div>
-            <div className="frame-list" aria-busy={framesLoading}>
+                <div className="frame-list" aria-busy={framesLoading}>
               {framesLoading && !frames.length
                 ? Array.from({ length: 5 }, (_, index) => (
                     <div className="frame-skeleton" key={index}>
@@ -377,8 +406,10 @@ export function DatasetPanel({
               {!framesLoading && !visibleFrames.length && (
                 <div className="list-empty">조건에 맞는 프레임이 없습니다.</div>
               )}
-            </div>
-          </section>
+                </div>
+              </section>
+            )}
+          </DetachablePanel>
         </>
       ) : (
         <div className="panel-empty">

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,6 @@ from .security import (
     opaque_id,
     resolve_under_root,
 )
-
 
 router = APIRouter(prefix="/api", tags=["datasets"])
 
@@ -88,6 +88,7 @@ def _configured_catalog_candidate(app: Any, dataset_root: Path) -> Path | None:
         return None
     try:
         import yaml
+
         from mms_shp_detection.config import _Yaml12SafeLoader
 
         document = yaml.load(
@@ -113,18 +114,138 @@ def _configured_catalog_candidate(app: Any, dataset_root: Path) -> Path | None:
         return None
 
 
+def _horizontal_crs(candidate: Any) -> Any:
+    if getattr(candidate, "is_compound", False):
+        projected = [item for item in candidate.sub_crs_list if item.is_projected]
+        geographic = [item for item in candidate.sub_crs_list if item.is_geographic]
+        return (projected or geographic or [candidate])[0]
+    return candidate
+
+
+def _unique_crs(candidates: list[Any]) -> list[Any]:
+    unique: list[Any] = []
+    for candidate in candidates:
+        horizontal = _horizontal_crs(candidate)
+        if not any(
+            horizontal.equals(existing, ignore_axis_order=True)
+            for existing in unique
+        ):
+            unique.append(horizontal)
+    return unique
+
+
+def _recover_vendor_las_crs(wkt: str, crs_type: Any) -> Any | None:
+    """Recover a horizontal UTM CRS from a malformed vendor LAS WKT.
+
+    Some Leica exports contain a damaged/non-ASCII PROJCS name and an
+    unbalanced quote, so PROJ rejects the complete compound WKT even though
+    its UTM parameters remain intact.  Recovery is deliberately narrow: only
+    a WGS84 UTM name or a complete standard UTM parameter set is accepted.
+    """
+
+    text = str(wkt)[:1_000_000]
+    upper = text.upper()
+    if "WGS_1984" not in upper and "WGS 84" not in upper:
+        return None
+
+    named = re.search(r"UTM\s*(?:ZONE\s*)?([1-9]|[1-5][0-9]|60)\s*([NS])", upper)
+    if named is not None:
+        zone = int(named.group(1))
+        north = named.group(2) == "N"
+        try:
+            return crs_type.from_epsg((32600 if north else 32700) + zone)
+        except Exception:
+            return None
+
+    if "TRANSVERSE_MERCATOR" not in upper:
+        return None
+
+    def parameter(name: str) -> float | None:
+        match = re.search(
+            rf'PARAMETER\s*\[\s*"{name}"\s*,\s*([-+0-9.eE]+)',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+    central_meridian = parameter("Central_Meridian")
+    false_easting = parameter("False_Easting")
+    false_northing = parameter("False_Northing")
+    scale_factor = parameter("Scale_Factor")
+    latitude_origin = parameter("Latitude_Of_Origin")
+    if None in (
+        central_meridian,
+        false_easting,
+        false_northing,
+        scale_factor,
+        latitude_origin,
+    ):
+        return None
+    assert central_meridian is not None
+    assert false_easting is not None
+    assert false_northing is not None
+    assert scale_factor is not None
+    assert latitude_origin is not None
+    zone = round((central_meridian + 183.0) / 6.0)
+    expected_meridian = zone * 6.0 - 183.0
+    if not (
+        1 <= zone <= 60
+        and abs(central_meridian - expected_meridian) < 1e-7
+        and abs(false_easting - 500_000.0) < 1e-4
+        and abs(scale_factor - 0.9996) < 1e-9
+        and abs(latitude_origin) < 1e-9
+    ):
+        return None
+    if abs(false_northing) < 1e-4:
+        north = True
+    elif abs(false_northing - 10_000_000.0) < 1e-4:
+        north = False
+    else:
+        return None
+    try:
+        return crs_type.from_epsg((32600 if north else 32700) + zone)
+    except Exception:
+        return None
+
+
+def _las_header_crs(header: Any, crs_type: Any) -> Any | None:
+    try:
+        parsed = header.parse_crs(prefer_wkt=True)
+        if parsed is not None:
+            return crs_type.from_user_input(parsed)
+    except Exception:
+        pass
+    vlrs = [
+        *list(getattr(header, "vlrs", ()) or ()),
+        *list(getattr(header, "evlrs", ()) or ()),
+    ]
+    for vlr in vlrs:
+        raw_wkt = getattr(vlr, "string", None)
+        if raw_wkt:
+            recovered = _recover_vendor_las_crs(str(raw_wkt), crs_type)
+            if recovered is not None:
+                return recovered
+    return None
+
+
 def detect_dataset_crs(app: Any, dataset_root: Path) -> str:
     """Detect one authoritative CRS from a matching catalog, PRJ, or LAS header."""
 
     assert_no_symlink_descendants(dataset_root)
     try:
         from pyproj import CRS
+        from pyproj.exceptions import CRSError
     except ImportError as exc:
         raise ValueError(
             "CRS could not be auto-detected because pyproj is not installed; enter an EPSG code."
         ) from exc
 
-    candidates: list[Any] = []
+    catalog_crs: list[Any] = []
     catalog_candidates = [
         _configured_catalog_candidate(app, dataset_root),
         app.state.config.project_root / ".cache" / "pointcloud_catalog.json",
@@ -141,10 +262,13 @@ def detect_dataset_crs(app: Any, dataset_root: Path) -> str:
                 == dataset_root.resolve(strict=True)
                 and (payload.get("crs_wkt") or payload.get("wkt"))
             ):
-                candidates.append(CRS.from_user_input(payload.get("crs_wkt") or payload["wkt"]))
-        except (OSError, ValueError, json.JSONDecodeError):
+                catalog_crs.append(
+                    CRS.from_user_input(payload.get("crs_wkt") or payload["wkt"])
+                )
+        except (OSError, ValueError, CRSError, json.JSONDecodeError):
             continue
 
+    prj_crs: list[Any] = []
     prj_paths = sorted(
         (path for path in dataset_root.rglob("*") if path.is_file() and path.suffix.casefold() == ".prj"),
         key=lambda path: str(path).casefold(),
@@ -155,45 +279,52 @@ def detect_dataset_crs(app: Any, dataset_root: Path) -> str:
         )
     for path in prj_paths[:200]:
         try:
-            candidates.append(CRS.from_wkt(path.read_text(encoding="utf-8-sig")))
-        except (OSError, UnicodeError, ValueError):
+            prj_crs.append(CRS.from_wkt(path.read_text(encoding="utf-8-sig")))
+        except (OSError, UnicodeError, ValueError, CRSError):
             continue
 
-    # LAS header reads are small and do not decode point records.  They are used
-    # only if catalogs/sidecars did not already provide an authority.
-    if not candidates:
-        try:
-            import laspy
+    # LAS/LAZ is the coordinate source used by the point/panorama workspace.
+    # Inspect it even if unrelated trajectory SHP files have WGS84 PRJ files.
+    las_crs: list[Any] = []
+    try:
+        import laspy
 
-            las_paths = sorted(
-                (path for path in dataset_root.rglob("*") if path.is_file() and path.suffix.casefold() == ".las"),
-                key=lambda path: str(path).casefold(),
+        las_paths = sorted(
+            (
+                path
+                for path in dataset_root.rglob("*")
+                if path.is_file() and path.suffix.casefold() in {".las", ".laz"}
+            ),
+            key=lambda path: str(path).casefold(),
+        )
+        if len(las_paths) > 200:
+            raise ValueError(
+                "Too many LAS/LAZ headers to auto-detect a unique CRS safely; "
+                "enter the delivery EPSG code."
             )
-            if len(las_paths) > 200:
-                raise ValueError(
-                    "Too many LAS headers to auto-detect a unique CRS safely; "
-                    "enter the delivery EPSG code."
-                )
-            for path in las_paths[:200]:
-                try:
-                    with laspy.open(path) as reader:
-                        parsed = reader.header.parse_crs(prefer_wkt=True)
-                    if parsed is not None:
-                        candidates.append(CRS.from_user_input(parsed))
-                except Exception:
-                    continue
-        except ImportError:
-            pass
+        for path in las_paths[:200]:
+            try:
+                with laspy.open(path) as reader:
+                    parsed = _las_header_crs(reader.header, CRS)
+                if parsed is not None:
+                    las_crs.append(parsed)
+            except Exception:
+                continue
+    except ImportError:
+        pass
 
+    selected_source = ""
     unique: list[Any] = []
-    for candidate in candidates:
-        horizontal = candidate
-        if getattr(candidate, "is_compound", False):
-            projected = [item for item in candidate.sub_crs_list if item.is_projected]
-            geographic = [item for item in candidate.sub_crs_list if item.is_geographic]
-            horizontal = (projected or geographic or [candidate])[0]
-        if not any(horizontal.equals(existing, ignore_axis_order=True) for existing in unique):
-            unique.append(horizontal)
+    for source_name, source_candidates in (
+        ("matching point-cloud catalog", catalog_crs),
+        ("LAS/LAZ headers", las_crs),
+        ("PRJ sidecars", prj_crs),
+    ):
+        source_unique = _unique_crs(source_candidates)
+        if source_unique:
+            selected_source = source_name
+            unique = source_unique
+            break
     if not unique:
         raise ValueError(
             "CRS could not be detected from a matching catalog, PRJ, or LAS header. "
@@ -205,7 +336,7 @@ def detect_dataset_crs(app: Any, dataset_root: Path) -> str:
             for item in unique
         ]
         raise ValueError(
-            "Multiple horizontal CRSs were detected "
+            f"Multiple horizontal CRSs were detected in {selected_source} "
             f"({', '.join(authorities)}); select the correct CRS explicitly."
         )
     authority = unique[0].to_authority()
@@ -578,6 +709,55 @@ async def get_dataset(dataset_id: str, request: Request) -> dict[str, Any]:
     return public_dataset(dataset)
 
 
+@router.delete("/datasets/{dataset_id}")
+async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any]:
+    """Remove a dataset from the workspace registry, never its source folder."""
+
+    store = request.app.state.store
+    dataset = store.get_dataset(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    active_run = store.active_run_for_dataset(dataset_id)
+    if active_run is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Dataset cannot be removed while run "
+                f"{active_run['id']} is {active_run['status']}."
+            ),
+        )
+
+    # Index/catalog tasks do not mutate source files.  Stop and drain them
+    # before clearing indexed frames so they cannot repopulate a hidden row.
+    pending_tasks = []
+    for registry in (request.app.state.scan_tasks, request.app.state.catalog_tasks):
+        task = registry.get(dataset_id)
+        if task is not None and not task.done():
+            task.cancel()
+            pending_tasks.append(task)
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    result = store.unregister_dataset(dataset_id, now=utc_now())
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    if result["status"] == "active_run":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Dataset cannot be removed while run "
+                f"{result['run_id']} is {result['run_status']}."
+            ),
+        )
+    request.app.state.catalogs.pop(dataset_id, None)
+    return {
+        "id": dataset_id,
+        "removed": True,
+        "source_deleted": False,
+        "detail": "Dataset was removed from the workspace; source files were preserved.",
+    }
+
+
 @router.get("/datasets/{dataset_id}/frames")
 async def get_frames(
     dataset_id: str,
@@ -713,6 +893,7 @@ def seed_catalog_cache(
     if config_path.is_file():
         try:
             import yaml
+
             from mms_shp_detection.config import _Yaml12SafeLoader
 
             document = yaml.load(

@@ -208,6 +208,16 @@ export const api = {
     return json<DatasetDetail>(`/api/datasets/${encodeURIComponent(id)}`, { signal })
   },
 
+  unregisterDataset(id: string) {
+    return json<{ id: string; removed: boolean; source_deleted: false; detail: string }>(
+      `/api/datasets/${encodeURIComponent(id)}`,
+      {
+      method: 'DELETE',
+      timeout: 30_000,
+      },
+    )
+  },
+
   route(id: string, signal?: AbortSignal) {
     return json<RouteResponse>(`/api/datasets/${encodeURIComponent(id)}/route`, {
       signal,
@@ -261,6 +271,37 @@ export const api = {
     )
     if (response.status === 202) {
       let message = '포인트 미리보기를 준비하고 있습니다.'
+      try {
+        const payload = (await response.json()) as { message?: string; detail?: string }
+        message = payload.message ?? payload.detail ?? message
+      } catch {
+        // Keep the useful default.
+      }
+      throw new ApiError(message, 202, 'INDEXING')
+    }
+    return response.arrayBuffer()
+  },
+
+  async panoramaPoints(
+    id: string,
+    frameId: string,
+    budget: number,
+    radius: number,
+    signal?: AbortSignal,
+  ) {
+    const response = await request(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(id)}/panorama-points/${encodeURIComponent(frameId)}`,
+        { budget, radius },
+      ),
+      {
+        signal,
+        timeout: 45_000,
+        headers: { Accept: 'application/vnd.mmso, application/octet-stream' },
+      },
+    )
+    if (response.status === 202) {
+      let message = '파노라마 포인트 인덱스를 준비하고 있습니다.'
       try {
         const payload = (await response.json()) as { message?: string; detail?: string }
         message = payload.message ?? payload.detail ?? message

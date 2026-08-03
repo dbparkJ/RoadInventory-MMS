@@ -104,11 +104,19 @@ export interface BootstrapResponse {
   map_style_url?: string
   datasets: DatasetSummary[]
   recent_runs?: RunRecord[]
+  preview_defaults?: {
+    panorama_point_yaw_offset_deg?: number
+    panorama_point_pitch_offset_deg?: number
+    panorama_point_budget?: number
+    panorama_point_radius_m?: number
+    panorama_point_cell_size_px?: number
+  }
   capabilities?: {
     upload?: boolean
     panorama?: boolean
     point_cloud?: boolean
     auto_optimize?: boolean
+    panorama_point_overlay?: boolean
   }
 }
 
@@ -174,6 +182,12 @@ export interface PointCloudPayload {
     min: [number, number, number]
     max: [number, number, number]
   }
+  pointCount: number
+}
+
+export interface PanoramaPointPayload {
+  coordinates: Float32Array
+  colors: Uint8Array | null
   pointCount: number
 }
 
