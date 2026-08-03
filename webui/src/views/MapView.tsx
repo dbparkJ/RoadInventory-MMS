@@ -3,13 +3,19 @@ import type { FeatureCollection } from 'geojson'
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap, type StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { buildRouteFeatureCollection } from '../lib/route'
-import type { Frame, RoutePoint } from '../types'
+import {
+  buildRouteFeatureCollection,
+  buildRouteRangeFeatureCollection,
+  buildTrackColorMap,
+  TRACK_COLORS,
+} from '../lib/route'
+import type { Frame, FrameRange, RoutePoint } from '../types'
 
 interface MapViewProps {
   route: RoutePoint[]
   frames: Frame[]
   selectedFrame: Frame | null
+  frameRange?: FrameRange | null
   loading: boolean
   mapStyleUrl?: string
   onSelectFrame: (frame: Frame) => void
@@ -46,6 +52,7 @@ export function MapView({
   route,
   frames,
   selectedFrame,
+  frameRange,
   loading,
   mapStyleUrl,
   onSelectFrame,
@@ -54,12 +61,19 @@ export function MapView({
   const mapRef = useRef<MapLibreMap | null>(null)
   const onSelectRef = useRef(onSelectFrame)
   const framesRef = useRef(frames)
+  const fittedRouteRef = useRef('')
+  const selectedFrameRef = useRef<string | null>(null)
   const [ready, setReady] = useState(false)
   const [satellite, setSatellite] = useState(false)
 
   onSelectRef.current = onSelectFrame
   framesRef.current = frames
 
+  const trackColors = useMemo(() => buildTrackColorMap(route), [route])
+  const frameIndexes = useMemo(
+    () => new Map(frames.map((frame) => [frame.id, frame.index])),
+    [frames],
+  )
   const frameGeoJson = useMemo<FeatureCollection>(
     () => ({
       type: 'FeatureCollection',
@@ -68,17 +82,27 @@ export function MapView({
         .map((frame) => ({
           type: 'Feature',
           id: frame.id,
-          properties: { id: frame.id, selected: frame.id === selectedFrame?.id ? 1 : 0 },
+          properties: {
+            id: frame.id,
+            selected: frame.id === selectedFrame?.id ? 1 : 0,
+            in_range:
+              frameRange && frame.index >= frameRange[0] && frame.index <= frameRange[1] ? 1 : 0,
+            track_color: trackColors.get(frame.track_id) ?? TRACK_COLORS[0],
+          },
           geometry: {
             type: 'Point',
             coordinates: [frame.coordinate!.lon, frame.coordinate!.lat],
           },
         })),
     }),
-    [frames, selectedFrame],
+    [frameRange, frames, selectedFrame, trackColors],
   )
 
   const routeGeoJson = useMemo(() => buildRouteFeatureCollection(route), [route])
+  const routeRangeGeoJson = useMemo(
+    () => buildRouteRangeFeatureCollection(route, frameIndexes, frameRange),
+    [frameIndexes, frameRange, route],
+  )
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
@@ -111,7 +135,28 @@ export function MapView({
         id: 'mms-route-line',
         type: 'line',
         source: 'mms-route',
-        paint: { 'line-color': '#36d9b1', 'line-width': 4, 'line-opacity': 0.95 },
+        paint: {
+          'line-color': ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
+          'line-width': 4,
+          'line-opacity': 0.95,
+        },
+      })
+      map.addSource('mms-route-range', { type: 'geojson', data: routeRangeGeoJson })
+      map.addLayer({
+        id: 'mms-route-range-halo',
+        type: 'line',
+        source: 'mms-route-range',
+        paint: { 'line-color': '#ffffff', 'line-width': 10, 'line-opacity': 0.72 },
+      })
+      map.addLayer({
+        id: 'mms-route-range-line',
+        type: 'line',
+        source: 'mms-route-range',
+        paint: {
+          'line-color': ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
+          'line-width': 6,
+          'line-opacity': 1,
+        },
       })
       map.addSource('mms-frames', { type: 'geojson', data: frameGeoJson })
       map.addLayer({
@@ -120,10 +165,29 @@ export function MapView({
         source: 'mms-frames',
         paint: {
           'circle-radius': ['case', ['==', ['get', 'selected'], 1], 8, 3],
-          'circle-color': ['case', ['==', ['get', 'selected'], 1], '#ffffff', '#32cda9'],
-          'circle-stroke-width': ['case', ['==', ['get', 'selected'], 1], 4, 1],
-          'circle-stroke-color': ['case', ['==', ['get', 'selected'], 1], '#2ad6ac', '#09261f'],
-          'circle-opacity': ['case', ['==', ['get', 'selected'], 1], 1, 0.82],
+          'circle-color': [
+            'case',
+            ['==', ['get', 'selected'], 1],
+            '#ffffff',
+            ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
+          ],
+          'circle-stroke-width': [
+            'case',
+            ['==', ['get', 'selected'], 1],
+            4,
+            ['==', ['get', 'in_range'], 1],
+            3,
+            1,
+          ],
+          'circle-stroke-color': [
+            'case',
+            ['==', ['get', 'selected'], 1],
+            ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
+            ['==', ['get', 'in_range'], 1],
+            '#ffffff',
+            '#09261f',
+          ],
+          'circle-opacity': ['case', ['==', ['get', 'in_range'], 1], 1, 0.82],
         },
       })
       map.on('mouseenter', 'mms-frames-points', () => {
@@ -154,13 +218,25 @@ export function MapView({
     if (!map || !ready) return
     ;(map.getSource('mms-route') as GeoJSONSource | undefined)?.setData(routeGeoJson)
     if (route.length > 1) {
+      const routeKey = `${route[0]?.frame_id ?? ''}:${route.at(-1)?.frame_id ?? ''}:${route.length}`
       const bounds = route.reduce(
         (result, point) => result.extend([point.lon, point.lat]),
         new maplibregl.LngLatBounds([route[0].lon, route[0].lat], [route[0].lon, route[0].lat]),
       )
-      map.fitBounds(bounds, { padding: 88, duration: 700, maxZoom: 17 })
+      map.fitBounds(bounds, {
+        padding: 88,
+        duration: fittedRouteRef.current === routeKey ? 450 : 0,
+        maxZoom: 17,
+      })
+      fittedRouteRef.current = routeKey
     }
   }, [ready, route, routeGeoJson])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !ready) return
+    ;(map.getSource('mms-route-range') as GeoJSONSource | undefined)?.setData(routeRangeGeoJson)
+  }, [ready, routeRangeGeoJson])
 
   useEffect(() => {
     const map = mapRef.current
@@ -170,7 +246,16 @@ export function MapView({
 
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !ready || !selectedFrame?.coordinate) return
+    if (!selectedFrame?.coordinate) {
+      selectedFrameRef.current = null
+      return
+    }
+    if (selectedFrameRef.current === null) {
+      selectedFrameRef.current = selectedFrame.id
+      return
+    }
+    if (!map || !ready || selectedFrameRef.current === selectedFrame.id) return
+    selectedFrameRef.current = selectedFrame.id
     map.easeTo({
       center: [selectedFrame.coordinate.lon, selectedFrame.coordinate.lat],
       duration: 520,

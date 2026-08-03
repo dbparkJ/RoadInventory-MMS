@@ -65,6 +65,7 @@ export interface Frame {
 export interface RoutePoint extends Coordinate {
   frame_id?: string
   track_id?: string
+  index?: number
   heading?: number
 }
 

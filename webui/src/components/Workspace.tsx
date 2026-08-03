@@ -3,14 +3,17 @@ import {
   ChevronRight,
   CircleGauge,
   CloudOff,
+  Eye,
   Image,
+  Keyboard,
   Layers3,
   Map,
   PanelRightClose,
   PanelRightOpen,
+  X,
 } from 'lucide-react'
-import { lazy, Suspense } from 'react'
-import type { DatasetSummary, Frame, RoutePoint, ViewMode } from '../types'
+import { lazy, Suspense, useEffect, useRef, type ReactNode } from 'react'
+import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
 
 const MapView = lazy(() =>
   import('../views/MapView').then((module) => ({ default: module.MapView })),
@@ -22,67 +25,125 @@ interface WorkspaceProps {
   dataset: DatasetSummary | null
   frames: Frame[]
   frame: Frame | null
+  frameRange: FrameRange | null
   route: RoutePoint[]
   routeLoading: boolean
   mapStyleUrl?: string
   demoMode: boolean
-  view: ViewMode
+  panoramaOpen: boolean
+  pointCloudOpen: boolean
+  hasMoreFrames: boolean
   inspectorOpen: boolean
-  onViewChange: (view: ViewMode) => void
+  detached?: boolean
+  externalAction?: ReactNode
+  onTogglePanorama: () => void
+  onTogglePointCloud: () => void
   onFrameChange: (frame: Frame) => void
+  onMoveFrame: (direction: -1 | 1) => void
   onToggleInspector: () => void
   onOpenSource: () => void
   onUseDemo: () => void
 }
 
-const tabs: Array<{ id: ViewMode; label: string; icon: typeof Map }> = [
-  { id: 'map', label: '지도', icon: Map },
-  { id: 'panorama', label: '파노라마', icon: Image },
-  { id: 'pointcloud', label: '3D 포인트', icon: Layers3 },
-]
-
 export function Workspace({
   dataset,
   frames,
   frame,
+  frameRange,
   route,
   routeLoading,
   mapStyleUrl,
   demoMode,
-  view,
+  panoramaOpen,
+  pointCloudOpen,
+  hasMoreFrames,
   inspectorOpen,
-  onViewChange,
+  detached = false,
+  externalAction,
+  onTogglePanorama,
+  onTogglePointCloud,
   onFrameChange,
+  onMoveFrame,
   onToggleInspector,
   onOpenSource,
   onUseDemo,
 }: WorkspaceProps) {
+  const workspaceRef = useRef<HTMLElement>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
-  const move = (direction: -1 | 1) => {
-    const next = frames[currentIndex + direction]
-    if (next) onFrameChange(next)
-  }
+  const canMovePrevious = currentIndex > 0
+  const canMoveNext = currentIndex >= 0 && (currentIndex < frames.length - 1 || hasMoreFrames)
+  const overlayCount = Number(panoramaOpen) + Number(pointCloudOpen)
+
+  useEffect(() => {
+    const ownerWindow = workspaceRef.current?.ownerDocument.defaultView ?? window
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.shiftKey
+      ) {
+        return
+      }
+      const target = event.target as HTMLElement | null
+      if (
+        target &&
+        (target.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName))
+      ) {
+        return
+      }
+
+      const previous = event.key === 'ArrowLeft' || event.code === 'KeyA'
+      const next = event.key === 'ArrowRight' || event.code === 'KeyD'
+      if (previous && canMovePrevious) {
+        event.preventDefault()
+        onMoveFrame(-1)
+      } else if (next && canMoveNext) {
+        event.preventDefault()
+        onMoveFrame(1)
+      }
+    }
+    ownerWindow.addEventListener('keydown', onKeyDown)
+    return () => ownerWindow.removeEventListener('keydown', onKeyDown)
+  }, [canMoveNext, canMovePrevious, detached, onMoveFrame])
 
   return (
-    <main className="workspace">
+    <main className="workspace" ref={workspaceRef}>
       <header className="workspace-bar">
-        <nav className="view-tabs" aria-label="데이터 보기 방식">
-          {tabs.map((tab) => {
-            const Icon = tab.icon
-            return (
-              <button
-                type="button"
-                key={tab.id}
-                className={view === tab.id ? 'active' : ''}
-                onClick={() => onViewChange(tab.id)}
-              >
-                <Icon size={15} />
-                {tab.label}
-              </button>
-            )
-          })}
+        <nav className="view-tabs layer-toggles" aria-label="표시 데이터 선택">
+          <button type="button" className="active base-layer" aria-pressed="true" title="기본 지도는 항상 표시됩니다.">
+            <Map size={15} />
+            지도
+          </button>
+          <button
+            type="button"
+            className={panoramaOpen ? 'active' : ''}
+            aria-pressed={panoramaOpen}
+            onClick={onTogglePanorama}
+            title="파노라마 오버레이 켜기/끄기"
+          >
+            <Image size={15} />
+            파노라마
+          </button>
+          <button
+            type="button"
+            className={pointCloudOpen ? 'active' : ''}
+            aria-pressed={pointCloudOpen}
+            onClick={onTogglePointCloud}
+            title="3D 포인트 오버레이 켜기/끄기"
+          >
+            <Layers3 size={15} />
+            3D 포인트
+          </button>
+          <span className="lazy-layer-note">
+            <Eye size={12} /> 필요한 데이터만 로드
+          </span>
         </nav>
         <div className="workspace-context">
+          <span className="shortcut-hint" title="이전/다음 프레임 단축키">
+            <Keyboard size={13} /> ← A&nbsp;&nbsp;D →
+          </span>
           {demoMode && (
             <span className="context-badge demo">
               <CloudOff size={13} />
@@ -95,6 +156,7 @@ export function Workspace({
               Frame {String(frame.index + 1).padStart(4, '0')}
             </span>
           )}
+          {externalAction}
           <button
             type="button"
             className="icon-button"
@@ -106,14 +168,14 @@ export function Workspace({
         </div>
       </header>
 
-      <div className="viewport">
+      <div className="viewport layered-viewport">
         {!dataset ? (
           <div className="viewport-empty">
             <div className="empty-orbit orbit-one" />
             <div className="empty-orbit orbit-two" />
             <Layers3 size={38} />
             <h2>공간 데이터를 연결해 주세요</h2>
-            <p>지도, 파노라마, 포인트 클라우드가 이 공간에 함께 표시됩니다.</p>
+            <p>지도, 파노라마, 포인트 클라우드를 한 공간에서 함께 확인할 수 있습니다.</p>
             <div className="empty-actions">
               <button type="button" className="button primary" onClick={onOpenSource}>
                 데이터 연결
@@ -124,37 +186,72 @@ export function Workspace({
             </div>
           </div>
         ) : (
-          <Suspense
-            fallback={
-              <ViewerLoading
-                label={`${view === 'map' ? '지도' : view === 'panorama' ? '파노라마' : '3D'} 엔진 준비 중`}
-              />
-            }
-          >
-            {view === 'map' ? (
+          <>
+            <Suspense fallback={<ViewerLoading label="지도 엔진 준비 중" />}>
               <MapView
                 route={route}
                 frames={frames}
                 selectedFrame={frame}
+                frameRange={frameRange}
                 loading={routeLoading}
                 mapStyleUrl={mapStyleUrl}
                 onSelectFrame={onFrameChange}
               />
-            ) : view === 'panorama' ? (
-              <PanoramaView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
-            ) : (
-              <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
+            </Suspense>
+
+            {overlayCount > 0 && (
+              <div className={`viewer-overlay-stack count-${overlayCount}`}>
+                {panoramaOpen && (
+                  <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 오버레이">
+                    <header className="viewer-pane-header">
+                      <span><Image size={14} /> 파노라마</span>
+                      <button type="button" onClick={onTogglePanorama} aria-label="파노라마 닫기" title="파노라마 닫기">
+                        <X size={14} />
+                      </button>
+                    </header>
+                    <div className="viewer-pane-content">
+                      <Suspense fallback={<ViewerLoading label="파노라마 엔진 준비 중" />}>
+                        <PanoramaView
+                          datasetId={dataset.id}
+                          frame={frame}
+                          demoMode={demoMode}
+                          onPreviousFrame={() => onMoveFrame(-1)}
+                          onNextFrame={() => onMoveFrame(1)}
+                          hasPreviousFrame={canMovePrevious}
+                          hasNextFrame={canMoveNext}
+                        />
+                      </Suspense>
+                    </div>
+                  </section>
+                )}
+                {pointCloudOpen && (
+                  <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 오버레이">
+                    <header className="viewer-pane-header">
+                      <span><Layers3 size={14} /> 3D 포인트</span>
+                      <button type="button" onClick={onTogglePointCloud} aria-label="3D 포인트 닫기" title="3D 포인트 닫기">
+                        <X size={14} />
+                      </button>
+                    </header>
+                    <div className="viewer-pane-content">
+                      <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
+                        <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
+                      </Suspense>
+                    </div>
+                  </section>
+                )}
+              </div>
             )}
-          </Suspense>
+          </>
         )}
 
         {dataset && frame && (
           <div className="frame-navigator">
             <button
               type="button"
-              disabled={currentIndex <= 0}
-              onClick={() => move(-1)}
+              disabled={!canMovePrevious}
+              onClick={() => onMoveFrame(-1)}
               aria-label="이전 프레임"
+              title="이전 프레임 (← 또는 A)"
             >
               <ChevronLeft size={17} />
             </button>
@@ -164,9 +261,10 @@ export function Workspace({
             </span>
             <button
               type="button"
-              disabled={currentIndex < 0 || currentIndex >= frames.length - 1}
-              onClick={() => move(1)}
+              disabled={!canMoveNext}
+              onClick={() => onMoveFrame(1)}
               aria-label="다음 프레임"
+              title="다음 프레임 (→ 또는 D)"
             >
               <ChevronRight size={17} />
             </button>

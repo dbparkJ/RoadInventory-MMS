@@ -11,6 +11,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Brand } from './components/Brand'
 import { DatasetPanel } from './components/DatasetPanel'
+import { DetachablePanel } from './components/DetachablePanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
 import { StorageDialog } from './components/StorageDialog'
@@ -35,7 +36,6 @@ import type {
   RunEvent,
   RunRecord,
   RunRequest,
-  ViewMode,
 } from './types'
 
 function App() {
@@ -55,7 +55,8 @@ function App() {
   const [frameTotal, setFrameTotal] = useState(0)
   const [route, setRoute] = useState<RoutePoint[]>([])
   const [routeLoading, setRouteLoading] = useState(false)
-  const [view, setView] = useState<ViewMode>('map')
+  const [panoramaOpen, setPanoramaOpen] = useState(false)
+  const [pointCloudOpen, setPointCloudOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(true)
   const [sourceOpen, setSourceOpen] = useState(false)
   const [queueOpen, setQueueOpen] = useState(false)
@@ -169,8 +170,8 @@ function App() {
     return () => controller.abort()
   }, [datasetId, demoMode, selectedDataset?.status, toast, trackId])
 
-  const loadMoreFrames = useCallback(async () => {
-    if (!datasetId || frameNextOffset === null || framesLoadingMore) return
+  const loadMoreFrames = useCallback(async (): Promise<Frame[]> => {
+    if (!datasetId || frameNextOffset === null || framesLoadingMore) return []
     const scope = `${datasetId}::${trackId}`
     const offset = frameNextOffset
     const controller = new AbortController()
@@ -179,7 +180,7 @@ function App() {
       const page = demoMode
         ? getDemoFrames(offset, 240, trackId || undefined)
         : await api.frames(datasetId, offset, 240, trackId || undefined, controller.signal)
-      if (frameScopeRef.current !== scope) return
+      if (frameScopeRef.current !== scope) return []
       setFrames((current) => {
         const byId = new Map(current.map((frame) => [frame.id, frame]))
         page.items.forEach((frame) => byId.set(frame.id, frame))
@@ -187,6 +188,7 @@ function App() {
       })
       setFrameTotal(page.total)
       setFrameNextOffset(resolveNextOffset(page))
+      return page.items
     } catch (reason) {
       if (!controller.signal.aborted && frameScopeRef.current === scope) {
         toast({
@@ -195,10 +197,29 @@ function App() {
           message: reason instanceof Error ? reason.message : undefined,
         })
       }
+      return []
     } finally {
       if (frameScopeRef.current === scope) setFramesLoadingMore(false)
     }
   }, [datasetId, demoMode, frameNextOffset, framesLoadingMore, toast, trackId])
+
+  const moveFrame = useCallback(
+    async (direction: -1 | 1) => {
+      if (!selectedFrame) return
+      const currentIndex = frames.findIndex((frame) => frame.id === selectedFrame.id)
+      const next = frames[currentIndex + direction]
+      if (next) {
+        setSelectedFrame(next)
+        return
+      }
+      if (direction === 1 && frameNextOffset !== null) {
+        const more = await loadMoreFrames()
+        const following = more.find((frame) => frame.index > selectedFrame.index) ?? more[0]
+        if (following) setSelectedFrame(following)
+      }
+    },
+    [frameNextOffset, frames, loadMoreFrames, selectedFrame],
+  )
 
   useEffect(() => {
     if (!datasetId || selectedDataset?.status !== 'ready') {
@@ -206,6 +227,7 @@ function App() {
       return
     }
     const controller = new AbortController()
+    setRoute([])
     setRouteLoading(true)
     const request = demoMode ? Promise.resolve(demoRoute) : api.route(datasetId, controller.signal)
     void request
@@ -363,7 +385,8 @@ function App() {
     setFrameRange(null)
     setDatasetId(dataset.id)
     setTrackId('')
-    setView('map')
+    setPanoramaOpen(false)
+    setPointCloudOpen(false)
     toast({
       tone: 'success',
       title: '데이터셋 준비가 완료되었습니다',
@@ -423,68 +446,90 @@ function App() {
       )}
 
       <div className="app-grid">
-        <DatasetPanel
-          datasets={datasets}
-          selectedDataset={selectedDataset}
-          selectedTrack={trackId}
-          frames={frames}
-          selectedFrame={selectedFrame}
-          framesLoading={framesLoading}
-          framesLoadingMore={framesLoadingMore}
-          frameTotal={frameTotal}
-          hasMoreFrames={frameNextOffset !== null}
-          frameRange={frameRange}
-          onDatasetChange={(id) => {
-            setFrameRange(null)
-            setDatasetId(id)
-            setTrackId('')
-          }}
-          onTrackChange={(id) => {
-            setFrameRange(null)
-            setTrackId(id)
-          }}
-          onFrameChange={setSelectedFrame}
-          onSetFrameRangeStart={(ordinal) =>
-            setFrameRange((current) => [
-              ordinal,
-              current && current[1] >= ordinal ? current[1] : ordinal,
-            ])
-          }
-          onSetFrameRangeEnd={(ordinal) =>
-            setFrameRange((current) => [
-              current && current[0] <= ordinal ? current[0] : ordinal,
-              ordinal,
-            ])
-          }
-          onClearFrameRange={() => setFrameRange(null)}
-          onLoadMoreFrames={() => void loadMoreFrames()}
-          onOpenSource={() => setSourceOpen(true)}
-        />
-        <Workspace
-          dataset={selectedDataset}
-          frames={frames}
-          frame={selectedFrame}
-          route={route}
-          routeLoading={routeLoading}
-          mapStyleUrl={boot?.map_style_url}
-          demoMode={demoMode}
-          view={view}
-          inspectorOpen={inspectorOpen}
-          onViewChange={setView}
-          onFrameChange={setSelectedFrame}
-          onToggleInspector={() => setInspectorOpen((value) => !value)}
-          onOpenSource={() => setSourceOpen(true)}
-          onUseDemo={useDemo}
-        />
+        <DetachablePanel id="data-explorer" title="작업 데이터" placeholderClassName="data-panel-slot">
+          {({ action }) => (
+            <DatasetPanel
+              datasets={datasets}
+              selectedDataset={selectedDataset}
+              selectedTrack={trackId}
+              frames={frames}
+              selectedFrame={selectedFrame}
+              framesLoading={framesLoading}
+              framesLoadingMore={framesLoadingMore}
+              frameTotal={frameTotal}
+              hasMoreFrames={frameNextOffset !== null}
+              frameRange={frameRange}
+              externalAction={action}
+              onDatasetChange={(id) => {
+                setFrameRange(null)
+                setDatasetId(id)
+                setTrackId('')
+              }}
+              onTrackChange={(id) => {
+                setFrameRange(null)
+                setTrackId(id)
+              }}
+              onFrameChange={setSelectedFrame}
+              onSetFrameRangeStart={(ordinal) =>
+                setFrameRange((current) => [
+                  ordinal,
+                  current && current[1] >= ordinal ? current[1] : ordinal,
+                ])
+              }
+              onSetFrameRangeEnd={(ordinal) =>
+                setFrameRange((current) => [
+                  current && current[0] <= ordinal ? current[0] : ordinal,
+                  ordinal,
+                ])
+              }
+              onFrameRangeChange={setFrameRange}
+              onClearFrameRange={() => setFrameRange(null)}
+              onLoadMoreFrames={() => void loadMoreFrames()}
+              onOpenSource={() => setSourceOpen(true)}
+            />
+          )}
+        </DetachablePanel>
+        <DetachablePanel id="workspace" title="공간 데이터 뷰어" placeholderClassName="workspace-slot">
+          {({ action, detached }) => (
+            <Workspace
+              dataset={selectedDataset}
+              frames={frames}
+              frame={selectedFrame}
+              frameRange={frameRange}
+              route={route}
+              routeLoading={routeLoading}
+              mapStyleUrl={boot?.map_style_url}
+              demoMode={demoMode}
+              panoramaOpen={panoramaOpen}
+              pointCloudOpen={pointCloudOpen}
+              hasMoreFrames={frameNextOffset !== null}
+              inspectorOpen={inspectorOpen}
+              detached={detached}
+              externalAction={action}
+              onTogglePanorama={() => setPanoramaOpen((value) => !value)}
+              onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
+              onFrameChange={setSelectedFrame}
+              onMoveFrame={moveFrame}
+              onToggleInspector={() => setInspectorOpen((value) => !value)}
+              onOpenSource={() => setSourceOpen(true)}
+              onUseDemo={useDemo}
+            />
+          )}
+        </DetachablePanel>
         {inspectorOpen && (
-          <OptimizationPanel
-            dataset={selectedDataset}
-            selectedTrack={trackId}
-            frameRange={frameRange}
-            busy={submitting}
-            onStart={startRun}
-            onOptimize={optimize}
-          />
+          <DetachablePanel id="process-setup" title="작업 설정" placeholderClassName="inspector-slot">
+            {({ action }) => (
+              <OptimizationPanel
+                dataset={selectedDataset}
+                selectedTrack={trackId}
+                frameRange={frameRange}
+                busy={submitting}
+                externalAction={action}
+                onStart={startRun}
+                onOptimize={optimize}
+              />
+            )}
+          </DetachablePanel>
         )}
       </div>
 

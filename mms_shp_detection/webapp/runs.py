@@ -246,7 +246,11 @@ def _build_job_config(
         _set_config_value(document, "data_root", str(dataset_root))
         _set_config_value(document, "output_dir", str(output_dir))
         _set_config_value(document, "pointcloud_cache_path", str(cache_file))
-        _set_config_value(document, "disable_console_progress", True)
+        # The web worker captures stderr/stdout into process.log.  Keep tqdm
+        # enabled there so the existing ``current/total`` parser can report
+        # real progress to SSE clients.  Disabling it made healthy, long runs
+        # appear permanently stuck at 0% in the operator UI.
+        _set_config_value(document, "disable_console_progress", False)
         # A server-side base config may itself be scoped for a previous batch.
         # Clear every persistent selector before applying this request's opaque
         # track selection, otherwise the two independent scopes are intersected.
@@ -378,6 +382,31 @@ def _progress_from_log(status_value: str, log_text: str) -> float:
         if int(total) > 0 and int(current) <= int(total)
     ]
     return max(ratios, default=0.0) * 100.0
+
+
+def _process_failure_message(app: Any, run: dict[str, Any], return_code: int) -> str:
+    """Return a concise operator-facing reason from bounded pipeline logs."""
+
+    log_text = _runtime_log_text(app, run)
+    if re.search(r"forrtl:\s*error\s*\(200\).*window-CLOSE", log_text, re.IGNORECASE):
+        return (
+            "The Windows host console closed and terminated the pipeline's native "
+            f"runtime (exit code {return_code})."
+        )
+    for line in reversed(log_text.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if re.search(
+            r"(?:\|\s*ERROR\s*\||Traceback|(?:Error|Exception):)",
+            candidate,
+            re.IGNORECASE,
+        ):
+            return (
+                f"Pipeline process exited with code {return_code}. "
+                f"Last error: {candidate[:600]}"
+            )
+    return f"Pipeline process exited with code {return_code}."
 
 
 def _bounded_result_files(
@@ -663,7 +692,15 @@ class RunManager:
             env["PYTHONUNBUFFERED"] = "1"
             kwargs: dict[str, Any] = {}
             if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # Do not attach native numerical libraries in the pipeline to
+                # the interactive web-server console.  Intel Fortran/MKL can
+                # otherwise abort a healthy job with ``forrtl: error (200)``
+                # when the launcher window receives a close event.  taskkill
+                # /T still terminates the hidden child tree on explicit cancel.
+                kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.CREATE_NO_WINDOW
+                )
             else:
                 kwargs["start_new_session"] = True
             if not self.app.state.store.begin_run_start(run_id, utc_now()):
@@ -707,7 +744,7 @@ class RunManager:
                 error = None
             else:
                 final_status = "failed"
-                error = f"Pipeline process exited with code {return_code}."
+                error = _process_failure_message(self.app, latest, return_code)
             self.app.state.store.update_run(
                 run_id,
                 finished,

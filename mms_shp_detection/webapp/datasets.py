@@ -626,6 +626,7 @@ async def get_route(dataset_id: str, request: Request) -> dict[str, Any]:
             ),
             "frame_id": frame["id"],
             "track_id": frame["track_id"],
+            "index": frame["ordinal"],
             **(
                 {"heading": frame["heading"]}
                 if frame.get("heading") is not None

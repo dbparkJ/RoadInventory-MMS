@@ -1,4 +1,6 @@
 import {
+  ChevronLeft,
+  ChevronRight,
   Expand,
   LoaderCircle,
   Maximize2,
@@ -13,14 +15,45 @@ import demoPanorama from '../assets/demo-panorama.svg'
 import { api } from '../lib/api'
 import type { Frame } from '../types'
 
+export type PanoramaQuality = 'fast' | 'high' | 'ultra'
+
+export function panoramaRequestWidth(
+  containerWidth: number,
+  devicePixelRatio: number,
+  quality: PanoramaQuality,
+): number {
+  const safeContainerWidth = containerWidth > 0 ? containerWidth : 1280
+  const safePixelRatio = Math.min(2, Math.max(1, devicePixelRatio || 1))
+  if (quality === 'ultra') return 8192
+  // Fixed 4K derivatives stay cache-friendly and remain sharp when an overlay
+  // is enlarged, detached to a second monitor, or switched to full screen.
+  if (quality === 'high') return 4096
+  const maximumWidth = 2048
+  const minimumWidth = 960
+  // Fast mode follows the current pane size to minimize transfer and decode time.
+  const panoramaScale = 1.5
+  return Math.min(
+    maximumWidth,
+    Math.max(minimumWidth, Math.round(safeContainerWidth * safePixelRatio * panoramaScale)),
+  )
+}
+
 export default function PanoramaView({
   datasetId,
   frame,
   demoMode,
+  onPreviousFrame,
+  onNextFrame,
+  hasPreviousFrame = true,
+  hasNextFrame = true,
 }: {
   datasetId: string
   frame: Frame | null
   demoMode: boolean
+  onPreviousFrame?: () => void
+  onNextFrame?: () => void
+  hasPreviousFrame?: boolean
+  hasNextFrame?: boolean
 }) {
   const stageRef = useRef<HTMLDivElement>(null)
   const [source, setSource] = useState<string | null>(demoMode ? demoPanorama : null)
@@ -29,6 +62,7 @@ export default function PanoramaView({
   const [fov, setFov] = useState(72)
   const [yaw, setYaw] = useState(0)
   const [pitch, setPitch] = useState(0)
+  const [quality, setQuality] = useState<PanoramaQuality>('high')
   const viewRef = useRef({ fov, yaw, pitch })
   viewRef.current = { fov, yaw, pitch }
   const [dragStart, setDragStart] = useState<{ x: number; y: number; yaw: number; pitch: number } | null>(
@@ -57,8 +91,8 @@ export default function PanoramaView({
     setLoading(true)
     setSource(null)
     const containerWidth = stageRef.current?.clientWidth ?? 1280
-    // Request a viewport-sized derivative, never the multi-gigapixel source image.
-    const width = Math.min(2048, Math.max(960, Math.round(containerWidth * window.devicePixelRatio)))
+    // Request a bounded viewport-sized derivative, never the multi-gigapixel source image.
+    const width = panoramaRequestWidth(containerWidth, window.devicePixelRatio, quality)
     void api
       .panorama(datasetId, frame.id, width, controller.signal)
       .then((result) => {
@@ -81,7 +115,7 @@ export default function PanoramaView({
       controller.abort()
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [datasetId, demoMode, frame, reloadKey])
+  }, [datasetId, demoMode, frame, quality, reloadKey])
 
   useEffect(() => {
     const host = stageRef.current
@@ -157,16 +191,49 @@ export default function PanoramaView({
 
   const toggleFullscreen = async () => {
     if (!stageRef.current) return
-    if (document.fullscreenElement) await document.exitFullscreen()
+    const ownerDocument = stageRef.current.ownerDocument
+    if (ownerDocument.fullscreenElement) await ownerDocument.exitFullscreen()
     else await stageRef.current.requestFullscreen()
+  }
+
+  const canGoPrevious = Boolean(frame && onPreviousFrame && hasPreviousFrame)
+  const canGoNext = Boolean(frame && onNextFrame && hasNextFrame)
+
+  const goToPreviousFrame = () => {
+    if (canGoPrevious) onPreviousFrame?.()
+  }
+
+  const goToNextFrame = () => {
+    if (canGoNext) onNextFrame?.()
   }
 
   return (
     <div
       ref={stageRef}
       className={`panorama-view ${dragStart ? 'dragging' : ''}`}
+      tabIndex={0}
+      role="region"
+      aria-label="파노라마 뷰어"
+      onKeyDown={(event) => {
+        if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return
+        const target = event.target as HTMLElement | null
+        if (
+          target &&
+          (target.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(target.tagName))
+        ) {
+          return
+        }
+        if (event.key === 'ArrowLeft' && canGoPrevious) {
+          event.preventDefault()
+          goToPreviousFrame()
+        } else if (event.key === 'ArrowRight' && canGoNext) {
+          event.preventDefault()
+          goToNextFrame()
+        }
+      }}
       onPointerDown={(event) => {
         if (!source) return
+        event.currentTarget.focus({ preventScroll: true })
         event.currentTarget.setPointerCapture(event.pointerId)
         setDragStart({ x: event.clientX, y: event.clientY, yaw, pitch })
       }}
@@ -184,6 +251,34 @@ export default function PanoramaView({
         changeZoom(event.deltaY > 0 ? 4 : -4)
       }}
     >
+      {frame && onPreviousFrame && (
+        <button
+          type="button"
+          className="panorama-step-zone previous"
+          aria-label="이전 프레임으로 이동"
+          title="이전 프레임 (←)"
+          disabled={!canGoPrevious}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={goToPreviousFrame}
+        >
+          <ChevronLeft aria-hidden="true" />
+          <span>이전</span>
+        </button>
+      )}
+      {frame && onNextFrame && (
+        <button
+          type="button"
+          className="panorama-step-zone next"
+          aria-label="다음 프레임으로 이동"
+          title="다음 프레임 (→)"
+          disabled={!canGoNext}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={goToNextFrame}
+        >
+          <span>다음</span>
+          <ChevronRight aria-hidden="true" />
+        </button>
+      )}
       {loading && (
         <div className="viewer-loading floating">
           <LoaderCircle className="spin" size={25} />
@@ -214,6 +309,19 @@ export default function PanoramaView({
           드래그하여 둘러보기
         </span>
         <i />
+        <label className="panorama-quality-control">
+          <span>화질</span>
+          <select
+            aria-label="파노라마 화질"
+            value={quality}
+            onPointerDown={(event) => event.stopPropagation()}
+            onChange={(event) => setQuality(event.target.value as PanoramaQuality)}
+          >
+            <option value="fast">빠름</option>
+            <option value="high">고화질 · 4K</option>
+            <option value="ultra">최고화질 · 8K</option>
+          </select>
+        </label>
         <button type="button" onClick={() => changeZoom(6)} aria-label="축소">
           <Minus size={15} />
         </button>

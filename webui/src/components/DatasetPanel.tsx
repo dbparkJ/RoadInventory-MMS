@@ -12,9 +12,10 @@ import {
   RotateCcw,
   Search,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { DatasetSummary, Frame, FrameRange } from '../types'
 import { formatCount, formatDistance, formatFrameTimestamp } from '../lib/format'
+import { TRACK_COLORS } from '../lib/route'
 
 const DATASET_STATUS: Record<DatasetSummary['status'], string> = {
   ready: '인덱스 준비됨',
@@ -33,11 +34,13 @@ interface DatasetPanelProps {
   frameTotal: number
   hasMoreFrames: boolean
   frameRange: FrameRange | null
+  externalAction?: ReactNode
   onDatasetChange: (id: string) => void
   onTrackChange: (id: string) => void
   onFrameChange: (frame: Frame) => void
   onSetFrameRangeStart: (ordinal: number) => void
   onSetFrameRangeEnd: (ordinal: number) => void
+  onFrameRangeChange: (range: FrameRange) => void
   onClearFrameRange: () => void
   onLoadMoreFrames: () => void
   onOpenSource: () => void
@@ -54,16 +57,19 @@ export function DatasetPanel({
   frameTotal,
   hasMoreFrames,
   frameRange,
+  externalAction,
   onDatasetChange,
   onTrackChange,
   onFrameChange,
   onSetFrameRangeStart,
   onSetFrameRangeEnd,
+  onFrameRangeChange,
   onClearFrameRange,
   onLoadMoreFrames,
   onOpenSource,
 }: DatasetPanelProps) {
   const [query, setQuery] = useState('')
+  const [rangeDraft, setRangeDraft] = useState<[string, string]>(['', ''])
   const visibleFrames = useMemo(() => {
     const normalized = query.trim().toLowerCase()
     if (!normalized) return frames
@@ -73,6 +79,24 @@ export function DatasetPanel({
         String(frame.index + 1).includes(normalized),
     )
   }, [frames, query])
+  const frameLimit = Math.max(1, selectedDataset?.frame_count ?? 1)
+  const parsedRange = rangeDraft.map((value) => Number(value)) as [number, number]
+  const rangeDraftValid = parsedRange.every(
+    (value) => Number.isInteger(value) && value >= 1 && value <= frameLimit,
+  )
+
+  useEffect(() => {
+    setRangeDraft(
+      frameRange ? [String(frameRange[0] + 1), String(frameRange[1] + 1)] : ['', ''],
+    )
+  }, [frameRange, selectedDataset?.id])
+
+  const applyRangeDraft = () => {
+    if (!rangeDraftValid) return
+    const start = Math.min(parsedRange[0], parsedRange[1]) - 1
+    const end = Math.max(parsedRange[0], parsedRange[1]) - 1
+    onFrameRangeChange([start, end])
+  }
 
   return (
     <aside className="data-panel" aria-label="데이터 탐색기">
@@ -81,9 +105,12 @@ export function DatasetPanel({
           <span className="eyebrow">DATA EXPLORER</span>
           <h2>작업 데이터</h2>
         </div>
-        <button type="button" className="icon-button" onClick={onOpenSource} title="데이터 추가">
-          <Cloud size={17} />
-        </button>
+        <div className="panel-heading-actions">
+          {externalAction}
+          <button type="button" className="icon-button" onClick={onOpenSource} title="데이터 추가">
+            <Cloud size={17} />
+          </button>
+        </div>
       </div>
 
       {selectedDataset ? (
@@ -151,7 +178,10 @@ export function DatasetPanel({
                   className={`track-row ${selectedTrack === track.id ? 'active' : ''}`}
                   onClick={() => onTrackChange(track.id)}
                 >
-                  <span className={`track-rail color-${index % 4}`} />
+                  <span
+                    className="track-rail"
+                    style={{ backgroundColor: TRACK_COLORS[index % TRACK_COLORS.length] }}
+                  />
                   <span>
                     <strong>{track.name}</strong>
                     <small>
@@ -186,6 +216,47 @@ export function DatasetPanel({
               </small>
             )}
             <div className="frame-range-picker">
+              <div className="frame-range-inputs">
+                <label>
+                  <span>시작 프레임</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={frameLimit}
+                    value={rangeDraft[0]}
+                    placeholder="1"
+                    aria-label="실행 시작 프레임 번호"
+                    onChange={(event) =>
+                      setRangeDraft((current) => [event.target.value, current[1]])
+                    }
+                    onKeyDown={(event) => event.key === 'Enter' && applyRangeDraft()}
+                  />
+                </label>
+                <span aria-hidden="true">–</span>
+                <label>
+                  <span>끝 프레임</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={frameLimit}
+                    value={rangeDraft[1]}
+                    placeholder={String(frameLimit)}
+                    aria-label="실행 끝 프레임 번호"
+                    onChange={(event) =>
+                      setRangeDraft((current) => [current[0], event.target.value])
+                    }
+                    onKeyDown={(event) => event.key === 'Enter' && applyRangeDraft()}
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={!rangeDraftValid}
+                  onClick={applyRangeDraft}
+                  title="입력한 프레임 범위를 작업 구간으로 적용"
+                >
+                  적용
+                </button>
+              </div>
               <div className="frame-range-actions" role="group" aria-label="실행 프레임 범위 지정">
                 <button
                   type="button"
@@ -259,8 +330,21 @@ export function DatasetPanel({
                     <button
                       type="button"
                       key={frame.id}
-                      className={`frame-row ${selectedFrame?.id === frame.id ? 'active' : ''}`}
-                      onClick={() => onFrameChange(frame)}
+                      className={`frame-row ${selectedFrame?.id === frame.id ? 'active' : ''} ${
+                        frameRange && frame.index >= frameRange[0] && frame.index <= frameRange[1]
+                          ? 'in-range'
+                          : ''
+                      }`}
+                      title="클릭하여 이동 · Shift+클릭하여 현재 프레임까지 작업 범위 선택"
+                      onClick={(event) => {
+                        if (event.shiftKey && selectedFrame) {
+                          onFrameRangeChange([
+                            Math.min(selectedFrame.index, frame.index),
+                            Math.max(selectedFrame.index, frame.index),
+                          ])
+                        }
+                        onFrameChange(frame)
+                      }}
                     >
                       <span className="frame-index">{String(frame.index + 1).padStart(4, '0')}</span>
                       <span className="frame-meta">

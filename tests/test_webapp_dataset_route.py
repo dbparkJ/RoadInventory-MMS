@@ -157,6 +157,7 @@ class WebAppDatasetRouteTests(unittest.TestCase):
                 self.assertEqual(route.json()["type"], "FeatureCollection")
                 self.assertEqual(len(route.json()["points"]), 1)
                 self.assertAlmostEqual(route.json()["points"][0]["lon"], 127.0)
+                self.assertEqual(route.json()["points"][0]["index"], 0)
 
                 frames = client.get(
                     f"/api/datasets/{dataset_id}/frames",

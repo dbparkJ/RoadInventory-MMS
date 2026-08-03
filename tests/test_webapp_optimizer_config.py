@@ -158,6 +158,7 @@ model_filters:
             self.assertIsNone(document["input"]["include_track_names"])
             self.assertIsNone(document["input"]["frame_id_from"])
             self.assertIsNone(document["input"]["frame_id_to"])
+            self.assertFalse(document["web_run"]["disable_console_progress"])
             self.assertEqual(resolved["start_index"], 0)
             self.assertEqual(resolved["limit_images"], 2)
 

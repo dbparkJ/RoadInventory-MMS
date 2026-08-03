@@ -11,7 +11,7 @@ import {
   Sparkles,
   WandSparkles,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import type {
   AutoPreset,
   DatasetSummary,
@@ -112,6 +112,7 @@ export function OptimizationPanel({
   selectedTrack,
   frameRange,
   busy,
+  externalAction,
   onStart,
   onOptimize,
 }: {
@@ -119,6 +120,7 @@ export function OptimizationPanel({
   selectedTrack: string
   frameRange: FrameRange | null
   busy: boolean
+  externalAction?: ReactNode
   onStart: (request: RunRequest) => Promise<void>
   onOptimize: (request: RunRequest) => Promise<ManualParameters | undefined>
 }) {
@@ -171,7 +173,10 @@ export function OptimizationPanel({
           <span className="eyebrow">PROCESS SETUP</span>
           <h2>작업 설정</h2>
         </div>
-        <span className="beta-tag">BETA</span>
+        <div className="panel-heading-actions">
+          <span className="beta-tag">BETA</span>
+          {externalAction}
+        </div>
       </div>
 
       <div className="inspector-scroll">
