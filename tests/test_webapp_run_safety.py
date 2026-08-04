@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import subprocess
@@ -11,6 +12,9 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from mms_shp_detection.config import PipelineConfig, config_sha256
+from mms_shp_detection.domain.models import JobStatus
+from mms_shp_detection.infrastructure.manifest_writer import RunManifestStore
 from mms_shp_detection.webapp import WebAppConfig, create_app
 from mms_shp_detection.webapp.app import WorkerProcessLock
 from mms_shp_detection.webapp.runs import (
@@ -57,6 +61,21 @@ def seed_run(store: WebStore, run_id: str) -> None:
             "updated_at": NOW,
         }
     )
+
+
+def seed_manifest(app, run_id: str, input_root: Path) -> RunManifestStore:
+    work = app.state.config.state_dir / "runs" / run_id
+    output = work / "output"
+    output.mkdir(parents=True)
+    (work / "config.yaml").write_text("config_version: 1\n", encoding="utf-8")
+    values = {"config_version": 1}
+    manifest = RunManifestStore(output / "run_manifest.json")
+    manifest.create(
+        job_id=run_id,
+        config=PipelineConfig(values=values, config_hash=config_sha256(values)),
+        input_root=input_root,
+    )
+    return manifest
 
 
 class WebAppRunSafetyTests(unittest.TestCase):
@@ -241,6 +260,203 @@ class WebAppRunSafetyTests(unittest.TestCase):
             second = store.claim_next_queued_run(NOW)
             self.assertIsNotNone(second)
             self.assertNotEqual(first["id"], second["id"])  # type: ignore[index]
+
+    def test_cas_transition_keeps_terminal_run_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as state_text:
+            store = WebStore(Path(state_text) / "registry.sqlite3")
+            seed_dataset(store)
+            seed_run(store, "run-terminal")
+            store.update_run("run-terminal", NOW, status="completed", finished_at=NOW)
+
+            changed = store.transition_run(
+                "run-terminal",
+                NOW,
+                from_statuses=("running", "cancelling"),
+                to_status="failed",
+                error="late worker failure",
+            )
+
+            self.assertFalse(changed)
+            self.assertEqual(store.get_run("run-terminal")["status"], "completed")  # type: ignore[index]
+
+    def test_public_manifest_projection_and_redacted_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-manifest")
+            manifest = seed_manifest(app, "run-manifest", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.set_progress(percent=42.5, current_stage="detect_project_and_estimate")
+            manifest.update_counts(images=12, detections_2d=7)
+            app.state.store.update_run("run-manifest", NOW, status="starting")
+            run = app.state.store.get_run("run-manifest")
+
+            public = public_run(app, run, include_log=False)  # type: ignore[arg-type]
+            self.assertEqual(public["status"], "preparing")
+            self.assertEqual(public["canonical_status"], "running")
+            self.assertEqual(public["job_id"], "run-manifest")
+            self.assertEqual(public["attempt"], 1)
+            self.assertEqual(public["progress"], 42.5)
+            self.assertEqual(public["current_stage"], "detect_project_and_estimate")
+            self.assertEqual(public["counts"]["images"], 12)
+
+            logs = app.state.config.state_dir / "runs" / "run-manifest" / "output" / "logs"
+            logs.mkdir()
+            (logs / "run.log").write_text(f"input={root}\n", encoding="utf-8")
+            with TestClient(app) as client:
+                artifact = client.get(
+                    "/api/runs/run-manifest/artifacts",
+                    params={"path": "run_manifest.json"},
+                )
+                self.assertEqual(artifact.status_code, 200, artifact.text)
+                self.assertNotIn(str(root), artifact.text)
+                self.assertIn("<server>", artifact.text)
+                denied_log = client.get(
+                    "/api/runs/run-manifest/artifacts",
+                    params={"path": "logs/run.log"},
+                )
+                self.assertEqual(denied_log.status_code, 404)
+
+    def test_zero_exit_requires_succeeded_manifest_and_propagates_job_id(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-invalid-success")
+            manifest = seed_manifest(app, "run-invalid-success", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            class EmptyStdout:
+                async def read(self, _size: int) -> bytes:
+                    return b""
+
+            class SuccessfulProcess:
+                pid = 4321
+                returncode = None
+                stdout = EmptyStdout()
+
+                async def wait(self) -> int:
+                    self.returncode = 0
+                    return 0
+
+            async def exercise() -> dict[str, object]:
+                with mock.patch(
+                    "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                    new=mock.AsyncMock(return_value=SuccessfulProcess()),
+                ) as spawn:
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+                    return spawn.await_args.kwargs
+
+            spawn_kwargs = asyncio.run(exercise())
+            self.assertEqual(
+                spawn_kwargs["env"]["MMS_PIPELINE_JOB_ID"], "run-invalid-success"  # type: ignore[index]
+            )
+            stored = app.state.store.get_run("run-invalid-success")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            self.assertIn("succeeded run manifest", stored["error"])  # type: ignore[index]
+            updated_manifest = manifest.read()
+            self.assertEqual(updated_manifest["status"], "failed")
+            self.assertEqual(updated_manifest["errors"][-1]["code"], "RUN_MANIFEST_NOT_SUCCEEDED")
+
+    def test_zero_exit_with_succeeded_manifest_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-valid-success")
+            manifest = seed_manifest(app, "run-valid-success", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            class EmptyStdout:
+                async def read(self, _size: int) -> bytes:
+                    return b""
+
+            class SuccessfulProcess:
+                pid = 4322
+                returncode = None
+                stdout = EmptyStdout()
+
+                async def wait(self) -> int:
+                    manifest.transition(JobStatus.VALIDATING)
+                    manifest.transition(JobStatus.RUNNING)
+                    manifest.transition(JobStatus.SUCCEEDED)
+                    self.returncode = 0
+                    return 0
+
+            async def exercise() -> None:
+                with mock.patch(
+                    "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                    new=mock.AsyncMock(return_value=SuccessfulProcess()),
+                ):
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+
+            asyncio.run(exercise())
+            stored = app.state.store.get_run("run-valid-success")
+            self.assertEqual(stored["status"], "completed")  # type: ignore[index]
+            self.assertEqual(stored["return_code"], 0)  # type: ignore[index]
+
+    def test_queued_cancel_synchronizes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-cancel-manifest")
+            manifest = seed_manifest(app, "run-cancel-manifest", root)
+
+            cancelled = asyncio.run(app.state.run_manager.cancel("run-cancel-manifest"))
+
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertTrue(cancelled["cancel_requested"])
+            self.assertEqual(manifest.read()["status"], "cancelled")
+
+    def test_launcher_error_synchronizes_failed_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-launch-error")
+            manifest = seed_manifest(app, "run-launch-error", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            async def exercise() -> None:
+                with mock.patch(
+                    "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                    new=mock.AsyncMock(side_effect=OSError("launcher unavailable")),
+                ):
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+
+            with TestClient(app):
+                asyncio.run(exercise())
+            stored = app.state.store.get_run("run-launch-error")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            failed_manifest = manifest.read()
+            self.assertEqual(failed_manifest["status"], "failed")
+            self.assertEqual(failed_manifest["errors"][-1]["code"], "RUN_LAUNCH_FAILED")
 
     def test_worker_process_lock_rejects_a_second_owner(self) -> None:
         with tempfile.TemporaryDirectory() as state_text:

@@ -7,9 +7,17 @@ import hashlib
 import json
 import sqlite3
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .domain.calibration import (
+    CalibrationResolution,
+    CalibrationResolver,
+    delivery_calibration_fingerprint,
+    normalize_calibration_component,
+    normalized_task_key,
+)
 
 LEICA_CALIBRATION_XOR_KEY = b"BFqjcI26rmlNV70EXD7Oh+Y8VDn"
 CALIBRATION_SCHEMA_VERSION = 2
@@ -252,15 +260,16 @@ def load_calibration_bundle(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid calibration JSON at {path}: {exc}") from exc
     if not isinstance(payload.get("tracks"), list):
-        raise ValueError(f"Calibration JSON has no tracks list: {path}")
+        raise ValueError(  # noqa: TRY004 - preserve the public loader contract
+            f"Calibration JSON has no tracks list: {path}"
+        )
     payload["calibration_path"] = str(path)
     payload["sha256"] = calibration_sha256(path)
     return payload
 
 
 def _normalized_container_name(value: str | None, suffix: str) -> str:
-    normalized = (value or "").lower()
-    return normalized[: -len(suffix)] if normalized.endswith(suffix) else normalized
+    return normalize_calibration_component(value, suffix)
 
 
 def match_task_calibration(task: dict[str, Any], bundle: dict[str, Any]) -> dict[str, Any] | None:
@@ -276,22 +285,9 @@ def match_task_calibration(task: dict[str, Any], bundle: dict[str, Any]) -> dict
 
 
 def _delivery_calibration_sha256(metadata: dict[str, Any]) -> str:
-    digest = hashlib.sha256()
-    paths = (
-        ("mms_ini", metadata.get("ini_path")),
-        ("sphere_internal_orientation", metadata.get("internal_orientation_path")),
-    )
-    for role, path_value in paths:
-        if not path_value:
-            continue
-        path = Path(str(path_value)).resolve()
-        digest.update(role.encode("ascii"))
-        digest.update(b"\0")
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
+    """Backward-compatible private alias for delivery provenance hashing."""
+
+    return delivery_calibration_fingerprint(metadata)
 
 
 def attach_calibration_metadata(
@@ -300,37 +296,50 @@ def attach_calibration_metadata(
     logger,
     *,
     require_calibration: bool = False,
+    resolution: CalibrationResolution | None = None,
 ) -> dict[str, Any] | None:
     """Attach matched calibration provenance and validate Sphere dimensions.
 
     Raw Front/Rear EUCM and boresight values are already consumed by Leica when
     exporting a stitched Sphere. They are intentionally *not* applied again.
     """
-    bundle = (
-        load_calibration_bundle(calibration_path)
-        if calibration_path is not None and calibration_path.is_file()
-        else None
-    )
-    unmatched: set[tuple[str | None, str | None]] = set()
+    # Resolve the entire scope before changing a task.  This preserves the
+    # legacy payload on success while making required-calibration failures
+    # transactional and suitable for model-load preflight.
+    if resolution is None:
+        resolution = CalibrationResolver(calibration_path).resolve(
+            tasks,
+            required=require_calibration,
+        )
+    else:
+        task_keys = tuple(normalized_task_key(task) for task in tasks)
+        if resolution.task_keys != task_keys:
+            raise ValueError(
+                "CalibrationResolution does not match the supplied task order"
+            )
+        if require_calibration:
+            resolution.require()
+    bundle = resolution.bundle
+    unmatched = {
+        (issue.job_name or None, issue.track_name or None)
+        for issue in resolution.issues
+    }
     matched_count = 0
-    delivery_hashes: dict[tuple[str, str], str] = {}
-    for task in tasks:
+    planned_updates: list[dict[str, Any]] = []
+    for task_index, task in enumerate(tasks):
+        selected = resolution.match_for_index(task_index)
+        if selected is None:
+            planned_updates.append({"calibration": None})
+            continue
+
+        updates: dict[str, Any] = {}
         delivery = task.get("delivery_calibration")
-        if isinstance(delivery, dict):
+        if isinstance(delivery, Mapping) and selected.matched_by == "delivery_job_track":
             ini_path = Path(str(delivery.get("ini_path") or ""))
             internal_path = Path(str(delivery.get("internal_orientation_path") or ""))
-            if not ini_path.is_file() or not internal_path.is_file():
-                unmatched.add((task.get("job_name"), task.get("track_name")))
-                task["calibration"] = None
-                continue
-            delivery_key = (str(ini_path.resolve()), str(internal_path.resolve()))
-            delivery_sha256 = delivery_hashes.get(delivery_key)
-            if delivery_sha256 is None:
-                delivery_sha256 = _delivery_calibration_sha256(delivery)
-                delivery_hashes[delivery_key] = delivery_sha256
-            task["calibration"] = {
+            updates["calibration"] = {
                 "calibration_path": str(ini_path.resolve()),
-                "calibration_sha256": delivery_sha256,
+                "calibration_sha256": selected.fingerprint,
                 "job": task.get("job_name"),
                 "track": task.get("track_name"),
                 "imaging_sensor_id": delivery.get("camera_name"),
@@ -344,13 +353,17 @@ def attach_calibration_metadata(
                 "application": "validated_vendor_delivery_sphere_metadata",
             }
             matched_count += 1
+            planned_updates.append(updates)
             continue
 
         match = match_task_calibration(task, bundle) if bundle is not None else None
         if match is None:
-            unmatched.add((task.get("job_name"), task.get("track_name")))
-            task["calibration"] = None
-            continue
+            # Resolver and adapter use the same normalization/matching rules;
+            # reaching this branch indicates an internal contract violation.
+            raise RuntimeError(
+                "Resolved calibration candidate could not be recovered for "
+                f"{task.get('job_name')}/{task.get('track_name')}"
+            )
 
         sensors = match.get("camera", {}).get("imaging_sensors", [])
         sphere_sensor = next(
@@ -389,16 +402,16 @@ def attach_calibration_metadata(
                     seconds=float(task["gps_sow_seconds"])
                     - int(task.get("gps_utc_offset_seconds", 18)),
                 )
-                task["timestamp_iso"] = corrected_timestamp.isoformat()
+                updates["timestamp_iso"] = corrected_timestamp.isoformat()
             else:
                 raise ValueError(
                     f"GPS week mismatch for {task['image_name']}: "
                     f"pose={task.get('gps_week')}, calibration={calibrated_gps_week}"
                 )
         if calibrated_gps_week is not None:
-            task["gps_week"] = int(calibrated_gps_week)
-            task["gps_week_source"] = "job.db"
-        task["calibration"] = {
+            updates["gps_week"] = int(calibrated_gps_week)
+            updates["gps_week_source"] = "job.db"
+        updates["calibration"] = {
             "calibration_path": bundle["calibration_path"],
             "calibration_sha256": bundle["sha256"],
             "job": match.get("job"),
@@ -410,16 +423,13 @@ def attach_calibration_metadata(
             "application": "validated_only_already_applied_to_leica_sphere",
         }
         matched_count += 1
+        planned_updates.append(updates)
+
+    for task, updates in zip(tasks, planned_updates):
+        task.update(updates)
 
     if unmatched:
         message = ", ".join(f"{job}/{track}" for job, track in sorted(unmatched, key=str))
-        if require_calibration:
-            if bundle is None:
-                raise FileNotFoundError(
-                    f"Calibration JSON not found: {calibration_path}; no delivery calibration for: "
-                    f"{message}"
-                )
-            raise ValueError(f"No matching calibration for: {message}")
         logger.warning("No matching calibration for %s", message)
     logger.info(
         "Matched calibration %s to %d/%d image tasks (raw camera calibration is not double-applied).",

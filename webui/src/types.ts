@@ -10,6 +10,53 @@ export type RunStatus =
   | 'cancelled'
   | 'cancelling'
 
+export type CanonicalRunStatus =
+  | 'pending'
+  | 'validating'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'retrying'
+  | 'cancelled'
+
+export interface RunErrorInfo {
+  code: string
+  message: string
+  stage: string
+  job_id: string
+  retryable: boolean
+  object_id?: string | null
+  context?: Record<string, unknown>
+  cause_type?: string | null
+}
+
+export interface RunStageResult {
+  stage_name: string
+  stage_version?: string
+  status: string
+  started_at?: string
+  finished_at?: string | null
+  elapsed_ms?: number | null
+  input_count?: number
+  output_count?: number
+  rejected_count?: number
+  metrics?: Record<string, number | string>
+  warnings?: unknown[]
+}
+
+export interface RunVersions {
+  [name: string]: unknown
+  git_commit?: string | null
+  model?: unknown
+  model_hashes?: Record<string, string>
+  config_hash?: string | null
+  config_schema?: number | string | null
+  calibration_id?: string | string[] | null
+  calibration_hash?: string | string[] | null
+}
+
+export type RunCounts = Record<string, number>
+
 export interface Coordinate {
   lon: number
   lat: number
@@ -158,13 +205,22 @@ export interface RunRequest {
 
 export interface RunRecord {
   id: string
+  job_id?: string
   dataset_id: string
   dataset_name?: string
   status: RunStatus
+  canonical_status?: CanonicalRunStatus
+  attempt?: number
+  manifest_schema_version?: number
   progress: number
   stage?: string
+  current_stage?: string | null
   message?: string
   error?: string
+  error_info?: RunErrorInfo | null
+  versions?: RunVersions
+  counts?: RunCounts
+  stage_results?: RunStageResult[]
   created_at: string
   started_at?: string
   finished_at?: string

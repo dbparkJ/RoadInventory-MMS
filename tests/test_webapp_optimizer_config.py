@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +162,17 @@ model_filters:
             self.assertFalse(document["web_run"]["disable_console_progress"])
             self.assertEqual(resolved["start_index"], 0)
             self.assertEqual(resolved["limit_images"], 2)
+            manifest = json.loads(
+                (path.parent / "output" / "run_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["job_id"], "run_test_config")
+            self.assertEqual(manifest["status"], "pending")
+            self.assertEqual(manifest["attempt"], 1)
+            self.assertEqual(
+                manifest["versions"]["config_hash"], manifest["config"]["hash"]
+            )
 
             ranged_path, ranged = _build_job_config(
                 app,

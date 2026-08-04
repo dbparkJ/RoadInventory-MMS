@@ -9,14 +9,22 @@ import signal
 import subprocess
 import sys
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import quote
 
 import yaml
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+from mms_shp_detection.config import PipelineConfig, config_sha256
+from mms_shp_detection.domain.models import JobStatus, PipelineErrorInfo
+from mms_shp_detection.infrastructure.manifest_writer import (
+    RunManifestStore,
+    validate_manifest_document,
+)
 
 from .datasets import catalog_path as dataset_catalog_path
 from .datasets import require_ready_dataset, seed_catalog_cache, utc_now
@@ -27,9 +35,11 @@ router = APIRouter(prefix="/api", tags=["runs"])
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 PUBLIC_STATUS = {
+    "starting": "preparing",
     "interrupted": "failed",
     "error": "failed",
 }
+MAX_RUN_MANIFEST_BYTES = 5_000_000
 PATH_OPTION_NAMES = {
     "data_root",
     "calibration_path",
@@ -51,7 +61,6 @@ SAFE_RESULT_SUFFIXES = {
     ".json",
     ".csv",
     ".txt",
-    ".log",
     ".las",
     ".laz",
     ".jpg",
@@ -305,6 +314,18 @@ def _build_job_config(
             yaml.safe_dump(document, allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
+        pipeline_config = PipelineConfig(
+            values=document,
+            config_hash=config_sha256(document),
+            source_path=config_path,
+        )
+        RunManifestStore(output_dir / "run_manifest.json").create(
+            job_id=run_id,
+            config=pipeline_config,
+            input_root=dataset_root,
+            dataset_job=(job_names[0] if len(set(job_names)) == 1 else "multiple"),
+            track=(track_names[0] if len(set(track_names)) == 1 else "multiple"),
+        )
         resolved = {
             "track_ids": track_ids,
             "track_names": track_names,
@@ -336,6 +357,55 @@ def _run_work_dir(app: Any, run: dict[str, Any]) -> Path:
     )
 
 
+def _run_manifest_path(
+    app: Any,
+    run: dict[str, Any],
+    *,
+    must_exist: bool,
+) -> Path:
+    return resolve_under_root(
+        _run_work_dir(app, run),
+        "output/run_manifest.json",
+        must_exist=must_exist,
+        expect_directory=False,
+        reject_symlinks=True,
+    )
+
+
+def _read_run_manifest(
+    app: Any,
+    run: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read one trusted-size manifest and verify that it belongs to the run."""
+
+    try:
+        path = _run_manifest_path(app, run, must_exist=True)
+        if path.is_symlink():
+            return None, "manifest is a symbolic link"
+        with path.open("rb") as handle:
+            size = int(os.fstat(handle.fileno()).st_size)
+            if size <= 0:
+                return None, "manifest is empty"
+            if size > MAX_RUN_MANIFEST_BYTES:
+                return None, "manifest exceeds the size limit"
+            payload = handle.read(MAX_RUN_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_RUN_MANIFEST_BYTES:
+            return None, "manifest exceeds the size limit"
+        document = json.loads(payload.decode("utf-8"))
+    except FileNotFoundError:
+        return None, "manifest is missing"
+    except (OSError, UnicodeError, json.JSONDecodeError, UnsafePath, ValueError):
+        return None, "manifest cannot be read"
+    if not isinstance(document, dict):
+        return None, "manifest root is not an object"
+    errors = validate_manifest_document(document)
+    if errors:
+        return None, "; ".join(errors[:8])
+    if document.get("job_id") != run.get("id"):
+        return None, "manifest job_id does not match the run"
+    return document, None
+
+
 def _redact(app: Any, value: str, run: dict[str, Any] | None = None) -> str:
     text = value
     sensitive = [
@@ -353,6 +423,68 @@ def _redact(app: Any, value: str, run: dict[str, Any] | None = None) -> str:
         text = text.replace(raw, "<server>")
         text = text.replace(raw.replace("\\", "/"), "<server>")
     return text
+
+
+def _redact_manifest_value(
+    app: Any,
+    value: Any,
+    run: dict[str, Any],
+) -> Any:
+    """Recursively remove private server paths from public manifest projections."""
+
+    if isinstance(value, dict):
+        return {
+            str(_redact_manifest_value(app, str(key), run)): _redact_manifest_value(
+                app, item, run
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_manifest_value(app, item, run) for item in value]
+    if not isinstance(value, str):
+        return value
+    redacted = _redact(app, value, run)
+    stripped = redacted.strip()
+    if redacted == value and (
+        re.match(r"^[A-Za-z]:[\\/]", stripped)
+        or stripped.startswith(("\\\\", "/"))
+    ):
+        basename = re.split(r"[\\/]", stripped.rstrip("\\/"))[-1]
+        return f"<server>/{basename}" if basename else "<server>"
+    return redacted
+
+
+def _sync_manifest_terminal(
+    app: Any,
+    run: dict[str, Any],
+    target: JobStatus,
+    *,
+    error: PipelineErrorInfo | None = None,
+) -> bool:
+    """Best-effort synchronization after the child stops or cannot launch."""
+
+    document, _reason = _read_run_manifest(app, run)
+    if document is None:
+        return False
+    current = JobStatus(document["status"])
+    terminal = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
+    if current in terminal and current != target:
+        return False
+    store = RunManifestStore(_run_manifest_path(app, run, must_exist=True))
+    try:
+        if error is not None:
+            errors = document.get("errors") or []
+            if not errors:
+                store.record_error(error)
+        store.transition(target)
+        return True
+    except (OSError, ValueError):
+        app.state.logger.warning(
+            "Could not synchronize run manifest %s to %s.",
+            run.get("id"),
+            target.value,
+        )
+        return False
 
 
 def _tail(path: Path, max_bytes: int = 32_768) -> str:
@@ -447,6 +579,8 @@ def _bounded_result_files(
                         if entry.is_symlink():
                             continue
                         if entry.is_dir(follow_symlinks=False):
+                            if entry.name.casefold() == "logs":
+                                continue
                             pending.append(Path(entry.path))
                             continue
                         if not entry.is_file(follow_symlinks=False):
@@ -773,8 +907,15 @@ def public_run(
     include_log: bool = False,
     include_results: bool = False,
 ) -> dict[str, Any]:
-    log_text = _runtime_log_text(app, item)
+    manifest, _manifest_problem = _read_run_manifest(app, item)
+    log_text = _runtime_log_text(app, item) if manifest is None or include_log else ""
     public_status = PUBLIC_STATUS.get(item["status"], item["status"])
+    manifest_progress = manifest.get("progress", {}) if manifest is not None else {}
+    progress = (
+        float(manifest_progress.get("percent", 0.0))
+        if manifest is not None and isinstance(manifest_progress, dict)
+        else _progress_from_log(item["status"], log_text)
+    )
     # Unregistered datasets remain as small tombstones so completed run
     # history can still show the delivery name without making that dataset
     # available for new browsing or processing.
@@ -786,7 +927,7 @@ def public_run(
         "dataset_id": item["dataset_id"],
         "dataset_name": dataset["name"] if dataset is not None else None,
         "status": public_status,
-        "progress": _progress_from_log(item["status"], log_text),
+        "progress": progress,
         "request": item["request"],
         "resolved": item["resolved"],
         "created_at": item["created_at"],
@@ -797,6 +938,32 @@ def public_run(
         "return_code": item.get("return_code"),
         "stage": public_status,
     }
+    if manifest is not None:
+        errors = manifest.get("errors") or []
+        error_info = errors[-1] if errors and isinstance(errors[-1], dict) else None
+        result.update(
+            {
+                "job_id": manifest["job_id"],
+                "manifest_schema_version": manifest["schema_version"],
+                "canonical_status": manifest["status"],
+                "attempt": manifest["attempt"],
+                "current_stage": manifest_progress.get("current_stage"),
+                "versions": _redact_manifest_value(
+                    app, manifest.get("versions", {}), item
+                ),
+                "counts": _redact_manifest_value(
+                    app, manifest.get("counts", {}), item
+                ),
+                "stage_results": _redact_manifest_value(
+                    app, manifest.get("stages", []), item
+                ),
+                "error_info": (
+                    _redact_manifest_value(app, error_info, item)
+                    if error_info is not None
+                    else None
+                ),
+            }
+        )
     if public_status == "completed":
         result["result_url"] = f"/api/runs/{item['id']}/results"
     if item.get("error"):
@@ -830,13 +997,30 @@ class RunManager:
         if self._active_process is not None and self._active_process.returncode is None:
             if self._active_run_id is not None:
                 now = utc_now()
-                self.app.state.store.update_run(
+                transitioned = self.app.state.store.transition_run(
                     self._active_run_id,
                     now,
-                    status="interrupted",
+                    from_statuses=("starting", "running", "cancelling"),
+                    to_status="interrupted",
                     error="Server stopped while this run was active.",
                     finished_at=now,
                 )
+                if transitioned:
+                    interrupted_run = self.app.state.store.get_run(self._active_run_id)
+                    if interrupted_run is not None:
+                        _sync_manifest_terminal(
+                            self.app,
+                            interrupted_run,
+                            JobStatus.FAILED,
+                            error=PipelineErrorInfo(
+                                code="WORKER_STOPPED",
+                                message="Server stopped while this run was active.",
+                                stage="worker",
+                                job_id=self._active_run_id,
+                                retryable=True,
+                                cause_type="WorkerShutdown",
+                            ),
+                        )
             await self._terminate(self._active_process)
         if self._worker is not None:
             try:
@@ -855,18 +1039,33 @@ class RunManager:
             return run
         now = utc_now()
         if run["status"] in {"queued", "preparing", "starting"}:
-            self.app.state.store.update_run(
+            transitioned = self.app.state.store.transition_run(
                 run_id,
                 now,
-                status="cancelled",
+                from_statuses=("queued", "preparing", "starting"),
+                to_status="cancelled",
                 cancel_requested=1,
                 finished_at=now,
             )
+            if transitioned:
+                cancelled = self.app.state.store.get_run(run_id)
+                if cancelled is not None:
+                    _sync_manifest_terminal(
+                        self.app, cancelled, JobStatus.CANCELLED
+                    )
         else:
-            self.app.state.store.update_run(
-                run_id, now, status="cancelling", cancel_requested=1
+            transitioned = self.app.state.store.transition_run(
+                run_id,
+                now,
+                from_statuses=("running", "cancelling"),
+                to_status="cancelling",
+                cancel_requested=1,
             )
-            if self._active_run_id == run_id and self._active_process is not None:
+            if (
+                transitioned
+                and self._active_run_id == run_id
+                and self._active_process is not None
+            ):
                 await self._terminate(self._active_process)
         self._wake.set()
         return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
@@ -949,6 +1148,7 @@ class RunManager:
             ]
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            env["MMS_PIPELINE_JOB_ID"] = run_id
             kwargs: dict[str, Any] = {}
             if os.name == "nt":
                 # Do not attach native numerical libraries in the pipeline to
@@ -992,6 +1192,7 @@ class RunManager:
             return_code = await process.wait()
             latest = self.app.state.store.get_run(run_id) or run
             finished = utc_now()
+            manifest_error: PipelineErrorInfo | None = None
             if latest.get("status") == "interrupted":
                 final_status = "interrupted"
                 error = latest.get("error") or "Server stopped while this run was active."
@@ -999,19 +1200,78 @@ class RunManager:
                 final_status = "cancelled"
                 error = None
             elif return_code == 0:
-                final_status = "completed"
-                error = None
+                manifest, manifest_problem = _read_run_manifest(self.app, latest)
+                if manifest is not None and manifest.get("status") == JobStatus.SUCCEEDED.value:
+                    final_status = "completed"
+                    error = None
+                else:
+                    final_status = "failed"
+                    error = (
+                        "Pipeline exited successfully but did not publish a valid "
+                        "succeeded run manifest."
+                    )
+                    manifest_error = PipelineErrorInfo(
+                        code=(
+                            "RUN_MANIFEST_INVALID"
+                            if manifest is None
+                            else "RUN_MANIFEST_NOT_SUCCEEDED"
+                        ),
+                        message=error,
+                        stage="finalize_manifest",
+                        job_id=run_id,
+                        retryable=False,
+                        context={"reason": manifest_problem or "status is not succeeded"},
+                        cause_type="ManifestValidationError",
+                    )
             else:
                 final_status = "failed"
                 error = _process_failure_message(self.app, latest, return_code)
-            self.app.state.store.update_run(
+                manifest, _manifest_problem = _read_run_manifest(self.app, latest)
+                progress = manifest.get("progress", {}) if manifest is not None else {}
+                stage = (
+                    progress.get("current_stage")
+                    or progress.get("failed_stage")
+                    or "pipeline"
+                    if isinstance(progress, dict)
+                    else "pipeline"
+                )
+                manifest_error = PipelineErrorInfo(
+                    code="PIPELINE_PROCESS_FAILED",
+                    message=error,
+                    stage=str(stage),
+                    job_id=run_id,
+                    retryable=False,
+                    context={"return_code": return_code},
+                    cause_type="ChildProcessError",
+                )
+            allowed_sources = {
+                "completed": ("running",),
+                "failed": ("preparing", "starting", "running"),
+                "cancelled": ("running", "cancelling"),
+                "interrupted": ("running", "cancelling", "interrupted"),
+            }
+            transitioned = self.app.state.store.transition_run(
                 run_id,
                 finished,
-                status=final_status,
+                from_statuses=allowed_sources[final_status],
+                to_status=final_status,
                 return_code=return_code,
                 error=error,
                 finished_at=finished,
             )
+            if transitioned and final_status == "cancelled":
+                terminal_run = self.app.state.store.get_run(run_id) or latest
+                _sync_manifest_terminal(
+                    self.app, terminal_run, JobStatus.CANCELLED
+                )
+            elif transitioned and final_status == "failed":
+                terminal_run = self.app.state.store.get_run(run_id) or latest
+                _sync_manifest_terminal(
+                    self.app,
+                    terminal_run,
+                    JobStatus.FAILED,
+                    error=manifest_error,
+                )
         except BaseException as exc:
             self.app.state.logger.exception("Run %s failed before completion", run_id)
             finished = utc_now()
@@ -1021,13 +1281,35 @@ class RunManager:
                 if latest and latest.get("cancel_requested")
                 else "failed"
             )
-            self.app.state.store.update_run(
+            error_text = _redact(self.app, str(exc) or type(exc).__name__, run)
+            transitioned = self.app.state.store.transition_run(
                 run_id,
                 finished,
-                status=final_status,
-                error=_redact(self.app, str(exc) or type(exc).__name__, run),
+                from_statuses=("preparing", "starting", "running", "cancelling"),
+                to_status=final_status,
+                error=error_text if final_status == "failed" else None,
                 finished_at=finished,
             )
+            if transitioned and latest is not None:
+                terminal_run = self.app.state.store.get_run(run_id) or latest
+                if final_status == "cancelled":
+                    _sync_manifest_terminal(
+                        self.app, terminal_run, JobStatus.CANCELLED
+                    )
+                else:
+                    _sync_manifest_terminal(
+                        self.app,
+                        terminal_run,
+                        JobStatus.FAILED,
+                        error=PipelineErrorInfo(
+                            code="RUN_LAUNCH_FAILED",
+                            message=error_text,
+                            stage="launcher",
+                            job_id=run_id,
+                            retryable=False,
+                            cause_type=type(exc).__name__,
+                        ),
+                    )
         finally:
             self._active_run_id = None
             self._active_process = None
@@ -1137,7 +1419,7 @@ def get_results(run_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.get("/runs/{run_id}/artifacts")
-async def get_artifact(run_id: str, path: str, request: Request) -> FileResponse:
+async def get_artifact(run_id: str, path: str, request: Request) -> Response:
     run = request.app.state.store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -1151,10 +1433,31 @@ async def get_artifact(run_id: str, path: str, request: Request) -> FileResponse
             expect_directory=False,
             reject_symlinks=True,
         )
+        if any(part.casefold() == "logs" for part in Path(relative).parts):
+            raise UnsafePath("Diagnostic logs are available only through redacted run status.")
         if artifact.suffix.casefold() not in SAFE_RESULT_SUFFIXES:
             raise UnsafePath("This artifact type is not downloadable.")
     except (UnsafePath, OSError) as exc:
         raise HTTPException(status_code=404, detail="Artifact not found.") from exc
+    if artifact.name.casefold() in RESULT_MANIFEST_NAMES:
+        try:
+            with artifact.open("rb") as handle:
+                size = int(os.fstat(handle.fileno()).st_size)
+                if size <= 0 or size > MAX_RUN_MANIFEST_BYTES:
+                    raise ValueError("Manifest size is outside the public limit.")
+                payload = handle.read(MAX_RUN_MANIFEST_BYTES + 1)
+            if len(payload) > MAX_RUN_MANIFEST_BYTES:
+                raise ValueError("Manifest size is outside the public limit.")
+            document = json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found.") from exc
+        return JSONResponse(
+            _redact_manifest_value(request.app, document, run),
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     return FileResponse(
         artifact,
         filename=artifact.name,
@@ -1171,7 +1474,7 @@ async def _event_stream(request: Request, run_id: str) -> AsyncIterator[str]:
         if run is None:
             yield 'event: error\ndata: {"detail":"Run not found."}\n\n'
             return
-        public = public_run(request.app, run, include_log=True)
+        public = public_run(request.app, run, include_log=False)
         payload = json.dumps(
             {"type": "snapshot", "run": public},
             ensure_ascii=False,

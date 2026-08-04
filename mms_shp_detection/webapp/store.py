@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 ACTIVE_RUN_STATUSES = ("queued", "preparing", "starting", "running", "cancelling")
 
@@ -725,6 +726,47 @@ class WebStore:
                 f"UPDATE runs SET {assignments} WHERE id=?",
                 (*selected.values(), run_id),
             )
+
+    def transition_run(
+        self,
+        run_id: str,
+        now: str,
+        *,
+        from_statuses: Iterable[str],
+        to_status: str,
+        **fields: Any,
+    ) -> bool:
+        """Atomically move a run only from an explicitly allowed state.
+
+        ``update_run`` remains available for migrations and compatibility, while
+        lifecycle code uses this compare-and-set operation so a late worker or
+        cancellation request cannot overwrite a terminal result.
+        """
+
+        expected = tuple(dict.fromkeys(str(value) for value in from_statuses))
+        if not expected:
+            raise ValueError("from_statuses must contain at least one status.")
+        allowed = {
+            "pid",
+            "return_code",
+            "error",
+            "cancel_requested",
+            "started_at",
+            "finished_at",
+        }
+        selected = {key: value for key, value in fields.items() if key in allowed}
+        selected = {"status": str(to_status), **selected, "updated_at": now}
+        assignments = ", ".join(f"{key}=?" for key in selected)
+        placeholders = ",".join("?" for _ in expected)
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE runs SET {assignments}
+                WHERE id=? AND status IN ({placeholders})
+                """,
+                (*selected.values(), run_id, *expected),
+            )
+            return bool(cursor.rowcount)
 
     def recover_after_restart(self, now: str) -> int:
         with self.connection(write=True) as connection:

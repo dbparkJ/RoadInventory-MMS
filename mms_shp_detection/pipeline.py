@@ -23,6 +23,7 @@ from concurrent.futures import (
 )
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -38,9 +39,25 @@ from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 from ultralytics import YOLO
 
+from .app.pipeline_service import (
+    ManifestProgressReporter,
+    PipelineContext,
+    StageOutcome,
+    generate_job_id,
+    pipeline_error_info,
+    pipeline_scope,
+    resolve_git_commit,
+    tracked_stage,
+)
 from .alignment import estimate_panorama_alignment
 from .calibration import attach_calibration_metadata
-from .config import ConfigError, parse_args_with_config, serializable_config, validate_config_value
+from .config import (
+    ConfigError,
+    PipelineConfig,
+    parse_args_with_config,
+    serializable_config,
+    validate_config_value,
+)
 from .dataset import scan_image_tasks
 from .geometry import (
     apply_panorama_angular_offsets,
@@ -80,6 +97,9 @@ from .shp_writer import (
     write_pole_shapefile,
     write_shapefile,
 )
+from .domain.models import JobStatus, StageResult
+from .domain.calibration import CalibrationResolver
+from .infrastructure.manifest_writer import RunManifestStore
 
 
 RESULT_SCHEMA_VERSION = 17
@@ -115,6 +135,23 @@ POLE_CROP_SEMANTICS = {
         "exist in that format are written with explicit unknown/default values."
     ),
 }
+
+
+def _run_manifest_store(args: argparse.Namespace) -> RunManifestStore | None:
+    path = getattr(args, "_run_manifest_path", None)
+    return RunManifestStore(Path(path)) if path else None
+
+
+def _tracked_stage_for_args(
+    args: argparse.Namespace,
+    name: str,
+    *,
+    version: str = "1",
+):
+    manifest = _run_manifest_store(args)
+    if manifest is None:
+        return nullcontext(StageOutcome())
+    return tracked_stage(manifest, name, version=version)
 
 
 class _AdaptiveStageGate:
@@ -7676,76 +7713,158 @@ def prepare_shared_pipeline_context(
 ) -> dict[str, Any]:
     """Prepare immutable dataset/catalog inputs once for every model."""
 
-    all_image_tasks = scan_image_tasks(
-        args.data_root,
-        logger,
-        pose_format=args.pose_format,
-        gps_week=args.gps_week,
-        gps_utc_offset_seconds=args.gps_utc_offset_seconds,
-    )
-    image_tasks = select_image_tasks_for_scope(
-        all_image_tasks,
-        args,
-        logger=logger,
-    )
-    calibration_bundle = attach_calibration_metadata(
-        image_tasks,
-        args.calibration_path,
-        logger,
-        require_calibration=args.require_calibration,
-    )
+    run_manifest = _run_manifest_store(args)
+    with _tracked_stage_for_args(args, "discover_inputs") as stage:
+        all_image_tasks = scan_image_tasks(
+            args.data_root,
+            logger,
+            pose_format=args.pose_format,
+            gps_week=args.gps_week,
+            gps_utc_offset_seconds=args.gps_utc_offset_seconds,
+        )
+        image_tasks = select_image_tasks_for_scope(
+            all_image_tasks,
+            args,
+            logger=logger,
+        )
+        stage.input_count = len(all_image_tasks)
+        stage.output_count = len(image_tasks)
+        stage.rejected_count = len(all_image_tasks) - len(image_tasks)
+
+    with _tracked_stage_for_args(args, "attach_calibration") as stage:
+        resolution = CalibrationResolver(
+            args.calibration_path,
+            job_id=str(getattr(args, "_pipeline_job_id", "")),
+        ).resolve(
+            image_tasks,
+            required=bool(args.require_calibration),
+        )
+        # Keep the existing adapter as the only task-mutation path. The pure
+        # resolver above guarantees all missing/ambiguous keys are known first.
+        calibration_bundle = attach_calibration_metadata(
+            image_tasks,
+            args.calibration_path,
+            logger,
+            require_calibration=args.require_calibration,
+            resolution=resolution,
+        )
+        stage.input_count = len(image_tasks)
+        stage.output_count = len(resolution.matches)
+        stage.rejected_count = len(resolution.issues)
+        stage.metrics["job_track_matches"] = len(resolution.matches)
+        stage.metrics["job_track_issues"] = len(resolution.issues)
+        if run_manifest is not None:
+            run_manifest.set_calibrations(resolution.matches)
+
     image_tasks.sort(key=lambda item: (item["timestamp_iso"], item["image_path"]))
     dataset_signature = build_dataset_signature(image_tasks)
-    catalog_path, included_leica_jobs = _scoped_pointcloud_catalog_path(
-        Path(args.pointcloud_cache_path),
-        all_image_tasks=all_image_tasks,
-        selected_image_tasks=image_tasks,
-        logger=logger,
-    )
-    args.pointcloud_cache_path = catalog_path
-    pointcloud_catalog = build_pointcloud_catalog(
-        args.data_root,
-        catalog_path,
-        logger,
-        source=args.point_source,
-        las_chunk_size=max(10_000, args.las_index_chunk_points),
-        # An empty tuple intentionally excludes LAS for legacy-only scopes.
-        include_jobs=included_leica_jobs,
-    )
-    crs_wkt = (
-        validate_crs_wkt(
-            args.crs_wkt_path.read_text(encoding="utf-8-sig"),
-            label=str(args.crs_wkt_path),
+    if run_manifest is not None:
+        input_root = Path(args.data_root).resolve(strict=False)
+        input_files: list[str] = []
+        for task in image_tasks:
+            path = Path(str(task["image_path"])).resolve(strict=False)
+            try:
+                input_files.append(path.relative_to(input_root).as_posix())
+            except ValueError:
+                input_files.append(path.name)
+        jobs = sorted(
+            {str(task.get("job_name")) for task in image_tasks if task.get("job_name")}
         )
-        if args.crs_wkt_path is not None
-        else resolve_matched_crs_wkt(
+        tracks = sorted(
+            {str(task.get("track_name")) for task in image_tasks if task.get("track_name")}
+        )
+        run_manifest.set_input(
+            files=input_files,
+            fingerprints={"dataset": dataset_signature},
+            dataset_job=jobs[0] if len(jobs) == 1 else "multiple",
+            track=tracks[0] if len(tracks) == 1 else "multiple",
+        )
+
+    with _tracked_stage_for_args(args, "load_or_build_spatial_index") as stage:
+        catalog_path, included_leica_jobs = _scoped_pointcloud_catalog_path(
+            Path(args.pointcloud_cache_path),
+            all_image_tasks=all_image_tasks,
+            selected_image_tasks=image_tasks,
+            logger=logger,
+        )
+        args.pointcloud_cache_path = catalog_path
+        pointcloud_catalog = build_pointcloud_catalog(
+            args.data_root,
+            catalog_path,
+            logger,
+            source=args.point_source,
+            las_chunk_size=max(10_000, args.las_index_chunk_points),
+            # An empty tuple intentionally excludes LAS for legacy-only scopes.
+            include_jobs=included_leica_jobs,
+        )
+        stage.input_count = len(image_tasks)
+        stage.output_count = len(pointcloud_catalog.get("files", []))
+        stage.metrics["source_type"] = str(
+            pointcloud_catalog.get("selected_source_type") or "unknown"
+        )
+
+    with _tracked_stage_for_args(args, "validate_inputs") as stage:
+        crs_wkt = (
+            validate_crs_wkt(
+                args.crs_wkt_path.read_text(encoding="utf-8-sig"),
+                label=str(args.crs_wkt_path),
+            )
+            if args.crs_wkt_path is not None
+            else resolve_matched_crs_wkt(
+                image_tasks,
+                pointcloud_catalog,
+                max(1, args.pointcloud_neighbor_count),
+            )
+        )
+        pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
+        if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
+            raise ValueError(
+                "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
+            )
+        maximum_pose_separation = validate_pose_pointcloud_proximity(
             image_tasks,
             pointcloud_catalog,
             max(1, args.pointcloud_neighbor_count),
+            args.max_pose_pointcloud_separation_m,
         )
-    )
-    pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
-    if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
-        raise ValueError(
-            "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
+        alignment_report = run_panorama_alignment_qa(
+            image_tasks,
+            pointcloud_catalog,
+            args,
+            alignment_report_path,
+            logger,
+            dataset_signature=dataset_signature,
         )
-    maximum_pose_separation = validate_pose_pointcloud_proximity(
-        image_tasks,
-        pointcloud_catalog,
-        max(1, args.pointcloud_neighbor_count),
-        args.max_pose_pointcloud_separation_m,
-    )
-    alignment_report = run_panorama_alignment_qa(
-        image_tasks,
-        pointcloud_catalog,
-        args,
-        alignment_report_path,
-        logger,
-        dataset_signature=dataset_signature,
-    )
+        stage.input_count = len(image_tasks)
+        stage.output_count = len(image_tasks)
+        stage.metrics["crs_present"] = str(bool(crs_wkt)).lower()
+        if maximum_pose_separation is not None:
+            stage.metrics["max_pose_separation_m"] = maximum_pose_separation
+
+    application_context: PipelineContext | None = None
+    if run_manifest is not None:
+        manifest_document = run_manifest.read()
+        source_path = getattr(args, "_config_path", None)
+        application_context = PipelineContext(
+            job_id=str(manifest_document["job_id"]),
+            config=PipelineConfig(
+                values=serializable_config(args),
+                config_hash=str(getattr(args, "_pipeline_config_hash")),
+                source_path=Path(source_path).resolve() if source_path else None,
+            ),
+            input_root=Path(args.data_root).resolve(),
+            output_root=Path(args.output_dir).resolve(),
+            dataset_job=str(manifest_document["dataset_job"]),
+            track=str(manifest_document["track"]),
+            calibrations=resolution.matches,
+            manifest=run_manifest,
+        )
+
     return {
+        "pipeline_context": application_context,
         "image_tasks": image_tasks,
         "calibration_bundle": calibration_bundle,
+        "calibration_resolution": resolution,
         "dataset_signature": dataset_signature,
         "catalog_path": catalog_path,
         "pointcloud_catalog": pointcloud_catalog,
@@ -8044,6 +8163,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     )
     logger.info("Pole classification policy report: %s", classification_policy_path.resolve())
     model_sha256 = _sha256_file(args.model_path.resolve())
+    run_manifest = _run_manifest_store(args)
+    if run_manifest is not None:
+        run_manifest.add_model_version(args.model_path.name, model_sha256)
     run_fingerprint = build_run_fingerprint(
         args,
         pointcloud_catalog,
@@ -8388,6 +8510,26 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         return prepared_run
 
     progress_totals = {"images": 0, "detections": 0, "points": 0, "failures": 0}
+    processing_started: datetime | None = None
+    progress_reporter: ManifestProgressReporter | None = None
+    if run_manifest is not None:
+        current_status = JobStatus(run_manifest.read()["status"])
+        if current_status == JobStatus.VALIDATING:
+            run_manifest.transition(JobStatus.RUNNING)
+        processing_started = run_manifest.begin_stage(
+            "detect_project_and_estimate",
+            version=str(RESULT_SCHEMA_VERSION),
+        )
+        progress_reporter = ManifestProgressReporter(
+            run_manifest,
+            total_images=len(image_tasks),
+        )
+
+    def update_progress(event: dict[str, Any]) -> None:
+        _update_progress_bar(progress_bar, progress_totals, event)
+        if progress_reporter is not None:
+            progress_reporter.update(progress_totals)
+
     progress_disabled = bool(getattr(args, "disable_console_progress", False))
     with tqdm(
         total=len(image_tasks),
@@ -8408,11 +8550,7 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             summary = worker_process(
                 image_tasks,
                 runtime,
-                progress_callback=lambda event: _update_progress_bar(
-                    progress_bar,
-                    progress_totals,
-                    event,
-                ),
+                progress_callback=update_progress,
             )
             logger.info(
                 "Single-worker run finished: images=%d detections=%d points=%d",
@@ -8463,6 +8601,8 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             return_when=FIRST_COMPLETED,
                         )
                         _drain_progress_queue(progress_queue, progress_bar, progress_totals)
+                        if progress_reporter is not None:
+                            progress_reporter.update(progress_totals)
 
                         now = time.monotonic()
                         if now >= next_heartbeat:
@@ -8544,6 +8684,8 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                                     ],
                                 )
                     _drain_progress_queue(progress_queue, progress_bar, progress_totals)
+                    if progress_reporter is not None:
+                        progress_reporter.update(progress_totals)
             logger.info(
                 "Multi-worker run finished: images=%d detections=%d points=%d",
                 summary["images"],
@@ -8562,8 +8704,46 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             errors=summary["failures"],
             refresh=True,
         )
+    if progress_reporter is not None:
+        progress_reporter.update(summary, force=True)
+    if run_manifest is not None and processing_started is not None:
+        run_manifest.record_stage(
+            StageResult(
+                stage_name="detect_project_and_estimate",
+                stage_version=str(RESULT_SCHEMA_VERSION),
+                status="succeeded",
+                started_at=processing_started,
+                finished_at=datetime.now(timezone.utc),
+                input_count=len(image_tasks),
+                output_count=int(summary["detections"]),
+                rejected_count=int(summary["failures"]),
+                metrics={
+                    "projected_points": int(summary["points"]),
+                    "workers": int(actual_num_workers),
+                },
+            )
+        )
 
-    return finalize_prepared_model_run(prepared_run, summary)
+    with _tracked_stage_for_args(args, "write_outputs") as output_stage:
+        run_result = finalize_prepared_model_run(prepared_run, summary)
+        feature_counts = run_result.get("feature_counts", {})
+        output_stage.input_count = int(summary["detections"])
+        output_stage.output_count = sum(int(value) for value in feature_counts.values())
+        output_stage.metrics.update(
+            {
+                "detections": int(feature_counts.get("detections", 0)),
+                "poles": int(feature_counts.get("poles", 0)),
+            }
+        )
+        if run_manifest is not None:
+            run_manifest.update_counts(
+                images=int(summary["images"]),
+                detections_2d=int(summary["detections"]),
+                projected_3d=int(summary["points"]),
+                valid_features=output_stage.output_count,
+                rejected_features=int(summary["failures"]),
+            )
+    return run_result
 
 
 def _accumulate_summary(
@@ -8795,6 +8975,23 @@ def run_parallel_multi_model_pipeline(
         summary = "; ".join(f"{key}: {error}" for key, error in model_failures)
         raise RuntimeError(f"Every model failed to load: {summary}")
 
+    run_manifest = _run_manifest_store(first_args)
+    processing_started: datetime | None = None
+    output_started: datetime | None = None
+    progress_reporter: ManifestProgressReporter | None = None
+    if run_manifest is not None:
+        current_status = JobStatus(run_manifest.read()["status"])
+        if current_status == JobStatus.VALIDATING:
+            run_manifest.transition(JobStatus.RUNNING)
+        processing_started = run_manifest.begin_stage(
+            "detect_project_and_estimate",
+            version=str(RESULT_SCHEMA_VERSION),
+        )
+        progress_reporter = ManifestProgressReporter(
+            run_manifest,
+            total_images=len(reference_tasks) * len(active_states),
+        )
+
     work_queues = {
         state["model_key"]: queue.Queue(maxsize=coordinator.queue_depth)
         for state in active_states
@@ -8834,6 +9031,12 @@ def run_parallel_multi_model_pipeline(
                 errors=total_failures,
                 refresh=False,
             )
+            if progress_reporter is not None:
+                aggregate = {
+                    key: sum(item[key] for item in summaries.values())
+                    for key in ("images", "detections", "points", "failures")
+                }
+                progress_reporter.update(aggregate)
 
     def raise_pending_consumer_error() -> None:
         try:
@@ -9195,6 +9398,28 @@ def run_parallel_multi_model_pipeline(
         )
         raise producer_error
 
+    aggregate_summary = {
+        key: sum(item[key] for item in summaries.values())
+        for key in ("images", "detections", "points", "failures")
+    }
+    if progress_reporter is not None:
+        progress_reporter.update(aggregate_summary, force=True)
+    if run_manifest is not None and processing_started is not None:
+        run_manifest.record_stage(
+            StageResult(
+                stage_name="detect_project_and_estimate",
+                stage_version=str(RESULT_SCHEMA_VERSION),
+                status="succeeded",
+                started_at=processing_started,
+                finished_at=datetime.now(timezone.utc),
+                input_count=len(reference_tasks) * len(active_states),
+                output_count=int(aggregate_summary["detections"]),
+                rejected_count=int(aggregate_summary["failures"]),
+                metrics={"projected_points": int(aggregate_summary["points"])},
+            )
+        )
+        output_started = run_manifest.begin_stage("write_outputs", version="1")
+
     for state in active_states:
         model_key = state["model_key"]
         entry = entry_by_key[model_key]
@@ -9253,9 +9478,34 @@ def run_parallel_multi_model_pipeline(
             f"{len(model_failures)} model run(s) failed after all models were attempted: "
             f"{summary}"
         )
+    if run_manifest is not None and output_started is not None:
+        feature_count = sum(
+            sum(int(value) for value in (entry.get("feature_counts") or {}).values())
+            for entry in manifest["models"]
+            if entry.get("status") == "completed"
+        )
+        run_manifest.record_stage(
+            StageResult(
+                stage_name="write_outputs",
+                stage_version="1",
+                status="succeeded",
+                started_at=output_started,
+                finished_at=datetime.now(timezone.utc),
+                input_count=int(aggregate_summary["detections"]),
+                output_count=feature_count,
+                rejected_count=int(aggregate_summary["failures"]),
+            )
+        )
+        run_manifest.update_counts(
+            images=len(reference_tasks),
+            detections_2d=int(aggregate_summary["detections"]),
+            projected_3d=int(aggregate_summary["points"]),
+            valid_features=feature_count,
+            rejected_features=int(aggregate_summary["failures"]),
+        )
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def _run_pipeline_impl(args: argparse.Namespace) -> None:
     """Run one checkpoint or every configured checkpoint in isolated outputs."""
 
     configured_model_dir = getattr(args, "model_dir", None)
@@ -9423,6 +9673,155 @@ def run_pipeline(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"{len(failures)} model run(s) failed after all models were attempted: {summary}"
         )
+
+
+def _archive_previous_run_manifest(
+    store: RunManifestStore,
+    *,
+    next_job_id: str,
+) -> None:
+    if not store.exists():
+        return
+    document = store.read()
+    if document["job_id"] == next_job_id:
+        return
+    if document["status"] not in {
+        JobStatus.SUCCEEDED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+    }:
+        raise RuntimeError(
+            "Output directory already contains a non-terminal run manifest for "
+            f"job {document['job_id']!r}."
+        )
+    history_dir = store.path.parent / "run_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    safe_job_id = sanitize_name(str(document["job_id"]))
+    destination = history_dir / f"{safe_job_id}.manifest.json"
+    if destination.exists():
+        destination = history_dir / f"{safe_job_id}.{uuid.uuid4().hex[:8]}.manifest.json"
+    os.replace(store.path, destination)
+
+
+def _published_output_summary(output_dir: Path) -> dict[str, Any]:
+    shapefiles: list[str] = []
+    try:
+        for path in sorted(output_dir.glob("shp/*.shp")):
+            if path.is_file() and ".in_progress" not in path.name:
+                shapefiles.append(path.relative_to(output_dir).as_posix())
+        for path in sorted(output_dir.glob("*/shp/*.shp")):
+            if path.is_file() and ".in_progress" not in path.name:
+                shapefiles.append(path.relative_to(output_dir).as_posix())
+    except OSError:
+        shapefiles = []
+    return {
+        "root": ".",
+        "shapefiles": shapefiles,
+        "models_manifest": (
+            "models_manifest.json"
+            if (output_dir / "models_manifest.json").is_file()
+            else None
+        ),
+    }
+
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    """Run the legacy pipeline behind a durable, validated job contract."""
+
+    pipeline_config = PipelineConfig.from_namespace(args)
+    job_id = generate_job_id(args, pipeline_config)
+    dataset_job, track = pipeline_scope(args)
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifestStore(output_dir / "run_manifest.json")
+    _archive_previous_run_manifest(manifest, next_job_id=job_id)
+    manifest.create(
+        job_id=job_id,
+        config=pipeline_config,
+        input_root=Path(args.data_root),
+        dataset_job=dataset_job,
+        track=track,
+    )
+    manifest.set_config_provenance(pipeline_config)
+    manifest.set_versions(
+        git_commit=resolve_git_commit(Path(__file__).resolve().parents[1]),
+    )
+    args._run_manifest_path = str(manifest.path)
+    args._pipeline_job_id = job_id
+    args._pipeline_config_hash = pipeline_config.config_hash
+
+    current = JobStatus(manifest.read()["status"])
+    if current == JobStatus.PENDING:
+        manifest.transition(JobStatus.VALIDATING)
+
+    active_stage = "validate_config"
+    try:
+        with tracked_stage(manifest, active_stage) as stage:
+            configured_model_dir = getattr(args, "model_dir", None)
+            model_paths = discover_model_paths(
+                configured_model_dir,
+                getattr(args, "model_path", None),
+            )
+            stage.input_count = 1
+            stage.output_count = len(model_paths)
+            stage.metrics["model_count"] = len(model_paths)
+            manifest.set_versions(model=[path.name for path in model_paths])
+
+        active_stage = "pipeline"
+        _run_pipeline_impl(args)
+        current = JobStatus(manifest.read()["status"])
+        if current == JobStatus.VALIDATING:
+            manifest.transition(JobStatus.RUNNING)
+        active_stage = "finalize_manifest"
+        with tracked_stage(manifest, active_stage) as stage:
+            outputs = _published_output_summary(output_dir)
+            manifest.set_outputs(outputs)
+            stage.output_count = len(outputs["shapefiles"])
+            stage.metrics["published_shapefiles"] = len(outputs["shapefiles"])
+        manifest.transition(JobStatus.SUCCEEDED)
+    except KeyboardInterrupt as exc:
+        manifest.fail_active_stage()
+        document = manifest.read()
+        stage_name = (
+            document["progress"].get("failed_stage")
+            or document["progress"].get("current_stage")
+            or active_stage
+        )
+        manifest.record_error(
+            pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
+        )
+        current = JobStatus(manifest.read()["status"])
+        if current in {JobStatus.PENDING, JobStatus.VALIDATING, JobStatus.RUNNING}:
+            manifest.transition(JobStatus.CANCELLED)
+        raise
+    except BaseException as exc:
+        manifest.fail_active_stage()
+        document = manifest.read()
+        stage_name = (
+            document["progress"].get("failed_stage")
+            or document["progress"].get("current_stage")
+            or active_stage
+        )
+        error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
+        manifest.record_error(error_info)
+        current = JobStatus(manifest.read()["status"])
+        if current in {
+            JobStatus.PENDING,
+            JobStatus.VALIDATING,
+            JobStatus.RUNNING,
+            JobStatus.RETRYING,
+        }:
+            manifest.transition(JobStatus.FAILED)
+        raise
+    finally:
+        active_error = sys.exception()
+        try:
+            manifest.write_summary()
+        except (OSError, ValueError) as summary_error:
+            if active_error is not None:
+                active_error.add_note(f"Could not write run summary: {summary_error}")
+            else:
+                raise
 
 
 def main() -> None:

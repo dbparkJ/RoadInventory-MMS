@@ -9,18 +9,66 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useState } from 'react'
-import type { RunRecord, RunStatus } from '../types'
+import type { CanonicalRunStatus, RunRecord } from '../types'
 import { formatDate, formatDuration } from '../lib/format'
 import { RunResultsDialog } from './RunResultsDialog'
 
-const STATUS: Record<RunStatus, { label: string; icon: typeof Clock3 }> = {
+const STATUS = {
   queued: { label: '대기 중', icon: Clock3 },
   preparing: { label: '준비 중', icon: CircleDashed },
+  starting: { label: '시작 중', icon: LoaderCircle },
   running: { label: '실행 중', icon: LoaderCircle },
   completed: { label: '완료', icon: CheckCircle2 },
   failed: { label: '실패', icon: XCircle },
   cancelled: { label: '취소됨', icon: Ban },
   cancelling: { label: '취소 중', icon: LoaderCircle },
+}
+
+const CANONICAL_STATUS: Record<CanonicalRunStatus, { label: string; icon: typeof Clock3 }> = {
+  pending: STATUS.queued,
+  validating: STATUS.preparing,
+  running: STATUS.running,
+  succeeded: STATUS.completed,
+  failed: STATUS.failed,
+  retrying: { label: '재시도 중', icon: LoaderCircle },
+  cancelled: STATUS.cancelled,
+}
+
+const UNKNOWN_STATUS = { label: '알 수 없는 상태', icon: CircleDashed }
+const ACTIVE_STATUSES = new Set(['queued', 'preparing', 'starting', 'running', 'cancelling'])
+const ACTIVE_CANONICAL_STATUSES = new Set<CanonicalRunStatus>([
+  'pending',
+  'validating',
+  'running',
+  'retrying',
+])
+
+function statusMeta(run: RunRecord) {
+  const legacy = Object.prototype.hasOwnProperty.call(STATUS, run.status)
+    ? STATUS[run.status as keyof typeof STATUS]
+    : undefined
+  if (legacy) return legacy
+  const canonical =
+    run.canonical_status &&
+    Object.prototype.hasOwnProperty.call(CANONICAL_STATUS, run.canonical_status)
+      ? CANONICAL_STATUS[run.canonical_status]
+      : undefined
+  return canonical ?? UNKNOWN_STATUS
+}
+
+function isActive(run: RunRecord) {
+  return (
+    ACTIVE_STATUSES.has(run.status) ||
+    (run.canonical_status !== undefined && ACTIVE_CANONICAL_STATUSES.has(run.canonical_status))
+  )
+}
+
+function statusClass(status: string) {
+  return Object.prototype.hasOwnProperty.call(STATUS, status) ? status : 'unknown'
+}
+
+function normalizedProgress(progress: number) {
+  return Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : 0
 }
 
 export function RunQueue({
@@ -50,7 +98,7 @@ export function RunQueue({
         </header>
         <div className="queue-overview">
           <div>
-            <strong>{runs.filter((run) => ['running', 'preparing'].includes(run.status)).length}</strong>
+            <strong>{runs.filter(isActive).length}</strong>
             <small>실행 중</small>
           </div>
           <div>
@@ -89,25 +137,36 @@ function RunCard({
   onCancel: (id: string) => void
   onOpenResults: (run: RunRecord) => void
 }) {
-  const meta = STATUS[run.status]
+  const meta = statusMeta(run)
   const Icon = meta.icon
-  const active = ['queued', 'preparing', 'running', 'cancelling'].includes(run.status)
+  const active = isActive(run)
+  const progress = normalizedProgress(run.progress)
+  const spinning =
+    ['starting', 'running', 'cancelling'].includes(run.status) ||
+    run.canonical_status === 'retrying'
   return (
-    <article className={`run-card status-${run.status}`}>
+    <article className={`run-card status-${statusClass(run.status)}`}>
       <div className="run-card-top">
         <span className="run-status">
-          <Icon size={15} className={['running', 'cancelling'].includes(run.status) ? 'spin' : ''} />
+          <Icon size={15} className={spinning ? 'spin' : ''} />
           {meta.label}
         </span>
         <time>{formatDate(run.created_at)}</time>
       </div>
       <h3>{run.dataset_name ?? run.dataset_id}</h3>
-      <p>{run.error ?? run.message ?? run.stage ?? '작업 요청을 준비하고 있습니다.'}</p>
-      <div className="progress-track" aria-label={`진행률 ${Math.round(run.progress)}%`}>
-        <span style={{ width: `${Math.max(0, Math.min(100, run.progress))}%` }} />
+      <p>
+        {run.error_info?.message ??
+          run.error ??
+          run.message ??
+          run.current_stage ??
+          run.stage ??
+          '작업 요청을 준비하고 있습니다.'}
+      </p>
+      <div className="progress-track" aria-label={`진행률 ${Math.round(progress)}%`}>
+        <span style={{ width: `${progress}%` }} />
       </div>
       <div className="run-progress-meta">
-        <strong>{Math.round(run.progress)}%</strong>
+        <strong>{Math.round(progress)}%</strong>
         {active && run.eta_seconds !== undefined && Number.isFinite(run.eta_seconds) && (
           <small>예상 {formatDuration(run.eta_seconds)}</small>
         )}

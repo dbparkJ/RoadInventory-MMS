@@ -219,9 +219,73 @@ match the server configuration rather than inventing dataset-independent values.
 record. Progress is 0–100 and status is one of `queued`, `preparing`, `running`, `completed`,
 `failed`, `cancelled`, or `cancelling`.
 
+`status` is the stable v1 UI lifecycle field and retains the values above. A run backed by the
+versioned execution manifest can additionally include the following fields; old clients may ignore
+them, and the server may omit them for legacy runs that do not have a manifest:
+
+```json
+{
+  "id": "run_01",
+  "job_id": "run_01",
+  "status": "running",
+  "canonical_status": "running",
+  "attempt": 1,
+  "manifest_schema_version": 1,
+  "current_stage": "detect_project_and_estimate",
+  "error_info": null,
+  "versions": {
+    "git_commit": "8d3c7f1",
+    "config_hash": "sha256:...",
+    "config_schema": 1,
+    "model_hashes": { "sign": "sha256:..." },
+    "calibration_id": "cal-2026-07",
+    "calibration_hash": "sha256:..."
+  },
+  "counts": {
+    "images": 420,
+    "detections_2d": 37,
+    "projected_3d": 31,
+    "valid_features": 26,
+    "rejected_features": 5
+  },
+  "stage_results": [
+    {
+      "stage_name": "validate_inputs",
+      "stage_version": "1",
+      "status": "succeeded",
+      "started_at": "2026-08-04T01:00:00Z",
+      "finished_at": "2026-08-04T01:00:01Z",
+      "elapsed_ms": 1000,
+      "input_count": 420,
+      "output_count": 420,
+      "rejected_count": 0,
+      "metrics": {},
+      "warnings": []
+    }
+  ]
+}
+```
+
+`canonical_status` is one of `pending`, `validating`, `running`, `succeeded`, `failed`, `retrying`,
+or `cancelled`. `error_info`, when present, contains `code`, `message`, `stage`, `job_id`, and
+`retryable`, with optional `object_id`, `context`, and `cause_type`. Manifest-derived paths and
+diagnostics exposed by this public projection must be server-relative and operator-safe; absolute
+input, model, calibration, config, and output paths are not part of `RunRecord`.
+
+`GET /api/runs/{id}/artifacts?path=run_manifest.json` and the equivalent models manifest response
+return recursively redacted JSON. Pipeline `.log` files and files below an output `logs/` directory
+are diagnostic data and are not exposed through the general artifact-download endpoint. The
+redacted `log_tail` on `GET /api/runs/{id}` remains the operator-facing diagnostic view.
+
+Clients must treat unrecognized `status` values as forward-compatible data. They should render a
+neutral fallback instead of indexing an exhaustive status table without a fallback. The current UI
+uses `canonical_status` for a more specific label when available.
+
 `GET /api/runs/{id}/events` is an SSE stream. The preferred format is a named `event: run` whose
 data is either a `RunRecord` or `{ "run": RunRecord }`. Default messages and named `progress`,
 `stage`, `completed`, `failed`, and `cancelled` events are also accepted for compatibility.
+Snapshot events omit `log_tail`; progress and the current stage come from the manifest, with the
+legacy bounded log parser used only when no valid manifest exists.
 
 ## Resumable folder upload
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -40,6 +44,69 @@ _Yaml12SafeLoader.add_implicit_resolver(
 
 class ConfigError(ValueError):
     """Raised when a pipeline YAML file cannot be mapped to CLI options."""
+
+
+def _json_compatible(value: Any) -> Any:
+    """Normalize config values into a deterministic JSON-compatible tree."""
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_compatible(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_json_compatible(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def canonical_config_json(value: Mapping[str, Any] | argparse.Namespace) -> str:
+    """Return canonical JSON used to identify an effective pipeline config."""
+
+    public = serializable_config(value) if isinstance(value, argparse.Namespace) else value
+    return json.dumps(
+        _json_compatible(public),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def config_sha256(value: Mapping[str, Any] | argparse.Namespace) -> str:
+    return hashlib.sha256(canonical_config_json(value).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Immutable, normalized view of the effective legacy argparse contract.
+
+    The processing functions continue to receive ``argparse.Namespace`` during
+    the incremental migration. New application and manifest code uses this
+    model so configuration is interpreted and fingerprinted exactly once.
+    """
+
+    values: Mapping[str, Any]
+    config_hash: str
+    source_path: Path | None = None
+    schema_version: int = 1
+
+    @classmethod
+    def from_namespace(cls, args: argparse.Namespace) -> "PipelineConfig":
+        values = _json_compatible(serializable_config(args))
+        source = getattr(args, "_config_path", None)
+        return cls(
+            values=MappingProxyType(values),
+            config_hash=config_sha256(values),
+            source_path=Path(source).resolve() if source else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.values)
 
 
 _RANGES: dict[str, tuple[float | None, float | None]] = {
