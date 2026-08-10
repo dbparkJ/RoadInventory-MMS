@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +13,9 @@ from .models import CalibrationMatch, PipelineError, PipelineErrorInfo
 
 CALIBRATION_NOT_FOUND = "CALIBRATION_NOT_FOUND"
 CALIBRATION_AMBIGUOUS = "CALIBRATION_AMBIGUOUS"
+CALIBRATION_INVALID = "CALIBRATION_INVALID"
+CALIBRATION_VERSION_UNSUPPORTED = "CALIBRATION_VERSION_UNSUPPORTED"
+SUPPORTED_CALIBRATION_SCHEMA_VERSION = 2
 _AVAILABLE_KEY_SAMPLE_LIMIT = 20
 
 
@@ -43,6 +48,64 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _identity_json_value(value: Any, *, key: str = "") -> Any:
+    """Normalize task metadata without reading calibration file contents."""
+
+    if isinstance(value, Path) or (key.endswith("_path") and value):
+        return os.path.normcase(
+            str(Path(str(value)).expanduser().resolve(strict=False))
+        )
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _identity_json_value(item, key=str(item_key))
+            for item_key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_identity_json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_identity_json_value(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def calibration_task_identity(task: Mapping[str, Any]) -> str:
+    """Bind a resolution to its Job/Track and delivery calibration metadata."""
+
+    delivery = task.get("delivery_calibration")
+    task_locator = {
+        key: _identity_json_value(task[key], key=key)
+        for key in (
+            "record_name",
+            "image_name",
+            "image_path",
+            "pose_csv_path",
+            "frame_id",
+        )
+        if task.get(key) is not None
+    }
+    payload = {
+        "normalized_key": normalized_task_key(task),
+        "task_locator": task_locator,
+        "delivery_calibration": (
+            _identity_json_value(delivery) if isinstance(delivery, Mapping) else None
+        ),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def delivery_calibration_fingerprint(metadata: Mapping[str, Any]) -> str:
     """Match the legacy delivery-calibration provenance hash byte-for-byte."""
 
@@ -66,20 +129,125 @@ def delivery_calibration_fingerprint(metadata: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
-def _load_bundle(path: Path | None) -> dict[str, Any] | None:
+def _bundle_error(
+    *,
+    code: str,
+    message: str,
+    path: Path,
+    job_id: str,
+    stage: str,
+    schema_version: Any = None,
+    cause: BaseException | None = None,
+) -> PipelineError:
+    context: dict[str, Any] = {
+        "calibration_path": str(path),
+        "supported_schema_versions": [SUPPORTED_CALIBRATION_SCHEMA_VERSION],
+    }
+    if schema_version is not None:
+        context["schema_version"] = schema_version
+    return PipelineError(
+        PipelineErrorInfo(
+            code=code,
+            message=message,
+            stage=stage,
+            job_id=job_id,
+            retryable=False,
+            context=context,
+            cause_type=type(cause).__name__ if cause is not None else None,
+        )
+    )
+
+
+def _load_bundle(
+    path: Path | None,
+    *,
+    job_id: str,
+    stage: str,
+) -> dict[str, Any] | None:
     if path is None or not path.is_file():
         return None
     resolved = path.resolve()
     try:
         payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid calibration JSON at {resolved}: {exc}") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("tracks"), list):
-        raise ValueError(  # noqa: TRY004 - preserve the legacy loader contract
-            f"Calibration JSON has no tracks list: {resolved}"
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=f"Invalid calibration JSON at {resolved}: {exc}",
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            cause=exc,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=f"Calibration JSON root must be an object: {resolved}",
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+        )
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=f"Calibration JSON has no integer schema_version: {resolved}",
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            schema_version=schema_version,
+        )
+    if schema_version != SUPPORTED_CALIBRATION_SCHEMA_VERSION:
+        raise _bundle_error(
+            code=CALIBRATION_VERSION_UNSUPPORTED,
+            message=(
+                "Unsupported calibration schema_version "
+                f"{schema_version} at {resolved}; "
+                f"expected {SUPPORTED_CALIBRATION_SCHEMA_VERSION}"
+            ),
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            schema_version=schema_version,
+        )
+    if not isinstance(payload.get("tracks"), list):
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=f"Calibration JSON has no tracks list: {resolved}",
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            schema_version=schema_version,
+        )
+    invalid_track_indexes = [
+        index
+        for index, item in enumerate(payload["tracks"])
+        if not isinstance(item, Mapping)
+    ]
+    if invalid_track_indexes:
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=(
+                f"Calibration JSON contains non-object track entries at indexes "
+                f"{invalid_track_indexes}: {resolved}"
+            ),
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            schema_version=schema_version,
         )
     payload["calibration_path"] = str(resolved)
-    payload["sha256"] = _sha256_file(resolved)
+    try:
+        payload["sha256"] = _sha256_file(resolved)
+    except OSError as exc:
+        raise _bundle_error(
+            code=CALIBRATION_INVALID,
+            message=f"Could not fingerprint calibration JSON at {resolved}: {exc}",
+            path=resolved,
+            job_id=job_id,
+            stage=stage,
+            schema_version=schema_version,
+            cause=exc,
+        ) from exc
     return payload
 
 
@@ -119,6 +287,7 @@ class CalibrationResolution:
         compare=False,
     )
     _task_keys: tuple[str, ...] = field(default=(), repr=False, compare=False)
+    _task_identities: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -130,6 +299,10 @@ class CalibrationResolution:
     @property
     def task_keys(self) -> tuple[str, ...]:
         return self._task_keys
+
+    @property
+    def task_identities(self) -> tuple[str, ...]:
+        return self._task_identities
 
     def require(
         self,
@@ -162,7 +335,9 @@ class CalibrationResolver:
         stage: str = "attach_calibration",
     ) -> None:
         self.calibration_path = (
-            Path(calibration_path).expanduser() if calibration_path is not None else None
+            Path(calibration_path).expanduser()
+            if calibration_path is not None
+            else None
         )
         self.job_id = job_id
         self.stage = stage
@@ -173,13 +348,19 @@ class CalibrationResolver:
         *,
         required: bool = False,
     ) -> CalibrationResolution:
-        bundle = _load_bundle(self.calibration_path)
+        bundle = _load_bundle(
+            self.calibration_path,
+            job_id=self.job_id,
+            stage=self.stage,
+        )
         bundle_tracks = tuple(
             item
             for item in (bundle.get("tracks", []) if bundle is not None else [])
             if isinstance(item, Mapping)
         )
-        available_bundle_keys = tuple(sorted({_bundle_track_key(item) for item in bundle_tracks}))
+        available_bundle_keys = tuple(
+            sorted({_bundle_track_key(item) for item in bundle_tracks})
+        )
 
         searched_roots: set[Path] = set()
         if self.calibration_path is not None:
@@ -192,6 +373,7 @@ class CalibrationResolver:
             tuple[str, str, str, str, str], CalibrationMatch
         ] = {}
         available_keys = set(available_bundle_keys)
+        delivery_fingerprints: dict[tuple[str, str], str] = {}
 
         for task in tasks:
             job_name = str(task.get("job_name") or "")
@@ -213,7 +395,14 @@ class CalibrationResolver:
                 if str(delivery.get("internal_orientation_path") or ""):
                     searched_roots.add(internal_path.resolve(strict=False).parent)
                 if ini_path.is_file() and internal_path.is_file():
-                    fingerprint = delivery_calibration_fingerprint(delivery)
+                    delivery_key = (
+                        os.path.normcase(str(ini_path.resolve())),
+                        os.path.normcase(str(internal_path.resolve())),
+                    )
+                    fingerprint = delivery_fingerprints.get(delivery_key)
+                    if fingerprint is None:
+                        fingerprint = delivery_calibration_fingerprint(delivery)
+                        delivery_fingerprints[delivery_key] = fingerprint
                     calibration_id = str(
                         delivery.get("calibration_id")
                         or delivery.get("serial_number")
@@ -251,15 +440,15 @@ class CalibrationResolver:
                 ]
                 candidate_keys = tuple(_bundle_track_key(item) for item in candidates)
                 matched_by = (
-                    "exact_job_track"
-                    if normalized_track
-                    else "exact_job_unique_track"
+                    "exact_job_track" if normalized_track else "exact_job_unique_track"
                 )
                 if len(candidates) == 1 and bundle is not None:
                     candidate = candidates[0]
+                    candidate_job = candidate.get("job") or job_name
+                    candidate_track = candidate.get("track") or track_name
                     calibration_id = str(
                         candidate.get("calibration_id")
-                        or f"{candidate.get('job') or job_name}/{candidate.get('track') or track_name}"
+                        or f"{candidate_job}/{candidate_track}"
                     )
                     match = CalibrationMatch(
                         job_name=job_name,
@@ -315,13 +504,18 @@ class CalibrationResolver:
             matches=tuple(successful_by_identity.values()),
             issues=tuple(issues),
             bundle=bundle,
-            searched_roots=tuple(sorted(searched_roots, key=lambda path: str(path).casefold())),
-            normalized_keys=tuple(sorted({normalized_task_key(task) for task in tasks})),
+            searched_roots=tuple(
+                sorted(searched_roots, key=lambda path: str(path).casefold())
+            ),
+            normalized_keys=tuple(
+                sorted({normalized_task_key(task) for task in tasks})
+            ),
             available_keys_sample=tuple(sorted(available_keys))[
                 :_AVAILABLE_KEY_SAMPLE_LIMIT
             ],
             _task_matches=tuple(task_matches),
             _task_keys=tuple(normalized_task_key(task) for task in tasks),
+            _task_identities=tuple(calibration_task_identity(task) for task in tasks),
         )
         if required and resolution.issues:
             _raise_resolution_error(
@@ -366,10 +560,14 @@ def _raise_resolution_error(
 
 __all__ = [
     "CALIBRATION_AMBIGUOUS",
+    "CALIBRATION_INVALID",
     "CALIBRATION_NOT_FOUND",
+    "CALIBRATION_VERSION_UNSUPPORTED",
+    "SUPPORTED_CALIBRATION_SCHEMA_VERSION",
     "CalibrationIssue",
     "CalibrationResolution",
     "CalibrationResolver",
+    "calibration_task_identity",
     "delivery_calibration_fingerprint",
     "normalize_calibration_component",
     "normalized_task_key",

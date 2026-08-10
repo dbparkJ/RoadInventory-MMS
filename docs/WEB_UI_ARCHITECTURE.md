@@ -20,7 +20,7 @@
 
 ```text
 React/Vite 작업자 UI
-  ├─ MapLibre 지도와 주행 경로
+  ├─ same-origin iframe의 VWorld WebGL 3.0 지도와 주행 경로
   ├─ 지연 로딩 360° 파노라마
   └─ 점 예산 기반 Three.js 점군
           │ REST + SSE
@@ -87,8 +87,17 @@ worker를 독립 프로세스로 배치할 수 있습니다.
 - 겹친 노선으로 인한 과밀 표시를 막기 위해 기본 지도에는 선택 트랙 또는 현재 프레임의
   트랙만 표시합니다. 사용자가 일반 설정에서 명시적으로 켠 경우에만 전체 트랙을 함께
   표시합니다.
-- 지도 타일은 MapLibre style URL로 교체할 수 있습니다. API key는 빌드 산출물에
-  넣지 않고 서버 환경변수로 주입합니다.
+- 지도는 VWorld WebGL 3.0 SDK의 `document.write()` 로더와 전역 `vw`/`ws3d` 상태를
+  React 문서에서 격리하기 위해 same-origin iframe에서 실행합니다. 기존 지도
+  style URL을 bootstrap 설정으로 받지 않으며, bootstrap은
+  `{"provider":"vworld","engine":"webgl","version":"3.0"}` 메타데이터만 제공합니다.
+- VWorld 인증키와 현재 origin은 SDK loader query에 전달됩니다. 인증키는
+  브라우저에 노출되는 개발용 클라이언트 값으로 취급하고, 배포 origin을
+  VWorld 인증키 설정과 일치시켜야 합니다. iframe 크기가 바뀌면 VWorld
+  `map.updateSize(...)`와 Cesium resize를 함께 호출합니다.
+- 경로·선택 구간·프레임·SHP는 서로 다른 Cesium `CustomDataSource`로 관리합니다.
+  한 종류가 바뀔 때 다른 피처를 재생성하지 않으며, 대량 entity 교체 중에는
+  `EntityCollection.suspendEvents()`/`resumeEvents()`로 변경 알림을 묶습니다.
 
 ## 데이터 등록과 업로드
 

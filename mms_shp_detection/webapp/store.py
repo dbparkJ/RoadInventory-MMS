@@ -173,7 +173,9 @@ class WebStore:
             ).fetchone()
         return self.dataset_from_row(row)
 
-    def find_dataset(self, root_id: str, relative_path: str, crs: str) -> dict[str, Any] | None:
+    def find_dataset(
+        self, root_id: str, relative_path: str, crs: str
+    ) -> dict[str, Any] | None:
         with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM datasets WHERE root_id=? AND relative_path=? AND crs=?",
@@ -390,7 +392,9 @@ class WebStore:
                 (*params, int(limit), int(offset)),
             ).fetchall()
         return [
-            self.frame_from_row(row) for row in rows if row is not None  # type: ignore[misc]
+            self.frame_from_row(row)
+            for row in rows
+            if row is not None  # type: ignore[misc]
         ], total
 
     def all_frames(self, dataset_id: str) -> list[dict[str, Any]]:
@@ -561,7 +565,12 @@ class WebStore:
         return dict(row) if row is not None else None
 
     def update_upload_offset(
-        self, upload_id: str, file_id: str, expected_offset: int, new_offset: int, now: str
+        self,
+        upload_id: str,
+        file_id: str,
+        expected_offset: int,
+        new_offset: int,
+        now: str,
     ) -> bool:
         with self.connection(write=True) as connection:
             cursor = connection.execute(
@@ -620,13 +629,56 @@ class WebStore:
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
-            row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
         return self.run_from_row(row)
 
     def list_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def list_runs_with_statuses(
+        self,
+        statuses: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        selected = tuple(dict.fromkeys(str(value) for value in statuses))
+        if not selected:
+            return []
+        placeholders = ",".join("?" for _ in selected)
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM runs WHERE status IN ({placeholders}) ORDER BY created_at",
+                selected,
+            ).fetchall()
+        return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def list_runs_requiring_restart_reconciliation(
+        self,
+        execution_contract_version: int,
+    ) -> list[dict[str, Any]]:
+        """Select active rows plus contract terminal rows that may need resync."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN (
+                    'preparing','starting','running','cancelling','interrupted'
+                )
+                   OR (
+                        status IN ('failed','cancelled')
+                        AND json_extract(
+                            resolved_json,
+                            '$.run_execution_contract_version'
+                        ) = ?
+                   )
+                ORDER BY created_at
+                """,
+                (int(execution_contract_version),),
             ).fetchall()
         return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
 
@@ -773,23 +825,25 @@ class WebStore:
             connection.execute(
                 """
                 UPDATE runs SET status='queued',pid=NULL,updated_at=?
-                WHERE status IN ('preparing','starting') AND cancel_requested=0
+                WHERE status='preparing' AND cancel_requested=0
                 """,
                 (now,),
             )
-            connection.execute(
+            cancelled_cursor = connection.execute(
                 """
                 UPDATE runs SET status='cancelled',finished_at=?,updated_at=?
-                WHERE status IN ('preparing','starting') AND cancel_requested=1
+                WHERE status IN ('preparing','starting','running','cancelling')
+                    AND cancel_requested=1
                 """,
                 (now, now),
             )
-            cursor = connection.execute(
+            interrupted_cursor = connection.execute(
                 """
                 UPDATE runs SET status='interrupted',
                     error='Server restarted while this run was active.',
                     finished_at=?,updated_at=?
-                WHERE status IN ('running','cancelling')
+                WHERE status IN ('starting','running','cancelling')
+                    AND cancel_requested=0
                 """,
                 (now, now),
             )
@@ -808,7 +862,7 @@ class WebStore:
                 """,
                 (now,),
             )
-            return int(cursor.rowcount)
+            return int(cancelled_cursor.rowcount) + int(interrupted_cursor.rowcount)
 
     def ping(self) -> bool:
         with self.connection() as connection:

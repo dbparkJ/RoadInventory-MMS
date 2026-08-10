@@ -32,7 +32,6 @@ interface WorkspaceProps {
   frameRange: FrameRange | null
   route: RoutePoint[]
   routeLoading: boolean
-  mapStyleUrl?: string
   demoMode: boolean
   panoramaOpen: boolean
   pointCloudOpen: boolean
@@ -59,7 +58,6 @@ export function Workspace({
   frameRange,
   route,
   routeLoading,
-  mapStyleUrl,
   demoMode,
   panoramaOpen,
   pointCloudOpen,
@@ -204,7 +202,6 @@ export function Workspace({
                 showAllTracks={settings.showAllMapTracks}
                 frameRange={frameRange}
                 loading={routeLoading}
-                mapStyleUrl={mapStyleUrl}
                 onSelectFrame={onFrameChange}
               />
             </Suspense>

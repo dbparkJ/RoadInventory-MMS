@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
-import os
 import sys
 from pathlib import Path
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,8 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="storage_roots",
         help="Allowed server folder. Repeat to expose more than one root.",
     )
-    parser.add_argument("--state-dir", type=Path, default=PROJECT_ROOT / ".cache" / "webapp")
-    parser.add_argument("--map-style-url", default=os.environ.get("MMS_MAP_STYLE_URL"))
+    parser.add_argument(
+        "--state-dir", type=Path, default=PROJECT_ROOT / ".cache" / "webapp"
+    )
     parser.add_argument("--no-run-worker", action="store_true")
     parser.add_argument("--reload", action="store_true")
     parser.add_argument(
@@ -69,7 +68,6 @@ def main() -> None:
         # ``None`` lets WebAppConfig honor MMS_WEB_STORAGE_ROOTS before its
         # project/data fallback. Explicit --storage-root values still win.
         allowed_roots=args.storage_roots or None,
-        map_style_url=args.map_style_url,
         enable_run_worker=not args.no_run_worker,
     )
     app = create_app(config)

@@ -19,9 +19,9 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 - 콘솔 상태바/처리율/ETA 표시와 전체 파일 로그 저장
 - Windows/Linux 공용 가상환경 자동 구성 및 PyTorch/CUDA smoke test
 - 서버 폴더·재개 가능한 업로드, 작업 구간, 수치 입력/자동 설정을 묶은 웹 작업실
-- MapLibre 지도, 360° 파노라마, 점 예산 기반 3D 점군의 동기화된 검수 화면
+- VWorld WebGL 3.0 지도, 360° 파노라마, 점 예산 기반 3D 점군의 동기화된 검수 화면
 
-수집업체에 전달할 입력 데이터 요구사항은 [docs/MMS_DATA_SPEC.md](docs/MMS_DATA_SPEC.md)에 정리되어 있습니다. 환경 구성 세부사항은 [ENV_SETUP.md](ENV_SETUP.md)를 참고하십시오.
+수집업체에 전달할 입력 데이터 요구사항은 [docs/MMS_DATA_SPEC.md](docs/MMS_DATA_SPEC.md)에 정리되어 있습니다. 환경 구성 세부사항은 [ENV_SETUP.md](ENV_SETUP.md)를 참고하십시오. 현재 실행 흐름과 개선 상태는 [현재 아키텍처](docs/current_architecture.md)와 [아키텍처 개선 보고서](docs/ARCHITECTURE_IMPROVEMENT_REPORT.md)에서 확인할 수 있습니다.
 
 ## 저장소 구성
 
@@ -40,10 +40,12 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 | `scripts/verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
 | `mms_shp_detection/` | 데이터 탐색, 투영, 점군, 지주, SHP 구현 |
 | `mms_shp_detection/webapp/` | 데이터 등록·preview·업로드·GPU 작업 큐 API |
-| `webui/` | React/MapLibre/Three.js 작업자 UI |
+| `webui/` | React/VWorld WebGL 3.0/Three.js 작업자 UI |
 | `tests/` | 설정·투영·점군·지주·SHP 회귀 테스트 |
 | `docs/MMS_DATA_SPEC.md` | MMS 수집업체 전달용 데이터 명세 |
 | `docs/WEB_UI_ARCHITECTURE.md` | 대용량 로딩, 서버 배치, 보안·운영 설계 |
+| `docs/current_architecture.md` | CLI·웹·worker의 현재 호출 흐름과 데이터 계약 |
+| `docs/ARCHITECTURE_IMPROVEMENT_REPORT.md` | 구현 범위, 호환성, 검증 결과와 후속 로드맵 |
 
 ## 웹 작업실 빠른 시작
 
@@ -80,8 +82,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1 --dry-run
   --storage-root \\nas\MMS\archive
 ```
 
-지도 스타일은 `MMS_MAP_STYLE_URL`, 허용 저장소는 운영체제의 경로 구분자로 나눈
-`MMS_WEB_STORAGE_ROOTS` 환경변수로도 설정할 수 있습니다. 이 앱에는 자체 로그인
+지도는 same-origin iframe에서 VWorld WebGL 3.0 SDK를 로드하며
+외부 지도 style URL 설정을 사용하지 않습니다. SDK 인증키는
+브라우저 loader 요청에 포함되는 클라이언트 값이며, VWorld에 등록된
+origin에서 사용해야 합니다. 허용 저장소는 운영체제의 경로 구분자로 나눈
+`MMS_WEB_STORAGE_ROOTS` 환경변수로 설정할 수 있습니다. 이 앱에는 자체 로그인
 기능이 없으므로 기본 실행기는 loopback 주소만 허용합니다. 외부 접속 운영 시에는
 API를 `127.0.0.1`에 유지하고, TLS와 사용자 인증을 적용한 reverse proxy만 외부에
 노출하십시오. 방화벽과 인증 proxy로 포트 접근을 이미 제한한 별도 컨테이너 구성에서만
@@ -91,6 +96,18 @@ GPU 작업 큐와 재시작 복구의 단일 소유권을 보장하기 위해 �
 ASGI worker를 1개만 실행합니다. 같은 상태 폴더를 쓰는 두 번째 worker는 시작 단계의
 OS lock에서 거부됩니다. 수평 확장은 API/worker와 상태 저장소를 분리하는 후속 서버
 구성에서 진행하십시오.
+
+서버 재시작 시 아직 child를 만들지 않은 `preparing` 실행만 다시 queue에 넣습니다.
+이미 spawn됐을 수 있는 `starting`/`running`/`cancelling` 실행은 중복 실행을 막기 위해
+manifest와 terminal 상태를 조정합니다. 완료 stage부터 이어가는 checkpoint resume는
+없습니다. 또한 저장된 PID의 프로세스 identity를 안전하게 확인할 정보가 아직 없으므로,
+비정상 종료 뒤 남은 child는 운영자가 확인·종료해야 합니다.
+
+웹이 생성한 `config.yaml`은 정확한 파일 SHA-256으로 pending manifest에 고정되며,
+자식 파이프라인이 같은 파일을 읽었을 때만 실행을 이어갑니다. 실행 성공은 exit code만이
+아니라 stage가 모순되지 않는 `succeeded` manifest, 현재 실행이 선언한 완전한 SHP
+bundle, 다중 모델일 때 완료 상태와 SHP 목록이 일치하는 `models_manifest.json`까지
+검증한 뒤 공개됩니다.
 
 등록을 마친 원본 폴더는 scan·preview·pipeline 실행 중에는 변경하지 말고, 운영
 서버에서는 가능하면 API/worker에 읽기 전용으로 mount하십시오. 새 업로드는 incoming
@@ -546,6 +563,12 @@ YOLO의 bbox·segmentation polygon은 원본 파노라마 픽셀로 역변환됩
 
 ```text
 <output_dir>/
+  run_manifest.json                      # 작업 상태·단계·설정/모델/calibration provenance
+  run_summary.{json,md}                  # 기계/사람용 최종 실행 요약
+  .run_manifest.json.lock                # manifest 프로세스 간 잠금 파일
+  run_history/                           # 같은 root의 이전 terminal metadata(산출물 snapshot 아님)
+    <job>.manifest.json
+    <job>.summary.{json,md}
   models_manifest.json                   # 전체 모델 실행 상태·프로필·출력 위치
   forward_views/<job_track>/*.jpg        # 모든 모델이 공유하는 정면 YOLO 입력 QA
   logs/
@@ -628,7 +651,7 @@ paths:
 
 샘플 LAS의 수평 CRS는 WGS 84 / UTM zone 52N(EPSG:32652 상당)입니다. 프로젝트의 수직 datum 메타데이터는 EGM2008과 타원체고 표기가 서로 모순되므로, 현재 코드는 Z를 임의 변환하지 않고 점군 값을 그대로 보존합니다. 공급업체로부터 권위 있는 수직 datum과 compound WKT를 받아 확정해야 합니다.
 
-최종 sign/pole SHP는 완성된 임시 bundle을 재개방해 `POINTZ`, record 수, 필수 sidecar를 검사한 뒤 함께 게시합니다. QGIS·ArcGIS·XDROAD가 기존 DBF/SHP를 열고 있으면 Windows에서 교체가 실패할 수 있으므로 실행 전에 해당 레이어를 닫거나 새 `output_dir`을 사용하십시오. `.mms_shp_publish.lock` 파일이 남아 있는 것은 정상이며 실제 배타 잠금은 프로세스 종료 시 해제됩니다.
+최종 sign/pole SHP는 완성된 임시 bundle을 재개방해 `POINTZ`, record 수, 필수 sidecar를 검사한 뒤 함께 게시합니다. 실행 성공은 현재 attempt가 manifest에 선언한 각 SHP의 `.shp/.shx/.dbf/.prj/.cpg/.qpj/.wkt2`가 모두 output root 안에 있고 비어 있지 않을 때만 인정합니다. output 폴더를 다시 훑어 과거 실행의 stale SHP를 새 결과로 포함하지 않습니다. QGIS·ArcGIS·XDROAD가 기존 DBF/SHP를 열고 있으면 Windows에서 교체가 실패할 수 있으므로 실행 전에 해당 레이어를 닫거나 새 `output_dir`을 사용하십시오. `.mms_shp_publish.lock` 파일이 남아 있는 것은 정상이며 실제 배타 잠금은 프로세스 종료 시 해제됩니다.
 
 ### JSON과 LAS provenance
 
@@ -663,8 +686,16 @@ paths:
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe .\scripts\verify_environment.py
 .\.venv\Scripts\python.exe -m compileall -q mms_shp_detection scripts tests
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pytest -q
+Set-Location .\webui
+npm test -- --run
+npm run build
+Set-Location ..
 ```
+
+`run_history/`는 manifest와 summary만 보존합니다. 같은 output root의 SHP와
+`models_manifest.json` 자체를 복제하지 않으므로 장기 감사용 산출물 snapshot이 필요하면
+실행별 `output_dir` 또는 별도 immutable artifact 저장소를 사용하십시오.
 
 Linux에서는 `.\.venv\Scripts\python.exe` 대신 `./.venv/bin/python`을 사용합니다.
 

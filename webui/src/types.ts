@@ -146,10 +146,16 @@ export interface StorageTreeResponse {
   truncated?: boolean
 }
 
+export interface MapProviderMetadata {
+  provider: 'vworld'
+  engine: 'webgl'
+  version: '3.0'
+}
+
 export interface BootstrapResponse {
   api_version: string
   server_name?: string
-  map_style_url?: string
+  map: MapProviderMetadata
   datasets: DatasetSummary[]
   recent_runs?: RunRecord[]
   preview_defaults?: {

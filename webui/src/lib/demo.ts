@@ -68,6 +68,11 @@ export const demoDataset: DatasetDetail = {
 export const demoBootstrap: BootstrapResponse = {
   api_version: 'demo',
   server_name: '로컬 데모',
+  map: {
+    provider: 'vworld',
+    engine: 'webgl',
+    version: '3.0',
+  },
   datasets: [demoDataset],
   capabilities: {
     upload: true,

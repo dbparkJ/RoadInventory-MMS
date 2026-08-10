@@ -39,6 +39,7 @@ from scipy.spatial import cKDTree
 from tqdm.auto import tqdm
 from ultralytics import YOLO
 
+from .alignment import estimate_panorama_alignment
 from .app.pipeline_service import (
     ManifestProgressReporter,
     PipelineContext,
@@ -49,7 +50,6 @@ from .app.pipeline_service import (
     resolve_git_commit,
     tracked_stage,
 )
-from .alignment import estimate_panorama_alignment
 from .calibration import attach_calibration_metadata
 from .config import (
     ConfigError,
@@ -59,19 +59,26 @@ from .config import (
     validate_config_value,
 )
 from .dataset import scan_image_tasks
+from .domain.calibration import CalibrationResolver
+from .domain.models import JobStatus, StageResult
 from .geometry import (
-    apply_panorama_angular_offsets,
     angular_radius_from_bbox,
-    build_perspective_panorama_remap,
+    apply_panorama_angular_offsets,
     build_camera_axes,
+    build_perspective_panorama_remap,
     build_view_axes,
     fit_perspective_overview,
-    pixel_to_world_ray,
     perspective_pixel_to_world_ray,
+    pixel_to_world_ray,
     project_points_perspective,
     render_perspective_view_from_panorama,
     world_ray_to_equirectangular_pixel,
     world_ray_to_perspective_pixel,
+)
+from .infrastructure.manifest_writer import (
+    MAX_MANIFEST_INPUT_FILES,
+    RunManifestStore,
+    validate_published_outputs,
 )
 from .pointcloud import (
     PointCloudReaderCache,
@@ -97,10 +104,6 @@ from .shp_writer import (
     write_pole_shapefile,
     write_shapefile,
 )
-from .domain.models import JobStatus, StageResult
-from .domain.calibration import CalibrationResolver
-from .infrastructure.manifest_writer import RunManifestStore
-
 
 RESULT_SCHEMA_VERSION = 17
 DATASET_SIGNATURE_VERSION = 1
@@ -314,7 +317,9 @@ def parse_class_id_list(value: Any) -> tuple[int, ...]:
     elif isinstance(value, (list, tuple)):
         values = list(value)
     else:
-        raise argparse.ArgumentTypeError("class IDs must be a YAML list or comma-separated text")
+        raise argparse.ArgumentTypeError(
+            "class IDs must be a YAML list or comma-separated text"
+        )
     try:
         parsed = tuple(dict.fromkeys(int(item) for item in values))
     except (TypeError, ValueError) as exc:
@@ -432,7 +437,9 @@ def resolve_pole_classification_policy(
         ),
     }
     configured_ids = sorted({value for values in groups.values() for value in values})
-    catalog_counts = _classification_counts(pointcloud_catalog.get("classification_summary"))
+    catalog_counts = _classification_counts(
+        pointcloud_catalog.get("classification_summary")
+    )
     files = list(pointcloud_catalog.get("files") or [])
     if not catalog_counts:
         for item in files:
@@ -580,18 +587,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         metavar="IMAGE_STEM",
-        help=(
-            "Inclusive lower image-stem bound using case-insensitive natural order."
-        ),
+        help=("Inclusive lower image-stem bound using case-insensitive natural order."),
     )
     parser.add_argument(
         "--frame-id-to",
         type=str,
         default=None,
         metavar="IMAGE_STEM",
-        help=(
-            "Inclusive upper image-stem bound using case-insensitive natural order."
-        ),
+        help=("Inclusive upper image-stem bound using case-insensitive natural order."),
     )
     parser.add_argument(
         "--pose-format",
@@ -1076,8 +1079,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pole-min-consecutive-vertical-bins", type=int, default=4)
     parser.add_argument("--pole-max-observed-z-gap-m", type=float, default=1.0)
     parser.add_argument("--pole-min-vertical-occupancy-ratio", type=float, default=0.35)
-    parser.add_argument("--pole-middle-support-start-fraction", type=float, default=0.20)
-    parser.add_argument("--pole-min-middle-support-coverage-ratio", type=float, default=0.30)
+    parser.add_argument(
+        "--pole-middle-support-start-fraction", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--pole-min-middle-support-coverage-ratio", type=float, default=0.30
+    )
     parser.add_argument(
         "--pole-preferred-min-completeness-ratio",
         type=float,
@@ -1140,9 +1147,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.20,
         help="Fraction of robust shaft Z-bins used in each endpoint centre.",
     )
-    parser.add_argument("--pole-direct-max-axis-sign-distance-m", type=float, default=0.75)
+    parser.add_argument(
+        "--pole-direct-max-axis-sign-distance-m", type=float, default=0.75
+    )
     parser.add_argument("--pole-max-axis-sign-distance-m", type=float, default=8.0)
-    parser.add_argument("--pole-horizontal-connection-radius-m", type=float, default=0.25)
+    parser.add_argument(
+        "--pole-horizontal-connection-radius-m", type=float, default=0.25
+    )
     parser.add_argument(
         "--pole-horizontal-connection-z-tolerance-m",
         type=float,
@@ -1225,7 +1236,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pole-occlusion-gap-m", type=float, default=0.35)
     parser.add_argument("--pole-max-ground-penetration-m", type=float, default=0.10)
-    parser.add_argument("--pole-max-ground-support-distance-m", type=float, default=0.35)
+    parser.add_argument(
+        "--pole-max-ground-support-distance-m", type=float, default=0.35
+    )
     parser.add_argument(
         "--pole-ground-class-ids",
         type=parse_class_id_list,
@@ -1243,10 +1256,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pole-observation-merge-radius-m", type=float, default=0.75)
     parser.add_argument("--pole-min-observations", type=int, default=1)
-    parser.add_argument("--sign-observation-merge-xy-radius-m", type=float, default=0.25)
+    parser.add_argument(
+        "--sign-observation-merge-xy-radius-m", type=float, default=0.25
+    )
     parser.add_argument("--sign-observation-merge-z-radius-m", type=float, default=0.25)
-    parser.add_argument("--sign-observation-fallback-xy-radius-m", type=float, default=0.15)
-    parser.add_argument("--sign-observation-fallback-z-radius-m", type=float, default=0.20)
+    parser.add_argument(
+        "--sign-observation-fallback-xy-radius-m", type=float, default=0.15
+    )
+    parser.add_argument(
+        "--sign-observation-fallback-z-radius-m", type=float, default=0.20
+    )
     parser.add_argument(
         "--disable-pole-debug",
         action="store_true",
@@ -1344,7 +1363,9 @@ def setup_logging(
 ) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(logger_name or f"mms_shp_detection_{os.getpid()}")
-    resolved_level = logging.getLevelName(level.upper()) if isinstance(level, str) else level
+    resolved_level = (
+        logging.getLevelName(level.upper()) if isinstance(level, str) else level
+    )
     if not isinstance(resolved_level, int):
         raise ValueError(f"Unsupported log level: {level!r}")
     logger.setLevel(resolved_level)
@@ -1770,9 +1791,7 @@ def build_dataset_signature(image_tasks: list[dict[str, Any]]) -> dict[str, Any]
                 "pose": {key: task.get(key) for key in pose_keys},
                 "panorama": panorama,
                 "sidecar_file": file_stat(sidecar_path) if sidecar_path else None,
-                "calibration": {
-                    key: calibration.get(key) for key in calibration_keys
-                }
+                "calibration": {key: calibration.get(key) for key in calibration_keys}
                 if calibration
                 else None,
             }
@@ -1788,9 +1807,7 @@ def build_dataset_signature(image_tasks: list[dict[str, Any]]) -> dict[str, Any]
     return {
         "signature_version": DATASET_SIGNATURE_VERSION,
         "task_count": len(records),
-        "image_file_count": len(
-            {record["image_file"]["path"] for record in records}
-        ),
+        "image_file_count": len({record["image_file"]["path"] for record in records}),
         "pose_file_count": len(
             {
                 record["pose_file"]["path"]
@@ -1838,23 +1855,15 @@ def build_panorama_alignment_qa_fingerprint(
             1, int(getattr(args, "pointcloud_neighbor_count"))
         ),
         "sample_images": int(getattr(args, "alignment_qa_sample_images")),
-        "max_points_per_image": int(
-            getattr(args, "alignment_qa_max_points_per_image")
-        ),
+        "max_points_per_image": int(getattr(args, "alignment_qa_max_points_per_image")),
         "search_radius_px": int(getattr(args, "alignment_qa_search_radius_px")),
         "trim_fraction": float(getattr(args, "alignment_qa_trim_fraction")),
         "minimum_range_m": float(getattr(args, "alignment_qa_min_range_m")),
         "maximum_range_m": float(getattr(args, "alignment_qa_max_range_m")),
-        "minimum_valid_samples": int(
-            getattr(args, "alignment_qa_min_valid_samples")
-        ),
+        "minimum_valid_samples": int(getattr(args, "alignment_qa_min_valid_samples")),
         "maximum_mad_px": float(getattr(args, "alignment_qa_max_mad_px")),
-        "base_yaw_offset_deg": float(
-            getattr(args, "panorama_yaw_offset_deg", 0.0)
-        ),
-        "base_pitch_offset_deg": float(
-            getattr(args, "panorama_pitch_offset_deg", 0.0)
-        ),
+        "base_yaw_offset_deg": float(getattr(args, "panorama_yaw_offset_deg", 0.0)),
+        "base_pitch_offset_deg": float(getattr(args, "panorama_pitch_offset_deg", 0.0)),
     }
     payload = {
         "cache_version": PANORAMA_ALIGNMENT_QA_CACHE_VERSION,
@@ -1947,13 +1956,19 @@ def build_run_fingerprint(
         "code_sha256": code_sha256,
         "parameters": parameters,
         "model_sha256": model_sha256 or _sha256_file(model_path),
-        "calibration_sha256": calibration_bundle.get("sha256") if calibration_bundle else None,
+        "calibration_sha256": calibration_bundle.get("sha256")
+        if calibration_bundle
+        else None,
         "dataset_signature": dataset_signature,
         "pointcloud_source": pointcloud_catalog.get("selected_source_type"),
         "pointcloud_signature": pointcloud_catalog.get("signature"),
-        "crs_wkt": pointcloud_catalog.get("resolved_crs_wkt", pointcloud_catalog.get("crs_wkt")),
+        "crs_wkt": pointcloud_catalog.get(
+            "resolved_crs_wkt", pointcloud_catalog.get("crs_wkt")
+        ),
     }
-    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    rendered = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
 
@@ -1965,9 +1980,13 @@ def resolve_matched_crs_wkt(
     """Resolve a valid, semantically common CRS for the files these tasks can use."""
     matched_files: dict[str, dict[str, Any]] = {}
     for task in image_tasks:
-        for item in match_nearest_pointcloud_files(task, pointcloud_catalog, neighbor_count):
+        for item in match_nearest_pointcloud_files(
+            task, pointcloud_catalog, neighbor_count
+        ):
             matched_files[str(item.get("path"))] = item
-    missing = [item.get("path") for item in matched_files.values() if not item.get("crs_wkt")]
+    missing = [
+        item.get("path") for item in matched_files.values() if not item.get("crs_wkt")
+    ]
     if missing:
         return None
 
@@ -1977,16 +1996,20 @@ def resolve_matched_crs_wkt(
         try:
             parsed.append((path, CRS.from_wkt(wkt)))
         except CRSError as exc:
-            raise ValueError(f"Invalid CRS WKT in matched point cloud {path}: {exc}") from exc
+            raise ValueError(
+                f"Invalid CRS WKT in matched point cloud {path}: {exc}"
+            ) from exc
 
     if not parsed:
         fallback = pointcloud_catalog.get("crs_wkt")
-        return validate_crs_wkt(str(fallback), label="point-cloud catalog") if fallback else None
+        return (
+            validate_crs_wkt(str(fallback), label="point-cloud catalog")
+            if fallback
+            else None
+        )
 
     reference_path, reference_crs = parsed[0]
-    inconsistent = [
-        path for path, crs in parsed[1:] if not reference_crs.equals(crs)
-    ]
+    inconsistent = [path for path, crs in parsed[1:] if not reference_crs.equals(crs)]
     if inconsistent:
         raise ValueError(
             "Matched point-cloud files declare semantically inconsistent CRS: "
@@ -2029,7 +2052,9 @@ def validate_pose_pointcloud_proximity(
             raise ValueError(f"Pose has no XY origin: {task.get('image_name')}")
         origin_x, origin_y = float(origin[0]), float(origin[1])
         distances: list[float] = []
-        for item in match_nearest_pointcloud_files(task, pointcloud_catalog, neighbor_count):
+        for item in match_nearest_pointcloud_files(
+            task, pointcloud_catalog, neighbor_count
+        ):
             minimum = item.get("file_min")
             maximum = item.get("file_max")
             if (
@@ -2045,8 +2070,20 @@ def validate_pose_pointcloud_proximity(
                 continue
             min_x, min_y = float(minimum[0]), float(minimum[1])
             max_x, max_y = float(maximum[0]), float(maximum[1])
-            dx = min_x - origin_x if origin_x < min_x else origin_x - max_x if origin_x > max_x else 0.0
-            dy = min_y - origin_y if origin_y < min_y else origin_y - max_y if origin_y > max_y else 0.0
+            dx = (
+                min_x - origin_x
+                if origin_x < min_x
+                else origin_x - max_x
+                if origin_x > max_x
+                else 0.0
+            )
+            dy = (
+                min_y - origin_y
+                if origin_y < min_y
+                else origin_y - max_y
+                if origin_y > max_y
+                else 0.0
+            )
             distances.append(math.hypot(dx, dy))
 
         if not distances:
@@ -2059,7 +2096,9 @@ def validate_pose_pointcloud_proximity(
             offenders.append((str(task.get("image_name")), nearest))
 
     if offenders:
-        examples = ", ".join(f"{name}={distance:.1f}m" for name, distance in offenders[:5])
+        examples = ", ".join(
+            f"{name}={distance:.1f}m" for name, distance in offenders[:5]
+        )
         raise ValueError(
             "Pose origins are too far from their matched point clouds; a CRS/job mismatch is likely "
             f"(limit={limit:.1f}m, examples: {examples})."
@@ -2101,7 +2140,9 @@ def validate_panorama_image(image_task: dict[str, Any], image_rgb: np.ndarray) -
     """Validate that the exported Sphere matches the projection implemented here."""
     metadata = image_task.get("panorama") or {}
     if metadata.get("projection", "equirectangular") != "equirectangular":
-        raise ValueError(f"Unsupported panorama projection for {image_task['image_name']}: {metadata}")
+        raise ValueError(
+            f"Unsupported panorama projection for {image_task['image_name']}: {metadata}"
+        )
 
     actual_height, actual_width = image_rgb.shape[:2]
     expected_width = metadata.get("image_width")
@@ -2223,9 +2264,7 @@ def reconcile_remote_supports_from_direct_anchors(
         return int(number)
 
     def has_direct_association(item: dict[str, Any]) -> bool:
-        association_distance = finite_number(
-            item.get("association_distance_m")
-        )
+        association_distance = finite_number(item.get("association_distance_m"))
         return (
             association_distance is not None
             and 0.0 <= association_distance <= direct_distance_m
@@ -2236,23 +2275,16 @@ def reconcile_remote_supports_from_direct_anchors(
         if not isinstance(item, dict):
             continue
         pole_xyz = tuple(
-            finite_number(item.get(key))
-            for key in ("pole_x", "pole_y", "pole_z")
+            finite_number(item.get(key)) for key in ("pole_x", "pole_y", "pole_z")
         )
         if any(value is None for value in pole_xyz):
             continue
         association_value = item.get("association_distance_m")
         association_distance = (
-            None
-            if association_value is None
-            else finite_number(association_value)
+            None if association_value is None else finite_number(association_value)
         )
-        if (
-            association_value is not None
-            and (
-                association_distance is None
-                or association_distance < 0.0
-            )
+        if association_value is not None and (
+            association_distance is None or association_distance < 0.0
         ):
             continue
         normalized = dict(item)
@@ -2359,8 +2391,7 @@ def reconcile_remote_supports_from_direct_anchors(
         detection_id = str(detection.get("detection_id") or "")
         if (
             not detection_id
-            or str(detection.get("model_object_type") or "")
-            != "traffic_signal"
+            or str(detection.get("model_object_type") or "") != "traffic_signal"
         ):
             continue
         existing_relations = existing_by_detection.get(detection_id, [])
@@ -2380,15 +2411,9 @@ def reconcile_remote_supports_from_direct_anchors(
             if not isinstance(hypothesis, dict):
                 continue
             try:
-                raw_coverage = float(
-                    hypothesis[
-                        "horizontal_connection_coverage_ratio"
-                    ]
-                )
+                raw_coverage = float(hypothesis["horizontal_connection_coverage_ratio"])
                 coherent_coverage = float(
-                    hypothesis[
-                        "horizontal_connection_coherent_coverage_ratio"
-                    ]
+                    hypothesis["horizontal_connection_coherent_coverage_ratio"]
                 )
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
@@ -2399,10 +2424,7 @@ def reconcile_remote_supports_from_direct_anchors(
                 or raw_coverage < 0.20
                 or not math.isfinite(coherent_coverage)
                 or coherent_coverage < 0.075
-                or hypothesis.get(
-                    "horizontal_connection_endpoint_anchored"
-                )
-                is not True
+                or hypothesis.get("horizontal_connection_endpoint_anchored") is not True
             ):
                 continue
             try:
@@ -2425,9 +2447,7 @@ def reconcile_remote_supports_from_direct_anchors(
                             "rejection_reason": str(
                                 hypothesis.get("rejection_reason") or ""
                             ),
-                            "horizontal_connection_coverage_ratio": (
-                                raw_coverage
-                            ),
+                            "horizontal_connection_coverage_ratio": (raw_coverage),
                             "horizontal_connection_coherent_coverage_ratio": (
                                 coherent_coverage
                             ),
@@ -2465,9 +2485,7 @@ def reconcile_remote_supports_from_direct_anchors(
         if not all(math.isfinite(value) for value in (sign_x, sign_y, sign_z)):
             continue
 
-        matches: list[
-            tuple[float, float, dict[str, Any], dict[str, Any]]
-        ] = []
+        matches: list[tuple[float, float, dict[str, Any], dict[str, Any]]] = []
         for anchor in anchors:
             if anchor["record_name"] != str(detection.get("record_name") or ""):
                 continue
@@ -2521,10 +2539,8 @@ def reconcile_remote_supports_from_direct_anchors(
         )
         if not matches:
             continue
-        if (
-            len(matches) > 1
-            and matches[1][0] - matches[0][0]
-            < min(uniqueness_margin_m, hypothesis_anchor_radius_m / 3.0)
+        if len(matches) > 1 and matches[1][0] - matches[0][0] < min(
+            uniqueness_margin_m, hypothesis_anchor_radius_m / 3.0
         ):
             continue
 
@@ -2555,27 +2571,19 @@ def reconcile_remote_supports_from_direct_anchors(
                 "pole_quality": 0.0,
                 "association_distance_m": distance,
                 "horizontal_connection_coverage_ratio": (
-                    matched_hypothesis[
-                        "horizontal_connection_coverage_ratio"
-                    ]
+                    matched_hypothesis["horizontal_connection_coverage_ratio"]
                 ),
                 "horizontal_connection_coherent_coverage_ratio": (
-                    matched_hypothesis[
-                        "horizontal_connection_coherent_coverage_ratio"
-                    ]
+                    matched_hypothesis["horizontal_connection_coherent_coverage_ratio"]
                 ),
                 "horizontal_connection_coherent_ratio": matched_hypothesis[
                     "horizontal_connection_coherent_ratio"
                 ],
                 "horizontal_connection_coherent_point_fraction": (
-                    matched_hypothesis[
-                        "horizontal_connection_coherent_point_fraction"
-                    ]
+                    matched_hypothesis["horizontal_connection_coherent_point_fraction"]
                 ),
                 "horizontal_connection_endpoint_anchored": (
-                    matched_hypothesis[
-                        "horizontal_connection_endpoint_anchored"
-                    ]
+                    matched_hypothesis["horizontal_connection_endpoint_anchored"]
                 ),
                 "pole_search_mode": "multi_frame_direct_anchor",
                 "pole_fallback_attempted": False,
@@ -2595,9 +2603,7 @@ def reconcile_remote_supports_from_direct_anchors(
                 ),
                 "support_anchor_xy_spread_m": anchor["xy_spread_m"],
                 "support_anchor_z_spread_m": anchor["z_spread_m"],
-                "support_reconciled_replaced_remote": bool(
-                    existing_relations
-                ),
+                "support_reconciled_replaced_remote": bool(existing_relations),
             }
         )
         if existing_relations:
@@ -2627,7 +2633,9 @@ def refresh_shapefile_from_txt(
     sign_fallback_xy_radius_m: float = 0.15,
     sign_fallback_z_radius_m: float = 0.20,
 ) -> int:
-    records = collect_detection_records(txt_dir, logger=logger, run_fingerprint=run_fingerprint)
+    records = collect_detection_records(
+        txt_dir, logger=logger, run_fingerprint=run_fingerprint
+    )
     pole_relations: list[dict[str, Any]] = []
     if pole_shp_path is not None:
         pole_observations = collect_pole_records(
@@ -2659,7 +2667,9 @@ def refresh_shapefile_from_txt(
         unsupported_z_radius_m=sign_fallback_z_radius_m,
     )
     write_shapefile(records, shp_path, crs_wkt=crs_wkt)
-    logger.info("Refreshed SHP (%s) with %d features at %s", reason, len(records), shp_path)
+    logger.info(
+        "Refreshed SHP (%s) with %d features at %s", reason, len(records), shp_path
+    )
     if pole_shp_path is not None:
         write_pole_shapefile(pole_relations, pole_shp_path, crs_wkt=crs_wkt)
         logger.info(
@@ -2697,10 +2707,14 @@ def remove_generated_shapefile_bundle(shp_path: Path, logger) -> None:
         try:
             component.unlink(missing_ok=True)
         except OSError:
-            logger.warning("Could not remove completed intermediate artifact: %s", component)
+            logger.warning(
+                "Could not remove completed intermediate artifact: %s", component
+            )
 
 
-def split_chunks(items: list[dict[str, Any]], num_chunks: int) -> list[list[dict[str, Any]]]:
+def split_chunks(
+    items: list[dict[str, Any]], num_chunks: int
+) -> list[list[dict[str, Any]]]:
     if not items:
         return []
     num_chunks = max(1, min(num_chunks, len(items)))
@@ -2718,7 +2732,9 @@ def build_panorama_tiles(
     tile_overlap_px: int,
 ) -> list[dict[str, Any]]:
     sector_count = 4
-    output_width = max(256, tile_width_px if tile_width_px > 0 else image_width // sector_count)
+    output_width = max(
+        256, tile_width_px if tile_width_px > 0 else image_width // sector_count
+    )
     output_height = max(256, tile_height_px if tile_height_px > 0 else image_height)
     base_hfov_deg = 360.0 / sector_count
     overlap_hfov_deg = (float(tile_overlap_px) / float(max(1, image_width))) * 360.0
@@ -2917,8 +2933,12 @@ def unwrap_panorama_x_coordinates(
     if not x_values or panorama_width <= 0:
         return x_values
     if reference_x is None:
-        angles = np.asarray(x_values, dtype=np.float64) * (2.0 * math.pi / panorama_width)
-        mean_angle = math.atan2(float(np.sin(angles).mean()), float(np.cos(angles).mean()))
+        angles = np.asarray(x_values, dtype=np.float64) * (
+            2.0 * math.pi / panorama_width
+        )
+        mean_angle = math.atan2(
+            float(np.sin(angles).mean()), float(np.cos(angles).mean())
+        )
         reference_x = (mean_angle % (2.0 * math.pi)) * panorama_width / (2.0 * math.pi)
     return [
         float(value + round((reference_x - value) / panorama_width) * panorama_width)
@@ -3078,15 +3098,22 @@ def merge_detection_candidates(
         return []
 
     kept: list[dict[str, Any]] = []
-    for candidate in sorted(candidates, key=lambda item: item["confidence"], reverse=True):
+    for candidate in sorted(
+        candidates, key=lambda item: item["confidence"], reverse=True
+    ):
         suppress = False
         for existing in kept:
             if existing["class_id"] != candidate["class_id"]:
                 continue
-            panorama_width = existing.get("panorama_width") or candidate.get("panorama_width")
-            if circular_bbox_iou_xyxy(
-                existing["bbox_xyxy"], candidate["bbox_xyxy"], panorama_width
-            ) >= iou_threshold:
+            panorama_width = existing.get("panorama_width") or candidate.get(
+                "panorama_width"
+            )
+            if (
+                circular_bbox_iou_xyxy(
+                    existing["bbox_xyxy"], candidate["bbox_xyxy"], panorama_width
+                )
+                >= iou_threshold
+            ):
                 existing_sources = set(existing.get("detection_sources", []))
                 existing_sources.update(candidate.get("detection_sources", []))
                 existing["detection_sources"] = sorted(existing_sources)
@@ -3157,11 +3184,7 @@ def run_yolo_prediction(
     except RuntimeError as retry_exc:
         if not _is_cuda_out_of_memory(retry_exc):
             raise
-        model_name = (
-            runtime.get("model_name")
-            or runtime.get("model_key")
-            or "model"
-        )
+        model_name = runtime.get("model_name") or runtime.get("model_key") or "model"
         raise PersistentCudaOutOfMemoryError(
             f"Serialized CUDA inference still ran out of memory for {model_name}; "
             "the model was circuit-broken for the remainder of this run."
@@ -3272,7 +3295,9 @@ def run_forward_detection_on_view(
         detection_source="forward",
         panorama_mapping=mapping,
     )
-    logger.info("Forward perspective detection produced %d detections.", len(candidates))
+    logger.info(
+        "Forward perspective detection produced %d detections.", len(candidates)
+    )
     return candidates
 
 
@@ -3371,7 +3396,7 @@ def run_tiled_panorama_detection(
     candidates: list[dict[str, Any]] = []
     batch_size = runtime["tile_batch_size"]
     for batch_start in range(0, len(tiles), batch_size):
-        batch_tiles = tiles[batch_start:batch_start + batch_size]
+        batch_tiles = tiles[batch_start : batch_start + batch_size]
         batch_sources = [
             Image.fromarray(
                 render_perspective_view_from_panorama(
@@ -3586,8 +3611,7 @@ def save_debug_crop(
         step = max(1, int(math.ceil(point_pixels_xy.shape[0] / 500)))
         sampled = point_pixels_xy[::step]
         point_list = [
-            (int(point[0]) - crop_x1, int(point[1]) - crop_y1)
-            for point in sampled
+            (int(point[0]) - crop_x1, int(point[1]) - crop_y1) for point in sampled
         ]
         draw.point(point_list, fill=(0, 185, 220, 255))
 
@@ -3659,7 +3683,11 @@ def project_representative_point_pixel(
         rectified_view["hfov_deg"],
         rectified_view["vfov_deg"],
     )
-    if not bool(valid[0]) or not math.isfinite(float(u[0])) or not math.isfinite(float(v[0])):
+    if (
+        not bool(valid[0])
+        or not math.isfinite(float(u[0]))
+        or not math.isfinite(float(v[0]))
+    ):
         return None
     return float(u[0]), float(v[0])
 
@@ -3689,8 +3717,12 @@ def make_projection_panel(
                 (panel_size - (margin * 2)) / max(span[0] * 2.0, 1e-3),
                 (panel_size - (margin * 2)) / max(span[1] * 2.0, 1e-3),
             )
-            pixel_x = np.rint((panel_size * 0.5) + (sampled_points[:, 0] * scale)).astype(np.int32)
-            pixel_y = np.rint((panel_size * 0.5) - (sampled_points[:, 1] * scale)).astype(np.int32)
+            pixel_x = np.rint(
+                (panel_size * 0.5) + (sampled_points[:, 0] * scale)
+            ).astype(np.int32)
+            pixel_y = np.rint(
+                (panel_size * 0.5) - (sampled_points[:, 1] * scale)
+            ).astype(np.int32)
 
             in_bounds = (
                 (pixel_x >= 0)
@@ -3773,7 +3805,9 @@ def save_point_cloud_preview(
 
     info_panel = preview[panel_size:, panel_size:]
     info_panel[:] = 245
-    cv2.rectangle(info_panel, (0, 0), (panel_size - 1, panel_size - 1), (210, 210, 210), 1)
+    cv2.rectangle(
+        info_panel, (0, 0), (panel_size - 1, panel_size - 1), (210, 210, 210), 1
+    )
     info_lines = [
         "Representative point",
         f"mode: {representative_mode}",
@@ -3800,7 +3834,9 @@ def save_point_cloud_preview(
     Image.fromarray(preview).save(output_path)
 
 
-def points_to_bbox(points_xy: list[list[float]]) -> tuple[float, float, float, float] | None:
+def points_to_bbox(
+    points_xy: list[list[float]],
+) -> tuple[float, float, float, float] | None:
     if not points_xy:
         return None
     x_values = [float(point[0]) for point in points_xy]
@@ -3844,7 +3880,9 @@ def iter_detection_support_pixels(
     ]
     if polygon_xy:
         step = max(1, len(polygon_xy) // 64)
-        points.extend((float(point[0]), float(point[1])) for point in polygon_xy[::step])
+        points.extend(
+            (float(point[0]), float(point[1])) for point in polygon_xy[::step]
+        )
     return points
 
 
@@ -3884,7 +3922,11 @@ def transform_panorama_points_to_perspective(
             hfov_deg,
             vfov_deg,
         )
-        if local_z <= 1e-6 or not math.isfinite(projected_x) or not math.isfinite(projected_y):
+        if (
+            local_z <= 1e-6
+            or not math.isfinite(projected_x)
+            or not math.isfinite(projected_y)
+        ):
             continue
         transformed.append([float(projected_x), float(projected_y)])
     return transformed
@@ -4156,9 +4198,8 @@ def write_pole_las(
     source_gps_time_types = records.get("gps_time_type")
     if source_gps_time_types is not None:
         all_gps_time_types = np.asarray(source_gps_time_types, dtype=np.int64)
-        if (
-            all_gps_time_types.ndim != 1
-            or all_gps_time_types.shape[0] != len(records["xyz"])
+        if all_gps_time_types.ndim != 1 or all_gps_time_types.shape[0] != len(
+            records["xyz"]
         ):
             raise ValueError("gps_time_type must contain one value per source point")
         selected_gps_time_types = all_gps_time_types[indices]
@@ -4203,7 +4244,9 @@ def write_pole_las(
     las.blue = rgb16[:, 2]
     las.intensity = np.asarray(records["intensity"], dtype=np.uint16)[indices]
     classes = np.asarray(records["classification"], dtype=np.int16)[indices]
-    las.classification = np.clip(np.where(classes >= 0, classes, 0), 0, 255).astype(np.uint8)
+    las.classification = np.clip(np.where(classes >= 0, classes, 0), 0, 255).astype(
+        np.uint8
+    )
     gps_time = np.asarray(records["gps_time"], dtype=np.float64)[indices]
     las.gps_time = np.nan_to_num(gps_time, nan=0.0, posinf=0.0, neginf=0.0)
     las.return_number = np.clip(
@@ -4226,19 +4269,23 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         axis_inlier_radius_m=float(runtime["pole_axis_inlier_radius_m"]),
         min_vertical_span_m=float(runtime["pole_min_vertical_span_m"]),
         min_vertical_bins=int(runtime["pole_min_vertical_bins"]),
-        min_consecutive_vertical_bins=int(runtime["pole_min_consecutive_vertical_bins"]),
+        min_consecutive_vertical_bins=int(
+            runtime["pole_min_consecutive_vertical_bins"]
+        ),
         max_observed_z_gap_m=float(runtime["pole_max_observed_z_gap_m"]),
-        min_vertical_occupancy_ratio=float(runtime["pole_min_vertical_occupancy_ratio"]),
-        middle_support_start_fraction=float(runtime["pole_middle_support_start_fraction"]),
+        min_vertical_occupancy_ratio=float(
+            runtime["pole_min_vertical_occupancy_ratio"]
+        ),
+        middle_support_start_fraction=float(
+            runtime["pole_middle_support_start_fraction"]
+        ),
         min_middle_support_coverage_ratio=float(
             runtime["pole_min_middle_support_coverage_ratio"]
         ),
         preferred_min_completeness_ratio=float(
             runtime["pole_preferred_min_completeness_ratio"]
         ),
-        geometry_ground_clearance_m=float(
-            runtime["pole_geometry_ground_clearance_m"]
-        ),
+        geometry_ground_clearance_m=float(runtime["pole_geometry_ground_clearance_m"]),
         geometry_remote_min_completeness_ratio=float(
             runtime["pole_geometry_remote_min_completeness_ratio"]
         ),
@@ -4250,12 +4297,8 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         ),
         min_points=int(runtime["pole_min_points"]),
         max_axis_tilt_deg=float(runtime["pole_max_axis_tilt_deg"]),
-        axis_plumb_max_tilt_deg=float(
-            runtime["pole_axis_plumb_max_tilt_deg"]
-        ),
-        axis_plumb_full_tilt_deg=float(
-            runtime["pole_axis_plumb_full_tilt_deg"]
-        ),
+        axis_plumb_max_tilt_deg=float(runtime["pole_axis_plumb_max_tilt_deg"]),
+        axis_plumb_full_tilt_deg=float(runtime["pole_axis_plumb_full_tilt_deg"]),
         axis_plumb_endpoint_fraction=float(
             runtime["pole_axis_plumb_endpoint_fraction"]
         ),
@@ -4272,9 +4315,7 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
         horizontal_connection_above_tolerance_m=float(
             runtime["pole_horizontal_connection_above_tolerance_m"]
         ),
-        horizontal_connection_bin_m=float(
-            runtime["pole_horizontal_connection_bin_m"]
-        ),
+        horizontal_connection_bin_m=float(runtime["pole_horizontal_connection_bin_m"]),
         horizontal_connection_min_points_per_bin=int(
             runtime["pole_horizontal_connection_min_points_per_bin"]
         ),
@@ -4288,9 +4329,7 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
             runtime["pole_min_horizontal_connection_coherent_ratio"]
         ),
         min_horizontal_connection_coherent_point_fraction=float(
-            runtime[
-                "pole_min_horizontal_connection_coherent_point_fraction"
-            ]
+            runtime["pole_min_horizontal_connection_coherent_point_fraction"]
         ),
         remote_max_endpoint_tilt_deg=float(
             runtime["pole_remote_max_endpoint_tilt_deg"]
@@ -4320,9 +4359,7 @@ def build_pole_search_parameters(runtime: dict[str, Any]) -> PoleSearchParameter
             runtime["pole_ground_geometry_preference_margin_m"]
         ),
         occlusion_gap_m=float(runtime["pole_occlusion_gap_m"]),
-        max_ground_penetration_m=float(
-            runtime["pole_max_ground_penetration_m"]
-        ),
+        max_ground_penetration_m=float(runtime["pole_max_ground_penetration_m"]),
         max_ground_support_distance_m=float(
             runtime["pole_max_ground_support_distance_m"]
         ),
@@ -4350,9 +4387,7 @@ def build_pole_fallback_parameters(
         max_axis_sign_distance_m=float(
             runtime["pole_fallback_max_axis_sign_distance_m"]
         ),
-        min_vertical_span_m=float(
-            runtime["pole_fallback_min_vertical_span_m"]
-        ),
+        min_vertical_span_m=float(runtime["pole_fallback_min_vertical_span_m"]),
         horizontal_connection_radius_m=float(
             runtime["pole_fallback_horizontal_connection_radius_m"]
         ),
@@ -4360,9 +4395,7 @@ def build_pole_fallback_parameters(
             runtime["pole_fallback_horizontal_connection_z_tolerance_m"]
         ),
         horizontal_connection_above_tolerance_m=float(
-            runtime[
-                "pole_fallback_horizontal_connection_above_tolerance_m"
-            ]
+            runtime["pole_fallback_horizontal_connection_above_tolerance_m"]
         ),
         horizontal_connection_bin_m=float(
             runtime["pole_fallback_horizontal_connection_bin_m"]
@@ -4426,31 +4459,19 @@ def pole_cross_profile_candidate_key(
 ) -> tuple[float, ...]:
     """Compare strict/fallback candidates without profile-dependent bin counts."""
 
-    completeness = float(
-        getattr(candidate, "completeness_ratio", 0.0) or 0.0
-    )
-    association_distance = float(
-        getattr(candidate, "association_distance_m", math.inf)
-    )
+    completeness = float(getattr(candidate, "completeness_ratio", 0.0) or 0.0)
+    association_distance = float(getattr(candidate, "association_distance_m", math.inf))
     direct = association_distance <= direct_max_axis_sign_distance_m
-    connection_coverage = (
-        1.0
-        if direct
-        else pole_connection_coverage(candidate)
-    )
+    connection_coverage = 1.0 if direct else pole_connection_coverage(candidate)
     axis_rmse = float(getattr(candidate, "radial_rmse_m", math.inf))
     ground_rmse_value = getattr(candidate, "ground_rmse_m", None)
     ground_rmse = (
-        float(ground_rmse_value)
-        if ground_rmse_value is not None
-        else math.inf
+        float(ground_rmse_value) if ground_rmse_value is not None else math.inf
     )
     has_ground = getattr(candidate, "ground_z", None) is not None
     status = str(getattr(candidate, "status", "REVIEW") or "REVIEW")
     common = (
-        0.0
-        if completeness >= preferred_min_completeness_ratio
-        else 1.0,
+        0.0 if completeness >= preferred_min_completeness_ratio else 1.0,
         0.0 if has_ground else 1.0,
         0.0 if status == "AUTO" else 1.0,
         0.0 if direct else 1.0,
@@ -4501,9 +4522,7 @@ def select_cross_profile_pole_candidate(
     ordered = sorted(candidates, key=rank_key)
     initial_tier = rank_key(ordered[0])[:4]
     same_tier = tuple(
-        candidate
-        for candidate in ordered
-        if rank_key(candidate)[:4] == initial_tier
+        candidate for candidate in ordered if rank_key(candidate)[:4] == initial_tier
     )
     return select_pole_candidate(
         same_tier,
@@ -4638,11 +4657,7 @@ def build_pole_search_corridor_masks(
 
     x1, y1, x2, y2 = (float(value) for value in corridor_bbox)
     vertical_band = valid & (pixels[:, 1] >= y1) & (pixels[:, 1] <= y2)
-    strict = (
-        vertical_band
-        & (pixels[:, 0] >= x1)
-        & (pixels[:, 0] <= x2)
-    )
+    strict = vertical_band & (pixels[:, 0] >= x1) & (pixels[:, 0] <= x2)
     radial_to_sign = np.linalg.norm(points[:, :2] - sign[None, :2], axis=1)
     remote_axis = vertical_band & (
         radial_to_sign > parameters.direct_max_axis_sign_distance_m
@@ -4806,7 +4821,9 @@ def build_pole_debug_overview_view(
         base_points.append(np.asarray(candidate.base_xyz, dtype=np.float64))
         observed_segment = build_pole_debug_axis_segments(candidate)["observed"]
         if observed_segment is not None:
-            axis_points.extend(np.asarray(point, dtype=np.float64) for point in observed_segment)
+            axis_points.extend(
+                np.asarray(point, dtype=np.float64) for point in observed_segment
+            )
         ground = getattr(candidate, "ground_estimate", None)
         if ground is not None and np.asarray(ground.support_xyz).size:
             ground_points.extend(
@@ -4984,7 +5001,9 @@ def save_pole_debug_image(
     draw.rectangle((x1, y1, x2, y2), outline=(80, 255, 80, 255), width=3)
     if polygon:
         outline_points = [tuple(point) for point in polygon]
-        draw.line([*outline_points, outline_points[0]], fill=(255, 220, 0, 255), width=2)
+        draw.line(
+            [*outline_points, outline_points[0]], fill=(255, 220, 0, 255), width=2
+        )
     draw.rectangle(corridor_bbox, outline=(255, 180, 0, 220), width=2)
 
     sign_pixels, sign_valid = _project_points_to_rectified_view(
@@ -4993,7 +5012,9 @@ def save_pole_debug_image(
         rectified_view,
     )
     if np.any(sign_valid):
-        sampled = sign_pixels[sign_valid][:: max(1, int(math.ceil(sign_valid.sum() / 400)))]
+        sampled = sign_pixels[sign_valid][
+            :: max(1, int(math.ceil(sign_valid.sum() / 400)))
+        ]
         draw.point([(int(p[0]), int(p[1])) for p in sampled], fill=(0, 185, 220, 255))
 
     status_text = reason or "pole not found"
@@ -5007,8 +5028,12 @@ def save_pole_debug_image(
             rectified_view,
         )
         if np.any(pole_valid):
-            sampled = pole_pixels[pole_valid][:: max(1, int(math.ceil(pole_valid.sum() / 1600)))]
-            draw.point([(int(p[0]), int(p[1])) for p in sampled], fill=(255, 30, 220, 235))
+            sampled = pole_pixels[pole_valid][
+                :: max(1, int(math.ceil(pole_valid.sum() / 1600)))
+            ]
+            draw.point(
+                [(int(p[0]), int(p[1])) for p in sampled], fill=(255, 30, 220, 235)
+            )
 
         for candidate_index, candidate in enumerate(pole_result.candidates, start=1):
             association_distance = float(candidate.association_distance_m)
@@ -5023,9 +5048,7 @@ def save_pole_debug_image(
                     f" plumb={int(candidate.axis_plumb_adjusted)}"
                 )
             if candidate.multi_return_fraction is not None:
-                shaft_summary += (
-                    f" multi-return={candidate.multi_return_fraction:.2f}"
-                )
+                shaft_summary += f" multi-return={candidate.multi_return_fraction:.2f}"
             if connection_coverage is None:
                 connection_info_lines.append(
                     f"support{candidate_index}=direct assoc={association_distance:.3f}m "
@@ -5039,8 +5062,7 @@ def save_pole_debug_image(
                 connection_info_lines.append(
                     f"arm{candidate_index}={occupied_bins}/{expected_bins} "
                     f"coverage={float(connection_coverage):.2f} "
-                    f"assoc={association_distance:.3f}m "
-                    + shaft_summary
+                    f"assoc={association_distance:.3f}m " + shaft_summary
                 )
                 if (
                     candidate.horizontal_connection_ridge_density_points_per_m
@@ -5062,7 +5084,10 @@ def save_pole_debug_image(
                         f"{candidate.horizontal_connection_coherent_point_fraction or 0.0:.2f} "
                         f"anchored={int(bool(candidate.horizontal_connection_endpoint_anchored))}"
                     )
-                if sign_points_xyz.size and abs(float(candidate.axis_direction[2])) > 1e-9:
+                if (
+                    sign_points_xyz.size
+                    and abs(float(candidate.axis_direction[2])) > 1e-9
+                ):
                     sign_anchor = np.median(sign_points_xyz, axis=0)
                     axis_distance = (
                         float(sign_anchor[2]) - float(candidate.base_xyz[2])
@@ -5072,10 +5097,12 @@ def save_pole_debug_image(
                         + np.asarray(candidate.axis_direction, dtype=np.float64)
                         * axis_distance
                     )
-                    connection_pixels, connection_valid = _project_points_to_rectified_view(
-                        np.vstack((sign_anchor, attachment_xyz)),
-                        origin_xyz,
-                        rectified_view,
+                    connection_pixels, connection_valid = (
+                        _project_points_to_rectified_view(
+                            np.vstack((sign_anchor, attachment_xyz)),
+                            origin_xyz,
+                            rectified_view,
+                        )
                     )
                     if np.all(connection_valid):
                         draw.line(
@@ -5099,8 +5126,12 @@ def save_pole_debug_image(
                         outline=(190, 230, 255, 255),
                     )
                 if visible_ground.shape[0] >= 3:
-                    hull = cv2.convexHull(visible_ground.astype(np.float32)).reshape(-1, 2)
-                    hull_points = [tuple(float(value) for value in point) for point in hull]
+                    hull = cv2.convexHull(visible_ground.astype(np.float32)).reshape(
+                        -1, 2
+                    )
+                    hull_points = [
+                        tuple(float(value) for value in point) for point in hull
+                    ]
                     draw.line(
                         [*hull_points, hull_points[0]],
                         fill=(30, 145, 255, 230),
@@ -5130,10 +5161,12 @@ def save_pole_debug_image(
                     )
             extrapolated_segment = axis_segments["ground_extrapolated"]
             if extrapolated_segment is not None:
-                extrapolated_pixels, extrapolated_valid = _project_points_to_rectified_view(
-                    np.vstack(extrapolated_segment),
-                    origin_xyz,
-                    rectified_view,
+                extrapolated_pixels, extrapolated_valid = (
+                    _project_points_to_rectified_view(
+                        np.vstack(extrapolated_segment),
+                        origin_xyz,
+                        rectified_view,
+                    )
                 )
                 if np.all(extrapolated_valid):
                     _draw_dashed_debug_line(
@@ -5157,8 +5190,12 @@ def save_pole_debug_image(
                 outline=(50, 255, 50, 255),
                 width=4,
             )
-            draw.line((px - radius, py, px + radius, py), fill=(50, 255, 50, 255), width=3)
-            draw.line((px, py - radius, px, py + radius), fill=(50, 255, 50, 255), width=3)
+            draw.line(
+                (px - radius, py, px + radius, py), fill=(50, 255, 50, 255), width=3
+            )
+            draw.line(
+                (px, py - radius, px, py + radius), fill=(50, 255, 50, 255), width=3
+            )
         status_text = (
             f"pole={pole_result.pole_type} | {pole_result.method} | "
             f"{pole_result.status} | points={pole_result.point_indices.size}"
@@ -5224,9 +5261,7 @@ def extract_pole_for_detection(
         "classification_mode": str(
             classification_policy.get("effective_mode") or "GEOMETRY"
         ),
-        "classification_reason": str(
-            classification_policy.get("reason") or "unknown"
-        ),
+        "classification_reason": str(classification_policy.get("reason") or "unknown"),
     }
     wide_runtime = dict(runtime)
     wide_runtime["perspective_min_fov_deg"] = max(
@@ -5244,7 +5279,9 @@ def extract_pole_for_detection(
         runtime=wide_runtime,
     )
 
-    class_tag = sanitize_name(f"{detection_payload['class_id']:03d}_{detection_payload['class_name']}")
+    class_tag = sanitize_name(
+        f"{detection_payload['class_id']:03d}_{detection_payload['class_name']}"
+    )
     base_name = f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}"
     debug_path = (
         Path(runtime["pole_debug_dir"]) / image_task["record_name"] / f"{base_name}.jpg"
@@ -5266,8 +5303,7 @@ def extract_pole_for_detection(
         search_parameters: PoleSearchParameters,
     ) -> dict[str, Any] | None:
         neighborhood_radius = (
-            search_parameters.search_radius_m
-            + search_parameters.ground_search_radius_m
+            search_parameters.search_radius_m + search_parameters.ground_search_radius_m
         )
         minimum = sign_xyz - np.asarray(
             [
@@ -5300,10 +5336,7 @@ def extract_pole_for_detection(
             "maximum_xyz": [float(value) for value in maximum],
             "intersected_block_count": len(selected_blocks),
             "intersected_pointcloud_files": sorted(
-                {
-                    str(pointcloud_file["path"])
-                    for pointcloud_file, _ in selected_blocks
-                }
+                {str(pointcloud_file["path"]) for pointcloud_file, _ in selected_blocks}
             ),
             "retained_point_count": 0,
         }
@@ -5408,9 +5441,7 @@ def extract_pole_for_detection(
     selected_state = strict_state
     result = strict_state["result"] if strict_state is not None else None
     all_support_hypotheses = (
-        list(strict_state["support_hypotheses"])
-        if strict_state is not None
-        else []
+        list(strict_state["support_hypotheses"]) if strict_state is not None else []
     )
     strict_corridor_point_count = (
         int(strict_state["strict_count"]) if strict_state is not None else 0
@@ -5422,19 +5453,12 @@ def extract_pole_for_detection(
     pole_fallback_used = False
     fallback_strict_corridor_point_count: int | None = None
     fallback_expanded_corridor_point_count: int | None = None
-    if (
-        fallback_parameters is not None
-        and (result is None or result.status != "AUTO")
-    ):
+    if fallback_parameters is not None and (result is None or result.status != "AUTO"):
         pole_fallback_attempted = True
         fallback_state = load_and_search(fallback_parameters)
         if fallback_state is not None:
-            all_support_hypotheses.extend(
-                fallback_state["support_hypotheses"]
-            )
-            fallback_strict_corridor_point_count = int(
-                fallback_state["strict_count"]
-            )
+            all_support_hypotheses.extend(fallback_state["support_hypotheses"])
+            fallback_strict_corridor_point_count = int(fallback_state["strict_count"])
             fallback_expanded_corridor_point_count = int(
                 fallback_state["expanded_count"]
             )
@@ -5642,9 +5666,7 @@ def extract_pole_for_detection(
         "corridor_point_count": int(corridor_mask.sum()),
         "strict_corridor_point_count": strict_corridor_point_count,
         "expanded_corridor_point_count": expanded_corridor_point_count,
-        "fallback_strict_corridor_point_count": (
-            fallback_strict_corridor_point_count
-        ),
+        "fallback_strict_corridor_point_count": (fallback_strict_corridor_point_count),
         "fallback_expanded_corridor_point_count": (
             fallback_expanded_corridor_point_count
         ),
@@ -5701,8 +5723,10 @@ def extract_pole_for_detection(
     ground_penalty_rmse = (
         ground_rmse if ground_rmse is not None else parameters.ground_max_rmse_m
     )
-    quality = float(detection_payload["confidence"]) * coverage * math.exp(
-        -(5.0 * axis_rmse) - (2.0 * ground_penalty_rmse)
+    quality = (
+        float(detection_payload["confidence"])
+        * coverage
+        * math.exp(-(5.0 * axis_rmse) - (2.0 * ground_penalty_rmse))
     )
     if result.status != "AUTO":
         quality *= 0.75
@@ -5719,7 +5743,9 @@ def extract_pole_for_detection(
             "max_observed_z_gap_m": float(item.max_observed_z_gap_m),
             "vertical_occupancy_ratio": float(item.vertical_occupancy_ratio),
             "middle_support_bin_count": (
-                None if item.middle_support_bin_count is None else int(item.middle_support_bin_count)
+                None
+                if item.middle_support_bin_count is None
+                else int(item.middle_support_bin_count)
             ),
             "middle_expected_bin_count": (
                 None
@@ -5765,9 +5791,7 @@ def extract_pole_for_detection(
             "horizontal_connection_ridge_density_points_per_m": (
                 None
                 if item.horizontal_connection_ridge_density_points_per_m is None
-                else float(
-                    item.horizontal_connection_ridge_density_points_per_m
-                )
+                else float(item.horizontal_connection_ridge_density_points_per_m)
             ),
             "horizontal_connection_coherent_bin_count": (
                 None
@@ -5787,9 +5811,7 @@ def extract_pole_for_detection(
             "horizontal_connection_coherent_point_fraction": (
                 None
                 if item.horizontal_connection_coherent_point_fraction is None
-                else float(
-                    item.horizontal_connection_coherent_point_fraction
-                )
+                else float(item.horizontal_connection_coherent_point_fraction)
             ),
             "horizontal_connection_endpoint_anchored": (
                 item.horizontal_connection_endpoint_anchored
@@ -5824,7 +5846,9 @@ def extract_pole_for_detection(
             "ground_rmse_m": None
             if item.ground_rmse_m is None
             else float(item.ground_rmse_m),
-            "bottom_gap_m": None if item.bottom_gap_m is None else float(item.bottom_gap_m),
+            "bottom_gap_m": None
+            if item.bottom_gap_m is None
+            else float(item.bottom_gap_m),
             "ground_support_distance_m": (
                 None
                 if item.ground_support_distance_m is None
@@ -5839,10 +5863,14 @@ def extract_pole_for_detection(
             "dominant_class_fraction": item.dominant_class_fraction,
             "multi_return_fraction": item.multi_return_fraction,
             "ground_fit_method": (
-                item.ground_estimate.method if item.ground_estimate is not None else None
+                item.ground_estimate.method
+                if item.ground_estimate is not None
+                else None
             ),
             "ground_cell_count": (
-                item.ground_estimate.cell_count if item.ground_estimate is not None else 0
+                item.ground_estimate.cell_count
+                if item.ground_estimate is not None
+                else 0
             ),
             "ground_candidate_cell_count": (
                 item.ground_estimate.candidate_cell_count
@@ -5954,12 +5982,14 @@ def crop_points_for_las_export(
 
     nearest_index = int(
         np.argmin(
-            np.linalg.norm(points_xyz.astype(np.float64) - representative_xyz[None, :], axis=1)
+            np.linalg.norm(
+                points_xyz.astype(np.float64) - representative_xyz[None, :], axis=1
+            )
         )
     )
     return (
-        points_xyz[nearest_index:nearest_index + 1],
-        colors_rgb[nearest_index:nearest_index + 1],
+        points_xyz[nearest_index : nearest_index + 1],
+        colors_rgb[nearest_index : nearest_index + 1],
         True,
     )
 
@@ -6011,7 +6041,9 @@ def cluster_extracted_points(
         }
 
     tree = cKDTree(points_xyz.astype(np.float64))
-    neighbor_lists = tree.query_ball_point(points_xyz.astype(np.float64), r=cluster_radius_m)
+    neighbor_lists = tree.query_ball_point(
+        points_xyz.astype(np.float64), r=cluster_radius_m
+    )
     core_mask = np.asarray(
         [len(neighbors) >= cluster_min_neighbors for neighbors in neighbor_lists],
         dtype=bool,
@@ -6067,7 +6099,9 @@ def cluster_extracted_points(
         if not candidate_core_neighbors:
             continue
 
-        candidate_clusters = point_cluster_ids[np.asarray(candidate_core_neighbors, dtype=np.int32)]
+        candidate_clusters = point_cluster_ids[
+            np.asarray(candidate_core_neighbors, dtype=np.int32)
+        ]
         candidate_clusters = candidate_clusters[candidate_clusters >= 0]
         if candidate_clusters.size == 0:
             continue
@@ -6246,12 +6280,7 @@ def collect_detection_points_at_range(
             u = u[finite_projection]
             v = v[finite_projection]
             crop_x1, crop_y1, crop_x2, crop_y2 = crop_bbox
-            in_crop = (
-                (u >= crop_x1)
-                & (u < crop_x2)
-                & (v >= crop_y1)
-                & (v < crop_y2)
-            )
+            in_crop = (u >= crop_x1) & (u < crop_x2) & (v >= crop_y1) & (v < crop_y2)
             if not np.any(in_crop):
                 continue
 
@@ -6268,9 +6297,7 @@ def collect_detection_points_at_range(
                 continue
 
             selected_points.append(coords_xyz[in_mask])
-            selected_pixels.append(
-                np.column_stack((u_int[in_mask], v_int[in_mask]))
-            )
+            selected_pixels.append(np.column_stack((u_int[in_mask], v_int[in_mask])))
             selected_distances.append(distances[in_mask])
             used_pointcloud_files.add(pointcloud_file["path"])
             selected_block_count += 1
@@ -6348,9 +6375,11 @@ def evaluate_point_range_fallback_quality(
     core_mask_fraction = float(np.mean(core_membership)) if pixels_xy.size else 0.0
     representative_inside_core_mask = False
     if representative_pixel_xy is not None:
-        representative_pixel = np.rint(
-            np.asarray(representative_pixel_xy, dtype=np.float64)
-        ).astype(np.int64).reshape(1, 2)
+        representative_pixel = (
+            np.rint(np.asarray(representative_pixel_xy, dtype=np.float64))
+            .astype(np.int64)
+            .reshape(1, 2)
+        )
         representative_inside_core_mask = bool(
             _pixels_inside_detection_mask(
                 representative_pixel,
@@ -6364,10 +6393,7 @@ def evaluate_point_range_fallback_quality(
     )
     finite_distances = distances[np.isfinite(distances)]
     depth_span_m = (
-        float(
-            np.quantile(finite_distances, 0.95)
-            - np.quantile(finite_distances, 0.05)
-        )
+        float(np.quantile(finite_distances, 0.95) - np.quantile(finite_distances, 0.05))
         if finite_distances.size
         else None
     )
@@ -6379,24 +6405,18 @@ def evaluate_point_range_fallback_quality(
     minimum_core_fraction = float(
         runtime["point_range_fallback_min_core_mask_fraction"]
     )
-    maximum_depth_span_m = float(
-        runtime["point_range_fallback_max_depth_span_m"]
-    )
+    maximum_depth_span_m = float(runtime["point_range_fallback_max_depth_span_m"])
     failures: list[str] = []
     if point_count < minimum_points:
         failures.append(f"point_count_lt_{minimum_points}")
     if cluster_count != 1:
         failures.append("cluster_count_ne_1")
     if cluster_fraction < minimum_cluster_fraction:
-        failures.append(
-            f"cluster_fraction_lt_{minimum_cluster_fraction:.2f}"
-        )
+        failures.append(f"cluster_fraction_lt_{minimum_cluster_fraction:.2f}")
     if not representative_inside_core_mask:
         failures.append("representative_outside_core_mask")
     if core_mask_fraction < minimum_core_fraction:
-        failures.append(
-            f"core_mask_fraction_lt_{minimum_core_fraction:.2f}"
-        )
+        failures.append(f"core_mask_fraction_lt_{minimum_core_fraction:.2f}")
     if depth_span_m is None or depth_span_m > maximum_depth_span_m:
         failures.append(f"depth_span_gt_{maximum_depth_span_m:.2f}m")
     return {
@@ -6430,23 +6450,29 @@ def extract_points_for_detection(
         runtime=runtime,
     )
 
-    class_tag = sanitize_name(f"{detection_payload['class_id']:03d}_{detection_payload['class_name']}")
+    class_tag = sanitize_name(
+        f"{detection_payload['class_id']:03d}_{detection_payload['class_name']}"
+    )
     image_crop_dir = Path(runtime["image_crops_dir"]) / image_task["record_name"]
-    image_crop_name = f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.jpg"
+    image_crop_name = (
+        f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.jpg"
+    )
     image_crop_path = image_crop_dir / image_crop_name
     point_preview_dir = Path(runtime["point_previews_dir"]) / image_task["record_name"]
-    point_preview_name = f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.png"
+    point_preview_name = (
+        f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.png"
+    )
     point_preview_path = point_preview_dir / point_preview_name
 
-    base_label = f"{detection_payload['class_name']} {detection_payload['confidence']:.3f}"
+    base_label = (
+        f"{detection_payload['class_name']} {detection_payload['confidence']:.3f}"
+    )
     base_info_lines = [
         f"ray={rectified_view['center_ray_angle_deg']:.1f}deg",
         f"fov={rectified_view['hfov_deg']:.1f}/{rectified_view['vfov_deg']:.1f}",
     ]
     strict_range_m = float(runtime["max_range_m"])
-    range_fallback_enabled = bool(
-        runtime.get("point_range_fallback_enabled", False)
-    )
+    range_fallback_enabled = bool(runtime.get("point_range_fallback_enabled", False))
     fallback_range_m = float(
         runtime.get("point_range_fallback_max_range_m", strict_range_m)
     )
@@ -6624,9 +6650,7 @@ def extract_points_for_detection(
             "cluster_point_count": 0,
             "cluster_count": 0,
             "point_match_mode": (
-                "range_fallback_empty"
-                if range_fallback_attempted
-                else "strict_empty"
+                "range_fallback_empty" if range_fallback_attempted else "strict_empty"
             ),
             "point_match_max_range_m": point_match_max_range_m,
             "point_match_min_point_count": int(runtime["min_point_count"]),
@@ -6650,7 +6674,9 @@ def extract_points_for_detection(
         quantile=runtime["front_surface_quantile"],
         min_support=runtime["front_surface_min_support"],
     )
-    front_surface_mask = distances <= (front_surface_anchor_m + runtime["depth_window_m"])
+    front_surface_mask = distances <= (
+        front_surface_anchor_m + runtime["depth_window_m"]
+    )
     if np.any(front_surface_mask):
         points_xyz = points_xyz[front_surface_mask]
         pixels_xy = pixels_xy[front_surface_mask]
@@ -6695,7 +6721,9 @@ def extract_points_for_detection(
             "median_distance_m": None,
             "representative_point_mode": "nearest_cluster_median",
             "accepted_for_shp": False,
-            "exclude_reason": cluster_result["reason"] if cluster_result is not None else "no_dense_cluster",
+            "exclude_reason": cluster_result["reason"]
+            if cluster_result is not None
+            else "no_dense_cluster",
             "rectified_hfov_deg": float(rectified_view["hfov_deg"]),
             "rectified_vfov_deg": float(rectified_view["vfov_deg"]),
             "center_ray_angle_deg": float(rectified_view["center_ray_angle_deg"]),
@@ -6703,7 +6731,9 @@ def extract_points_for_detection(
             "representative_pixel_y": None,
             "raw_point_count": int(points_xyz.shape[0]),
             "cluster_point_count": 0,
-            "cluster_count": 0 if cluster_result is None else int(cluster_result["cluster_count"]),
+            "cluster_count": 0
+            if cluster_result is None
+            else int(cluster_result["cluster_count"]),
             "front_surface_anchor_m": front_surface_anchor_m,
             "point_match_mode": point_match_mode,
             "point_match_max_range_m": point_match_max_range_m,
@@ -6728,16 +6758,22 @@ def extract_points_for_detection(
     points_xyz = cluster_result["points_xyz"]
     pixels_xy = cluster_result["pixels_xy"]
     distances = cluster_result["distances"]
-    representative_xyz = np.asarray(cluster_result["representative_xyz"], dtype=np.float64)
+    representative_xyz = np.asarray(
+        cluster_result["representative_xyz"], dtype=np.float64
+    )
     pixel_colors = rectified_view["rectified_rgb"][pixels_xy[:, 1], pixels_xy[:, 0]]
-    las_points_xyz, las_pixel_colors, las_crop_fallback_used = crop_points_for_las_export(
-        points_xyz,
-        pixel_colors,
-        representative_xyz,
-        float(runtime["las_crop_half_extent_m"]),
+    las_points_xyz, las_pixel_colors, las_crop_fallback_used = (
+        crop_points_for_las_export(
+            points_xyz,
+            pixel_colors,
+            representative_xyz,
+            float(runtime["las_crop_half_extent_m"]),
+        )
     )
     point_crop_dir = Path(runtime["point_crops_dir"]) / image_task["record_name"]
-    point_crop_name = f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.las"
+    point_crop_name = (
+        f"{image_task['image_stem']}__det{detection_index:04d}__{class_tag}.las"
+    )
     point_crop_path = point_crop_dir / point_crop_name
     write_las(
         las_points_xyz,
@@ -6774,9 +6810,7 @@ def extract_points_for_detection(
             runtime,
         )
         accepted_for_shp = bool(fallback_quality["accepted"])
-        point_match_min_point_count = int(
-            fallback_quality["minimum_point_count"]
-        )
+        point_match_min_point_count = int(fallback_quality["minimum_point_count"])
     else:
         accepted_for_shp = point_count >= runtime["min_point_count"]
     exclude_reason = None
@@ -6808,7 +6842,8 @@ def extract_points_for_detection(
     policy = runtime.get("pole_classification_policy") or {}
     pole_classification_defaults = {
         "classification_mode_requested": str(
-            policy.get("requested_mode") or runtime.get("pole_classification_mode", "auto")
+            policy.get("requested_mode")
+            or runtime.get("pole_classification_mode", "auto")
         ),
         "classification_mode": str(policy.get("effective_mode") or "GEOMETRY"),
         "classification_reason": str(policy.get("reason") or "unknown"),
@@ -6822,9 +6857,7 @@ def extract_points_for_detection(
                 else nullcontext()
             )
             pole_timing = (
-                coordinator.timed(
-                    f"pole/{runtime.get('model_key') or 'model'}"
-                )
+                coordinator.timed(f"pole/{runtime.get('model_key') or 'model'}")
                 if coordinator is not None
                 else nullcontext()
             )
@@ -6869,11 +6902,15 @@ def extract_points_for_detection(
             "reason": "disabled",
         }
 
-    info_lines = base_info_lines + range_info_lines + [
-        f"raw={int(cluster_result['raw_point_count'])}",
-        f"cluster={point_count}",
-        f"clusters={int(cluster_result['cluster_count'])}",
-    ]
+    info_lines = (
+        base_info_lines
+        + range_info_lines
+        + [
+            f"raw={int(cluster_result['raw_point_count'])}",
+            f"cluster={point_count}",
+            f"clusters={int(cluster_result['cluster_count'])}",
+        ]
+    )
     if fallback_quality is not None:
         info_lines.append(
             "fallback="
@@ -6930,8 +6967,12 @@ def extract_points_for_detection(
         "rectified_hfov_deg": float(rectified_view["hfov_deg"]),
         "rectified_vfov_deg": float(rectified_view["vfov_deg"]),
         "center_ray_angle_deg": float(rectified_view["center_ray_angle_deg"]),
-        "representative_pixel_x": None if representative_pixel_xy is None else float(representative_pixel_xy[0]),
-        "representative_pixel_y": None if representative_pixel_xy is None else float(representative_pixel_xy[1]),
+        "representative_pixel_x": None
+        if representative_pixel_xy is None
+        else float(representative_pixel_xy[0]),
+        "representative_pixel_y": None
+        if representative_pixel_xy is None
+        else float(representative_pixel_xy[1]),
         "raw_point_count": int(cluster_result["raw_point_count"]),
         "cluster_point_count": int(cluster_result["cluster_point_count"]),
         "cluster_count": int(cluster_result["cluster_count"]),
@@ -6962,9 +7003,7 @@ def extract_points_for_detection(
             else bool(fallback_quality["representative_inside_core_mask"])
         ),
         "point_range_fallback_depth_span_m": (
-            None
-            if fallback_quality is None
-            else fallback_quality["depth_span_m"]
+            None if fallback_quality is None else fallback_quality["depth_span_m"]
         ),
         "pole": pole_payload,
     }
@@ -7015,7 +7054,9 @@ def compatible_existing_result_summary(
             txt_path,
         )
     else:
-        logger.info("Reprocessing stale result with a different input/config: %s", txt_path)
+        logger.info(
+            "Reprocessing stale result with a different input/config: %s", txt_path
+        )
     return None
 
 
@@ -7067,7 +7108,9 @@ def process_image_task(
         )
     if detection_candidates_override is None:
         if model is None:
-            raise ValueError("A YOLO model is required when detections are not precomputed")
+            raise ValueError(
+                "A YOLO model is required when detections are not precomputed"
+            )
         detection_candidates = run_yolo_detection_on_panorama(
             image_rgb=image_rgb,
             runtime=runtime,
@@ -7202,9 +7245,9 @@ def process_image_task(
             },
             "qa_report_path": (runtime.get("alignment_qa") or {}).get("report_path"),
             "qa_status": (runtime.get("alignment_qa") or {}).get("status"),
-            "recommended_total_yaw_offset_deg": (
-                runtime.get("alignment_qa") or {}
-            ).get("recommended_total_yaw_offset_deg"),
+            "recommended_total_yaw_offset_deg": (runtime.get("alignment_qa") or {}).get(
+                "recommended_total_yaw_offset_deg"
+            ),
             "recommended_total_pitch_offset_deg": (
                 runtime.get("alignment_qa") or {}
             ).get("recommended_total_pitch_offset_deg"),
@@ -7231,7 +7274,9 @@ def process_image_task(
     return {
         "images": 1,
         "detections": len(detections),
-        "points": sum(item["point_count"] for item in detections if item["point_count"]),
+        "points": sum(
+            item["point_count"] for item in detections if item["point_count"]
+        ),
         "failures": sum(
             1
             for item in detections
@@ -7383,8 +7428,7 @@ def run_panorama_alignment_qa(
         else:
             cache_valid = (
                 isinstance(cached, dict)
-                and cached.get("cache_version")
-                == PANORAMA_ALIGNMENT_QA_CACHE_VERSION
+                and cached.get("cache_version") == PANORAMA_ALIGNMENT_QA_CACHE_VERSION
                 and cached.get("estimator_version")
                 == PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION
                 and cached.get("cache_fingerprint") == cache_fingerprint
@@ -7418,7 +7462,9 @@ def run_panorama_alignment_qa(
         "status": "disabled" if not enabled else "running",
         "report_only": True,
         "applied_yaw_offset_deg": float(getattr(args, "panorama_yaw_offset_deg", 0.0)),
-        "applied_pitch_offset_deg": float(getattr(args, "panorama_pitch_offset_deg", 0.0)),
+        "applied_pitch_offset_deg": float(
+            getattr(args, "panorama_pitch_offset_deg", 0.0)
+        ),
         "report_path": str(report_path.resolve()),
     }
     if enabled:
@@ -7534,7 +7580,9 @@ def select_image_tasks_for_scope(
 
     frame_from = frame_bounds["frame_id_from"]
     frame_to = frame_bounds["frame_id_to"]
-    frame_from_key = _natural_frame_id_key(frame_from) if frame_from is not None else None
+    frame_from_key = (
+        _natural_frame_id_key(frame_from) if frame_from is not None else None
+    )
     frame_to_key = _natural_frame_id_key(frame_to) if frame_to is not None else None
     if (
         frame_from_key is not None
@@ -7553,9 +7601,7 @@ def select_image_tasks_for_scope(
     }
     folded_filters = {
         option_name: (
-            {name.casefold() for name in names}
-            if names is not None
-            else None
+            {name.casefold() for name in names} if names is not None else None
         )
         for option_name, names in name_filters.items()
     }
@@ -7671,7 +7717,9 @@ def _scoped_pointcloud_catalog_path(
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     suffix = base_path.suffix or ".json"
-    stem = base_path.name[: -len(base_path.suffix)] if base_path.suffix else base_path.name
+    stem = (
+        base_path.name[: -len(base_path.suffix)] if base_path.suffix else base_path.name
+    )
     scoped_path = base_path.with_name(f"{stem}.jobs-{digest}{suffix}")
 
     if not scoped_path.exists() and base_path.is_file():
@@ -7762,6 +7810,8 @@ def prepare_shared_pipeline_context(
         input_root = Path(args.data_root).resolve(strict=False)
         input_files: list[str] = []
         for task in image_tasks:
+            if len(input_files) >= MAX_MANIFEST_INPUT_FILES:
+                break
             path = Path(str(task["image_path"])).resolve(strict=False)
             try:
                 input_files.append(path.relative_to(input_root).as_posix())
@@ -7771,10 +7821,16 @@ def prepare_shared_pipeline_context(
             {str(task.get("job_name")) for task in image_tasks if task.get("job_name")}
         )
         tracks = sorted(
-            {str(task.get("track_name")) for task in image_tasks if task.get("track_name")}
+            {
+                str(task.get("track_name"))
+                for task in image_tasks
+                if task.get("track_name")
+            }
         )
         run_manifest.set_input(
             files=input_files,
+            file_count=len(image_tasks),
+            files_truncated=len(image_tasks) > len(input_files),
             fingerprints={"dataset": dataset_signature},
             dataset_job=jobs[0] if len(jobs) == 1 else "multiple",
             track=tracks[0] if len(tracks) == 1 else "multiple",
@@ -7817,7 +7873,10 @@ def prepare_shared_pipeline_context(
             )
         )
         pointcloud_catalog["resolved_crs_wkt"] = crs_wkt
-        if pointcloud_catalog.get("selected_source_type") in {"las", "mixed"} and not crs_wkt:
+        if (
+            pointcloud_catalog.get("selected_source_type") in {"las", "mixed"}
+            and not crs_wkt
+        ):
             raise ValueError(
                 "LAS files have missing or inconsistent CRS WKT; refuse to write a mislabeled SHP."
             )
@@ -7848,7 +7907,7 @@ def prepare_shared_pipeline_context(
         application_context = PipelineContext(
             job_id=str(manifest_document["job_id"]),
             config=PipelineConfig(
-                values=serializable_config(args),
+                values=getattr(args, "_pipeline_config_values"),
                 config_hash=str(getattr(args, "_pipeline_config_hash")),
                 source_path=Path(source_path).resolve() if source_path else None,
             ),
@@ -7917,9 +7976,7 @@ def finalize_prepared_model_run(
         pole_observations = reconcile_remote_supports_from_direct_anchors(
             records,
             pole_observations,
-            direct_distance_m=float(
-                runtime["pole_direct_max_axis_sign_distance_m"]
-            ),
+            direct_distance_m=float(runtime["pole_direct_max_axis_sign_distance_m"]),
             max_link_distance_m=max(
                 float(runtime["pole_max_axis_sign_distance_m"]),
                 float(runtime["pole_fallback_max_axis_sign_distance_m"]),
@@ -7936,15 +7993,13 @@ def finalize_prepared_model_run(
         unique_frame_observations = sum(
             int(item.get("obs_count") or 1)
             for item in {
-                str(relation.get("support_id")): relation
-                for relation in merged_poles
+                str(relation.get("support_id")): relation for relation in merged_poles
             }.values()
         )
         merged_poles = [
             item
             for item in merged_poles
-            if int(item.get("obs_count") or 1)
-            >= int(runtime["pole_min_observations"])
+            if int(item.get("obs_count") or 1) >= int(runtime["pole_min_observations"])
         ]
     attach_support_ids_to_detection_records(records, merged_poles)
     records, merged_poles = deduplicate_sign_and_pole_observations(
@@ -7952,12 +8007,8 @@ def finalize_prepared_model_run(
         merged_poles,
         supported_xy_radius_m=float(runtime["sign_observation_merge_xy_radius_m"]),
         supported_z_radius_m=float(runtime["sign_observation_merge_z_radius_m"]),
-        unsupported_xy_radius_m=float(
-            runtime["sign_observation_fallback_xy_radius_m"]
-        ),
-        unsupported_z_radius_m=float(
-            runtime["sign_observation_fallback_z_radius_m"]
-        ),
+        unsupported_xy_radius_m=float(runtime["sign_observation_fallback_xy_radius_m"]),
+        unsupported_z_radius_m=float(runtime["sign_observation_fallback_z_radius_m"]),
     )
 
     publication_pairs = [(staged_shp_path, shp_path)]
@@ -8022,9 +8073,7 @@ def finalize_prepared_model_run(
         "final_shapefiles": {
             "detections": str(shp_path.resolve()),
             "poles": (
-                str(pole_shp_path.resolve())
-                if runtime["pole_detection"]
-                else None
+                str(pole_shp_path.resolve()) if runtime["pole_detection"] else None
             ),
         },
         "feature_counts": {
@@ -8058,7 +8107,10 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         effective_config_path,
         json.dumps(serializable_config(args), ensure_ascii=False, indent=2),
     )
-    logger.info("Configuration source: %s", getattr(args, "_config_path", None) or "CLI/defaults")
+    logger.info(
+        "Configuration source: %s",
+        getattr(args, "_config_path", None) or "CLI/defaults",
+    )
     logger.info("Effective configuration: %s", effective_config_path.resolve())
 
     try:
@@ -8082,15 +8134,17 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     )
     logger.info("Output root: %s", args.output_dir)
     logger.info("Point-cloud cache path: %s", args.pointcloud_cache_path)
-    logger.info("Requested workers: %d | Effective workers: %d", args.num_workers, actual_num_workers)
+    logger.info(
+        "Requested workers: %d | Effective workers: %d",
+        args.num_workers,
+        actual_num_workers,
+    )
 
     shared_context = getattr(args, "_shared_pipeline_context", None)
     if shared_context is None:
         shared_context = prepare_shared_pipeline_context(
             args,
-            alignment_report_path=(
-                output_dirs["logs"] / "panorama_alignment_qa.json"
-            ),
+            alignment_report_path=(output_dirs["logs"] / "panorama_alignment_qa.json"),
             logger=logger,
         )
     image_tasks = list(shared_context["image_tasks"])
@@ -8115,7 +8169,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "effective_mode": "GEOMETRY",
             "uses_classification": False,
             "reason": "pole_detection_disabled",
-            "source_type": str(pointcloud_catalog.get("selected_source_type") or "unknown"),
+            "source_type": str(
+                pointcloud_catalog.get("selected_source_type") or "unknown"
+            ),
             "configured": {
                 "ground_class_ids": sorted(set(args.pole_ground_class_ids)),
                 "pole_class_ids": sorted(set(args.pole_class_ids)),
@@ -8143,9 +8199,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         pole_classification_policy["files_with_semantic_classes"],
         pole_classification_policy["source_file_count"],
     )
-    missing_semantic_paths = pole_classification_policy.get(
-        "_files_without_semantic_class_paths"
-    ) or []
+    missing_semantic_paths = (
+        pole_classification_policy.get("_files_without_semantic_class_paths") or []
+    )
     if args.pole_detection and missing_semantic_paths:
         logger.warning(
             "Configured semantic classes were absent from %d selected point-cloud file(s): %s",
@@ -8161,7 +8217,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             indent=2,
         ),
     )
-    logger.info("Pole classification policy report: %s", classification_policy_path.resolve())
+    logger.info(
+        "Pole classification policy report: %s", classification_policy_path.resolve()
+    )
     model_sha256 = _sha256_file(args.model_path.resolve())
     run_manifest = _run_manifest_store(args)
     if run_manifest is not None:
@@ -8224,7 +8282,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "use_full_panorama_detection": not args.disable_full_panorama_detection,
         "use_tiled_detection": not args.disable_tiled_detection,
         "tile_width_px": 0 if args.tile_width_px <= 0 else max(256, args.tile_width_px),
-        "tile_height_px": 0 if args.tile_height_px <= 0 else max(256, args.tile_height_px),
+        "tile_height_px": 0
+        if args.tile_height_px <= 0
+        else max(256, args.tile_height_px),
         "tile_overlap_px": max(0, args.tile_overlap_px),
         "tile_batch_size": max(1, args.tile_batch_size),
         "tile_merge_iou": min(0.99, max(0.0, args.tile_merge_iou)),
@@ -8262,7 +8322,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "perspective_view_size": max(256, args.perspective_view_size),
         "perspective_margin_deg": max(0.0, args.perspective_margin_deg),
         "perspective_min_fov_deg": max(1.0, args.perspective_min_fov_deg),
-        "perspective_max_fov_deg": max(args.perspective_min_fov_deg, args.perspective_max_fov_deg),
+        "perspective_max_fov_deg": max(
+            args.perspective_min_fov_deg, args.perspective_max_fov_deg
+        ),
         "cluster_radius_m": max(0.01, args.cluster_radius_m),
         "cluster_min_neighbors": max(1, args.cluster_min_neighbors),
         "cluster_trim_radius_multiplier": max(1.0, args.cluster_trim_radius_multiplier),
@@ -8279,9 +8341,7 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "pole_max_drop_m": float(args.pole_max_drop_m),
         "pole_top_margin_m": float(args.pole_top_margin_m),
         "pole_range_fallback_enabled": bool(args.pole_range_fallback_enabled),
-        "pole_fallback_search_radius_m": float(
-            args.pole_fallback_search_radius_m
-        ),
+        "pole_fallback_search_radius_m": float(args.pole_fallback_search_radius_m),
         "pole_fallback_max_drop_m": float(args.pole_fallback_max_drop_m),
         "pole_fallback_top_margin_m": float(args.pole_fallback_top_margin_m),
         "pole_fallback_max_axis_sign_distance_m": float(
@@ -8311,10 +8371,16 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "pole_axis_inlier_radius_m": float(args.pole_axis_inlier_radius_m),
         "pole_min_vertical_span_m": float(args.pole_min_vertical_span_m),
         "pole_min_vertical_bins": int(args.pole_min_vertical_bins),
-        "pole_min_consecutive_vertical_bins": int(args.pole_min_consecutive_vertical_bins),
+        "pole_min_consecutive_vertical_bins": int(
+            args.pole_min_consecutive_vertical_bins
+        ),
         "pole_max_observed_z_gap_m": float(args.pole_max_observed_z_gap_m),
-        "pole_min_vertical_occupancy_ratio": float(args.pole_min_vertical_occupancy_ratio),
-        "pole_middle_support_start_fraction": float(args.pole_middle_support_start_fraction),
+        "pole_min_vertical_occupancy_ratio": float(
+            args.pole_min_vertical_occupancy_ratio
+        ),
+        "pole_middle_support_start_fraction": float(
+            args.pole_middle_support_start_fraction
+        ),
         "pole_min_middle_support_coverage_ratio": float(
             args.pole_min_middle_support_coverage_ratio
         ),
@@ -8335,12 +8401,8 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "pole_min_points": int(args.pole_min_points),
         "pole_max_axis_tilt_deg": float(args.pole_max_axis_tilt_deg),
-        "pole_axis_plumb_max_tilt_deg": float(
-            args.pole_axis_plumb_max_tilt_deg
-        ),
-        "pole_axis_plumb_full_tilt_deg": float(
-            args.pole_axis_plumb_full_tilt_deg
-        ),
+        "pole_axis_plumb_max_tilt_deg": float(args.pole_axis_plumb_max_tilt_deg),
+        "pole_axis_plumb_full_tilt_deg": float(args.pole_axis_plumb_full_tilt_deg),
         "pole_axis_plumb_endpoint_fraction": float(
             args.pole_axis_plumb_endpoint_fraction
         ),
@@ -8378,12 +8440,8 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "pole_remote_max_endpoint_tilt_deg": float(
             args.pole_remote_max_endpoint_tilt_deg
         ),
-        "pole_long_remote_distance_m": float(
-            args.pole_long_remote_distance_m
-        ),
-        "pole_long_remote_transition_m": float(
-            args.pole_long_remote_transition_m
-        ),
+        "pole_long_remote_distance_m": float(args.pole_long_remote_distance_m),
+        "pole_long_remote_transition_m": float(args.pole_long_remote_transition_m),
         "pole_long_remote_min_vertical_span_m": float(
             args.pole_long_remote_min_vertical_span_m
         ),
@@ -8407,9 +8465,7 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             args.pole_ground_geometry_preference_margin_m
         ),
         "pole_occlusion_gap_m": float(args.pole_occlusion_gap_m),
-        "pole_max_ground_penetration_m": float(
-            args.pole_max_ground_penetration_m
-        ),
+        "pole_max_ground_penetration_m": float(args.pole_max_ground_penetration_m),
         "pole_max_ground_support_distance_m": float(
             args.pole_max_ground_support_distance_m
         ),
@@ -8571,7 +8627,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     else None,
                     pole_merge_radius_m=runtime["pole_observation_merge_radius_m"],
                     pole_min_observations=runtime["pole_min_observations"],
-                    sign_merge_xy_radius_m=runtime["sign_observation_merge_xy_radius_m"],
+                    sign_merge_xy_radius_m=runtime[
+                        "sign_observation_merge_xy_radius_m"
+                    ],
                     sign_merge_z_radius_m=runtime["sign_observation_merge_z_radius_m"],
                     sign_fallback_xy_radius_m=runtime[
                         "sign_observation_fallback_xy_radius_m"
@@ -8600,7 +8658,9 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             timeout=0.25,
                             return_when=FIRST_COMPLETED,
                         )
-                        _drain_progress_queue(progress_queue, progress_bar, progress_totals)
+                        _drain_progress_queue(
+                            progress_queue, progress_bar, progress_totals
+                        )
                         if progress_reporter is not None:
                             progress_reporter.update(progress_totals)
 
@@ -8620,16 +8680,24 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             ):
                                 safely_refresh_shapefile_from_txt(
                                     output_dirs["txt"],
-                                    output_dirs["shp"] / "detected_signs.in_progress.shp",
+                                    output_dirs["shp"]
+                                    / "detected_signs.in_progress.shp",
                                     logger,
                                     reason="heartbeat",
                                     run_fingerprint=run_fingerprint,
                                     crs_wkt=crs_wkt,
-                                    pole_shp_path=(output_dirs["shp"] / "pole_bottoms.in_progress.shp")
+                                    pole_shp_path=(
+                                        output_dirs["shp"]
+                                        / "pole_bottoms.in_progress.shp"
+                                    )
                                     if runtime["pole_detection"]
                                     else None,
-                                    pole_merge_radius_m=runtime["pole_observation_merge_radius_m"],
-                                    pole_min_observations=runtime["pole_min_observations"],
+                                    pole_merge_radius_m=runtime[
+                                        "pole_observation_merge_radius_m"
+                                    ],
+                                    pole_min_observations=runtime[
+                                        "pole_min_observations"
+                                    ],
                                     sign_merge_xy_radius_m=runtime[
                                         "sign_observation_merge_xy_radius_m"
                                     ],
@@ -8660,16 +8728,24 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                             if not args.disable_intermediate_shp:
                                 safely_refresh_shapefile_from_txt(
                                     output_dirs["txt"],
-                                    output_dirs["shp"] / "detected_signs.in_progress.shp",
+                                    output_dirs["shp"]
+                                    / "detected_signs.in_progress.shp",
                                     logger,
                                     reason=f"worker {completed_workers} completion",
                                     run_fingerprint=run_fingerprint,
                                     crs_wkt=crs_wkt,
-                                    pole_shp_path=(output_dirs["shp"] / "pole_bottoms.in_progress.shp")
+                                    pole_shp_path=(
+                                        output_dirs["shp"]
+                                        / "pole_bottoms.in_progress.shp"
+                                    )
                                     if runtime["pole_detection"]
                                     else None,
-                                    pole_merge_radius_m=runtime["pole_observation_merge_radius_m"],
-                                    pole_min_observations=runtime["pole_min_observations"],
+                                    pole_merge_radius_m=runtime[
+                                        "pole_observation_merge_radius_m"
+                                    ],
+                                    pole_min_observations=runtime[
+                                        "pole_min_observations"
+                                    ],
                                     sign_merge_xy_radius_m=runtime[
                                         "sign_observation_merge_xy_radius_m"
                                     ],
@@ -8707,11 +8783,12 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     if progress_reporter is not None:
         progress_reporter.update(summary, force=True)
     if run_manifest is not None and processing_started is not None:
+        processing_failed = int(summary["failures"]) > 0
         run_manifest.record_stage(
             StageResult(
                 stage_name="detect_project_and_estimate",
                 stage_version=str(RESULT_SCHEMA_VERSION),
-                status="succeeded",
+                status="failed" if processing_failed else "succeeded",
                 started_at=processing_started,
                 finished_at=datetime.now(timezone.utc),
                 input_count=len(image_tasks),
@@ -8723,6 +8800,16 @@ def _run_single_model_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 },
             )
         )
+        if processing_failed:
+            logger.error(
+                "Run has %d failed image/pole operation(s); final SHP publication "
+                "was withheld.",
+                summary["failures"],
+            )
+            raise RuntimeError(
+                f"Pipeline completed with {summary['failures']} failed image/pole "
+                "operation(s); see worker logs."
+            )
 
     with _tracked_stage_for_args(args, "write_outputs") as output_stage:
         run_result = finalize_prepared_model_run(prepared_run, summary)
@@ -8794,9 +8881,7 @@ def run_parallel_multi_model_pipeline(
         ),
     }
     manifest["scheduler"] = {
-        "inference_workers_requested": int(
-            first_args.multi_model_inference_workers
-        ),
+        "inference_workers_requested": int(first_args.multi_model_inference_workers),
         "pole_workers": int(first_args.multi_model_pole_workers),
         "per_model_queue_depth": int(first_args.multi_model_queue_depth),
         "cuda_oom_policy": "retry_serialized_then_circuit_break_model",
@@ -8822,9 +8907,7 @@ def run_parallel_multi_model_pipeline(
         for entry in manifest["models"]:
             entry["status"] = "interrupted" if interrupted else "failed"
             entry["error"] = error_text
-            entry["failure_log"] = str(
-                (logs_dir / "orchestrator.log").resolve()
-            )
+            entry["failure_log"] = str((logs_dir / "orchestrator.log").resolve())
         atomic_write_text(
             manifest_path,
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -8832,9 +8915,7 @@ def run_parallel_multi_model_pipeline(
         raise
 
     states: list[dict[str, Any]] = []
-    entry_by_key = {
-        str(entry["model_key"]): entry for entry in manifest["models"]
-    }
+    entry_by_key = {str(entry["model_key"]): entry for entry in manifest["models"]}
     preparation_failures: list[tuple[str, str]] = []
     for _model_path, effective, model_key, _profile_name, _object_type in prepared:
         entry = entry_by_key[model_key]
@@ -8902,12 +8983,11 @@ def run_parallel_multi_model_pipeline(
             manifest_path,
             json.dumps(manifest, ensure_ascii=False, indent=2),
         )
-        raise ValueError(
-            error_text
-        )
+        raise ValueError(error_text)
     reference_tasks = states[0]["image_tasks"]
     reference_task_keys = [
-        (str(item["image_path"]), str(item["timestamp_iso"])) for item in reference_tasks
+        (str(item["image_path"]), str(item["timestamp_iso"]))
+        for item in reference_tasks
     ]
     for state in states[1:]:
         task_keys = [
@@ -9204,9 +9284,7 @@ def run_parallel_multi_model_pipeline(
                             hfov_deg=float(mapping["hfov_deg"]),
                             vfov_deg=float(mapping["vfov_deg"]),
                             max_center_ray_angle_deg=float(
-                                needed_states[0]["runtime"][
-                                    "max_center_ray_angle_deg"
-                                ]
+                                needed_states[0]["runtime"]["max_center_ray_angle_deg"]
                             ),
                         )
                 except MemoryError:
@@ -9389,9 +9467,7 @@ def run_parallel_multi_model_pipeline(
             if entry["status"] == "running":
                 entry["status"] = "interrupted" if interrupted else "failed"
                 entry["error"] = error_text
-                entry["failure_log"] = str(
-                    (logs_dir / "orchestrator.log").resolve()
-                )
+                entry["failure_log"] = str((logs_dir / "orchestrator.log").resolve())
         atomic_write_text(
             manifest_path,
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -9405,11 +9481,14 @@ def run_parallel_multi_model_pipeline(
     if progress_reporter is not None:
         progress_reporter.update(aggregate_summary, force=True)
     if run_manifest is not None and processing_started is not None:
+        processing_status = (
+            "failed" if int(aggregate_summary["failures"]) > 0 else "succeeded"
+        )
         run_manifest.record_stage(
             StageResult(
                 stage_name="detect_project_and_estimate",
                 stage_version=str(RESULT_SCHEMA_VERSION),
-                status="succeeded",
+                status=processing_status,
                 started_at=processing_started,
                 finished_at=datetime.now(timezone.utc),
                 input_count=len(reference_tasks) * len(active_states),
@@ -9471,8 +9550,7 @@ def run_parallel_multi_model_pipeline(
 
     if model_failures:
         summary = "; ".join(
-            f"{model_key}: {error_text}"
-            for model_key, error_text in model_failures
+            f"{model_key}: {error_text}" for model_key, error_text in model_failures
         )
         raise RuntimeError(
             f"{len(model_failures)} model run(s) failed after all models were attempted: "
@@ -9505,7 +9583,32 @@ def run_parallel_multi_model_pipeline(
         )
 
 
-def _run_pipeline_impl(args: argparse.Namespace) -> None:
+def _model_manifest_execution_outputs(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+) -> dict[str, Any]:
+    """Collect only outputs explicitly published by the current model run."""
+
+    shapefiles: list[str] = []
+    for entry in manifest.get("models", []):
+        if (
+            not isinstance(entry, dict)
+            or entry.get("status") != "completed"
+            or not entry.get("published_current_run")
+        ):
+            continue
+        declared = entry.get("final_shapefiles")
+        if isinstance(declared, dict):
+            shapefiles.extend(
+                str(value) for value in declared.values() if value is not None
+            )
+    return {
+        "published_shapefiles": shapefiles,
+        "models_manifest": str(manifest_path.resolve()),
+    }
+
+
+def _run_pipeline_impl(args: argparse.Namespace) -> dict[str, Any]:
     """Run one checkpoint or every configured checkpoint in isolated outputs."""
 
     configured_model_dir = getattr(args, "model_dir", None)
@@ -9534,13 +9637,19 @@ def _run_pipeline_impl(args: argparse.Namespace) -> None:
         effective.output_dir = (
             base_output_dir / model_key if multi_model else base_output_dir
         )
-        prepared.append(
-            (model_path, effective, model_key, profile_name, object_type)
-        )
+        prepared.append((model_path, effective, model_key, profile_name, object_type))
 
     if not multi_model:
-        _run_single_model_pipeline(prepared[0][1])
-        return
+        run_result = _run_single_model_pipeline(prepared[0][1])
+        declared = run_result.get("final_shapefiles", {})
+        return {
+            "published_shapefiles": (
+                [str(value) for value in declared.values() if value is not None]
+                if isinstance(declared, dict)
+                else []
+            ),
+            "models_manifest": None,
+        }
 
     base_output_dir.mkdir(parents=True, exist_ok=True)
     (base_output_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -9609,7 +9718,13 @@ def _run_pipeline_impl(args: argparse.Namespace) -> None:
                 json.dumps(manifest, ensure_ascii=False, indent=2),
             )
             raise
-        return
+        # Persist the in-memory terminal view once more at the orchestration
+        # boundary so output validation never observes an older partial file.
+        atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        return _model_manifest_execution_outputs(manifest, manifest_path)
 
     failures: list[tuple[str, str]] = []
     for index, (_, effective, model_key, _, _) in enumerate(prepared):
@@ -9667,12 +9782,12 @@ def _run_pipeline_impl(args: argparse.Namespace) -> None:
 
     if failures:
         summary = "; ".join(
-            f"{model_key}: {error_text}"
-            for model_key, error_text in failures
+            f"{model_key}: {error_text}" for model_key, error_text in failures
         )
         raise RuntimeError(
             f"{len(failures)} model run(s) failed after all models were attempted: {summary}"
         )
+    return _model_manifest_execution_outputs(manifest, manifest_path)
 
 
 def _archive_previous_run_manifest(
@@ -9680,49 +9795,63 @@ def _archive_previous_run_manifest(
     *,
     next_job_id: str,
 ) -> None:
-    if not store.exists():
-        return
-    document = store.read()
-    if document["job_id"] == next_job_id:
-        return
-    if document["status"] not in {
-        JobStatus.SUCCEEDED.value,
-        JobStatus.FAILED.value,
-        JobStatus.CANCELLED.value,
-    }:
-        raise RuntimeError(
-            "Output directory already contains a non-terminal run manifest for "
-            f"job {document['job_id']!r}."
-        )
-    history_dir = store.path.parent / "run_history"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    safe_job_id = sanitize_name(str(document["job_id"]))
-    destination = history_dir / f"{safe_job_id}.manifest.json"
-    if destination.exists():
-        destination = history_dir / f"{safe_job_id}.{uuid.uuid4().hex[:8]}.manifest.json"
-    os.replace(store.path, destination)
+    store.archive_terminal(next_job_id=next_job_id)
 
 
-def _published_output_summary(output_dir: Path) -> dict[str, Any]:
+def _published_output_summary(
+    output_dir: Path,
+    execution_outputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize and validate only outputs declared by the current attempt."""
+
+    root = output_dir.resolve(strict=False)
     shapefiles: list[str] = []
-    try:
-        for path in sorted(output_dir.glob("shp/*.shp")):
-            if path.is_file() and ".in_progress" not in path.name:
-                shapefiles.append(path.relative_to(output_dir).as_posix())
-        for path in sorted(output_dir.glob("*/shp/*.shp")):
-            if path.is_file() and ".in_progress" not in path.name:
-                shapefiles.append(path.relative_to(output_dir).as_posix())
-    except OSError:
-        shapefiles = []
-    return {
+    seen: set[str] = set()
+    declared = execution_outputs.get("published_shapefiles", [])
+    if not isinstance(declared, list):
+        raise RuntimeError("Pipeline output contract did not return a Shapefile list.")
+    for value in declared:
+        path = Path(str(value))
+        resolved = (
+            path.resolve(strict=False)
+            if path.is_absolute()
+            else (root / path).resolve(strict=False)
+        )
+        try:
+            relative = resolved.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Pipeline declared an output outside its run root: {value!r}"
+            ) from exc
+        if relative not in seen:
+            seen.add(relative)
+            shapefiles.append(relative)
+
+    models_manifest: str | None = None
+    raw_models_manifest = execution_outputs.get("models_manifest")
+    if raw_models_manifest is not None:
+        path = Path(str(raw_models_manifest))
+        resolved = (
+            path.resolve(strict=False)
+            if path.is_absolute()
+            else (root / path).resolve(strict=False)
+        )
+        try:
+            models_manifest = resolved.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                "Pipeline declared a models manifest outside its run root."
+            ) from exc
+
+    outputs = {
         "root": ".",
-        "shapefiles": shapefiles,
-        "models_manifest": (
-            "models_manifest.json"
-            if (output_dir / "models_manifest.json").is_file()
-            else None
-        ),
+        "shapefiles": sorted(shapefiles),
+        "models_manifest": models_manifest,
     }
+    errors = validate_published_outputs(root, outputs)
+    if errors:
+        raise RuntimeError("Published output validation failed: " + "; ".join(errors))
+    return outputs
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -9735,13 +9864,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = RunManifestStore(output_dir / "run_manifest.json")
     _archive_previous_run_manifest(manifest, next_job_id=job_id)
-    manifest.create(
+    initial_manifest = manifest.create(
         job_id=job_id,
         config=pipeline_config,
         input_root=Path(args.data_root),
         dataset_job=dataset_job,
         track=track,
+        request_file_hash=getattr(args, "_config_file_hash", None),
     )
+    if initial_manifest["status"] != JobStatus.PENDING.value:
+        raise RuntimeError(
+            f"Pipeline job {job_id!r} is already initialized with status "
+            f"{initial_manifest['status']!r}; use a new job_id for a new attempt."
+        )
+    if not manifest.claim_pending_for_validation():
+        claimed_status = manifest.read()["status"]
+        raise RuntimeError(
+            f"Pipeline job {job_id!r} was already claimed with status "
+            f"{claimed_status!r}."
+        )
     manifest.set_config_provenance(pipeline_config)
     manifest.set_versions(
         git_commit=resolve_git_commit(Path(__file__).resolve().parents[1]),
@@ -9749,10 +9890,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     args._run_manifest_path = str(manifest.path)
     args._pipeline_job_id = job_id
     args._pipeline_config_hash = pipeline_config.config_hash
-
-    current = JobStatus(manifest.read()["status"])
-    if current == JobStatus.PENDING:
-        manifest.transition(JobStatus.VALIDATING)
+    args._pipeline_config_values = pipeline_config.to_dict()
 
     active_stage = "validate_config"
     try:
@@ -9768,34 +9906,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
             manifest.set_versions(model=[path.name for path in model_paths])
 
         active_stage = "pipeline"
-        _run_pipeline_impl(args)
+        execution_outputs = _run_pipeline_impl(args)
         current = JobStatus(manifest.read()["status"])
         if current == JobStatus.VALIDATING:
             manifest.transition(JobStatus.RUNNING)
         active_stage = "finalize_manifest"
         with tracked_stage(manifest, active_stage) as stage:
-            outputs = _published_output_summary(output_dir)
+            outputs = _published_output_summary(output_dir, execution_outputs)
             manifest.set_outputs(outputs)
             stage.output_count = len(outputs["shapefiles"])
             stage.metrics["published_shapefiles"] = len(outputs["shapefiles"])
         manifest.transition(JobStatus.SUCCEEDED)
     except KeyboardInterrupt as exc:
-        manifest.fail_active_stage()
-        document = manifest.read()
-        stage_name = (
-            document["progress"].get("failed_stage")
-            or document["progress"].get("current_stage")
-            or active_stage
-        )
-        manifest.record_error(
-            pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
-        )
-        current = JobStatus(manifest.read()["status"])
-        if current in {JobStatus.PENDING, JobStatus.VALIDATING, JobStatus.RUNNING}:
-            manifest.transition(JobStatus.CANCELLED)
-        raise
-    except BaseException as exc:
-        manifest.fail_active_stage()
         document = manifest.read()
         stage_name = (
             document["progress"].get("failed_stage")
@@ -9803,15 +9925,32 @@ def run_pipeline(args: argparse.Namespace) -> None:
             or active_stage
         )
         error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
-        manifest.record_error(error_info)
-        current = JobStatus(manifest.read()["status"])
+        current = JobStatus(document["status"])
+        if current in {JobStatus.PENDING, JobStatus.VALIDATING, JobStatus.RUNNING}:
+            try:
+                manifest.transition_terminal(JobStatus.CANCELLED, error=error_info)
+            except (OSError, ValueError) as manifest_error:
+                exc.add_note(f"Could not finalize cancelled manifest: {manifest_error}")
+        raise
+    except BaseException as exc:
+        document = manifest.read()
+        stage_name = (
+            document["progress"].get("failed_stage")
+            or document["progress"].get("current_stage")
+            or active_stage
+        )
+        error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
+        current = JobStatus(document["status"])
         if current in {
             JobStatus.PENDING,
             JobStatus.VALIDATING,
             JobStatus.RUNNING,
             JobStatus.RETRYING,
         }:
-            manifest.transition(JobStatus.FAILED)
+            try:
+                manifest.transition_terminal(JobStatus.FAILED, error=error_info)
+            except (OSError, ValueError) as manifest_error:
+                exc.add_note(f"Could not finalize failed manifest: {manifest_error}")
         raise
     finally:
         active_error = sys.exception()
@@ -9820,6 +9959,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         except (OSError, ValueError) as summary_error:
             if active_error is not None:
                 active_error.add_note(f"Could not write run summary: {summary_error}")
+            elif manifest.read()["status"] == JobStatus.SUCCEEDED.value:
+                # The manifest is the canonical commit record. A derivative
+                # human-readable summary must not turn that committed success
+                # into a contradictory non-zero process exit.
+                sys.stderr.write(
+                    f"Warning: could not write run summary: {summary_error}\n"
+                )
             else:
                 raise
 

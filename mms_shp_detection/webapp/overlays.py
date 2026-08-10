@@ -126,9 +126,7 @@ def _clean_layer_name(value: str | None, fallback: str) -> str:
 
 def _overlay_root(app: Any, dataset_id: str) -> Path:
     directory = (
-        app.state.config.state_dir
-        / "overlays"
-        / opaque_id("ds", dataset_id, length=32)
+        app.state.config.state_dir / "overlays" / opaque_id("ds", dataset_id, length=32)
     )
     directory.mkdir(parents=True, exist_ok=True)
     if directory.is_symlink():
@@ -177,7 +175,11 @@ def _read_manifest(
     include_unregistered: bool = False,
 ) -> dict[str, Any]:
     path = layer_dir / "manifest.json"
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MANIFEST_MAX_BYTES:
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_size > MANIFEST_MAX_BYTES
+    ):
         raise ValueError("Overlay manifest is missing or invalid.")
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -188,7 +190,9 @@ def _read_manifest(
 
 
 @contextmanager
-def _feature_db(layer_dir: Path, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+def _feature_db(
+    layer_dir: Path, *, write: bool = False
+) -> Iterator[sqlite3.Connection]:
     path = layer_dir / "features.sqlite3"
     if path.is_symlink() or not path.is_file():
         raise ValueError("Overlay feature store is missing.")
@@ -210,16 +214,16 @@ def _feature_db(layer_dir: Path, *, write: bool = False) -> Iterator[sqlite3.Con
 
 
 def _db_revision(connection: sqlite3.Connection) -> int:
-    row = connection.execute("SELECT value FROM metadata WHERE key='revision'").fetchone()
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key='revision'"
+    ).fetchone()
     if row is None:
         raise ValueError("Overlay revision is missing.")
     return int(row[0])
 
 
 def _active_count(connection: sqlite3.Connection) -> int:
-    row = connection.execute(
-        "SELECT COUNT(*) FROM features WHERE deleted=0"
-    ).fetchone()
+    row = connection.execute("SELECT COUNT(*) FROM features WHERE deleted=0").fetchone()
     return int(row[0]) if row is not None else 0
 
 
@@ -306,7 +310,9 @@ def _map_coordinates(value: Any, transform: Any) -> Any:
     return [_map_coordinates(item, transform) for item in value]
 
 
-def _transform_geometry(geometry: dict[str, Any] | None, transformer: Any) -> dict[str, Any] | None:
+def _transform_geometry(
+    geometry: dict[str, Any] | None, transformer: Any
+) -> dict[str, Any] | None:
     if geometry is None:
         return None
     geometry_type = str(geometry.get("type") or "")
@@ -341,7 +347,9 @@ def _shape_geometry_type(shape_type: int) -> str:
     }.get(normalized, name)
 
 
-def _point_columns(geometry: dict[str, Any] | None) -> tuple[float | None, float | None, float | None]:
+def _point_columns(
+    geometry: dict[str, Any] | None,
+) -> tuple[float | None, float | None, float | None]:
     if geometry is None or geometry.get("type") != "Point":
         return None, None, None
     coordinates = geometry.get("coordinates")
@@ -368,9 +376,7 @@ def _bundle_member(bundle_dir: Path, stem: str, suffix: str) -> Path | None:
 def _normalize_dbf_encoding(value: str) -> str:
     normalized = ENCODING_ALIASES.get(value.strip().strip("\"'").upper())
     if normalized is None:
-        raise ValueError(
-            "Unsupported DBF encoding. Use auto, UTF-8, CP949, or EUC-KR."
-        )
+        raise ValueError("Unsupported DBF encoding. Use auto, UTF-8, CP949, or EUC-KR.")
     try:
         codecs.lookup(normalized)
     except LookupError as exc:
@@ -451,7 +457,9 @@ def _resolve_crs(
         for suffix in (".prj", ".qpj", ".wkt2"):
             path = _bundle_member(bundle_dir, stem, suffix)
             if path is not None and path.stat().st_size <= 2 * 1024**2:
-                candidate = path.read_text(encoding="utf-8-sig", errors="replace").strip()
+                candidate = path.read_text(
+                    encoding="utf-8-sig", errors="replace"
+                ).strip()
                 if candidate:
                     break
     if not candidate:
@@ -650,7 +658,9 @@ def _import_bundle(
         "name": _clean_layer_name(name, stem),
         "source_kind": source_kind,
         "source_reference": source_reference,
-        "source_files": sorted(path.name for path in bundle_dir.iterdir() if path.is_file()),
+        "source_files": sorted(
+            path.name for path in bundle_dir.iterdir() if path.is_file()
+        ),
         "source_crs": source_crs.to_string(),
         "source_encoding": encoding,
         "dataset_crs": dataset_crs.to_string(),
@@ -671,13 +681,17 @@ def _safe_upload_filename(value: str | None) -> str:
     if not text or text in {".", ".."} or "/" in text or "\\" in text or "\x00" in text:
         raise ValueError("Every upload must have a plain file name.")
     if Path(text).suffix.casefold() not in SUPPORTED_SIDECARS | {".zip"}:
-        raise ValueError(f"Unsupported overlay file type: {Path(text).suffix or '(none)'}")
+        raise ValueError(
+            f"Unsupported overlay file type: {Path(text).suffix or '(none)'}"
+        )
     return text[:200]
 
 
 async def _save_uploads(app: Any, uploads: list[UploadFile], staging: Path) -> None:
     if not uploads or len(uploads) > app.state.config.max_overlay_upload_files:
-        raise OverlayTooLarge("Overlay upload file count is outside the configured limit.")
+        raise OverlayTooLarge(
+            "Overlay upload file count is outside the configured limit."
+        )
     names = [_safe_upload_filename(upload.filename) for upload in uploads]
     if len({name.casefold() for name in names}) != len(names):
         raise ValueError("Overlay upload contains duplicate file names.")
@@ -700,9 +714,13 @@ async def _save_uploads(app: Any, uploads: list[UploadFile], staging: Path) -> N
                     written += len(chunk)
                     total += len(chunk)
                     if written > app.state.config.max_overlay_file_bytes:
-                        raise OverlayTooLarge("An overlay upload file exceeds the size limit.")
+                        raise OverlayTooLarge(
+                            "An overlay upload file exceeds the size limit."
+                        )
                     if total > app.state.config.max_overlay_total_bytes:
-                        raise OverlayTooLarge("Overlay upload exceeds the total size limit.")
+                        raise OverlayTooLarge(
+                            "Overlay upload exceeds the total size limit."
+                        )
                     handle.write(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -759,13 +777,20 @@ def _extract_zip(
             if info.flag_bits & 0x1:
                 raise ValueError("Encrypted ZIP entries are not supported.")
             if info.file_size > max_file_bytes:
-                raise OverlayTooLarge("A decompressed SHP sidecar exceeds the size limit.")
+                raise OverlayTooLarge(
+                    "A decompressed SHP sidecar exceeds the size limit."
+                )
             total += int(info.file_size)
             if total > max_total_bytes:
-                raise OverlayTooLarge("Decompressed SHP bundle exceeds the total size limit.")
+                raise OverlayTooLarge(
+                    "Decompressed SHP bundle exceeds the total size limit."
+                )
             if info.file_size and info.compress_size == 0:
                 raise OverlayTooLarge("ZIP entry has an invalid compression ratio.")
-            if info.compress_size and info.file_size / info.compress_size > ZIP_RATIO_LIMIT:
+            if (
+                info.compress_size
+                and info.file_size / info.compress_size > ZIP_RATIO_LIMIT
+            ):
                 raise OverlayTooLarge("ZIP entry exceeds the safe compression ratio.")
             accepted.append((info, name))
             if len(accepted) > max_files:
@@ -784,7 +809,9 @@ def _extract_zip(
                         break
                     copied += len(chunk)
                     if copied > info.file_size or copied > max_file_bytes:
-                        raise OverlayTooLarge("ZIP entry expanded beyond its declared size.")
+                        raise OverlayTooLarge(
+                            "ZIP entry expanded beyond its declared size."
+                        )
                     destination.write(chunk)
             if copied != info.file_size:
                 raise ValueError("ZIP entry size did not match its declaration.")
@@ -804,7 +831,9 @@ def _decode_feature(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _transform_feature(feature: dict[str, Any], transformer: Any | None) -> dict[str, Any]:
+def _transform_feature(
+    feature: dict[str, Any], transformer: Any | None
+) -> dict[str, Any]:
     if transformer is None:
         return feature
     return {
@@ -899,7 +928,9 @@ def _updated_revision(
     return revision + 1
 
 
-def _write_edited_bundle(layer_dir: Path, manifest: dict[str, Any], output_dir: Path) -> Path:
+def _write_edited_bundle(
+    layer_dir: Path, manifest: dict[str, Any], output_dir: Path
+) -> Path:
     from mms_shp_detection.shp_writer import write_crs_sidecars
 
     safe_stem = re.sub(r"[^0-9A-Za-z_-]+", "_", str(manifest["name"])).strip("_")
@@ -940,7 +971,9 @@ def _write_edited_bundle(layer_dir: Path, manifest: dict[str, Any], output_dir: 
                 "SELECT * FROM features WHERE deleted=0 ORDER BY ordinal"
             )
             for row in rows:
-                geometry = json.loads(row["geometry_json"]) if row["geometry_json"] else None
+                geometry = (
+                    json.loads(row["geometry_json"]) if row["geometry_json"] else None
+                )
                 properties = json.loads(row["properties_json"])
                 if geometry is None:
                     writer.null()
@@ -953,7 +986,9 @@ def _write_edited_bundle(layer_dir: Path, manifest: dict[str, Any], output_dir: 
                     )
                 else:
                     writer.shape(geometry)
-                writer.record(*(properties.get(field["name"]) for field in manifest["fields"]))
+                writer.record(
+                    *(properties.get(field["name"]) for field in manifest["fields"])
+                )
     finally:
         writer.close()
     write_crs_sidecars(shp_path, str(manifest["dataset_crs"]))
@@ -986,7 +1021,11 @@ def _copy_bundle(members: list[Path], target_dir: Path) -> None:
 
 
 def _bundle_files(primary: Path) -> list[Path]:
-    if primary.suffix.casefold() != ".shp" or not primary.is_file() or primary.is_symlink():
+    if (
+        primary.suffix.casefold() != ".shp"
+        or not primary.is_file()
+        or primary.is_symlink()
+    ):
         raise FileNotFoundError("Shapefile result not found.")
     return [
         candidate
@@ -999,11 +1038,21 @@ def _bundle_files(primary: Path) -> list[Path]:
 
 
 def _result_shapefile(app: Any, run: dict[str, Any], raw_path: str) -> Path:
-    from .runs import _run_work_dir
+    from .runs import (
+        _output_path_identity,
+        _published_shapefile_paths,
+        _run_work_dir,
+    )
 
     relative = normalize_relative_path(raw_path, allow_empty=False)
     if Path(relative).suffix.casefold() != ".shp":
         raise UnsafePath("Result path must identify a .shp file.")
+    published_paths = _published_shapefile_paths(app, run)
+    if (
+        published_paths is not None
+        and _output_path_identity(relative) not in published_paths
+    ):
+        raise UnsafePath("Result path is not a published Shapefile output.")
     output = _run_work_dir(app, run) / "output"
     candidate = resolve_under_root(
         output,
@@ -1090,7 +1139,14 @@ def get_overlay(dataset_id: str, layer_id: str, request: Request) -> dict[str, A
     try:
         layer_dir = _layer_directory(request.app, dataset_id, layer_id)
         return _public_layer(layer_dir, _read_manifest(layer_dir))
-    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
         raise HTTPException(status_code=404, detail="Overlay layer not found.") from exc
 
 
@@ -1108,7 +1164,10 @@ async def unregister_overlay(
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
             manifest = _read_manifest(layer_dir, include_unregistered=True)
-            if manifest.get("dataset_id") != dataset_id or manifest.get("registered", True) is False:
+            if (
+                manifest.get("dataset_id") != dataset_id
+                or manifest.get("registered", True) is False
+            ):
                 raise FileNotFoundError("Overlay layer not found.")
             manifest["registered"] = False
             manifest["removed_at"] = utc_now()
@@ -1125,7 +1184,9 @@ async def unregister_overlay(
             ValueError,
             json.JSONDecodeError,
         ) as exc:
-            raise HTTPException(status_code=404, detail="Overlay layer not found.") from exc
+            raise HTTPException(
+                status_code=404, detail="Overlay layer not found."
+            ) from exc
     return {
         "id": layer_id,
         "deleted": True,
@@ -1149,7 +1210,9 @@ def get_overlay_features(
 ) -> dict[str, Any]:
     require_ready_dataset(request, dataset_id)
     if limit > request.app.state.config.max_overlay_response_features:
-        raise HTTPException(status_code=422, detail="Overlay response limit is too large.")
+        raise HTTPException(
+            status_code=422, detail="Overlay response limit is too large."
+        )
     spatial_values = (center_x, center_y, radius)
     if any(value is not None for value in spatial_values) and not all(
         value is not None for value in spatial_values
@@ -1158,10 +1221,14 @@ def get_overlay_features(
             status_code=422,
             detail="center_x, center_y, and radius must be supplied together.",
         )
-    if center_x is not None and center_y is not None and not (
-        math.isfinite(center_x) and math.isfinite(center_y)
+    if (
+        center_x is not None
+        and center_y is not None
+        and not (math.isfinite(center_x) and math.isfinite(center_y))
     ):
-        raise HTTPException(status_code=422, detail="Spatial filter center must be finite.")
+        raise HTTPException(
+            status_code=422, detail="Spatial filter center must be finite."
+        )
     spatial_filter = None
     try:
         layer_dir = _layer_directory(request.app, dataset_id, layer_id)
@@ -1232,8 +1299,17 @@ def get_overlay_features(
             if coordinate_space == "wgs84"
             else None
         )
-        features = [_transform_feature(_decode_feature(row), transformer) for row in rows]
-    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+        features = [
+            _transform_feature(_decode_feature(row), transformer) for row in rows
+        ]
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
         raise HTTPException(status_code=404, detail="Overlay layer not found.") from exc
     next_offset = offset + len(features) if offset + len(features) < total else None
     return {
@@ -1285,7 +1361,9 @@ def get_overlay_feature(
         json.JSONDecodeError,
         sqlite3.Error,
     ) as exc:
-        raise HTTPException(status_code=404, detail="Overlay feature not found.") from exc
+        raise HTTPException(
+            status_code=404, detail="Overlay feature not found."
+        ) from exc
     return {
         "feature": feature,
         "revision": revision,
@@ -1305,7 +1383,9 @@ async def update_overlay_feature(
 ) -> dict[str, Any]:
     require_ready_dataset(request, dataset_id)
     if payload.geometry is None and payload.properties is None:
-        raise HTTPException(status_code=422, detail="Geometry or properties must be supplied.")
+        raise HTTPException(
+            status_code=422, detail="Geometry or properties must be supplied."
+        )
     lock = _layer_lock(request.app, dataset_id, layer_id)
     async with lock:
         try:
@@ -1359,7 +1439,9 @@ async def update_overlay_feature(
                         point_x=?,point_y=?,point_z=?,updated_at=? WHERE id=?
                     """,
                     (
-                        None if geometry is None else _json_bytes(geometry).decode("utf-8"),
+                        None
+                        if geometry is None
+                        else _json_bytes(geometry).decode("utf-8"),
                         _json_bytes(properties).decode("utf-8"),
                         x,
                         y,
@@ -1397,7 +1479,13 @@ async def update_overlay_feature(
             raise
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (OSError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            sqlite3.Error,
+        ) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
     public_feature = _transform_feature(
         after,
@@ -1405,7 +1493,11 @@ async def update_overlay_feature(
         if payload.coordinate_space == "wgs84"
         else None,
     )
-    return {"feature": public_feature, "revision": revision, "coordinate_space": payload.coordinate_space}
+    return {
+        "feature": public_feature,
+        "revision": revision,
+        "coordinate_space": payload.coordinate_space,
+    }
 
 
 @router.delete("/datasets/{dataset_id}/overlays/{layer_id}/features/{feature_id}")
@@ -1491,7 +1583,9 @@ def project_overlay_on_panorama(
 
     require_ready_dataset(request, dataset_id)
     if limit > request.app.state.config.max_overlay_response_features:
-        raise HTTPException(status_code=422, detail="Overlay projection limit is too large.")
+        raise HTTPException(
+            status_code=422, detail="Overlay projection limit is too large."
+        )
     frame = request.app.state.store.get_frame(dataset_id, frame_id)
     if frame is None:
         raise HTTPException(status_code=404, detail="Frame not found.")
@@ -1558,7 +1652,10 @@ def project_overlay_on_panorama(
             u = v = depth = np.empty(0, dtype=np.float64)
         projected: list[dict[str, Any]] = []
         for index, row in enumerate(rows):
-            if not math.isfinite(float(depth[index])) or not 0.05 < depth[index] <= max_distance:
+            if (
+                not math.isfinite(float(depth[index]))
+                or not 0.05 < depth[index] <= max_distance
+            ):
                 continue
             projected.append(
                 {
@@ -1573,7 +1670,14 @@ def project_overlay_on_panorama(
             )
             if len(projected) >= limit:
                 break
-    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
         "layer_id": layer_id,
@@ -1669,7 +1773,10 @@ async def download_edited_overlay(
         zip_path,
         media_type="application/zip",
         filename=zip_path.name,
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
         background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
     )
 
@@ -1684,7 +1791,9 @@ async def download_result_shapefile(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     if run["status"] != "completed":
-        raise HTTPException(status_code=409, detail="Run results are not ready for download.")
+        raise HTTPException(
+            status_code=409, detail="Run results are not ready for download."
+        )
     temp_dir: Path | None = None
     try:
         primary = _result_shapefile(request.app, run, path)
@@ -1695,12 +1804,17 @@ async def download_result_shapefile(
     except (FileNotFoundError, OSError, TypeError, UnsafePath, ValueError) as exc:
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        raise HTTPException(status_code=404, detail="Shapefile result not found.") from exc
+        raise HTTPException(
+            status_code=404, detail="Shapefile result not found."
+        ) from exc
     return FileResponse(
         zip_path,
         media_type="application/zip",
         filename=zip_path.name,
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
         background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
     )
 
@@ -1715,7 +1829,9 @@ async def import_result_shapefile(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     if run["status"] != "completed":
-        raise HTTPException(status_code=409, detail="Run results are not ready to import.")
+        raise HTTPException(
+            status_code=409, detail="Run results are not ready to import."
+        )
     dataset = require_ready_dataset(request, run["dataset_id"])
     try:
         primary = _result_shapefile(request.app, run, payload.path)

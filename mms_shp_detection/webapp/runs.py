@@ -19,11 +19,16 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from mms_shp_detection.config import PipelineConfig, config_sha256
+from mms_shp_detection.config import (
+    PipelineConfig,
+    config_file_sha256,
+    config_sha256,
+)
 from mms_shp_detection.domain.models import JobStatus, PipelineErrorInfo
 from mms_shp_detection.infrastructure.manifest_writer import (
     RunManifestStore,
     validate_manifest_document,
+    validate_published_outputs,
 )
 
 from .datasets import catalog_path as dataset_catalog_path
@@ -40,6 +45,20 @@ PUBLIC_STATUS = {
     "error": "failed",
 }
 MAX_RUN_MANIFEST_BYTES = 5_000_000
+MAX_PUBLIC_STRUCTURED_ARTIFACT_BYTES = 25_000_000
+RUN_EXECUTION_CONTRACT_VERSION = 1
+_INLINE_WINDOWS_PATH = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]|\\\\)[^\s\"'<>]+"
+)
+_INLINE_FILE_URI = re.compile(
+    r"(?i)\bfile:(?:(?:/{1,3}|\\\\{1,2})[^\s\"'<>]+|[A-Z]:[\\/][^\s\"'<>]+)"
+)
+_INLINE_FORWARD_UNC_PATH = re.compile(
+    r"(?<![A-Za-z0-9:/])//[^/\s\"'<>]+(?:/[^/\s\"'<>]+)+"
+)
+_INLINE_POSIX_PATH = re.compile(
+    r"(?<![A-Za-z0-9:/>])/(?:[^/\s\"'<>]+(?:/[^/\s\"'<>]+)*)"
+)
 PATH_OPTION_NAMES = {
     "data_root",
     "calibration_path",
@@ -108,9 +127,13 @@ def _set_config_value(
         for child_key, child in node.items():
             normalized = child_key.replace("-", "_")
             child_inside_filters = inside_model_filters or normalized == "model_filters"
-            if normalized == key and (include_model_filters or not inside_model_filters):
+            if normalized == key and (
+                include_model_filters or not inside_model_filters
+            ):
                 matches.append(node)
-            if isinstance(child, dict) and (include_model_filters or not child_inside_filters):
+            if isinstance(child, dict) and (
+                include_model_filters or not child_inside_filters
+            ):
                 visit(child, inside_model_filters=child_inside_filters)
 
     visit(document)
@@ -184,9 +207,7 @@ def _frame_selection(
         else frames
     )
     selected = [
-        frame
-        for frame in selected_by_track
-        if first <= int(frame["ordinal"]) <= last
+        frame for frame in selected_by_track if first <= int(frame["ordinal"]) <= last
     ]
     if not selected:
         raise ValueError("Track and frame selections contain no frames.")
@@ -198,7 +219,9 @@ def _frame_selection(
     start_index = selected_positions[0]
     limit_images = selected_positions[-1] - selected_positions[0] + 1
     if limit_images != len(selected):
-        raise ValueError("Frame selection is not contiguous after applying track filters.")
+        raise ValueError(
+            "Frame selection is not contiguous after applying track filters."
+        )
     return track_ids, (first, last), start_index, limit_images
 
 
@@ -215,10 +238,13 @@ def _build_job_config(
     if base_path.is_file():
         from mms_shp_detection.config import _Yaml12SafeLoader
 
-        document = yaml.load(
-            base_path.read_text(encoding="utf-8-sig"),
-            Loader=_Yaml12SafeLoader,
-        ) or {}
+        document = (
+            yaml.load(
+                base_path.read_text(encoding="utf-8-sig"),
+                Loader=_Yaml12SafeLoader,
+            )
+            or {}
+        )
         if not isinstance(document, dict):
             raise ValueError("Pipeline configuration root must be an object.")
         _absolutize_config_paths(document, base_path.parent)
@@ -250,9 +276,7 @@ def _build_job_config(
             if track.get("record_name")
         ]
         job_names = [
-            str(track["job_name"])
-            for track in selected_tracks
-            if track.get("job_name")
+            str(track["job_name"]) for track in selected_tracks if track.get("job_name")
         ]
         cache_seed = seed_catalog_cache(
             app,
@@ -325,8 +349,11 @@ def _build_job_config(
             input_root=dataset_root,
             dataset_job=(job_names[0] if len(set(job_names)) == 1 else "multiple"),
             track=(track_names[0] if len(set(track_names)) == 1 else "multiple"),
+            request_file_hash=config_file_sha256(config_path),
+            config_is_effective=False,
         )
         resolved = {
+            "run_execution_contract_version": RUN_EXECUTION_CONTRACT_VERSION,
             "track_ids": track_ids,
             "track_names": track_names,
             "record_names": record_names,
@@ -406,6 +433,132 @@ def _read_run_manifest(
     return document, None
 
 
+def _run_output_validation_problem(
+    app: Any,
+    run: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str | None:
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, dict):
+        return "manifest outputs is not an object"
+    try:
+        output_root = resolve_under_root(
+            _run_work_dir(app, run),
+            "output",
+            must_exist=True,
+            expect_directory=True,
+            reject_symlinks=True,
+        )
+    except (OSError, UnsafePath, ValueError):
+        return "run output directory is missing or unsafe"
+    errors = validate_published_outputs(output_root, outputs)
+    return "; ".join(errors[:8]) if errors else None
+
+
+def _succeeded_manifest_contract_problem(
+    app: Any,
+    run: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    manifest_problem: str | None,
+) -> tuple[str, str] | None:
+    """Return the public error code and reason when success is not trustworthy."""
+
+    if manifest is None:
+        return "RUN_MANIFEST_INVALID", manifest_problem or "manifest is unavailable"
+    if manifest.get("status") != JobStatus.SUCCEEDED.value:
+        return (
+            "RUN_MANIFEST_NOT_SUCCEEDED",
+            f"manifest status is {manifest.get('status')!r}",
+        )
+    output_problem = _run_output_validation_problem(app, run, manifest)
+    if output_problem is not None:
+        return "RUN_OUTPUT_INVALID", output_problem
+    return None
+
+
+def _requires_run_execution_contract(run: dict[str, Any]) -> bool:
+    resolved = run.get("resolved")
+    return (
+        isinstance(resolved, dict)
+        and resolved.get("run_execution_contract_version")
+        == RUN_EXECUTION_CONTRACT_VERSION
+    )
+
+
+def _output_path_identity(value: str) -> str:
+    """Match filesystem case semantics while keeping manifest paths portable."""
+
+    return os.path.normcase(Path(value).as_posix())
+
+
+def _published_shapefile_paths(
+    app: Any,
+    run: dict[str, Any],
+) -> frozenset[str] | None:
+    """Return declared paths, an empty denied set, or ``None`` for legacy runs."""
+
+    manifest, manifest_problem = _read_run_manifest(app, run)
+    if manifest is None:
+        return frozenset() if _requires_run_execution_contract(run) else None
+    if (
+        _succeeded_manifest_contract_problem(app, run, manifest, manifest_problem)
+        is not None
+    ):
+        return frozenset()
+    outputs = manifest.get("outputs", {})
+    shapefiles = outputs.get("shapefiles", [])
+    return frozenset(
+        _output_path_identity(value) for value in shapefiles if isinstance(value, str)
+    )
+
+
+def _is_published_shapefile_component(
+    relative: str,
+    published_paths: frozenset[str] | None,
+) -> bool:
+    if published_paths is None:
+        return True
+    path = Path(relative)
+    if path.suffix.casefold() not in SHAPEFILE_BUNDLE_SUFFIXES:
+        return True
+    return _output_path_identity(path.with_suffix(".shp").as_posix()) in published_paths
+
+
+def _published_models_manifest_policy(
+    app: Any,
+    run: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Return whether models-manifest membership is enforced and its identity."""
+
+    manifest, manifest_problem = _read_run_manifest(app, run)
+    if manifest is None:
+        return _requires_run_execution_contract(run), None
+    if (
+        _succeeded_manifest_contract_problem(app, run, manifest, manifest_problem)
+        is not None
+    ):
+        return True, None
+    models_manifest = manifest.get("outputs", {}).get("models_manifest")
+    return (
+        True,
+        _output_path_identity(models_manifest)
+        if isinstance(models_manifest, str)
+        else None,
+    )
+
+
+def _is_published_models_manifest(
+    relative: str,
+    policy: tuple[bool, str | None],
+) -> bool:
+    if Path(relative).name.casefold() != "models_manifest.json":
+        return True
+    enforced, published_path = policy
+    return not enforced or (
+        published_path is not None and _output_path_identity(relative) == published_path
+    )
+
+
 def _redact(app: Any, value: str, run: dict[str, Any] | None = None) -> str:
     text = value
     sensitive = [
@@ -420,9 +573,12 @@ def _redact(app: Any, value: str, run: dict[str, Any] | None = None) -> str:
             pass
     for path in sensitive:
         raw = str(path.resolve(strict=False))
-        text = text.replace(raw, "<server>")
-        text = text.replace(raw.replace("\\", "/"), "<server>")
-    return text
+        for variant in {raw, raw.replace("\\", "/")}:
+            text = re.sub(re.escape(variant), "<server>", text, flags=re.IGNORECASE)
+    text = _INLINE_FILE_URI.sub("file:<server-path>", text)
+    text = _INLINE_FORWARD_UNC_PATH.sub("<server-path>", text)
+    text = _INLINE_WINDOWS_PATH.sub("<server-path>", text)
+    return _INLINE_POSIX_PATH.sub("<server-path>", text)
 
 
 def _redact_manifest_value(
@@ -446,8 +602,7 @@ def _redact_manifest_value(
     redacted = _redact(app, value, run)
     stripped = redacted.strip()
     if redacted == value and (
-        re.match(r"^[A-Za-z]:[\\/]", stripped)
-        or stripped.startswith(("\\\\", "/"))
+        re.match(r"^[A-Za-z]:[\\/]", stripped) or stripped.startswith(("\\\\", "/"))
     ):
         basename = re.split(r"[\\/]", stripped.rstrip("\\/"))[-1]
         return f"<server>/{basename}" if basename else "<server>"
@@ -472,11 +627,7 @@ def _sync_manifest_terminal(
         return False
     store = RunManifestStore(_run_manifest_path(app, run, must_exist=True))
     try:
-        if error is not None:
-            errors = document.get("errors") or []
-            if not errors:
-                store.record_error(error)
-        store.transition(target)
+        store.transition_terminal(target, error=error)
         return True
     except (OSError, ValueError):
         app.state.logger.warning(
@@ -709,9 +860,7 @@ def _priority_result_files(
                     continue
                 child = Path(entry.path)
                 try:
-                    is_junction = bool(
-                        getattr(child, "is_junction", lambda: False)()
-                    )
+                    is_junction = bool(getattr(child, "is_junction", lambda: False)())
                 except OSError:
                     continue
                 if is_junction:
@@ -742,9 +891,8 @@ def _priority_result_files(
                         truncated = True
                         break
                     try:
-                        if (
-                            entry.is_symlink()
-                            or not entry.is_file(follow_symlinks=False)
+                        if entry.is_symlink() or not entry.is_file(
+                            follow_symlinks=False
                         ):
                             continue
                     except OSError:
@@ -756,8 +904,7 @@ def _priority_result_files(
             continue
 
         unique_candidates = {
-            (path.stem.casefold(), path.suffix.casefold()): path
-            for path in candidates
+            (path.stem.casefold(), path.suffix.casefold()): path for path in candidates
         }
         primary_stems = sorted(
             stem for stem, suffix in unique_candidates if suffix == ".shp"
@@ -784,7 +931,24 @@ def _priority_result_files(
     ), truncated
 
 
-def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
+def _result_summary(
+    app: Any,
+    run: dict[str, Any],
+    *,
+    publish_shapefiles: bool | None = None,
+) -> dict[str, Any] | None:
+    if publish_shapefiles is None:
+        manifest, manifest_problem = _read_run_manifest(app, run)
+        publish_shapefiles = run.get("status") == "completed" and (
+            (
+                _succeeded_manifest_contract_problem(
+                    app, run, manifest, manifest_problem
+                )
+                is None
+            )
+            if _requires_run_execution_contract(run) or manifest is not None
+            else True
+        )
     try:
         output = _run_work_dir(app, run) / "output"
     except Exception:
@@ -808,9 +972,19 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
         }.values()
     )
     truncated = truncated or priority_truncated
-    result_paths.sort(
-        key=lambda path: path.relative_to(output).as_posix().casefold()
-    )
+    result_paths.sort(key=lambda path: path.relative_to(output).as_posix().casefold())
+    published_paths = _published_shapefile_paths(app, run)
+    models_manifest_policy = _published_models_manifest_policy(app, run)
+    result_paths = [
+        path
+        for path in result_paths
+        if _is_published_shapefile_component(
+            path.relative_to(output).as_posix(), published_paths
+        )
+        and _is_published_models_manifest(
+            path.relative_to(output).as_posix(), models_manifest_policy
+        )
+    ]
     files: list[dict[str, Any]] = []
     for path in result_paths:
         try:
@@ -825,8 +999,7 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
                 "size": int(stat.st_size),
                 "type": path.suffix.casefold().lstrip("."),
                 "url": (
-                    f"/api/runs/{run['id']}/artifacts?"
-                    f"path={quote(relative, safe='')}"
+                    f"/api/runs/{run['id']}/artifacts?path={quote(relative, safe='')}"
                 ),
             }
         )
@@ -843,9 +1016,19 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
         },
     }
     shapefiles: list[dict[str, Any]] = []
+    published_paths = published_paths if publish_shapefiles else frozenset()
     completed_primaries = (
-        (path for path in result_paths if path.suffix.casefold() == ".shp")
-        if run.get("status") == "completed"
+        (
+            path
+            for path in result_paths
+            if path.suffix.casefold() == ".shp"
+            and (
+                published_paths is None
+                or _output_path_identity(path.relative_to(output).as_posix())
+                in published_paths
+            )
+        )
+        if publish_shapefiles
         else ()
     )
     for primary in completed_primaries:
@@ -865,17 +1048,14 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
                 "path": relative,
                 "files": sorted(sidecars),
                 "download_url": (
-                    f"/api/runs/{run['id']}/shapefile?"
-                    f"path={quote(relative, safe='')}"
+                    f"/api/runs/{run['id']}/shapefile?path={quote(relative, safe='')}"
                 ),
                 "import_url": f"/api/runs/{run['id']}/shapefile/import",
             }
         )
     summary["shapefiles"] = shapefiles
     manifests = [
-        path
-        for path in result_paths
-        if path.name.casefold() in RESULT_MANIFEST_NAMES
+        path for path in result_paths if path.name.casefold() in RESULT_MANIFEST_NAMES
     ]
     manifests.sort(
         key=lambda path: (
@@ -885,13 +1065,23 @@ def _result_summary(app: Any, run: dict[str, Any]) -> dict[str, Any] | None:
     )
     for manifest in manifests:
         try:
-            if manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 5_000_000:
+            if (
+                manifest.is_file()
+                and not manifest.is_symlink()
+                and manifest.stat().st_size <= 5_000_000
+            ):
                 value = json.loads(manifest.read_text(encoding="utf-8"))
                 if isinstance(value, dict):
                     copied = False
                     for key in ("feature_counts", "status"):
                         if key in value:
-                            summary[key] = value[key]
+                            summary[key] = (
+                                "failed"
+                                if key == "status"
+                                and value[key] == JobStatus.SUCCEEDED.value
+                                and not publish_shapefiles
+                                else value[key]
+                            )
                             copied = True
                     if copied:
                         break
@@ -907,21 +1097,42 @@ def public_run(
     include_log: bool = False,
     include_results: bool = False,
 ) -> dict[str, Any]:
-    manifest, _manifest_problem = _read_run_manifest(app, item)
+    manifest, manifest_problem = _read_run_manifest(app, item)
+    has_valid_manifest = manifest is not None
+    succeeded_contract_problem = (
+        _succeeded_manifest_contract_problem(app, item, manifest, manifest_problem)
+        if manifest is not None and manifest.get("status") == JobStatus.SUCCEEDED.value
+        else None
+    )
+    if succeeded_contract_problem is not None:
+        manifest = None
     log_text = _runtime_log_text(app, item) if manifest is None or include_log else ""
     public_status = PUBLIC_STATUS.get(item["status"], item["status"])
+    completed_contract_problem: tuple[str, str] | None = None
+    if public_status == "completed" and (
+        _requires_run_execution_contract(item)
+        or has_valid_manifest
+        or succeeded_contract_problem is not None
+    ):
+        completed_contract_problem = (
+            succeeded_contract_problem
+            or _succeeded_manifest_contract_problem(
+                app, item, manifest, manifest_problem
+            )
+        )
+        if completed_contract_problem is not None:
+            public_status = "failed"
+            manifest = None
     manifest_progress = manifest.get("progress", {}) if manifest is not None else {}
     progress = (
         float(manifest_progress.get("percent", 0.0))
         if manifest is not None and isinstance(manifest_progress, dict)
-        else _progress_from_log(item["status"], log_text)
+        else _progress_from_log(public_status, log_text)
     )
     # Unregistered datasets remain as small tombstones so completed run
     # history can still show the delivery name without making that dataset
     # available for new browsing or processing.
-    dataset = app.state.store.get_dataset(
-        item["dataset_id"], include_unregistered=True
-    )
+    dataset = app.state.store.get_dataset(item["dataset_id"], include_unregistered=True)
     result = {
         "id": item["id"],
         "dataset_id": item["dataset_id"],
@@ -951,9 +1162,7 @@ def public_run(
                 "versions": _redact_manifest_value(
                     app, manifest.get("versions", {}), item
                 ),
-                "counts": _redact_manifest_value(
-                    app, manifest.get("counts", {}), item
-                ),
+                "counts": _redact_manifest_value(app, manifest.get("counts", {}), item),
                 "stage_results": _redact_manifest_value(
                     app, manifest.get("stages", []), item
                 ),
@@ -964,12 +1173,50 @@ def public_run(
                 ),
             }
         )
+    elif (
+        succeeded_contract_problem is not None or completed_contract_problem is not None
+    ):
+        contract_code, contract_reason = (
+            completed_contract_problem or succeeded_contract_problem
+        )
+        messages = {
+            "RUN_MANIFEST_INVALID": "Completed run manifest is missing or invalid.",
+            "RUN_MANIFEST_NOT_SUCCEEDED": (
+                "Completed run does not have a succeeded manifest."
+            ),
+            "RUN_OUTPUT_INVALID": (
+                "Succeeded manifest has incomplete or unsafe outputs."
+            ),
+        }
+        error_info = PipelineErrorInfo(
+            code=contract_code,
+            message=messages[contract_code],
+            stage="finalize_manifest",
+            job_id=str(item["id"]),
+            retryable=False,
+            context={"reason": contract_reason},
+            cause_type=(
+                "OutputValidationError"
+                if contract_code == "RUN_OUTPUT_INVALID"
+                else "ManifestValidationError"
+            ),
+        ).to_dict()
+        result.update(
+            {
+                "job_id": item["id"],
+                "error_info": _redact_manifest_value(app, error_info, item),
+            }
+        )
     if public_status == "completed":
         result["result_url"] = f"/api/runs/{item['id']}/results"
     if item.get("error"):
         result["error"] = _redact(app, str(item["error"]), item)
     if include_results:
-        summary = _result_summary(app, item)
+        summary = _result_summary(
+            app,
+            item,
+            publish_shapefiles=public_status == "completed",
+        )
         if summary is not None:
             result["results"] = summary
     if include_log:
@@ -985,43 +1232,193 @@ class RunManager:
         self._worker: asyncio.Task[None] | None = None
         self._active_run_id: str | None = None
         self._active_process: asyncio.subprocess.Process | None = None
+        self._lifecycle_lock = asyncio.Lock()
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._loop(), name="mms-single-gpu-runner")
+            self._worker = asyncio.create_task(
+                self._loop(), name="mms-single-gpu-runner"
+            )
             self._wake.set()
+
+    def recover_after_restart(self, now: str) -> int:
+        """Recover the registry and reconcile its interrupted child manifest."""
+
+        def apply_terminal_manifest(
+            current: dict[str, Any],
+            manifest: dict[str, Any] | None,
+            manifest_problem: str | None,
+        ) -> bool:
+            manifest_status = manifest.get("status") if manifest is not None else None
+            error: str | None = None
+            if manifest_status == JobStatus.SUCCEEDED.value:
+                succeeded_problem = _succeeded_manifest_contract_problem(
+                    self.app, current, manifest, manifest_problem
+                )
+                if succeeded_problem is not None:
+                    _code, reason = succeeded_problem
+                    legacy_status = "failed"
+                    error = (
+                        f"Succeeded manifest has incomplete or unsafe outputs: {reason}"
+                    )
+                else:
+                    legacy_status = "completed"
+            elif manifest_status == JobStatus.FAILED.value:
+                legacy_status = "failed"
+                errors = manifest.get("errors") or [] if manifest is not None else []
+                if errors and isinstance(errors[-1], dict):
+                    error = _redact(
+                        self.app,
+                        str(errors[-1].get("message") or "Pipeline failed."),
+                        current,
+                    )
+            elif manifest_status == JobStatus.CANCELLED.value:
+                legacy_status = "cancelled"
+            else:
+                return False
+            return self.app.state.store.transition_run(
+                str(current["id"]),
+                now,
+                from_statuses=(str(current["status"]),),
+                to_status=legacy_status,
+                error=error,
+                finished_at=(
+                    str(manifest.get("finished_at") or now)
+                    if manifest is not None
+                    else now
+                ),
+            )
+
+        recovery_candidates = (
+            self.app.state.store.list_runs_requiring_restart_reconciliation(
+                RUN_EXECUTION_CONTRACT_VERSION
+            )
+        )
+        recovered = self.app.state.store.recover_after_restart(now)
+        for previous in recovery_candidates:
+            run_id = str(previous["id"])
+            current = self.app.state.store.get_run(run_id)
+            if current is None or current.get("status") not in {
+                "interrupted",
+                "cancelled",
+                "failed",
+            }:
+                continue
+            current_status = str(current["status"])
+            manifest, manifest_problem = _read_run_manifest(self.app, current)
+            if apply_terminal_manifest(current, manifest, manifest_problem):
+                continue
+            target = (
+                JobStatus.CANCELLED
+                if current_status == "cancelled"
+                else JobStatus.FAILED
+            )
+            synchronized = _sync_manifest_terminal(
+                self.app,
+                current,
+                target,
+                error=(
+                    PipelineErrorInfo(
+                        code="WORKER_RESTARTED",
+                        message="Server restarted while this run was active.",
+                        stage="worker",
+                        job_id=run_id,
+                        retryable=True,
+                        cause_type="WorkerRestart",
+                    )
+                    if target == JobStatus.FAILED
+                    else None
+                ),
+            )
+            refreshed = self.app.state.store.get_run(run_id)
+            if refreshed is None:
+                continue
+            refreshed_manifest, refreshed_problem = _read_run_manifest(
+                self.app, refreshed
+            )
+            if apply_terminal_manifest(
+                refreshed, refreshed_manifest, refreshed_problem
+            ):
+                continue
+            if synchronized and target == JobStatus.FAILED:
+                self.app.state.store.transition_run(
+                    run_id,
+                    now,
+                    from_statuses=(str(refreshed["status"]),),
+                    to_status="failed",
+                    error="Server restarted while this run was active.",
+                    finished_at=now,
+                )
+        return recovered
+
+    async def _stop_active_run(
+        self,
+        run_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        now = utc_now()
+        active_run = self.app.state.store.get_run(run_id)
+        manifest, manifest_problem = (
+            _read_run_manifest(self.app, active_run)
+            if active_run is not None
+            else (None, "run registry entry is missing")
+        )
+        durable_success = (
+            active_run is not None
+            and _succeeded_manifest_contract_problem(
+                self.app, active_run, manifest, manifest_problem
+            )
+            is None
+        )
+        if durable_success:
+            self.app.state.store.transition_run(
+                run_id,
+                now,
+                from_statuses=("starting", "running", "cancelling"),
+                to_status="completed",
+                error=None,
+                finished_at=str(manifest.get("finished_at") or now),
+            )
+        else:
+            transitioned = self.app.state.store.transition_run(
+                run_id,
+                now,
+                from_statuses=("starting", "running", "cancelling"),
+                to_status="interrupted",
+                error="Server stopped while this run was active.",
+                finished_at=now,
+            )
+            if transitioned:
+                interrupted_run = self.app.state.store.get_run(run_id)
+                if interrupted_run is not None:
+                    _sync_manifest_terminal(
+                        self.app,
+                        interrupted_run,
+                        JobStatus.FAILED,
+                        error=PipelineErrorInfo(
+                            code="WORKER_STOPPED",
+                            message="Server stopped while this run was active.",
+                            stage="worker",
+                            job_id=run_id,
+                            retryable=True,
+                            cause_type="WorkerShutdown",
+                        ),
+                    )
+        await self._terminate(process)
 
     async def stop(self) -> None:
         self._stop.set()
         self._wake.set()
-        if self._active_process is not None and self._active_process.returncode is None:
-            if self._active_run_id is not None:
-                now = utc_now()
-                transitioned = self.app.state.store.transition_run(
+        async with self._lifecycle_lock:
+            if (
+                self._active_process is not None
+                and self._active_process.returncode is None
+                and self._active_run_id is not None
+            ):
+                await self._stop_active_run(
                     self._active_run_id,
-                    now,
-                    from_statuses=("starting", "running", "cancelling"),
-                    to_status="interrupted",
-                    error="Server stopped while this run was active.",
-                    finished_at=now,
+                    self._active_process,
                 )
-                if transitioned:
-                    interrupted_run = self.app.state.store.get_run(self._active_run_id)
-                    if interrupted_run is not None:
-                        _sync_manifest_terminal(
-                            self.app,
-                            interrupted_run,
-                            JobStatus.FAILED,
-                            error=PipelineErrorInfo(
-                                code="WORKER_STOPPED",
-                                message="Server stopped while this run was active.",
-                                stage="worker",
-                                job_id=self._active_run_id,
-                                retryable=True,
-                                cause_type="WorkerShutdown",
-                            ),
-                        )
-            await self._terminate(self._active_process)
         if self._worker is not None:
             try:
                 await asyncio.wait_for(self._worker, timeout=10)
@@ -1032,41 +1429,74 @@ class RunManager:
         self._wake.set()
 
     async def cancel(self, run_id: str) -> dict[str, Any]:
-        run = self.app.state.store.get_run(run_id)
-        if run is None:
-            raise KeyError(run_id)
-        if run["status"] in TERMINAL_STATUSES:
-            return run
-        now = utc_now()
-        if run["status"] in {"queued", "preparing", "starting"}:
-            transitioned = self.app.state.store.transition_run(
-                run_id,
-                now,
-                from_statuses=("queued", "preparing", "starting"),
-                to_status="cancelled",
-                cancel_requested=1,
-                finished_at=now,
-            )
-            if transitioned:
-                cancelled = self.app.state.store.get_run(run_id)
-                if cancelled is not None:
-                    _sync_manifest_terminal(
-                        self.app, cancelled, JobStatus.CANCELLED
-                    )
-        else:
-            transitioned = self.app.state.store.transition_run(
-                run_id,
-                now,
-                from_statuses=("running", "cancelling"),
-                to_status="cancelling",
-                cancel_requested=1,
-            )
-            if (
-                transitioned
-                and self._active_run_id == run_id
-                and self._active_process is not None
-            ):
-                await self._terminate(self._active_process)
+        for _attempt in range(8):
+            run = self.app.state.store.get_run(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            run_status = str(run["status"])
+            if run_status in TERMINAL_STATUSES:
+                return run
+            now = utc_now()
+            if run_status in {"queued", "preparing", "starting"}:
+                transitioned = self.app.state.store.transition_run(
+                    run_id,
+                    now,
+                    from_statuses=(run_status,),
+                    to_status="cancelled",
+                    cancel_requested=1,
+                    finished_at=now,
+                )
+                if transitioned:
+                    cancelled = self.app.state.store.get_run(run_id)
+                    if cancelled is not None:
+                        synchronized = _sync_manifest_terminal(
+                            self.app, cancelled, JobStatus.CANCELLED
+                        )
+                        if not synchronized:
+                            manifest, manifest_problem = _read_run_manifest(
+                                self.app, cancelled
+                            )
+                            if (
+                                _succeeded_manifest_contract_problem(
+                                    self.app,
+                                    cancelled,
+                                    manifest,
+                                    manifest_problem,
+                                )
+                                is None
+                            ):
+                                self.app.state.store.transition_run(
+                                    run_id,
+                                    now,
+                                    from_statuses=("cancelled",),
+                                    to_status="completed",
+                                    error=None,
+                                    finished_at=str(manifest.get("finished_at") or now),
+                                )
+                    self._wake.set()
+                    return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
+            elif run_status in {"running", "cancelling"}:
+                transitioned = self.app.state.store.transition_run(
+                    run_id,
+                    now,
+                    from_statuses=(run_status,),
+                    to_status="cancelling",
+                    cancel_requested=1,
+                )
+                if transitioned:
+                    if (
+                        self._active_run_id == run_id
+                        and self._active_process is not None
+                    ):
+                        await self._terminate(self._active_process)
+                    self._wake.set()
+                    return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
+            else:
+                return run
+            await asyncio.sleep(0)
+        self.app.state.logger.warning(
+            "Cancellation for run %s lost repeated status races.", run_id
+        )
         self._wake.set()
         return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
 
@@ -1157,31 +1587,36 @@ class RunManager:
                 # when the launcher window receives a close event.  taskkill
                 # /T still terminates the hidden child tree on explicit cancel.
                 kwargs["creationflags"] = (
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                    | subprocess.CREATE_NO_WINDOW
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
                 )
             else:
                 kwargs["start_new_session"] = True
-            if not self.app.state.store.begin_run_start(run_id, utc_now()):
-                return
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(self.app.state.config.project_root),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                **kwargs,
-            )
-            self._active_run_id = run_id
-            self._active_process = process
-            started = utc_now()
-            if not self.app.state.store.mark_run_running(
-                run_id,
-                pid=process.pid,
-                started_at=started,
-            ):
-                await self._terminate(process)
-                return
+            async with self._lifecycle_lock:
+                if self._stop.is_set():
+                    return
+                if not self.app.state.store.begin_run_start(run_id, utc_now()):
+                    return
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    cwd=str(self.app.state.config.project_root),
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    **kwargs,
+                )
+                self._active_run_id = run_id
+                self._active_process = process
+                if self._stop.is_set():
+                    await self._stop_active_run(run_id, process)
+                    return
+                started = utc_now()
+                if not self.app.state.store.mark_run_running(
+                    run_id,
+                    pid=process.pid,
+                    started_at=started,
+                ):
+                    await self._terminate(process)
+                    return
             with log_path.open("a", encoding="utf-8", buffering=1) as log:
                 if process.stdout is not None:
                     while True:
@@ -1193,40 +1628,47 @@ class RunManager:
             latest = self.app.state.store.get_run(run_id) or run
             finished = utc_now()
             manifest_error: PipelineErrorInfo | None = None
-            if latest.get("status") == "interrupted":
+            manifest, manifest_problem = _read_run_manifest(self.app, latest)
+            succeeded_problem = _succeeded_manifest_contract_problem(
+                self.app, latest, manifest, manifest_problem
+            )
+            if succeeded_problem is None:
+                # A fully validated terminal manifest is the durable commit. It
+                # wins over a cancellation/shutdown request that raced with the
+                # child process after publication completed.
+                final_status = "completed"
+                error = None
+            elif latest.get("status") == "interrupted":
                 final_status = "interrupted"
-                error = latest.get("error") or "Server stopped while this run was active."
+                error = (
+                    latest.get("error") or "Server stopped while this run was active."
+                )
             elif latest.get("cancel_requested") or latest.get("status") == "cancelling":
                 final_status = "cancelled"
                 error = None
             elif return_code == 0:
-                manifest, manifest_problem = _read_run_manifest(self.app, latest)
-                if manifest is not None and manifest.get("status") == JobStatus.SUCCEEDED.value:
-                    final_status = "completed"
-                    error = None
-                else:
-                    final_status = "failed"
-                    error = (
-                        "Pipeline exited successfully but did not publish a valid "
-                        "succeeded run manifest."
-                    )
-                    manifest_error = PipelineErrorInfo(
-                        code=(
-                            "RUN_MANIFEST_INVALID"
-                            if manifest is None
-                            else "RUN_MANIFEST_NOT_SUCCEEDED"
-                        ),
-                        message=error,
-                        stage="finalize_manifest",
-                        job_id=run_id,
-                        retryable=False,
-                        context={"reason": manifest_problem or "status is not succeeded"},
-                        cause_type="ManifestValidationError",
-                    )
+                problem_code, problem_reason = succeeded_problem
+                final_status = "failed"
+                error = (
+                    "Pipeline exited successfully but did not publish a valid "
+                    "succeeded run manifest."
+                )
+                manifest_error = PipelineErrorInfo(
+                    code=problem_code,
+                    message=error,
+                    stage="finalize_manifest",
+                    job_id=run_id,
+                    retryable=False,
+                    context={"reason": problem_reason},
+                    cause_type=(
+                        "OutputValidationError"
+                        if problem_code == "RUN_OUTPUT_INVALID"
+                        else "ManifestValidationError"
+                    ),
+                )
             else:
                 final_status = "failed"
                 error = _process_failure_message(self.app, latest, return_code)
-                manifest, _manifest_problem = _read_run_manifest(self.app, latest)
                 progress = manifest.get("progress", {}) if manifest is not None else {}
                 stage = (
                     progress.get("current_stage")
@@ -1245,8 +1687,8 @@ class RunManager:
                     cause_type="ChildProcessError",
                 )
             allowed_sources = {
-                "completed": ("running",),
-                "failed": ("preparing", "starting", "running"),
+                "completed": ("running", "cancelling", "interrupted"),
+                "failed": ("preparing", "starting", "running", "cancelling"),
                 "cancelled": ("running", "cancelling"),
                 "interrupted": ("running", "cancelling", "interrupted"),
             }
@@ -1261,9 +1703,7 @@ class RunManager:
             )
             if transitioned and final_status == "cancelled":
                 terminal_run = self.app.state.store.get_run(run_id) or latest
-                _sync_manifest_terminal(
-                    self.app, terminal_run, JobStatus.CANCELLED
-                )
+                _sync_manifest_terminal(self.app, terminal_run, JobStatus.CANCELLED)
             elif transitioned and final_status == "failed":
                 terminal_run = self.app.state.store.get_run(run_id) or latest
                 _sync_manifest_terminal(
@@ -1277,9 +1717,7 @@ class RunManager:
             finished = utc_now()
             latest = self.app.state.store.get_run(run_id)
             final_status = (
-                "cancelled"
-                if latest and latest.get("cancel_requested")
-                else "failed"
+                "cancelled" if latest and latest.get("cancel_requested") else "failed"
             )
             error_text = _redact(self.app, str(exc) or type(exc).__name__, run)
             transitioned = self.app.state.store.transition_run(
@@ -1293,9 +1731,7 @@ class RunManager:
             if transitioned and latest is not None:
                 terminal_run = self.app.state.store.get_run(run_id) or latest
                 if final_status == "cancelled":
-                    _sync_manifest_terminal(
-                        self.app, terminal_run, JobStatus.CANCELLED
-                    )
+                    _sync_manifest_terminal(self.app, terminal_run, JobStatus.CANCELLED)
                 else:
                     _sync_manifest_terminal(
                         self.app,
@@ -1434,34 +1870,70 @@ async def get_artifact(run_id: str, path: str, request: Request) -> Response:
             reject_symlinks=True,
         )
         if any(part.casefold() == "logs" for part in Path(relative).parts):
-            raise UnsafePath("Diagnostic logs are available only through redacted run status.")
+            raise UnsafePath(
+                "Diagnostic logs are available only through redacted run status."
+            )
         if artifact.suffix.casefold() not in SAFE_RESULT_SUFFIXES:
             raise UnsafePath("This artifact type is not downloadable.")
+        published_paths = _published_shapefile_paths(request.app, run)
+        if not _is_published_shapefile_component(relative, published_paths):
+            raise UnsafePath("This Shapefile component is not a published output.")
+        models_manifest_policy = _published_models_manifest_policy(request.app, run)
+        if not _is_published_models_manifest(relative, models_manifest_policy):
+            raise UnsafePath("This models manifest is not a published output.")
     except (UnsafePath, OSError) as exc:
         raise HTTPException(status_code=404, detail="Artifact not found.") from exc
-    if artifact.name.casefold() in RESULT_MANIFEST_NAMES:
+    if artifact.suffix.casefold() in {".json", ".txt"}:
+        size_limit = (
+            MAX_RUN_MANIFEST_BYTES
+            if artifact.name.casefold() in RESULT_MANIFEST_NAMES
+            else MAX_PUBLIC_STRUCTURED_ARTIFACT_BYTES
+        )
         try:
             with artifact.open("rb") as handle:
                 size = int(os.fstat(handle.fileno()).st_size)
-                if size <= 0 or size > MAX_RUN_MANIFEST_BYTES:
-                    raise ValueError("Manifest size is outside the public limit.")
-                payload = handle.read(MAX_RUN_MANIFEST_BYTES + 1)
-            if len(payload) > MAX_RUN_MANIFEST_BYTES:
-                raise ValueError("Manifest size is outside the public limit.")
-            document = json.loads(payload.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                if size <= 0 or size > size_limit:
+                    raise ValueError(
+                        "Structured artifact size is outside the public limit."
+                    )
+                payload = handle.read(size_limit + 1)
+            if len(payload) > size_limit:
+                raise ValueError(
+                    "Structured artifact size is outside the public limit."
+                )
+            decoded = payload.decode("utf-8")
+        except (OSError, UnicodeError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="Artifact not found.") from exc
+        attachment_headers = {
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": (
+                "attachment; filename*=UTF-8''" + quote(artifact.name, safe="")
+            ),
+        }
+        try:
+            document = json.loads(decoded)
+        except json.JSONDecodeError as exc:
+            if artifact.suffix.casefold() == ".json":
+                raise HTTPException(
+                    status_code=404, detail="Artifact not found."
+                ) from exc
+            return Response(
+                content=_redact(request.app, decoded, run),
+                media_type="text/plain; charset=utf-8",
+                headers=attachment_headers,
+            )
         return JSONResponse(
             _redact_manifest_value(request.app, document, run),
-            headers={
-                "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
+            headers=attachment_headers,
         )
     return FileResponse(
         artifact,
         filename=artifact.name,
-        headers={"Cache-Control": "private, no-cache", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "private, no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

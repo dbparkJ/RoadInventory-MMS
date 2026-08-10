@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import subprocess
 import tempfile
@@ -14,7 +15,10 @@ from fastapi.testclient import TestClient
 
 from mms_shp_detection.config import PipelineConfig, config_sha256
 from mms_shp_detection.domain.models import JobStatus
-from mms_shp_detection.infrastructure.manifest_writer import RunManifestStore
+from mms_shp_detection.infrastructure.manifest_writer import (
+    PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES,
+    RunManifestStore,
+)
 from mms_shp_detection.webapp import WebAppConfig, create_app
 from mms_shp_detection.webapp.app import WorkerProcessLock
 from mms_shp_detection.webapp.runs import (
@@ -49,13 +53,22 @@ def seed_dataset(store: WebStore, dataset_id: str = "dataset-a") -> None:
     )
 
 
-def seed_run(store: WebStore, run_id: str) -> None:
+def seed_run(
+    store: WebStore,
+    run_id: str,
+    *,
+    require_execution_contract: bool = False,
+) -> None:
     store.create_run(
         {
             "id": run_id,
             "dataset_id": "dataset-a",
             "request": {},
-            "resolved": {},
+            "resolved": (
+                {"run_execution_contract_version": 1}
+                if require_execution_contract
+                else {}
+            ),
             "work_relative": run_id,
             "created_at": NOW,
             "updated_at": NOW,
@@ -78,6 +91,12 @@ def seed_manifest(app, run_id: str, input_root: Path) -> RunManifestStore:
     return manifest
 
 
+def write_bundle(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES:
+        path.with_suffix(suffix).write_bytes(f"fixture:{suffix}".encode("ascii"))
+
+
 class WebAppRunSafetyTests(unittest.TestCase):
     def test_tqdm_output_drives_web_progress(self) -> None:
         log = "MMS multi-model:  12%|# | 24/200 [00:10<01:03]\r"
@@ -95,7 +114,10 @@ class WebAppRunSafetyTests(unittest.TestCase):
         self.assertIn("exit code 2", message)
 
     def test_active_and_collection_payloads_do_not_scan_result_tree(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             state = Path(state_text)
             app = create_app(
@@ -131,7 +153,10 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 summary.assert_not_called()
 
     def test_terminal_single_get_and_explicit_results_include_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             state = Path(state_text)
             config = WebAppConfig(
@@ -169,13 +194,21 @@ class WebAppRunSafetyTests(unittest.TestCase):
             with TestClient(app) as client:
                 single = client.get("/api/runs/run-complete")
                 self.assertEqual(single.status_code, 200)
-                self.assertEqual(single.json()["results"]["file_count"], 2)
+                single_payload = single.json()
+                self.assertEqual(single_payload["status"], "completed")
+                self.assertIn("result_url", single_payload)
+                self.assertEqual(single_payload["results"]["file_count"], 2)
                 explicit = client.get("/api/runs/run-complete/results")
                 self.assertEqual(explicit.status_code, 200)
                 self.assertEqual(explicit.json()["file_count"], 2)
 
-    def test_shapefile_and_manifest_discovery_bypasses_artifact_page_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+    def test_shapefile_and_manifest_discovery_bypasses_artifact_page_limit(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             state = Path(state_text)
             config = WebAppConfig(
@@ -198,11 +231,15 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 path.write_text(name, encoding="utf-8")
                 ordinary.append(path)
             for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
-                (shp_dir / f"detected_signs{suffix}").write_bytes(suffix.encode("ascii"))
+                (shp_dir / f"detected_signs{suffix}").write_bytes(
+                    suffix.encode("ascii")
+                )
             model_shp = output / "model_a" / "shp"
             model_shp.mkdir(parents=True)
             for suffix in (".shp", ".shx", ".dbf"):
-                (model_shp / f"pole_bottoms{suffix}").write_bytes(suffix.encode("ascii"))
+                (model_shp / f"pole_bottoms{suffix}").write_bytes(
+                    suffix.encode("ascii")
+                )
             (output / "run_manifest.json").write_text(
                 '{"status":"completed","feature_counts":{"detections":7}}',
                 encoding="utf-8",
@@ -280,7 +317,10 @@ class WebAppRunSafetyTests(unittest.TestCase):
             self.assertEqual(store.get_run("run-terminal")["status"], "completed")  # type: ignore[index]
 
     def test_public_manifest_projection_and_redacted_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             app = create_app(
                 allowed_roots=[root],
@@ -292,7 +332,9 @@ class WebAppRunSafetyTests(unittest.TestCase):
             manifest = seed_manifest(app, "run-manifest", root)
             manifest.transition(JobStatus.VALIDATING)
             manifest.transition(JobStatus.RUNNING)
-            manifest.set_progress(percent=42.5, current_stage="detect_project_and_estimate")
+            manifest.set_progress(
+                percent=42.5, current_stage="detect_project_and_estimate"
+            )
             manifest.update_counts(images=12, detections_2d=7)
             app.state.store.update_run("run-manifest", NOW, status="starting")
             run = app.state.store.get_run("run-manifest")
@@ -306,9 +348,28 @@ class WebAppRunSafetyTests(unittest.TestCase):
             self.assertEqual(public["current_stage"], "detect_project_and_estimate")
             self.assertEqual(public["counts"]["images"], 12)
 
-            logs = app.state.config.state_dir / "runs" / "run-manifest" / "output" / "logs"
+            logs = (
+                app.state.config.state_dir / "runs" / "run-manifest" / "output" / "logs"
+            )
             logs.mkdir()
             (logs / "run.log").write_text(f"input={root}\n", encoding="utf-8")
+            result_txt = logs.parent / "txt" / "frame.txt"
+            result_txt.parent.mkdir()
+            result_txt.write_text(
+                '{"image_path":"Z:\\\\private-delivery\\\\frame.jpg",'
+                '"message":"failed at Z:\\\\external-models\\\\secret.pt",'
+                '"posix_message":"failed at /mnt/private/secret.pt",'
+                '"root_posix_message":"failed at /secret.pt",'
+                '"forward_unc":"failed at //server/share/secret.pt",'
+                '"file_uri":"failed at file:///etc/passwd",'
+                '"url":"https://example.com/api/v1"}',
+                encoding="utf-8",
+            )
+            plain_txt = logs.parent / "txt" / "notes.txt"
+            plain_txt.write_text(
+                "failed at /private/model.pt; docs=https://example.com/api/v1",
+                encoding="utf-8",
+            )
             with TestClient(app) as client:
                 artifact = client.get(
                     "/api/runs/run-manifest/artifacts",
@@ -322,9 +383,33 @@ class WebAppRunSafetyTests(unittest.TestCase):
                     params={"path": "logs/run.log"},
                 )
                 self.assertEqual(denied_log.status_code, 404)
+                structured = client.get(
+                    "/api/runs/run-manifest/artifacts",
+                    params={"path": "txt/frame.txt"},
+                )
+                self.assertEqual(structured.status_code, 200, structured.text)
+                self.assertNotIn("private-delivery", structured.text)
+                self.assertNotIn("external-models", structured.text)
+                self.assertNotIn("/mnt/private", structured.text)
+                self.assertNotIn("/secret.pt", structured.text)
+                self.assertNotIn("//server/share", structured.text)
+                self.assertNotIn("file:///etc/passwd", structured.text)
+                self.assertIn("file:<server-path>", structured.json()["file_uri"])
+                self.assertIn("<server", structured.text)
+                self.assertEqual(structured.json()["url"], "https://example.com/api/v1")
+                plain = client.get(
+                    "/api/runs/run-manifest/artifacts",
+                    params={"path": "txt/notes.txt"},
+                )
+                self.assertEqual(plain.status_code, 200, plain.text)
+                self.assertNotIn("/private/model.pt", plain.text)
+                self.assertIn("https://example.com/api/v1", plain.text)
 
     def test_zero_exit_requires_succeeded_manifest_and_propagates_job_id(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             app = create_app(
                 allowed_roots=[root],
@@ -360,17 +445,23 @@ class WebAppRunSafetyTests(unittest.TestCase):
 
             spawn_kwargs = asyncio.run(exercise())
             self.assertEqual(
-                spawn_kwargs["env"]["MMS_PIPELINE_JOB_ID"], "run-invalid-success"  # type: ignore[index]
+                spawn_kwargs["env"]["MMS_PIPELINE_JOB_ID"],
+                "run-invalid-success",  # type: ignore[index]
             )
             stored = app.state.store.get_run("run-invalid-success")
             self.assertEqual(stored["status"], "failed")  # type: ignore[index]
             self.assertIn("succeeded run manifest", stored["error"])  # type: ignore[index]
             updated_manifest = manifest.read()
             self.assertEqual(updated_manifest["status"], "failed")
-            self.assertEqual(updated_manifest["errors"][-1]["code"], "RUN_MANIFEST_NOT_SUCCEEDED")
+            self.assertEqual(
+                updated_manifest["errors"][-1]["code"], "RUN_MANIFEST_NOT_SUCCEEDED"
+            )
 
     def test_zero_exit_with_succeeded_manifest_completes(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             app = create_app(
                 allowed_roots=[root],
@@ -380,6 +471,22 @@ class WebAppRunSafetyTests(unittest.TestCase):
             seed_dataset(app.state.store)
             seed_run(app.state.store, "run-valid-success")
             manifest = seed_manifest(app, "run-valid-success", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-valid-success"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
             claimed = app.state.store.claim_next_queued_run(NOW)
             self.assertIsNotNone(claimed)
 
@@ -410,9 +517,237 @@ class WebAppRunSafetyTests(unittest.TestCase):
             stored = app.state.store.get_run("run-valid-success")
             self.assertEqual(stored["status"], "completed")  # type: ignore[index]
             self.assertEqual(stored["return_code"], 0)  # type: ignore[index]
+            stale_path = shp_path.with_name("stale_previous_run.shp")
+            write_bundle(stale_path)
+            stale_models_manifest = shp_path.parents[1] / "models_manifest.json"
+            stale_models_manifest.write_text(
+                '{"models":[{"model_key":"stale"}]}',
+                encoding="utf-8",
+            )
+            summary = _result_summary(app, stored)  # type: ignore[arg-type]
+            self.assertEqual(
+                [item["path"] for item in summary["shapefiles"]],  # type: ignore[index]
+                ["shp/detected_signs.shp"],
+            )
+            self.assertNotIn(
+                "models_manifest.json",
+                {item["path"] for item in summary["files"]},  # type: ignore[index]
+            )
+            with TestClient(app) as client:
+                stale_download = client.get(
+                    "/api/runs/run-valid-success/shapefile",
+                    params={"path": "shp/stale_previous_run.shp"},
+                )
+                self.assertEqual(stale_download.status_code, 404)
+                stale_artifact = client.get(
+                    "/api/runs/run-valid-success/artifacts",
+                    params={"path": "shp/stale_previous_run.shp"},
+                )
+                self.assertEqual(stale_artifact.status_code, 404)
+                stale_models_artifact = client.get(
+                    "/api/runs/run-valid-success/artifacts",
+                    params={"path": "models_manifest.json"},
+                )
+                self.assertEqual(stale_models_artifact.status_code, 404)
+
+    def test_zero_exit_rejects_succeeded_manifest_without_outputs(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-missing-outputs")
+            manifest = seed_manifest(app, "run-missing-outputs", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            class EmptyStdout:
+                async def read(self, _size: int) -> bytes:
+                    return b""
+
+            class SuccessfulProcess:
+                pid = 4323
+                returncode = None
+                stdout = EmptyStdout()
+
+                async def wait(self) -> int:
+                    manifest.transition(JobStatus.VALIDATING)
+                    manifest.transition(JobStatus.RUNNING)
+                    manifest.transition(JobStatus.SUCCEEDED)
+                    self.returncode = 0
+                    return 0
+
+            async def exercise() -> None:
+                with mock.patch(
+                    "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                    new=mock.AsyncMock(return_value=SuccessfulProcess()),
+                ):
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+
+            asyncio.run(exercise())
+            stored = app.state.store.get_run("run-missing-outputs")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            public = public_run(app, stored)  # type: ignore[arg-type]
+            self.assertNotIn("canonical_status", public)
+            self.assertEqual(public["error_info"]["code"], "RUN_OUTPUT_INVALID")
+
+    def test_completed_contract_run_hides_results_after_output_damage(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(
+                app.state.store,
+                "run-damaged-output",
+                require_execution_contract=True,
+            )
+            manifest = seed_manifest(app, "run-damaged-output", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-damaged-output"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            app.state.store.update_run(
+                "run-damaged-output",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+            shp_path.with_suffix(".dbf").unlink()
+
+            stored = app.state.store.get_run("run-damaged-output")
+            public = public_run(
+                app,
+                stored,  # type: ignore[arg-type]
+                include_results=True,
+            )
+
+            self.assertEqual(public["status"], "failed")
+            self.assertNotIn("result_url", public)
+            self.assertEqual(public["error_info"]["code"], "RUN_OUTPUT_INVALID")
+            self.assertEqual(public["results"]["shapefiles"], [])
+            self.assertEqual(public["results"]["status"], "failed")
+            with TestClient(app) as client:
+                download = client.get(
+                    "/api/runs/run-damaged-output/shapefile",
+                    params={"path": "shp/detected_signs.shp"},
+                )
+                self.assertEqual(download.status_code, 404)
+
+    def test_invalid_output_contract_reason_redacts_manifest_server_paths(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(
+                app.state.store,
+                "run-private-contract-path",
+                require_execution_contract=True,
+            )
+            manifest = seed_manifest(app, "run-private-contract-path", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            document = manifest.read()
+            document["outputs"] = {
+                "root": ".",
+                "shapefiles": [r"Z:\private-delivery\secret.shp"],
+                "models_manifest": None,
+            }
+            manifest.path.write_text(
+                json.dumps(document),
+                encoding="utf-8",
+            )
+            app.state.store.update_run(
+                "run-private-contract-path",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+
+            stored = app.state.store.get_run("run-private-contract-path")
+            public = public_run(app, stored)  # type: ignore[arg-type]
+            rendered = json.dumps(public["error_info"])
+
+            self.assertEqual(public["status"], "failed")
+            self.assertNotIn("private-delivery", rendered)
+            self.assertIn("<server-path>", rendered)
+
+    def test_completed_contract_run_requires_its_manifest(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(
+                app.state.store,
+                "run-missing-manifest",
+                require_execution_contract=True,
+            )
+            work = app.state.config.state_dir / "runs" / "run-missing-manifest"
+            (work / "output").mkdir(parents=True)
+            app.state.store.update_run(
+                "run-missing-manifest",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+
+            stored = app.state.store.get_run("run-missing-manifest")
+            public = public_run(app, stored)  # type: ignore[arg-type]
+
+            self.assertEqual(public["status"], "failed")
+            self.assertNotIn("result_url", public)
+            self.assertEqual(public["error_info"]["code"], "RUN_MANIFEST_INVALID")
 
     def test_queued_cancel_synchronizes_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             app = create_app(
                 allowed_roots=[root],
@@ -430,7 +765,10 @@ class WebAppRunSafetyTests(unittest.TestCase):
             self.assertEqual(manifest.read()["status"], "cancelled")
 
     def test_launcher_error_synchronizes_failed_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             app = create_app(
                 allowed_roots=[root],
@@ -474,7 +812,10 @@ class WebAppRunSafetyTests(unittest.TestCase):
             second.release()
 
     def test_recovery_runs_only_after_the_worker_lock_is_held(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             with mock.patch.object(
                 WebStore,
                 "recover_after_restart",
@@ -489,8 +830,630 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 with TestClient(app):
                     recover.assert_called_once()
 
+    def test_restart_recovery_closes_a_running_manifest(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-restarted")
+            manifest = seed_manifest(app, "run-restarted", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            app.state.store.update_run("run-restarted", NOW, status="running")
+
+            recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(
+                app.state.store.get_run("run-restarted")["status"],  # type: ignore[index]
+                "failed",
+            )
+            recovered_manifest = manifest.read()
+            self.assertEqual(recovered_manifest["status"], "failed")
+            self.assertEqual(
+                recovered_manifest["errors"][-1]["code"],
+                "WORKER_RESTARTED",
+            )
+
+    def test_restart_recovery_trusts_a_succeeded_manifest(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-finished-before-restart")
+            manifest = seed_manifest(app, "run-finished-before-restart", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-finished-before-restart"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            app.state.store.update_run(
+                "run-finished-before-restart",
+                NOW,
+                status="running",
+            )
+
+            recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(
+                app.state.store.get_run("run-finished-before-restart")["status"],  # type: ignore[index]
+                "completed",
+            )
+
+    def test_restart_recovery_rejects_succeeded_manifest_without_outputs(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-invalid-restart")
+            manifest = seed_manifest(app, "run-invalid-restart", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            app.state.store.update_run(
+                "run-invalid-restart",
+                NOW,
+                status="running",
+            )
+
+            recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 1)
+            stored = app.state.store.get_run("run-invalid-restart")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            self.assertIn("incomplete", stored["error"])  # type: ignore[index]
+
+    def test_restart_recovery_rereads_manifest_when_terminal_sync_loses_race(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(
+                app.state.store,
+                "run-recovery-race",
+                require_execution_contract=True,
+            )
+            manifest = seed_manifest(app, "run-recovery-race", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-recovery-race"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            app.state.store.update_run(
+                "run-recovery-race",
+                NOW,
+                status="running",
+            )
+
+            def child_commits_success(*_args, **_kwargs) -> bool:
+                manifest.transition(JobStatus.SUCCEEDED)
+                return False
+
+            with mock.patch(
+                "mms_shp_detection.webapp.runs._sync_manifest_terminal",
+                side_effect=child_commits_success,
+            ):
+                recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(
+                app.state.store.get_run("run-recovery-race")["status"],  # type: ignore[index]
+                "completed",
+            )
+            self.assertEqual(manifest.read()["status"], "succeeded")
+
+    def test_restart_recovery_is_idempotent_for_an_interrupted_run(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-already-interrupted")
+            manifest = seed_manifest(app, "run-already-interrupted", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            app.state.store.update_run(
+                "run-already-interrupted",
+                NOW,
+                status="interrupted",
+            )
+
+            app.state.run_manager.recover_after_restart(NOW)
+            first_manifest = manifest.read()
+            app.state.run_manager.recover_after_restart(NOW)
+
+            stored = app.state.store.get_run("run-already-interrupted")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            self.assertEqual(manifest.read(), first_manifest)
+            self.assertEqual(first_manifest["errors"][-1]["code"], "WORKER_RESTARTED")
+
+    def test_restart_reconciles_contract_terminal_rows_after_cross_store_crash(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            for run_id, database_status in (
+                ("run-db-failed-first", "failed"),
+                ("run-db-cancelled-first", "cancelled"),
+            ):
+                seed_run(
+                    app.state.store,
+                    run_id,
+                    require_execution_contract=True,
+                )
+                manifest = seed_manifest(app, run_id, root)
+                manifest.transition(JobStatus.VALIDATING)
+                manifest.transition(JobStatus.RUNNING)
+                app.state.store.update_run(
+                    run_id,
+                    NOW,
+                    status=database_status,
+                    finished_at=NOW,
+                )
+
+            app.state.run_manager.recover_after_restart(NOW)
+
+            failed_manifest = RunManifestStore(
+                app.state.config.state_dir
+                / "runs"
+                / "run-db-failed-first"
+                / "output"
+                / "run_manifest.json"
+            ).read()
+            cancelled_manifest = RunManifestStore(
+                app.state.config.state_dir
+                / "runs"
+                / "run-db-cancelled-first"
+                / "output"
+                / "run_manifest.json"
+            ).read()
+            self.assertEqual(failed_manifest["status"], "failed")
+            self.assertEqual(failed_manifest["errors"][-1]["code"], "WORKER_RESTARTED")
+            self.assertEqual(cancelled_manifest["status"], "cancelled")
+
+    def test_restart_finishes_cancel_requested_active_rows(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            manifests: dict[str, RunManifestStore] = {}
+            for run_id, database_status in (
+                ("run-cancelled-while-preparing", "preparing"),
+                ("run-cancelled-while-running", "running"),
+            ):
+                seed_run(
+                    app.state.store,
+                    run_id,
+                    require_execution_contract=True,
+                )
+                manifest = seed_manifest(app, run_id, root)
+                if database_status == "running":
+                    manifest.transition(JobStatus.VALIDATING)
+                    manifest.transition(JobStatus.RUNNING)
+                manifests[run_id] = manifest
+                app.state.store.update_run(
+                    run_id,
+                    NOW,
+                    status=database_status,
+                    cancel_requested=1,
+                )
+            seed_run(app.state.store, "run-next-after-recovery")
+
+            recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 2)
+            for run_id, manifest in manifests.items():
+                stored = app.state.store.get_run(run_id)
+                self.assertEqual(stored["status"], "cancelled")  # type: ignore[index]
+                self.assertEqual(manifest.read()["status"], "cancelled")
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertEqual(claimed["id"], "run-next-after-recovery")  # type: ignore[index]
+
+    def test_restart_does_not_requeue_a_possibly_spawned_starting_run(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-starting-at-restart")
+            manifest = seed_manifest(app, "run-starting-at-restart", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            app.state.store.update_run(
+                "run-starting-at-restart",
+                NOW,
+                status="starting",
+            )
+
+            recovered = app.state.run_manager.recover_after_restart(NOW)
+
+            self.assertEqual(recovered, 1)
+            stored = app.state.store.get_run("run-starting-at-restart")
+            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
+            self.assertEqual(manifest.read()["status"], "failed")
+
+    def test_durable_success_wins_a_late_cancellation_request(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-late-cancel")
+            manifest = seed_manifest(app, "run-late-cancel", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-late-cancel"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            class EmptyStdout:
+                async def read(self, _size: int) -> bytes:
+                    return b""
+
+            class SuccessfulProcess:
+                pid = 4330
+                returncode = None
+                stdout = EmptyStdout()
+
+                async def wait(self) -> int:
+                    manifest.transition(JobStatus.VALIDATING)
+                    manifest.transition(JobStatus.RUNNING)
+                    app.state.store.update_run(
+                        "run-late-cancel",
+                        NOW,
+                        status="cancelling",
+                        cancel_requested=1,
+                    )
+                    manifest.transition(JobStatus.SUCCEEDED)
+                    self.returncode = 0
+                    return 0
+
+            async def exercise() -> None:
+                with mock.patch(
+                    "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                    new=mock.AsyncMock(return_value=SuccessfulProcess()),
+                ):
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+
+            asyncio.run(exercise())
+
+            stored = app.state.store.get_run("run-late-cancel")
+            self.assertEqual(stored["status"], "completed")  # type: ignore[index]
+            self.assertEqual(manifest.read()["status"], "succeeded")
+
+    def test_shutdown_preserves_an_already_committed_success(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-success-at-stop")
+            manifest = seed_manifest(app, "run-success-at-stop", root)
+            shp_path = (
+                app.state.config.state_dir
+                / "runs"
+                / "run-success-at-stop"
+                / "output"
+                / "shp"
+                / "detected_signs.shp"
+            )
+            write_bundle(shp_path)
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            app.state.store.update_run(
+                "run-success-at-stop",
+                NOW,
+                status="running",
+            )
+            process = SimpleNamespace(returncode=None)
+            app.state.run_manager._active_run_id = "run-success-at-stop"
+            app.state.run_manager._active_process = process
+
+            with mock.patch.object(
+                app.state.run_manager,
+                "_terminate",
+                new=mock.AsyncMock(),
+            ) as terminate:
+                asyncio.run(app.state.run_manager.stop())
+                terminate.assert_awaited_once_with(process)
+
+            stored = app.state.store.get_run("run-success-at-stop")
+            self.assertEqual(stored["status"], "completed")  # type: ignore[index]
+            self.assertEqual(manifest.read()["status"], "succeeded")
+
+    def test_cancel_retries_when_queued_run_becomes_running(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-cancel-cas")
+            original_transition = app.state.store.transition_run
+            raced = False
+
+            def race_once(run_id: str, now: str, **kwargs) -> bool:
+                nonlocal raced
+                if kwargs.get("to_status") == "cancelled" and not raced:
+                    raced = True
+                    app.state.store.update_run(
+                        run_id,
+                        now,
+                        status="running",
+                    )
+                    return False
+                return original_transition(run_id, now, **kwargs)
+
+            with mock.patch.object(
+                app.state.store,
+                "transition_run",
+                side_effect=race_once,
+            ):
+                cancelled = asyncio.run(app.state.run_manager.cancel("run-cancel-cas"))
+
+            self.assertTrue(raced)
+            self.assertEqual(cancelled["status"], "cancelling")
+            self.assertEqual(cancelled["cancel_requested"], 1)
+
+    def test_process_failure_wins_a_concurrent_cancelling_transition(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-failure-cancel-race")
+            manifest = seed_manifest(app, "run-failure-cancel-race", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+
+            class EmptyStdout:
+                async def read(self, _size: int) -> bytes:
+                    return b""
+
+            class FailedProcess:
+                pid = 4881
+                returncode = None
+                stdout = EmptyStdout()
+
+                async def wait(self) -> int:
+                    manifest.transition(JobStatus.VALIDATING)
+                    manifest.transition(JobStatus.RUNNING)
+                    self.returncode = 2
+                    return 2
+
+            original_transition = app.state.store.transition_run
+            raced = False
+
+            def request_cancel_before_failure(run_id: str, now: str, **kwargs) -> bool:
+                nonlocal raced
+                if kwargs.get("to_status") == "failed" and not raced:
+                    raced = True
+                    app.state.store.update_run(
+                        run_id,
+                        now,
+                        status="cancelling",
+                        cancel_requested=1,
+                    )
+                return original_transition(run_id, now, **kwargs)
+
+            async def exercise() -> None:
+                with (
+                    mock.patch(
+                        "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                        new=mock.AsyncMock(return_value=FailedProcess()),
+                    ),
+                    mock.patch.object(
+                        app.state.store,
+                        "transition_run",
+                        side_effect=request_cancel_before_failure,
+                    ),
+                ):
+                    await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+
+            asyncio.run(exercise())
+
+            self.assertTrue(raced)
+            self.assertEqual(
+                app.state.store.get_run("run-failure-cancel-race")["status"],  # type: ignore[index]
+                "failed",
+            )
+            self.assertEqual(manifest.read()["status"], "failed")
+
+    def test_shutdown_waits_for_spawn_and_terminates_the_published_child(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-shutdown-spawn")
+            manifest = seed_manifest(app, "run-shutdown-spawn", root)
+            claimed = app.state.store.claim_next_queued_run(NOW)
+            self.assertIsNotNone(claimed)
+            process = SimpleNamespace(pid=4882, returncode=None, stdout=None)
+
+            async def exercise() -> mock.AsyncMock:
+                spawn_started = asyncio.Event()
+                release_spawn = asyncio.Event()
+
+                async def delayed_spawn(*_args, **_kwargs):
+                    spawn_started.set()
+                    await release_spawn.wait()
+                    return process
+
+                async def terminate_child(candidate) -> None:
+                    self.assertIs(candidate, process)
+                    candidate.returncode = -15
+
+                with (
+                    mock.patch(
+                        "mms_shp_detection.webapp.runs.asyncio.create_subprocess_exec",
+                        side_effect=delayed_spawn,
+                    ),
+                    mock.patch.object(
+                        app.state.run_manager,
+                        "_terminate",
+                        new=mock.AsyncMock(side_effect=terminate_child),
+                    ) as terminate,
+                ):
+                    execute_task = asyncio.create_task(
+                        app.state.run_manager._execute(claimed)  # type: ignore[arg-type]
+                    )
+                    await spawn_started.wait()
+                    stop_task = asyncio.create_task(app.state.run_manager.stop())
+                    await asyncio.sleep(0)
+                    release_spawn.set()
+                    await asyncio.gather(execute_task, stop_task)
+                    return terminate
+
+            terminate = asyncio.run(exercise())
+
+            self.assertEqual(terminate.await_count, 1)
+            self.assertEqual(
+                app.state.store.get_run("run-shutdown-spawn")["status"],  # type: ignore[index]
+                "interrupted",
+            )
+            self.assertEqual(manifest.read()["status"], "failed")
+
     def test_cancellation_during_spawn_cannot_publish_running_status(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             state = Path(state_text)
             app = create_app(
                 allowed_roots=[Path(root_text)],

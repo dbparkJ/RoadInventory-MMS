@@ -14,7 +14,6 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-
 DEFAULT_CONFIG_NAME = "config.yaml"
 
 
@@ -29,9 +28,7 @@ class _Yaml12SafeLoader(yaml.SafeLoader):
 
 _Yaml12SafeLoader.yaml_implicit_resolvers = {
     key: [
-        (tag, pattern)
-        for tag, pattern in resolvers
-        if tag != "tag:yaml.org,2002:bool"
+        (tag, pattern) for tag, pattern in resolvers if tag != "tag:yaml.org,2002:bool"
     ]
     for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
@@ -64,10 +61,24 @@ def _json_compatible(value: Any) -> Any:
     return value
 
 
+def _immutable_json_value(value: Any) -> Any:
+    """Detach and freeze a normalized JSON tree for application contracts."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _immutable_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_immutable_json_value(item) for item in value)
+    return value
+
+
 def canonical_config_json(value: Mapping[str, Any] | argparse.Namespace) -> str:
     """Return canonical JSON used to identify an effective pipeline config."""
 
-    public = serializable_config(value) if isinstance(value, argparse.Namespace) else value
+    public = (
+        serializable_config(value) if isinstance(value, argparse.Namespace) else value
+    )
     return json.dumps(
         _json_compatible(public),
         ensure_ascii=False,
@@ -79,6 +90,22 @@ def canonical_config_json(value: Mapping[str, Any] | argparse.Namespace) -> str:
 
 def config_sha256(value: Mapping[str, Any] | argparse.Namespace) -> str:
     return hashlib.sha256(canonical_config_json(value).encode("utf-8")).hexdigest()
+
+
+def config_file_sha256(path: Path) -> str:
+    """Hash the exact YAML artifact handed from a launcher to the pipeline."""
+
+    digest = hashlib.sha256()
+    resolved = Path(path).expanduser().resolve()
+    try:
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ConfigError(
+            f"Could not hash YAML configuration {resolved}: {exc}"
+        ) from exc
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -95,6 +122,22 @@ class PipelineConfig:
     source_path: Path | None = None
     schema_version: int = 1
 
+    def __post_init__(self) -> None:
+        normalized = _json_compatible(self.values)
+        expected_hash = config_sha256(normalized)
+        if self.config_hash != expected_hash:
+            raise ConfigError(
+                "PipelineConfig hash does not match its normalized values: "
+                f"{self.config_hash!r} != {expected_hash!r}"
+            )
+        object.__setattr__(self, "values", _immutable_json_value(normalized))
+        if self.source_path is not None:
+            object.__setattr__(
+                self,
+                "source_path",
+                Path(self.source_path).resolve(strict=False),
+            )
+
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "PipelineConfig":
         values = _json_compatible(serializable_config(args))
@@ -106,7 +149,12 @@ class PipelineConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.values)
+        value = _json_compatible(self.values)
+        if not isinstance(
+            value, dict
+        ):  # pragma: no cover - guarded by the type contract
+            raise ConfigError("PipelineConfig values must normalize to an object.")
+        return value
 
 
 _RANGES: dict[str, tuple[float | None, float | None]] = {
@@ -307,7 +355,9 @@ def _convert_scalar(
         if not isinstance(value, (str, os.PathLike)):
             raise ConfigError(f"'{dotted_key}' must be a file-system path.")
         expanded = Path(os.path.expandvars(os.path.expanduser(os.fspath(value))))
-        converted = expanded if expanded.is_absolute() else (config_dir / expanded).resolve()
+        converted = (
+            expanded if expanded.is_absolute() else (config_dir / expanded).resolve()
+        )
     elif action.type is not None:
         if action.type is int and (
             isinstance(value, bool)
@@ -349,9 +399,13 @@ def _validate_range(dest: str, value: Any, dotted_key: str) -> None:
             f"'{dotted_key}' must be greater than {lower}; received {value!r}."
         )
     if lower is not None and value < lower:
-        raise ConfigError(f"'{dotted_key}' must be at least {lower}; received {value!r}.")
+        raise ConfigError(
+            f"'{dotted_key}' must be at least {lower}; received {value!r}."
+        )
     if upper is not None and value > upper:
-        raise ConfigError(f"'{dotted_key}' must be at most {upper}; received {value!r}.")
+        raise ConfigError(
+            f"'{dotted_key}' must be at most {upper}; received {value!r}."
+        )
 
 
 def validate_config_value(dest: str, value: Any, dotted_key: str) -> None:
@@ -381,7 +435,9 @@ def load_config_defaults(
             Loader=_Yaml12SafeLoader,
         )
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise ConfigError(f"Could not read YAML configuration {resolved_path}: {exc}") from exc
+        raise ConfigError(
+            f"Could not read YAML configuration {resolved_path}: {exc}"
+        ) from exc
 
     if document is None:
         document = {}
@@ -422,7 +478,11 @@ def load_config_defaults(
 
     minimum_fov = defaults.get("perspective_min_fov_deg")
     maximum_fov = defaults.get("perspective_max_fov_deg")
-    if minimum_fov is not None and maximum_fov is not None and minimum_fov > maximum_fov:
+    if (
+        minimum_fov is not None
+        and maximum_fov is not None
+        and minimum_fov > maximum_fov
+    ):
         raise ConfigError(
             "perspective_min_fov_deg cannot be greater than perspective_max_fov_deg."
         )
@@ -464,9 +524,7 @@ def load_config_defaults(
         and defaults.get("disable_full_panorama_detection")
         and defaults.get("disable_tiled_detection")
     ):
-        raise ConfigError(
-            "Full-panorama and tiled detection cannot both be disabled."
-        )
+        raise ConfigError("Full-panorama and tiled detection cannot both be disabled.")
     return defaults
 
 
@@ -543,8 +601,10 @@ def parse_args_with_config(
             raw_argv,
             default_config_path=default_config_path,
         )
+        config_file_hash: str | None = None
         if config_path is not None:
             defaults = load_config_defaults(parser, config_path)
+            config_file_hash = config_file_sha256(config_path)
             parser.set_defaults(**defaults)
     except ConfigError as exc:
         parser.error(str(exc))
@@ -561,6 +621,7 @@ def parse_args_with_config(
     # Private metadata is excluded from processing fingerprints and is useful
     # only for the run log/effective configuration snapshot.
     args._config_path = str(config_path.resolve()) if config_path is not None else None
+    args._config_file_hash = config_file_hash
     args._cli_override_dests = tuple(sorted(cli_override_dests))
     return args
 

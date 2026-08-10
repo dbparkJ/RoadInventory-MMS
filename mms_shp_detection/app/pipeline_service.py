@@ -46,7 +46,9 @@ class PipelineStage(Protocol):
 
     def run(self, context: PipelineContext) -> StageResult: ...
 
-    def validate_output(self, context: PipelineContext, result: StageResult) -> None: ...
+    def validate_output(
+        self, context: PipelineContext, result: StageResult
+    ) -> None: ...
 
 
 @dataclass
@@ -79,8 +81,12 @@ def _single_scope_name(value: Any, *, fallback: str) -> str:
 
 def pipeline_scope(args: Any) -> tuple[str, str]:
     return (
-        _single_scope_name(getattr(args, "include_job_names", None), fallback="multiple"),
-        _single_scope_name(getattr(args, "include_track_names", None), fallback="multiple"),
+        _single_scope_name(
+            getattr(args, "include_job_names", None), fallback="multiple"
+        ),
+        _single_scope_name(
+            getattr(args, "include_track_names", None), fallback="multiple"
+        ),
     )
 
 
@@ -89,7 +95,9 @@ def generate_job_id(args: Any, config: PipelineConfig) -> str:
 
     requested = os.environ.get("MMS_PIPELINE_JOB_ID", "").strip()
     if requested:
-        if len(requested) > 128 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", requested):
+        if len(requested) > 128 or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", requested
+        ):
             raise ConfigError(
                 "MMS_PIPELINE_JOB_ID must contain only letters, digits, '.', '_' or '-'"
             )

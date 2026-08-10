@@ -12,15 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from .domain.calibration import (
+    SUPPORTED_CALIBRATION_SCHEMA_VERSION,
     CalibrationResolution,
     CalibrationResolver,
+    calibration_task_identity,
     delivery_calibration_fingerprint,
     normalize_calibration_component,
     normalized_task_key,
 )
 
 LEICA_CALIBRATION_XOR_KEY = b"BFqjcI26rmlNV70EXD7Oh+Y8VDn"
-CALIBRATION_SCHEMA_VERSION = 2
+CALIBRATION_SCHEMA_VERSION = SUPPORTED_CALIBRATION_SCHEMA_VERSION
 
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
@@ -313,9 +315,13 @@ def attach_calibration_metadata(
         )
     else:
         task_keys = tuple(normalized_task_key(task) for task in tasks)
-        if resolution.task_keys != task_keys:
+        task_identities = tuple(calibration_task_identity(task) for task in tasks)
+        if (
+            resolution.task_keys != task_keys
+            or resolution.task_identities != task_identities
+        ):
             raise ValueError(
-                "CalibrationResolution does not match the supplied task order"
+                "CalibrationResolution does not match the supplied task identities or order"
             )
         if require_calibration:
             resolution.require()

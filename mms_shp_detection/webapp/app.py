@@ -77,7 +77,6 @@ class WebAppConfig:
     state_dir: Path | None = None
     allowed_roots: Sequence[Path | str] | Mapping[str, Path | str] | None = None
     pipeline_config_path: Path | None = None
-    map_style_url: str | None = None
     server_name: str = "MMS 작업 서버"
     upload_relative_dir: str = "_web_uploads"
     max_upload_files: int = 100_000
@@ -125,28 +124,29 @@ class WebAppConfig:
                 )
             else:
                 self.allowed_roots = (self.project_root / "data",)
-        if self.map_style_url is None:
-            self.map_style_url = os.environ.get("MMS_MAP_STYLE_URL") or None
         normalize_relative_path(self.upload_relative_dir, allow_empty=False)
-        if min(
-            self.max_upload_files,
-            self.max_upload_file_bytes,
-            self.max_upload_total_bytes,
-            self.max_upload_chunk_bytes,
-            self.max_tree_entries,
-            self.max_result_files,
-            self.max_result_shapefiles,
-            self.max_result_shapefile_files,
-            self.max_result_priority_entries,
-            self.max_route_points,
-            self.max_panorama_previews,
-            self.max_point_previews,
-            self.max_overlay_upload_files,
-            self.max_overlay_file_bytes,
-            self.max_overlay_total_bytes,
-            self.max_overlay_features,
-            self.max_overlay_response_features,
-        ) <= 0:
+        if (
+            min(
+                self.max_upload_files,
+                self.max_upload_file_bytes,
+                self.max_upload_total_bytes,
+                self.max_upload_chunk_bytes,
+                self.max_tree_entries,
+                self.max_result_files,
+                self.max_result_shapefiles,
+                self.max_result_shapefile_files,
+                self.max_result_priority_entries,
+                self.max_route_points,
+                self.max_panorama_previews,
+                self.max_point_previews,
+                self.max_overlay_upload_files,
+                self.max_overlay_file_bytes,
+                self.max_overlay_total_bytes,
+                self.max_overlay_features,
+                self.max_overlay_response_features,
+            )
+            <= 0
+        ):
             raise ValueError("Web server limits must be positive.")
         if self.max_result_shapefile_files < self.max_result_shapefiles:
             raise ValueError(
@@ -168,7 +168,9 @@ def _make_storage_roots(config: WebAppConfig) -> list[StorageRoot]:
     for label, path in items:
         resolved = path.expanduser().resolve(strict=True)
         if not resolved.is_dir():
-            raise NotADirectoryError(f"Configured storage root is not a directory: {label}")
+            raise NotADirectoryError(
+                f"Configured storage root is not a directory: {label}"
+            )
         identity = str(resolved).casefold()
         if identity in seen:
             continue
@@ -219,7 +221,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response.headers.setdefault(
                 "Cache-Control", "public, max-age=31536000, immutable"
             )
-        elif request.url.path == "/" or request.url.path.endswith("/index.html"):
+        elif (
+            request.url.path == "/"
+            or request.url.path.endswith("/index.html")
+            or request.url.path.endswith("/vworld-map.html")
+        ):
             response.headers["Cache-Control"] = "no-cache"
         return response
 
@@ -301,7 +307,9 @@ def _public_root_entry(root: StorageRoot, relative_path: str) -> dict[str, Any]:
     }
 
 
-def _tree_payload(root: StorageRoot, relative_path: str, max_entries: int) -> dict[str, Any]:
+def _tree_payload(
+    root: StorageRoot, relative_path: str, max_entries: int
+) -> dict[str, Any]:
     target = resolve_under_root(
         root.path,
         relative_path,
@@ -376,14 +384,24 @@ def create_app(
 
     if config is not None and any(
         value is not None
-        for value in (allowed_roots, storage_roots, state_dir, project_root, start_runner)
+        for value in (
+            allowed_roots,
+            storage_roots,
+            state_dir,
+            project_root,
+            start_runner,
+        )
     ):
-        raise ValueError("Pass either WebAppConfig or create_app keyword overrides, not both.")
+        raise ValueError(
+            "Pass either WebAppConfig or create_app keyword overrides, not both."
+        )
     if allowed_roots is not None and storage_roots is not None:
         raise ValueError("allowed_roots and storage_roots are aliases; pass only one.")
     if config is None:
         config = WebAppConfig(
-            project_root=Path(project_root) if project_root is not None else _default_project_root(),
+            project_root=Path(project_root)
+            if project_root is not None
+            else _default_project_root(),
             state_dir=Path(state_dir) if state_dir is not None else None,
             allowed_roots=allowed_roots if allowed_roots is not None else storage_roots,
             enable_run_worker=True if start_runner is None else bool(start_runner),
@@ -393,7 +411,9 @@ def create_app(
     roots = _make_storage_roots(config)
     writable_roots = [root for root in roots if root.writable]
     if not writable_roots:
-        raise ValueError("At least one storage root must be writable for server uploads.")
+        raise ValueError(
+            "At least one storage root must be writable for server uploads."
+        )
     store = WebStore(config.state_dir / "registry.sqlite3")
     logger = _setup_logger(config.state_dir)
 
@@ -404,7 +424,7 @@ def create_app(
             if config.enable_run_worker:
                 app.state.worker_process_lock.acquire()
                 worker_lock_acquired = True
-                recovered = store.recover_after_restart(utc_now())
+                recovered = app.state.run_manager.recover_after_restart(utc_now())
                 if recovered:
                     logger.warning(
                         "Recovered %d interrupted run(s) after server restart.",
@@ -472,9 +492,7 @@ def create_app(
         app.state.panorama_yaw_offset_deg,
         app.state.panorama_pitch_offset_deg,
     ) = _panorama_alignment_defaults(config.pipeline_config_path)
-    app.state.worker_process_lock = WorkerProcessLock(
-        config.state_dir / "worker.lock"
-    )
+    app.state.worker_process_lock = WorkerProcessLock(config.state_dir / "worker.lock")
     try:
         from mms_shp_detection.pointcloud import PointCloudReaderCache
 
@@ -531,9 +549,7 @@ def create_app(
 
     @app.get("/api/bootstrap", tags=["system"])
     async def bootstrap() -> dict[str, Any]:
-        datasets = [
-            public_dataset(item) for item in store.list_datasets(limit=100)
-        ]
+        datasets = [public_dataset(item) for item in store.list_datasets(limit=100)]
         recent_runs = [
             public_run(app, item, include_log=False)
             for item in store.list_runs(limit=20)
@@ -542,8 +558,11 @@ def create_app(
         return {
             "api_version": API_VERSION,
             "server_name": config.server_name,
-            "map_style_url": config.map_style_url,
-            "map": {"style_url": config.map_style_url},
+            "map": {
+                "provider": "vworld",
+                "engine": "webgl",
+                "version": "3.0",
+            },
             "preview_defaults": {
                 "panorama_point_yaw_offset_deg": app.state.panorama_yaw_offset_deg,
                 "panorama_point_pitch_offset_deg": app.state.panorama_pitch_offset_deg,

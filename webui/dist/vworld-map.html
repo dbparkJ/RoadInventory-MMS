@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>VWorld WebGL 3.0</title>
+    <style>
+      html,
+      body,
+      #vmap {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #13212b;
+      }
+    </style>
+    <script>
+      // The official VWorld 3.0 bootstrap writes its dependent scripts with
+      // document.write(), so it must run synchronously while this document is parsed.
+      // `domain` is required for URI validation and keeps the static host deployable
+      // on localhost, 127.0.0.1, or the registered production origin.
+      ;(() => {
+        const mmsVworldDevelopmentKey = 'EE4D1CA9-BEA1-3AFF-AE81-DE0B92A0E352'
+        const mmsVworldOrigin = encodeURIComponent(window.location.origin)
+        document.write(
+          '<script src="https://map.vworld.kr/js/webglMapInit.js.do?version=3.0' +
+            '&apiKey=' +
+            mmsVworldDevelopmentKey +
+            '&domain=' +
+            mmsVworldOrigin +
+            '"><\/script>',
+        )
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="vmap"></div>
+  </body>
+</html>

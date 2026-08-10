@@ -633,7 +633,6 @@ function App() {
               frameRange={frameRange}
               route={route}
               routeLoading={routeLoading}
-              mapStyleUrl={boot?.map_style_url}
               demoMode={demoMode}
               panoramaOpen={panoramaOpen}
               pointCloudOpen={pointCloudOpen}

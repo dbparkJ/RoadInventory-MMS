@@ -46,6 +46,19 @@ describe('RunQueue', () => {
     expect(screen.getByRole('button', { name: '취소' })).toBeInTheDocument()
   })
 
+  it('prefers a more specific canonical status over the legacy queue status', () => {
+    render(
+      <RunQueue
+        runs={[run({ status: 'running', canonical_status: 'retrying' })]}
+        open
+        onClose={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('재시도 중')).toBeInTheDocument()
+  })
+
   it('recognizes the internal starting state without throwing', () => {
     render(
       <RunQueue

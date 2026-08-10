@@ -15,7 +15,10 @@ from scripts.run_web import is_loopback_bind
 
 class WebAppHealthSafetyTests(unittest.TestCase):
     def test_health_bootstrap_and_tree_never_expose_absolute_root(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             (root / "dataset-a").mkdir()
             (root / "readme.txt").write_text("ok", encoding="utf-8")
@@ -31,7 +34,17 @@ class WebAppHealthSafetyTests(unittest.TestCase):
 
                 bootstrap = client.get("/api/bootstrap")
                 self.assertEqual(bootstrap.status_code, 200)
-                self.assertTrue(bootstrap.json()["capabilities"]["resumable_uploads"])
+                bootstrap_payload = bootstrap.json()
+                self.assertTrue(bootstrap_payload["capabilities"]["resumable_uploads"])
+                self.assertEqual(
+                    bootstrap_payload["map"],
+                    {
+                        "provider": "vworld",
+                        "engine": "webgl",
+                        "version": "3.0",
+                    },
+                )
+                self.assertNotIn("map_style_url", bootstrap_payload)
                 serialized = bootstrap.text
                 self.assertNotIn(str(root), serialized)
 
@@ -54,7 +67,11 @@ class WebAppHealthSafetyTests(unittest.TestCase):
                 self.assertEqual(absolute.status_code, 422)
 
     def test_symlink_directory_is_not_selectable_or_traversable(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as outside_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as outside_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             root = Path(root_text)
             link = root / "linked"
             try:
@@ -69,7 +86,9 @@ class WebAppHealthSafetyTests(unittest.TestCase):
             with TestClient(app) as client:
                 root_id = client.get("/api/storage").json()["roots"][0]["id"]
                 tree = client.get(f"/api/storage/{root_id}/tree").json()
-                linked = next(item for item in tree["entries"] if item["name"] == "linked")
+                linked = next(
+                    item for item in tree["entries"] if item["name"] == "linked"
+                )
                 self.assertFalse(linked["selectable"])
                 self.assertTrue(linked["symlink"])
                 self.assertEqual(
@@ -106,7 +125,10 @@ class WebAppHealthSafetyTests(unittest.TestCase):
                 normalize_relative_path(unsafe, allow_empty=False)
 
     def test_dataset_scan_runs_symlink_preflight_before_background_work(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             app = create_app(
                 allowed_roots=[Path(root_text)],
                 state_dir=Path(state_text),
@@ -138,7 +160,10 @@ class WebAppHealthSafetyTests(unittest.TestCase):
         self.assertFalse(is_loopback_bind("mms.internal.example"))
 
     def test_storage_root_environment_is_used_without_cli_override(self) -> None:
-        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
             with mock.patch.dict(
                 os.environ,
                 {"MMS_WEB_STORAGE_ROOTS": root_text},

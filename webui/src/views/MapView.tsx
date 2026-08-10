@@ -1,7 +1,5 @@
-import { Crosshair, Layers, LoaderCircle, Navigation2 } from 'lucide-react'
+import { AlertTriangle, Crosshair, Layers, LoaderCircle, Navigation2, RotateCcw } from 'lucide-react'
 import type { FeatureCollection } from 'geojson'
-import maplibregl, { type GeoJSONSource, type Map as MapLibreMap, type StyleSpecification } from 'maplibre-gl'
-import 'maplibre-gl/dist/maplibre-gl.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { resolveMapTrackScope } from '../lib/mapScope'
@@ -11,6 +9,23 @@ import {
   buildTrackColorMap,
   TRACK_COLORS,
 } from '../lib/route'
+import {
+  cameraTargetForCoordinates,
+  createVWorldDataSource,
+  moveVWorldMap,
+  pickedEntityId,
+  removeVWorldDataSource,
+  renderVWorldFrames,
+  renderVWorldOverlay,
+  renderVWorldRoute,
+  renderVWorldRouteRange,
+  resizeVWorldMap,
+  startVWorldMap,
+  VWORLD_CONTAINER_ID,
+  VWORLD_IFRAME_URL,
+  type VWorldCustomDataSource,
+  type VWorldRuntime,
+} from '../lib/vworld'
 import type { Frame, FrameRange, RoutePoint } from '../types'
 
 interface MapViewProps {
@@ -21,35 +36,39 @@ interface MapViewProps {
   showAllTracks?: boolean
   frameRange?: FrameRange | null
   loading: boolean
-  mapStyleUrl?: string
   onSelectFrame: (frame: Frame) => void
 }
 
-const fallbackStyle: StyleSpecification = {
-  version: 8,
-  glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
-  sources: {
-    osm: {
-      type: 'raster',
-      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-      tileSize: 256,
-      attribution: '© OpenStreetMap contributors',
-      maxzoom: 19,
-    },
-  },
-  layers: [
-    {
-      id: 'osm',
-      type: 'raster',
-      source: 'osm',
-      paint: {
-        'raster-saturation': -0.78,
-        'raster-contrast': 0.08,
-        'raster-brightness-min': 0.18,
-        'raster-brightness-max': 0.8,
-      },
-    },
-  ],
+interface VWorldBoot {
+  frameWindow: Window
+  promise: Promise<VWorldRuntime>
+}
+
+interface VWorldSources {
+  route: VWorldCustomDataSource
+  routeRange: VWorldCustomDataSource
+  frames: VWorldCustomDataSource
+  overlay: VWorldCustomDataSource
+}
+
+async function createVWorldSources(runtime: VWorldRuntime): Promise<VWorldSources> {
+  const created: VWorldCustomDataSource[] = []
+  const create = async (name: string) => {
+    const source = await createVWorldDataSource(runtime, name)
+    created.push(source)
+    return source
+  }
+  try {
+    return {
+      route: await create('mms-route'),
+      routeRange: await create('mms-route-range'),
+      frames: await create('mms-frames'),
+      overlay: await create('mms-overlay'),
+    }
+  } catch (reason) {
+    created.forEach((source) => removeVWorldDataSource(runtime, source))
+    throw reason
+  }
 }
 
 export function MapView({
@@ -60,17 +79,25 @@ export function MapView({
   showAllTracks = false,
   frameRange,
   loading,
-  mapStyleUrl,
   onSelectFrame,
 }: MapViewProps) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const mapRef = useRef<MapLibreMap | null>(null)
+  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const bootRef = useRef<VWorldBoot | null>(null)
+  const runtimeRef = useRef<VWorldRuntime | null>(null)
+  const dataSourcesRef = useRef<VWorldSources | null>(null)
+  const frameClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
+  const overlayClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
   const onSelectRef = useRef(onSelectFrame)
   const framesRef = useRef(frames)
   const fittedRouteRef = useRef('')
   const selectedFrameRef = useRef<string | null>(null)
+  const initialCameraRef = useRef(
+    cameraTargetForCoordinates(route.map((point) => [point.lon, point.lat] as const)),
+  )
   const [ready, setReady] = useState(false)
-  const [satellite, setSatellite] = useState(false)
+  const [highContrast, setHighContrast] = useState(false)
+  const [mapError, setMapError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
   const overlay = useOptionalOverlayWorkspace()
   const overlayRef = useRef(overlay)
 
@@ -167,231 +194,209 @@ export function MapView({
   }, [displayAllTracks, effectiveTrackId, frameIndexes, frameRange, route])
 
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: mapStyleUrl ?? fallbackStyle,
-      center: route[0] ? [route[0].lon, route[0].lat] : [126.978, 37.5665],
-      zoom: route.length ? 13.8 : 11,
-      pitch: 34,
-      bearing: -14,
-      attributionControl: false,
-      maxPitch: 70,
-    })
-    mapRef.current = map
-    map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'bottom-right')
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-left')
+    const iframe = iframeRef.current
+    if (!iframe) return
+    let cancelled = false
+    let installing = false
+    let runtime: VWorldRuntime | null = null
+    let dataSources: VWorldSources | null = null
+    let resizeObserver: ResizeObserver | null = null
+    let mapClickHandler:
+      | ((
+          windowPosition: unknown,
+          ecefPosition: unknown,
+          cartographic: { longitudeDD?: number; latitudeDD?: number; height?: number } | null,
+        ) => void)
+      | null = null
 
-    const resizeObserver = new ResizeObserver(() => map.resize())
-    resizeObserver.observe(containerRef.current)
-
-    map.on('load', () => {
-      map.addSource('mms-route', { type: 'geojson', data: routeGeoJson })
-      map.addLayer({
-        id: 'mms-route-halo',
-        type: 'line',
-        source: 'mms-route',
-        paint: { 'line-color': '#07111f', 'line-width': 8, 'line-opacity': 0.55 },
-      })
-      map.addLayer({
-        id: 'mms-route-line',
-        type: 'line',
-        source: 'mms-route',
-        paint: {
-          'line-color': ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
-          'line-width': 4,
-          'line-opacity': 0.95,
-        },
-      })
-      map.addSource('mms-route-range', { type: 'geojson', data: routeRangeGeoJson })
-      map.addLayer({
-        id: 'mms-route-range-halo',
-        type: 'line',
-        source: 'mms-route-range',
-        paint: { 'line-color': '#ffffff', 'line-width': 10, 'line-opacity': 0.72 },
-      })
-      map.addLayer({
-        id: 'mms-route-range-line',
-        type: 'line',
-        source: 'mms-route-range',
-        paint: {
-          'line-color': ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
-          'line-width': 6,
-          'line-opacity': 1,
-        },
-      })
-      map.addSource('mms-frames', { type: 'geojson', data: frameGeoJson })
-      map.addLayer({
-        id: 'mms-frames-points',
-        type: 'circle',
-        source: 'mms-frames',
-        paint: {
-          'circle-radius': ['case', ['==', ['get', 'selected'], 1], 8, 3],
-          'circle-color': [
-            'case',
-            ['==', ['get', 'selected'], 1],
-            '#ffffff',
-            ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
-          ],
-          'circle-stroke-width': [
-            'case',
-            ['==', ['get', 'selected'], 1],
-            4,
-            ['==', ['get', 'in_range'], 1],
-            3,
-            1,
-          ],
-          'circle-stroke-color': [
-            'case',
-            ['==', ['get', 'selected'], 1],
-            ['coalesce', ['get', 'track_color'], TRACK_COLORS[0]],
-            ['==', ['get', 'in_range'], 1],
-            '#ffffff',
-            '#09261f',
-          ],
-          'circle-opacity': ['case', ['==', ['get', 'in_range'], 1], 1, 0.82],
-        },
-      })
-      map.on('mouseenter', 'mms-frames-points', () => {
-        map.getCanvas().style.cursor = 'pointer'
-      })
-      map.on('mouseleave', 'mms-frames-points', () => {
-        map.getCanvas().style.cursor = ''
-      })
-      map.on('click', 'mms-frames-points', (event) => {
-        const id = event.features?.[0]?.properties?.id as string | undefined
-        const frame = framesRef.current.find((candidate) => candidate.id === id)
-        if (frame) onSelectRef.current(frame)
-      })
-      map.addSource('mms-overlay-features', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] },
-      })
-      map.addLayer({
-        id: 'mms-overlay-polygons',
-        type: 'fill',
-        source: 'mms-overlay-features',
-        filter: ['==', ['geometry-type'], 'Polygon'],
-        paint: {
-          'fill-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
-          'fill-opacity': ['case', ['==', ['get', '__overlay_selected'], 1], 0.45, 0.2],
-          'fill-outline-color': '#ffffff',
-        },
-      })
-      map.addLayer({
-        id: 'mms-overlay-lines',
-        type: 'line',
-        source: 'mms-overlay-features',
-        filter: ['==', ['geometry-type'], 'LineString'],
-        paint: {
-          'line-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
-          'line-width': ['case', ['==', ['get', '__overlay_selected'], 1], 6, 3],
-          'line-opacity': 0.95,
-        },
-      })
-      map.addLayer({
-        id: 'mms-overlay-points-halo',
-        type: 'circle',
-        source: 'mms-overlay-features',
-        filter: ['==', ['geometry-type'], 'Point'],
-        paint: {
-          'circle-radius': ['case', ['==', ['get', '__overlay_selected'], 1], 11, 8],
-          'circle-color': '#07111f',
-          'circle-opacity': 0.82,
-        },
-      })
-      map.addLayer({
-        id: 'mms-overlay-points',
-        type: 'circle',
-        source: 'mms-overlay-features',
-        filter: ['==', ['geometry-type'], 'Point'],
-        paint: {
-          'circle-radius': ['case', ['==', ['get', '__overlay_selected'], 1], 7, 5],
-          'circle-color': ['coalesce', ['get', '__overlay_color'], '#ffb84d'],
-          'circle-stroke-width': ['case', ['==', ['get', '__overlay_selected'], 1], 3, 1],
-          'circle-stroke-color': '#ffffff',
-          'circle-opacity': 0.96,
-        },
-      })
-      const overlayLayerIds = ['mms-overlay-points', 'mms-overlay-lines', 'mms-overlay-polygons']
-      overlayLayerIds.forEach((layerId) => {
-        map.on('mouseenter', layerId, () => {
-          map.getCanvas().style.cursor = 'pointer'
-        })
-        map.on('mouseleave', layerId, () => {
-          map.getCanvas().style.cursor = ''
-        })
-      })
-      map.on('click', (event) => {
-        const current = overlayRef.current
-        if (!current) return
-        const hits = map.queryRenderedFeatures(event.point, { layers: overlayLayerIds })
-        const properties = hits[0]?.properties
-        if (properties?.__overlay_layer_id && properties?.__overlay_feature_id !== undefined) {
-          current.selectFeature({
-            layerId: String(properties.__overlay_layer_id),
-            featureId: String(properties.__overlay_feature_id),
-          })
+    const install = async () => {
+      if (installing || cancelled) return
+      const frameWindow = iframe.contentWindow
+      if (!frameWindow || !iframe.contentDocument?.getElementById(VWORLD_CONTAINER_ID)) return
+      installing = true
+      try {
+        if (!bootRef.current || bootRef.current.frameWindow !== frameWindow) {
+          bootRef.current = {
+            frameWindow,
+            promise: startVWorldMap(
+              frameWindow,
+              VWORLD_CONTAINER_ID,
+              initialCameraRef.current,
+            ),
+          }
+        }
+        runtime = await bootRef.current.promise
+        if (cancelled) return
+        dataSources = await createVWorldSources(runtime)
+        if (cancelled) {
+          Object.values(dataSources).forEach((source) =>
+            removeVWorldDataSource(runtime!, source),
+          )
           return
         }
-        if (current.pickMode) {
-          void current.applyPickedCoordinate([event.lngLat.lng, event.lngLat.lat], 'wgs84')
+
+        runtimeRef.current = runtime
+        dataSourcesRef.current = dataSources
+        mapClickHandler = (windowPosition, _ecefPosition, cartographic) => {
+          if (!runtime) return
+          try {
+            const entityId = pickedEntityId(runtime.viewer.scene.pick(windowPosition))
+            const target = entityId
+              ? overlayClickTargetsRef.current.get(entityId) ??
+                frameClickTargetsRef.current.get(entityId)
+              : undefined
+            if (target) {
+              target()
+              return
+            }
+          } catch {
+            // A terrain click can legitimately have no pickable entity.
+          }
+
+          const current = overlayRef.current
+          if (!current?.pickMode || !cartographic) return
+          const lon = Number(cartographic.longitudeDD)
+          const lat = Number(cartographic.latitudeDD)
+          const height = Number(cartographic.height ?? 0)
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) return
+          void current.applyPickedCoordinate(
+            [lon, lat, Number.isFinite(height) ? height : 0],
+            'wgs84',
+          )
         }
-      })
-      setReady(true)
-    })
+        runtime.map.onClick.addEventListener(mapClickHandler)
+
+        const resize = () => {
+          if (!runtime) return
+          resizeVWorldMap(runtime, iframe.clientWidth, iframe.clientHeight)
+        }
+        resizeObserver = new ResizeObserver(resize)
+        resizeObserver.observe(iframe)
+        frameWindow.requestAnimationFrame(resize)
+        setMapError(null)
+        setReady(true)
+      } catch (reason) {
+        if (cancelled) return
+        installing = false
+        const message = reason instanceof Error ? reason.message : 'VWorld 지도를 초기화하지 못했습니다.'
+        setReady(false)
+        setMapError(message)
+      }
+    }
+
+    const onLoad = () => void install()
+    iframe.addEventListener('load', onLoad)
+    if (iframe.contentDocument?.readyState === 'complete') void install()
 
     return () => {
-      resizeObserver.disconnect()
-      map.remove()
-      mapRef.current = null
+      cancelled = true
+      iframe.removeEventListener('load', onLoad)
+      resizeObserver?.disconnect()
+      if (runtime && mapClickHandler) {
+        try {
+          runtime.map.onClick.removeEventListener(mapClickHandler)
+        } catch {
+          // The isolated iframe may already be leaving the document.
+        }
+      }
+      if (runtime && dataSources) {
+        Object.values(dataSources).forEach((source) => removeVWorldDataSource(runtime!, source))
+      }
+      try {
+        runtime?.map.clear()
+      } catch {
+        // Removing the iframe releases the VWorld singleton and WebGL context.
+      }
+      if (runtimeRef.current === runtime) runtimeRef.current = null
+      if (dataSourcesRef.current === dataSources) dataSourcesRef.current = null
+      frameClickTargetsRef.current = new Map()
+      overlayClickTargetsRef.current = new Map()
     }
-    // The map instance owns its initial style; later data changes use sources below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mapStyleUrl])
+  }, [reloadToken])
 
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !ready) return
-    ;(map.getSource('mms-route') as GeoJSONSource | undefined)?.setData(routeGeoJson)
-    if (visibleRoute.length > 1) {
-      const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
-      const bounds = visibleRoute.reduce(
-        (result, point) => result.extend([point.lon, point.lat]),
-        new maplibregl.LngLatBounds(
-          [visibleRoute[0].lon, visibleRoute[0].lat],
-          [visibleRoute[0].lon, visibleRoute[0].lat],
-        ),
+    const runtime = runtimeRef.current
+    const source = dataSourcesRef.current?.route
+    if (!runtime || !source || !ready) return
+    try {
+      renderVWorldRoute(runtime, source, routeGeoJson)
+    } catch (reason) {
+      setMapError(
+        reason instanceof Error ? reason.message : 'VWorld 지도 도형을 표시하지 못했습니다.',
       )
-      map.fitBounds(bounds, {
-        padding: 88,
-        duration: fittedRouteRef.current === routeKey ? 450 : 0,
-        maxZoom: 17,
-      })
-      fittedRouteRef.current = routeKey
     }
-  }, [displayAllTracks, effectiveTrackId, ready, routeGeoJson, visibleRoute])
+  }, [ready, routeGeoJson])
 
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !ready) return
-    ;(map.getSource('mms-route-range') as GeoJSONSource | undefined)?.setData(routeRangeGeoJson)
+    const runtime = runtimeRef.current
+    const source = dataSourcesRef.current?.routeRange
+    if (!runtime || !source || !ready) return
+    try {
+      renderVWorldRouteRange(runtime, source, routeRangeGeoJson)
+    } catch (reason) {
+      setMapError(
+        reason instanceof Error ? reason.message : 'VWorld 선택 구간을 표시하지 못했습니다.',
+      )
+    }
   }, [ready, routeRangeGeoJson])
 
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !ready) return
-    ;(map.getSource('mms-frames') as GeoJSONSource | undefined)?.setData(frameGeoJson)
+    const runtime = runtimeRef.current
+    const source = dataSourcesRef.current?.frames
+    if (!runtime || !source || !ready) return
+    try {
+      frameClickTargetsRef.current = renderVWorldFrames(
+        runtime,
+        source,
+        frameGeoJson,
+        (frameId) => {
+          const frame = framesRef.current.find((candidate) => candidate.id === frameId)
+          if (frame) onSelectRef.current(frame)
+        },
+      )
+    } catch (reason) {
+      setMapError(
+        reason instanceof Error ? reason.message : 'VWorld 프레임을 표시하지 못했습니다.',
+      )
+    }
   }, [frameGeoJson, ready])
 
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !ready) return
-    ;(map.getSource('mms-overlay-features') as GeoJSONSource | undefined)?.setData(overlayGeoJson)
+    const runtime = runtimeRef.current
+    const source = dataSourcesRef.current?.overlay
+    if (!runtime || !source || !ready) return
+    try {
+      overlayClickTargetsRef.current = renderVWorldOverlay(
+        runtime,
+        source,
+        overlayGeoJson,
+        (layerId, featureId) => {
+          overlayRef.current?.selectFeature({ layerId, featureId })
+        },
+      )
+    } catch (reason) {
+      setMapError(
+        reason instanceof Error ? reason.message : 'VWorld SHP 피처를 표시하지 못했습니다.',
+      )
+    }
   }, [overlayGeoJson, ready])
 
   useEffect(() => {
-    const map = mapRef.current
+    const runtime = runtimeRef.current
+    if (!runtime || !ready || visibleRoute.length === 0) return
+    const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
+    if (fittedRouteRef.current === routeKey) return
+    fittedRouteRef.current = routeKey
+    moveVWorldMap(
+      runtime,
+      cameraTargetForCoordinates(
+        visibleRoute.map((point) => [point.lon, point.lat] as const),
+      ),
+    )
+  }, [displayAllTracks, effectiveTrackId, ready, visibleRoute])
+
+  useEffect(() => {
+    const runtime = runtimeRef.current
     if (!selectedFrame?.coordinate) {
       selectedFrameRef.current = null
       return
@@ -400,51 +405,82 @@ export function MapView({
       selectedFrameRef.current = selectedFrame.id
       return
     }
-    if (!map || !ready || selectedFrameRef.current === selectedFrame.id) return
+    if (!runtime || !ready || selectedFrameRef.current === selectedFrame.id) return
     selectedFrameRef.current = selectedFrame.id
-    map.easeTo({
-      center: [selectedFrame.coordinate.lon, selectedFrame.coordinate.lat],
-      duration: 520,
-      zoom: Math.max(map.getZoom(), 16),
+    moveVWorldMap(runtime, {
+      lon: selectedFrame.coordinate.lon,
+      lat: selectedFrame.coordinate.lat,
+      height: 420,
+      heading: -(selectedFrame.heading ?? 0),
+      tilt: -65,
     })
   }, [ready, selectedFrame])
 
   const recenter = () => {
-    if (!selectedFrame?.coordinate || !mapRef.current) return
-    mapRef.current.flyTo({
-      center: [selectedFrame.coordinate.lon, selectedFrame.coordinate.lat],
-      zoom: 17.2,
-      pitch: 46,
-      bearing: -(selectedFrame.heading ?? 0),
-      duration: 900,
+    const runtime = runtimeRef.current
+    if (!selectedFrame?.coordinate || !runtime) return
+    moveVWorldMap(runtime, {
+      lon: selectedFrame.coordinate.lon,
+      lat: selectedFrame.coordinate.lat,
+      height: 280,
+      heading: -(selectedFrame.heading ?? 0),
+      tilt: -62,
     })
+  }
+
+  const retry = () => {
+    bootRef.current = null
+    fittedRouteRef.current = ''
+    setMapError(null)
+    setReady(false)
+    setReloadToken((value) => value + 1)
   }
 
   return (
     <div
-      className={`map-view ${satellite ? 'satellite-mode' : ''}`}
+      className={`map-view ${highContrast ? 'high-contrast-mode' : ''}`}
+      data-map-provider="vworld-webgl-3.0"
       data-track-scope={displayAllTracks ? 'all' : effectiveTrackId ?? 'none'}
       data-route-feature-count={routeGeoJson.features.length}
       data-overlay-feature-count={overlayGeoJson.features.length}
     >
-      <div ref={containerRef} className="map-container" />
-      {loading && (
-        <div className="map-loading">
+      <iframe
+        key={reloadToken}
+        ref={iframeRef}
+        className="map-container vworld-map-frame"
+        src={`${VWORLD_IFRAME_URL}?reload=${reloadToken}`}
+        title="VWorld WebGL 3D 지도"
+      />
+      {(!ready || loading) && !mapError && (
+        <div className="map-loading" role="status">
           <LoaderCircle size={15} className="spin" />
-          이동 경로 불러오는 중
+          {!ready ? 'VWorld 지도 엔진 준비 중' : '이동 경로 불러오는 중'}
+        </div>
+      )}
+      {mapError && (
+        <div className="map-provider-error" role="alert">
+          <AlertTriangle size={18} />
+          <span>
+            <strong>VWorld 지도를 열 수 없습니다</strong>
+            <small>{mapError}</small>
+          </span>
+          <button type="button" onClick={retry}>
+            <RotateCcw size={14} /> 다시 시도
+          </button>
         </div>
       )}
       <div className="map-tools">
-        <button type="button" onClick={recenter} disabled={!selectedFrame?.coordinate}>
+        <button type="button" onClick={recenter} disabled={!ready || !selectedFrame?.coordinate}>
           <Crosshair size={16} />
           현재 프레임
         </button>
-        <button type="button" onClick={() => setSatellite((value) => !value)}>
+        <button type="button" onClick={() => setHighContrast((value) => !value)} disabled={!ready}>
           <Layers size={16} />
-          {satellite ? '기본 톤' : '고대비'}
+          {highContrast ? '기본 톤' : '고대비'}
         </button>
       </div>
       <div className="map-legend">
+        <span className="map-provider-badge">VWorld 3D</span>
         <span>
           <i
             className="legend-route"
@@ -461,7 +497,13 @@ export function MapView({
           MMS 프레임
         </span>
         {overlayGeoJson.features.length > 0 && (
-          <span title={overlayMapTotal > overlayGeoJson.features.length ? '속성표에서 다음 피처를 불러오면 지도 표시도 확장됩니다.' : '표시 중인 SHP 피처'}>
+          <span
+            title={
+              overlayMapTotal > overlayGeoJson.features.length
+                ? '속성표에서 다음 피처를 불러오면 지도 표시도 확장됩니다.'
+                : '표시 중인 SHP 피처'
+            }
+          >
             SHP {overlayGeoJson.features.length.toLocaleString('ko-KR')}
             {overlayMapTotal > overlayGeoJson.features.length
               ? ` / ${overlayMapTotal.toLocaleString('ko-KR')} 미리보기`

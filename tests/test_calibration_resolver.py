@@ -11,8 +11,11 @@ from unittest import mock
 from mms_shp_detection.calibration import attach_calibration_metadata
 from mms_shp_detection.domain.calibration import (
     CALIBRATION_AMBIGUOUS,
+    CALIBRATION_INVALID,
     CALIBRATION_NOT_FOUND,
+    CALIBRATION_VERSION_UNSUPPORTED,
     CalibrationResolver,
+    delivery_calibration_fingerprint,
 )
 from mms_shp_detection.domain.models import PipelineError
 
@@ -63,7 +66,9 @@ def _task(job: str, track: str | None, image_name: str = "frame.jpg") -> dict:
 
 
 class CalibrationResolverTests(unittest.TestCase):
-    def test_exact_match_normalizes_case_whitespace_and_container_suffixes(self) -> None:
+    def test_exact_match_normalizes_case_whitespace_and_container_suffixes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "calibration.json"
             _write_bundle(
@@ -112,6 +117,74 @@ class CalibrationResolverTests(unittest.TestCase):
         self.assertEqual(match.source_path, ini_path.resolve())
         self.assertEqual(len(match.fingerprint), 64)
         self.assertFalse(resolution.issues)
+
+    def test_delivery_fingerprint_is_cached_by_calibration_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ini_path = root / "MMS.ini"
+            internal_path = root / "Internal Orientation.txt"
+            ini_path.write_bytes(b"ini")
+            internal_path.write_bytes(b"orientation")
+            delivery = {
+                "ini_path": str(ini_path),
+                "internal_orientation_path": str(internal_path),
+                "serial_number": "SERIAL-7",
+            }
+            tasks = [_task("Delivery.job", "Track07.scan") for _ in range(4)]
+            for task in tasks:
+                task["delivery_calibration"] = delivery.copy()
+
+            with mock.patch(
+                "mms_shp_detection.domain.calibration.delivery_calibration_fingerprint",
+                wraps=delivery_calibration_fingerprint,
+            ) as fingerprint:
+                resolution = CalibrationResolver(None).resolve(tasks, required=True)
+
+        self.assertTrue(resolution.ok)
+        self.assertEqual(fingerprint.call_count, 1)
+        self.assertEqual(len(resolution.matches), 1)
+        for index in range(len(tasks)):
+            match = resolution.match_for_index(index)
+            self.assertIsNotNone(match)
+            assert match is not None
+            self.assertEqual(match.fingerprint, resolution.matches[0].fingerprint)
+
+    def test_invalid_and_unsupported_bundle_versions_are_structured_errors(
+        self,
+    ) -> None:
+        cases = (
+            ({"tracks": []}, CALIBRATION_INVALID),
+            ({"schema_version": "2", "tracks": []}, CALIBRATION_INVALID),
+            (
+                {"schema_version": 999, "tracks": []},
+                CALIBRATION_VERSION_UNSUPPORTED,
+            ),
+            ({"schema_version": 2, "tracks": [None]}, CALIBRATION_INVALID),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "calibration.json"
+            for document, expected_code in cases:
+                with self.subTest(document=document):
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises(PipelineError) as captured:
+                        CalibrationResolver(path, job_id="run-schema").resolve([])
+
+                    info = captured.exception.info
+                    self.assertEqual(info.code, expected_code)
+                    self.assertEqual(info.job_id, "run-schema")
+                    self.assertEqual(info.stage, "attach_calibration")
+                    self.assertFalse(info.retryable)
+                    self.assertEqual(
+                        info.context["supported_schema_versions"],
+                        [2],
+                    )
+
+            path.write_text("{not-json", encoding="utf-8")
+            with self.assertRaises(PipelineError) as captured:
+                CalibrationResolver(path, job_id="run-invalid-json").resolve([])
+
+            self.assertEqual(captured.exception.info.code, CALIBRATION_INVALID)
+            self.assertEqual(captured.exception.info.cause_type, "JSONDecodeError")
 
     def test_ambiguous_and_all_missing_keys_are_reported_together(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,7 +246,9 @@ class CalibrationResolverTests(unittest.TestCase):
             {item["normalized_key"] for item in info.context["issues"]},
             {"job_a/track01", "job_b/track02"},
         )
-        self.assertEqual(info.context["normalized_keys"], ["job_a/track01", "job_b/track02"])
+        self.assertEqual(
+            info.context["normalized_keys"], ["job_a/track01", "job_b/track02"]
+        )
 
 
 class CalibrationAttachCompatibilityTests(unittest.TestCase):
@@ -228,6 +303,69 @@ class CalibrationAttachCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(captured.exception.info.code, CALIBRATION_NOT_FOUND)
         self.assertEqual(tasks, before)
+
+    def test_precomputed_delivery_resolution_rejects_same_key_task_reordering(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def delivery_task(label: str) -> dict:
+                ini_path = root / f"{label}.ini"
+                internal_path = root / f"{label}.txt"
+                ini_path.write_bytes(label.encode())
+                internal_path.write_bytes(f"{label}-orientation".encode())
+                task = _task("Delivery.job", "Track07.scan", f"{label}.jpg")
+                task["delivery_calibration"] = {
+                    "ini_path": str(ini_path),
+                    "internal_orientation_path": str(internal_path),
+                    "serial_number": label,
+                }
+                return task
+
+            first = delivery_task("first")
+            second = delivery_task("second")
+            resolution = CalibrationResolver(None).resolve(
+                [first, second],
+                required=True,
+            )
+            before = copy.deepcopy([second, first])
+
+            with self.assertRaisesRegex(ValueError, "task identities or order"):
+                attach_calibration_metadata(
+                    [second, first],
+                    None,
+                    mock.Mock(),
+                    require_calibration=True,
+                    resolution=resolution,
+                )
+
+        self.assertEqual([second, first], before)
+
+    def test_precomputed_delivery_resolution_rejects_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ini_path = root / "MMS.ini"
+            internal_path = root / "Internal Orientation.txt"
+            ini_path.write_bytes(b"ini")
+            internal_path.write_bytes(b"orientation")
+            task = _task("Delivery.job", "Track07.scan")
+            task["delivery_calibration"] = {
+                "ini_path": str(ini_path),
+                "internal_orientation_path": str(internal_path),
+                "serial_number": "before",
+            }
+            resolution = CalibrationResolver(None).resolve([task], required=True)
+            task["delivery_calibration"]["serial_number"] = "after"
+
+            with self.assertRaisesRegex(ValueError, "task identities or order"):
+                attach_calibration_metadata(
+                    [task],
+                    None,
+                    mock.Mock(),
+                    require_calibration=True,
+                    resolution=resolution,
+                )
 
 
 if __name__ == "__main__":

@@ -21,7 +21,11 @@ or 5xx failures. Mutating requests are not automatically retried.
 {
   "api_version": "1",
   "server_name": "MMS Processing Server",
-  "map_style_url": "/map/style.json",
+  "map": {
+    "provider": "vworld",
+    "engine": "webgl",
+    "version": "3.0"
+  },
   "capabilities": {
     "upload": true,
     "panorama": true,
@@ -32,6 +36,10 @@ or 5xx failures. Mutating requests are not automatically retried.
   "recent_runs": ["RunRecord"]
 }
 ```
+
+`map` identifies the fixed browser map integration. The API does not accept or publish an external
+map style URL. VWorld WebGL 3.0 is loaded by the same-origin map iframe, and its browser-visible SDK key
+and current origin are sent directly to the VWorld loader rather than through bootstrap.
 
 An unavailable bootstrap activates a read-only browser demo. A successful response with no
 datasets displays the data-source empty state and opens the connection dialog.
@@ -178,8 +186,10 @@ bit 0 means RGB and bit 1 means normalized equirectangular coordinates, header b
 and maximum `(u, v, distance_m)`, and each record is `u:f32, v:f32, distance_m:f32, rgb:u8x3`.
 `u` and `v` are normalized to `[0, 1]`.
 
-MapLibre, the spherical panorama renderer, and the point-cloud renderer are lazy-loaded view
-chunks. The shared Three.js dependency is excluded from the initial application bundle.
+The VWorld WebGL 3.0 map view uses a same-origin iframe so the SDK's global viewer lifecycle is
+isolated from React. The map view, spherical panorama renderer, and point-cloud renderer are
+lazy-loaded; the external VWorld SDK is not bundled by Vite. The shared Three.js dependency is
+excluded from the initial application bundle.
 
 ## Optimization and runs
 
@@ -250,6 +260,7 @@ them, and the server may omit them for legacy runs that do not have a manifest:
   },
   "stage_results": [
     {
+      "attempt": 1,
       "stage_name": "validate_inputs",
       "stage_version": "1",
       "status": "succeeded",
@@ -272,10 +283,43 @@ or `cancelled`. `error_info`, when present, contains `code`, `message`, `stage`,
 diagnostics exposed by this public projection must be server-relative and operator-safe; absolute
 input, model, calibration, config, and output paths are not part of `RunRecord`.
 
-`GET /api/runs/{id}/artifacts?path=run_manifest.json` and the equivalent models manifest response
-return recursively redacted JSON. Pipeline `.log` files and files below an output `logs/` directory
-are diagnostic data and are not exposed through the general artifact-download endpoint. The
-redacted `log_tail` on `GET /api/runs/{id}` remains the operator-facing diagnostic view.
+`attempt` starts at 1. A failed manifest can be moved explicitly through
+`failed -> retrying -> running`, which increments the attempt and resets progress, counts, and
+declared outputs while preserving prior diagnostic history. The current Web API has no automatic
+retry policy or retry endpoint; `retrying` is a forward-compatible canonical state, not an implied
+automatic action.
+
+`GET /api/runs/{id}/artifacts` parses every downloadable `.json` and pipeline `.txt` JSON artifact,
+recursively redacts server paths, and returns the safe JSON as an attachment. This includes the run
+and models manifests as well as frame result TXT files. Run/model manifests are limited to 5 MB and
+other JSON/TXT artifacts to 25 MB. Empty, non-UTF-8, or oversized artifacts and malformed `.json`
+return `404`. A plain-text `.txt` that is not JSON is returned only after bounded UTF-8 decoding and
+inline path redaction. Pipeline `.log` files and files below an output `logs/` directory are
+diagnostic data and are not exposed through the general artifact-download endpoint. The redacted
+`log_tail` on `GET /api/runs/{id}` remains the operator-facing diagnostic view.
+
+A worker exit code of zero is not sufficient for `completed`: the run manifest must be valid and
+`succeeded`, and every Shapefile declared by the current attempt must have a complete, non-empty
+`.shp/.shx/.dbf/.prj/.cpg/.qpj/.wkt2` bundle below that run's output root. The server does not
+rescan the directory to infer successful outputs: result summaries, artifact links, ZIP downloads,
+and imports expose only manifest-declared Shapefiles. For a multi-model run, the declared models
+manifest must also be valid schema version 2, every model must be a completed current-run
+publication, and its Shapefile set must exactly match the root run manifest. A contract-versioned
+run whose manifest is
+missing or whose output later becomes incomplete is projected as failed and omits `result_url`.
+Runs created before the execution-contract marker remain on the legacy bounded-result fallback.
+
+The server records the exact SHA-256 of the generated YAML handoff before queueing. The child must
+read the same file hash under the same job/input identity before it can claim the pending manifest;
+after defaults and supported overrides are resolved, the canonical effective-config hash is stored
+separately as provenance.
+
+On server restart, only a pre-spawn `preparing` row is requeued. A possibly spawned `starting` row
+and `running`/`cancelling` rows are reconciled to a terminal DB/manifest state; a complete durable
+`succeeded` manifest wins a late cancellation or shutdown race. There is no stage-checkpoint resume.
+The manifest input section records the selected image-task count/fingerprint, at most 1,000 relative
+path samples, and a truncation flag; those private inputs are available only through the redacted
+manifest artifact and are not copied into `RunRecord`.
 
 Clients must treat unrecognized `status` values as forward-compatible data. They should render a
 neutral fallback instead of indexing an exhaustive status table without a fallback. The current UI

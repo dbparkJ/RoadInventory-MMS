@@ -19,7 +19,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
-          if (id.includes('maplibre-gl')) return 'maplibre'
           if (id.includes('/three/')) return 'three'
           if (id.includes('lucide-react')) return 'icons'
           return undefined

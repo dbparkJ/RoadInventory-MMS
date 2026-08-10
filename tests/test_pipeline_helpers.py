@@ -18,42 +18,51 @@ from PIL import Image
 from pyproj import CRS
 
 from mms_shp_detection.config import ConfigError, parse_args_with_config
-from mms_shp_detection.pole import PoleSearchParameters, cluster_pole_observations
-from mms_shp_detection.shp_writer import collect_detection_records
+from mms_shp_detection.geometry import (
+    build_perspective_panorama_remap,
+    perspective_pixel_to_world_ray,
+    pixel_to_world_ray,
+    world_ray_to_equirectangular_pixel,
+    world_ray_to_perspective_pixel,
+)
+from mms_shp_detection.infrastructure.manifest_writer import (
+    PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES,
+)
 from mms_shp_detection.pipeline import (
     POINT_CROP_SEMANTICS,
     POLE_CROP_SEMANTICS,
     MultiModelCoordinator,
     PersistentCudaOutOfMemoryError,
+    _scoped_pointcloud_catalog_path,
     apply_model_filter,
     build_arg_parser,
     build_dataset_signature,
     build_forward_detection_mapping,
     build_panorama_alignment_qa_fingerprint,
-    build_pole_fallback_parameters,
     build_pole_debug_axis_segments,
     build_pole_debug_overview_view,
-    build_pole_search_parameters,
+    build_pole_fallback_parameters,
     build_pole_search_corridor_masks,
+    build_pole_search_parameters,
     build_rectified_detection_view,
     build_run_fingerprint,
     circular_bbox_iou_xyxy,
     collect_detection_points_at_range,
     create_forward_detection_qa_image,
     discover_model_paths,
-    evaluate_point_range_fallback_quality,
     ensure_output_dirs,
+    evaluate_point_range_fallback_quality,
     find_pole_bases_with_corridor_fallback,
     load_panorama_rgb,
     missing_result_artifacts,
-    pole_cross_profile_candidate_key,
     pole_classifications_for_policy,
+    pole_cross_profile_candidate_key,
     prepare_shared_pipeline_context,
     reconcile_remote_supports_from_direct_anchors,
+    render_forward_detection_view,
     resolve_matched_crs_wkt,
     resolve_num_workers,
     resolve_pole_classification_policy,
-    render_forward_detection_view,
     robust_front_surface_distance,
     run_panorama_alignment_qa,
     run_parallel_multi_model_pipeline,
@@ -62,7 +71,6 @@ from mms_shp_detection.pipeline import (
     safely_refresh_shapefile_from_txt,
     save_debug_crop,
     select_cross_profile_pole_candidate,
-    _scoped_pointcloud_catalog_path,
     unwrap_panorama_x_coordinates,
     validate_crs_wkt,
     validate_panorama_image,
@@ -71,13 +79,14 @@ from mms_shp_detection.pipeline import (
     write_las,
     write_pole_las,
 )
-from mms_shp_detection.geometry import (
-    build_perspective_panorama_remap,
-    pixel_to_world_ray,
-    perspective_pixel_to_world_ray,
-    world_ray_to_equirectangular_pixel,
-    world_ray_to_perspective_pixel,
-)
+from mms_shp_detection.pole import PoleSearchParameters, cluster_pole_observations
+from mms_shp_detection.shp_writer import collect_detection_records
+
+
+def _write_output_bundle(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES:
+        path.with_suffix(suffix).write_bytes(f"fixture:{suffix}".encode("ascii"))
 
 
 def _classification_catalog(
@@ -2418,8 +2427,21 @@ class MultiModelExecutionTests(unittest.TestCase):
                 "b.pt": {"object_type": "traffic_signal"},
             }
 
+            def publish_fixture(effective: argparse.Namespace) -> dict[str, object]:
+                shp_path = Path(effective.output_dir) / "shp" / "detected_signs.shp"
+                _write_output_bundle(shp_path)
+                return {
+                    "run_fingerprint": "a" * 64,
+                    "final_shapefiles": {
+                        "detections": str(shp_path.resolve()),
+                        "poles": None,
+                    },
+                    "feature_counts": {"detections": 0, "poles": 0},
+                }
+
             with mock.patch(
-                "mms_shp_detection.pipeline._run_single_model_pipeline"
+                "mms_shp_detection.pipeline._run_single_model_pipeline",
+                side_effect=publish_fixture,
             ) as single_model:
                 run_pipeline(args)
 
@@ -2476,9 +2498,32 @@ class MultiModelExecutionTests(unittest.TestCase):
                 "b.pt": {"object_type": "traffic_signal"},
             }
 
+            def publish_parallel_fixture(
+                _prepared,
+                *,
+                manifest: dict,
+                **_kwargs,
+            ) -> None:
+                for entry in manifest["models"]:
+                    shp_path = (
+                        Path(entry["output_dir"]) / "shp" / "detected_signs.shp"
+                    )
+                    _write_output_bundle(shp_path)
+                    entry.update(
+                        {
+                            "status": "completed",
+                            "published_current_run": True,
+                            "final_shapefiles": {
+                                "detections": str(shp_path.resolve()),
+                                "poles": None,
+                            },
+                        }
+                    )
+
             with (
                 mock.patch(
-                    "mms_shp_detection.pipeline.run_parallel_multi_model_pipeline"
+                    "mms_shp_detection.pipeline.run_parallel_multi_model_pipeline",
+                    side_effect=publish_parallel_fixture,
                 ) as parallel_run,
                 mock.patch(
                     "mms_shp_detection.pipeline._run_single_model_pipeline"
@@ -3111,6 +3156,10 @@ class PipelineInputScopeTests(unittest.TestCase):
                 "files": [],
             }
 
+            def publish_pairs(pairs: list[tuple[Path, Path]]) -> None:
+                for _source, target in pairs:
+                    _write_output_bundle(Path(target))
+
             with (
                 mock.patch(
                     "mms_shp_detection.pipeline.setup_logging",
@@ -3153,7 +3202,10 @@ class PipelineInputScopeTests(unittest.TestCase):
                     return_value=[],
                 ),
                 mock.patch("mms_shp_detection.pipeline.write_shapefile"),
-                mock.patch("mms_shp_detection.pipeline.publish_shapefile_bundles"),
+                mock.patch(
+                    "mms_shp_detection.pipeline.publish_shapefile_bundles",
+                    side_effect=publish_pairs,
+                ),
             ):
                 run_pipeline(args)
 

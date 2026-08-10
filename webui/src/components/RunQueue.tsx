@@ -44,16 +44,15 @@ const ACTIVE_CANONICAL_STATUSES = new Set<CanonicalRunStatus>([
 ])
 
 function statusMeta(run: RunRecord) {
-  const legacy = Object.prototype.hasOwnProperty.call(STATUS, run.status)
-    ? STATUS[run.status as keyof typeof STATUS]
-    : undefined
-  if (legacy) return legacy
   const canonical =
     run.canonical_status &&
     Object.prototype.hasOwnProperty.call(CANONICAL_STATUS, run.canonical_status)
       ? CANONICAL_STATUS[run.canonical_status]
       : undefined
-  return canonical ?? UNKNOWN_STATUS
+  if (canonical) return canonical
+  return Object.prototype.hasOwnProperty.call(STATUS, run.status)
+    ? STATUS[run.status as keyof typeof STATUS]
+    : UNKNOWN_STATUS
 }
 
 function isActive(run: RunRecord) {
