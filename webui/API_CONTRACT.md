@@ -38,8 +38,10 @@ or 5xx failures. Mutating requests are not automatically retried.
 ```
 
 `map` identifies the fixed browser map integration. The API does not accept or publish an external
-map style URL. VWorld WebGL 3.0 is loaded by the same-origin map iframe, and its browser-visible SDK key
-and current origin are sent directly to the VWorld loader rather than through bootstrap.
+map style URL. The non-satellite 2D view creates one OpenLayers tile layer from VWorld's official
+`Base` WMTS endpoint, with no OSM fallback layer. The WebGL 3.0 map is loaded by an isolated
+same-origin iframe. Their browser-visible development key and current origin are sent directly to
+VWorld rather than through bootstrap.
 
 An unavailable bootstrap activates a read-only browser demo. A successful response with no
 datasets displays the data-source empty state and opens the connection dialog.
@@ -186,10 +188,74 @@ bit 0 means RGB and bit 1 means normalized equirectangular coordinates, header b
 and maximum `(u, v, distance_m)`, and each record is `u:f32, v:f32, distance_m:f32, rgb:u8x3`.
 `u` and `v` are normalized to `[0, 1]`.
 
-The VWorld WebGL 3.0 map view uses a same-origin iframe so the SDK's global viewer lifecycle is
-isolated from React. The map view, spherical panorama renderer, and point-cloud renderer are
+The VWorld Base WMTS 2D general-map and WebGL 3.0 views use separate same-origin iframes so each
+map runtime is isolated from React and cross-document popup moves. The map view, spherical
+panorama renderer, and point-cloud renderer are
 lazy-loaded; the external VWorld SDK is not bundled by Vite. The shared Three.js dependency is
 excluded from the initial application bundle.
+
+`GET /api/datasets/{id}/frames/{frame_id}/panorama-projection` returns the calibrated dataset-space
+`origin`, `forward`, `right`, and `up` vectors used by the server's equirectangular projection.
+The point viewer fetches this once per frame and projects hovered MMSP local XYZ to normalized
+panorama `(u, v)` in the browser; pointer movement never triggers per-point HTTP requests.
+
+## SHP review and editing
+
+`GET /api/datasets/{id}/overlays` lists registered SHP layers. Feature collections are paged by
+`GET /api/datasets/{id}/overlays/{layer_id}/features?coordinate_space=dataset|wgs84&offset=...&limit=...`.
+The client keeps layer selection, visibility, loaded pages, and feature selection in one shared
+context so the advanced editor, map, panorama, and point viewer stay in sync. The main dataset panel
+only exposes a searchable layer list and visibility toggles; feature loading and the full attribute
+table stay in the advanced SHP management panel.
+
+`PATCH /api/datasets/{id}/overlays/{layer_id}` changes the user-facing `name` and/or shared
+`color` (`#RRGGBB`). It requires `expected_metadata_revision`; a stale value returns `409`, while an
+empty/unsafe name or invalid color returns `422`. The response contains the updated layer and next
+`metadata_revision`. These display settings live in the overlay manifest, survive application
+restart, and do not increment the independent feature `revision`.
+
+`POST /api/datasets/{id}/overlays/{layer_id}/features` creates a feature with exactly one of:
+
+- `geometry` plus `coordinate_space` for a clicked Point position; or
+- `copy_geometry_from` for a geometry-only copy of an existing feature in the same layer.
+
+Both forms accept `expected_revision` for optimistic concurrency. Map-click creation is restricted
+to Point layers. A copied feature keeps no user attributes: every DBF field is blank except an exact
+case-insensitive `ID` field, which is assigned the next numeric value. The durable internal feature
+ID and ordinal also increase monotonically and are not reused after deletion. The response is the
+new feature and updated revision; subsequent edited-bundle ZIP exports include the new row.
+
+`PATCH /api/datasets/{id}/overlays/{layer_id}/features/{feature_id}` updates coordinates and/or
+properties, and `DELETE` marks a feature deleted from the editable copy. The original uploaded SHP
+bundle is preserved. Revision conflicts return `409`; invalid geometry, field values, or coordinate
+space return `422`.
+
+`GET /api/datasets/{id}/overlays/{layer_id}/project/{frame_id}` returns nearby Point features as
+normalized panorama coordinates and includes their complete properties. The optional
+`max_distance` bounds the query.
+
+`GET /api/datasets/{id}/frames/{frame_id}/detections` independently returns the bounded raw YOLO
+observations for every model in the newest completed run that contains an exact record/image result
+for that frame. It does not require a result SHP to be imported or visible, and dismissed queue rows
+remain readable because their durable run artifacts are preserved. The server resolves only exact
+server-managed `output/{model}/txt/{record}/{image}.txt` files, rejects traversal, links, oversized
+files, mismatched payload identities, and unknown bbox spaces. A request parses at most 64 MiB of
+model manifests plus result JSON across the completed-run lookup, at most 64 models, and returns at
+most 2,000 boxes. Reaching any of those limits stops scanning immediately and sets `truncated: true`.
+Each observation has an opaque per-run/model `source_id` for deterministic deduplication.
+
+Pipeline result schema 18 explicitly stores each `bbox_xyxy` as
+`panorama_equirectangular_pixels` after the full, tiled, or forward perspective detector has been
+inverse-mapped to its source panorama. Schema 17 has the same established coordinate contract and
+is supported for existing results. An explicitly labelled legacy `forward_rectilinear_pixels` box
+is inverse-mapped only when complete forward-view dimensions, FOV, panorama dimensions, and yaw /
+pitch alignment metadata are present; the server never guesses an unlabeled legacy coordinate
+space. The panorama client requests this endpoint once per frame and renders the boxes regardless
+of SHP layer visibility. A completed-run revision change re-fetches the same selected frame, so an
+SSE completion exposes newly written boxes without requiring navigation or reload. When a raw box
+matches a representative feature in a visible result SHP by detection identity, compatible model /
+image / class metadata, and panorama bbox, the client draws only the raw box but retains the SHP
+`layerId` / `featureId` for selection and Details; unrelated raw observations remain unlinked.
 
 ## Optimization and runs
 
@@ -228,6 +294,12 @@ match the server configuration rather than inventing dataset-independent values.
 `GET /api/runs` returns `{ "items": RunRecord[] }`. `POST /api/runs/{id}/cancel` returns the updated
 record. Progress is 0–100 and status is one of `queued`, `preparing`, `running`, `completed`,
 `failed`, `cancelled`, or `cancelling`.
+
+`DELETE /api/runs/{id}` dismisses a completed or failed run from collection/bootstrap responses.
+This is a visibility operation, not artifact deletion: the response contains
+`{ "dismissed": true, "artifacts_preserved": true }`, and direct run, result, and archive URLs
+remain valid. Internally recovered `interrupted` rows are eligible because they are projected as
+`failed`; queued, active, and cancelled rows return `409`.
 
 `status` is the stable v1 UI lifecycle field and retains the values above. A run backed by the
 versioned execution manifest can additionally include the following fields; old clients may ignore
@@ -297,6 +369,16 @@ return `404`. A plain-text `.txt` that is not JSON is returned only after bounde
 inline path redaction. Pipeline `.log` files and files below an output `logs/` directory are
 diagnostic data and are not exposed through the general artifact-download endpoint. The redacted
 `log_tail` on `GET /api/runs/{id}` remains the operator-facing diagnostic view.
+
+`GET /api/runs/{id}/archive?scope=all` returns one ZIP containing every publicly downloadable
+result while preserving output-relative paths. `scope=detected-images` returns only images below an
+`image_crops` directory; shared `forward_views`, point previews, and pole debug images are not part
+of that focused archive. Both scopes reject active or unverified completed runs, skip logs,
+unsupported files, symbolic links, junctions, stale undeclared Shapefile bundles, and untrusted
+models manifests. JSON/TXT members use the same bounded parsing and recursive server-path redaction
+as the individual artifact endpoint. `GET /api/runs/{id}/results` advertises both links under
+`archives.all` and `archives.detected_images`; the operator UI downloads these ZIPs instead of
+listing every ordinary artifact separately.
 
 A worker exit code of zero is not sufficient for `completed`: the run manifest must be valid and
 `succeeded`, and every Shapefile declared by the current attempt must have a complete, non-empty

@@ -5,7 +5,14 @@ import type { DatasetSummary, Frame } from '../types'
 import { Workspace } from './Workspace'
 
 vi.mock('../views/MapView', () => ({
-  MapView: () => <div data-testid="map-view" />,
+  MapView: ({ mapMode, onMapModeChange }: { mapMode: '2d' | '3d'; onMapModeChange: (mode: '2d' | '3d') => void }) => {
+    const instance = useState(() => crypto.randomUUID())[0]
+    return (
+      <div data-testid="map-view" data-instance={instance} data-mode={mapMode}>
+        <button type="button" onClick={() => onMapModeChange('3d')}>mock 3D</button>
+      </div>
+    )
+  },
 }))
 
 vi.mock('../views/PanoramaView', () => ({
@@ -115,7 +122,44 @@ function ControlledWorkspace({ onMoveFrame = vi.fn() }: { onMoveFrame?: (directi
 }
 
 describe('Workspace popup viewers', () => {
-  it('opens panorama and 3D points directly in independent windows', async () => {
+  it('remounts the map when the workspace crosses a document boundary', async () => {
+    const props: ComponentProps<typeof Workspace> = {
+      dataset: DATASET,
+      frames: FRAMES,
+      frame: FRAMES[1],
+      frameRange: null,
+      route: [],
+      routeLoading: false,
+      demoMode: false,
+      panoramaOpen: false,
+      pointCloudOpen: false,
+      hasMoreFrames: false,
+      detached: false,
+      onTogglePanorama: vi.fn(),
+      onTogglePointCloud: vi.fn(),
+      onFrameChange: vi.fn(),
+      onMoveFrame: vi.fn(),
+      onOpenSource: vi.fn(),
+      onUseDemo: vi.fn(),
+    }
+    const view = render(<Workspace {...props} />)
+    const mainInstance = (await screen.findByTestId('map-view')).dataset.instance
+    fireEvent.click(screen.getByRole('button', { name: 'mock 3D' }))
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+
+    view.rerender(<Workspace {...props} detached />)
+    const popupInstance = screen.getByTestId('map-view').dataset.instance
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+
+    view.rerender(<Workspace {...props} detached={false} />)
+    const returnedInstance = screen.getByTestId('map-view').dataset.instance
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+
+    expect(popupInstance).not.toBe(mainInstance)
+    expect(returnedInstance).not.toBe(popupInstance)
+  })
+
+  it('opens panorama and 3D points only in independent windows', async () => {
     const panoramaPopup = fakePopup()
     const pointPopup = fakePopup()
     const open = vi
@@ -137,8 +181,8 @@ describe('Workspace popup viewers', () => {
       expect(panoramaPopup.document.querySelector('[data-testid="panorama-view"]')).not.toBeNull()
       expect(pointPopup.document.querySelector('[data-testid="point-cloud-view"]')).not.toBeNull()
     })
-    expect(document.querySelector('[aria-label="파노라마 팝업"]')).toBeNull()
-    expect(document.querySelector('[aria-label="3D 포인트 팝업"]')).toBeNull()
+    expect(screen.queryByTestId('panorama-view')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('point-cloud-view')).not.toBeInTheDocument()
 
     panoramaPopup.dispatchEvent(
       new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', cancelable: true }),

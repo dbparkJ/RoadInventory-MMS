@@ -15,6 +15,7 @@ import type {
   OverlayEncoding,
   OverlayFeature,
   OverlayFeatureCollection,
+  OverlayFeatureCreateRequest,
   OverlayLayer,
 } from '../types'
 
@@ -37,11 +38,26 @@ export interface OverlaySelection {
   featureId: string | number
 }
 
-interface OverlayContextValue {
+export interface OverlaySelectionOptions {
+  /**
+   * Whether selecting the feature should also locate and open its MMS frame.
+   * Attribute-only actions such as the hover tooltip's Details button disable
+   * this so opening the editor cannot reset every viewer.
+   */
+  navigate?: boolean
+}
+
+export type OverlayPickTarget =
+  | { kind: 'move'; layerId: string; featureId: string | number }
+  | { kind: 'create'; layerId: string }
+
+export interface OverlayContextValue {
   datasetId: string
   layers: OverlayLayer[]
   features: Record<string, LayerFeatures>
   visibleLayerIds: Set<string>
+  activeLayerId: string
+  setActiveLayerId: (layerId: string) => void
   selected: OverlaySelection | null
   selectedLayer: OverlayLayer | null
   selectedFeature: OverlayFeature | null
@@ -50,15 +66,22 @@ interface OverlayContextValue {
   datasetFeatures: Array<{ layerId: string; color: string; feature: OverlayFeature }>
   loading: boolean
   uploading: boolean
+  creatingFeature: boolean
   pickMode: boolean
+  pickTarget: OverlayPickTarget | null
   setPickMode: (enabled: boolean) => void
+  beginCreatePoint: (layerId: string) => void
   refresh: () => Promise<void>
   ensureDatasetFeatures: (layerId: string) => Promise<void>
   loadMoreDatasetFeatures: (layerId: string) => Promise<void>
   upload: (files: File[], name?: string, crs?: string, encoding?: OverlayEncoding) => Promise<void>
+  updateLayerMetadata: (layerId: string, patch: { name?: string; color?: string }) => Promise<void>
   removeLayer: (layerId: string) => Promise<void>
   toggleLayer: (layerId: string) => void
-  selectFeature: (selection: OverlaySelection | null) => void
+  selectFeature: (
+    selection: OverlaySelection | null,
+    options?: OverlaySelectionOptions,
+  ) => void
   updateSelected: (patch: {
     geometry?: { type: 'Point'; coordinates: [number, number, number?] }
     coordinate_space?: OverlayCoordinateSpace
@@ -68,6 +91,7 @@ interface OverlayContextValue {
     coordinates: [number, number, number?],
     coordinateSpace: OverlayCoordinateSpace,
   ) => Promise<void>
+  copySelectedLocation: () => Promise<void>
   deleteSelected: () => Promise<void>
   layerColor: (layerId: string) => string
 }
@@ -104,6 +128,7 @@ export function OverlayProvider({
   const [layers, setLayers] = useState<OverlayLayer[]>([])
   const [features, setFeatures] = useState<Record<string, LayerFeatures>>({})
   const [visibleLayerIds, setVisibleLayerIds] = useState<Set<string>>(new Set())
+  const [activeLayerId, setActiveLayerId] = useState('')
   const [selected, setSelected] = useState<OverlaySelection | null>(null)
   const [selectedDatasetDetail, setSelectedDatasetDetail] = useState<{
     layerId: string
@@ -112,7 +137,9 @@ export function OverlayProvider({
   } | null>(null)
   const [loading, setLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
-  const [pickMode, setPickMode] = useState(false)
+  const [creatingFeature, setCreatingFeature] = useState(false)
+  const [pickTarget, setPickTarget] = useState<OverlayPickTarget | null>(null)
+  const pickMode = pickTarget !== null
   const requestGeneration = useRef(0)
   const refreshControllerRef = useRef<AbortController | null>(null)
   const loadedDatasetRef = useRef('')
@@ -122,13 +149,58 @@ export function OverlayProvider({
   const visibleLayerIdsRef = useRef(visibleLayerIds)
   visibleLayerIdsRef.current = visibleLayerIds
 
-  const layerColor = useCallback((layerId: string) => {
-    let hash = 0
-    for (let index = 0; index < layerId.length; index += 1) {
-      hash = (hash * 31 + layerId.charCodeAt(index)) | 0
-    }
-    return LAYER_COLORS[Math.abs(hash) % LAYER_COLORS.length]
-  }, [])
+  const layerColor = useCallback(
+    (layerId: string) => {
+      const savedColor = layers.find((layer) => layer.id === layerId)?.color
+      if (savedColor) return savedColor
+      let hash = 0
+      for (let index = 0; index < layerId.length; index += 1) {
+        hash = (hash * 31 + layerId.charCodeAt(index)) | 0
+      }
+      return LAYER_COLORS[Math.abs(hash) % LAYER_COLORS.length]
+    },
+    [layers],
+  )
+
+  const setPickMode = useCallback(
+    (enabled: boolean) => {
+      if (!enabled) {
+        setPickTarget(null)
+        return
+      }
+      if (!selected) {
+        notify?.({ tone: 'info', title: '먼저 위치를 수정할 SHP 피처를 선택해 주세요.' })
+        return
+      }
+      setPickTarget({
+        kind: 'move',
+        layerId: selected.layerId,
+        featureId: selected.featureId,
+      })
+    },
+    [notify, selected],
+  )
+
+  const beginCreatePoint = useCallback(
+    (layerId: string) => {
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!layer) {
+        notify?.({ tone: 'error', title: '신규 피처를 추가할 SHP 레이어가 없습니다.' })
+        return
+      }
+      if (demoMode) {
+        notify?.({ tone: 'info', title: '데모 모드에서는 SHP 피처를 추가할 수 없습니다.' })
+        return
+      }
+      if (layer.geometry_type !== 'Point') {
+        notify?.({ tone: 'info', title: '지도 클릭 신규 추가는 Point 레이어에서만 사용할 수 있습니다.' })
+        return
+      }
+      setActiveLayerId(layerId)
+      setPickTarget({ kind: 'create', layerId })
+    },
+    [demoMode, layers, notify],
+  )
 
   const loadFeaturePage = useCallback(
     async (
@@ -248,8 +320,10 @@ export function OverlayProvider({
       setLayers([])
       setFeatures({})
       setVisibleLayerIds(new Set())
+      setActiveLayerId('')
       setSelected(null)
       setSelectedDatasetDetail(null)
+      setPickTarget(null)
       return
     }
     const controller = new AbortController()
@@ -260,8 +334,10 @@ export function OverlayProvider({
       setLayers([])
       setFeatures({})
       setVisibleLayerIds(new Set())
+      setActiveLayerId('')
       setSelected(null)
       setSelectedDatasetDetail(null)
+      setPickTarget(null)
     }
     setLoading(true)
     try {
@@ -278,6 +354,9 @@ export function OverlayProvider({
       })
       knownLayerIdsRef.current = nextLayerIds
       setLayers(nextLayers)
+      setActiveLayerId((current) =>
+        current && nextLayerIds.has(current) ? current : (nextLayers[0]?.id ?? ''),
+      )
       setFeatures((current) =>
         Object.fromEntries(
           nextLayers.map((layer) => {
@@ -295,6 +374,9 @@ export function OverlayProvider({
       setVisibleLayerIds(visibleForLoad)
       setSelected((current) =>
         current && nextLayers.some((layer) => layer.id === current.layerId) ? current : null,
+      )
+      setPickTarget((current) =>
+        current && nextLayerIds.has(current.layerId) ? current : null,
       )
       const visibleLayers = nextLayers.filter((layer) => visibleForLoad.has(layer.id))
       let nextLayerIndex = 0
@@ -394,12 +476,12 @@ export function OverlayProvider({
         setPickMode(false)
       } else if (event.code === 'KeyP' && selected) {
         event.preventDefault()
-        setPickMode((current) => !current)
+        setPickMode(!pickMode)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [pickMode, selected])
+  }, [pickMode, selected, setPickMode])
 
   const upload = useCallback(
     async (files: File[], name?: string, crs?: string, encoding: OverlayEncoding = 'auto') => {
@@ -417,6 +499,7 @@ export function OverlayProvider({
           message: `${response.layer.name} · ${response.layer.feature_count.toLocaleString('ko-KR')}개 피처`,
         })
         await refresh()
+        setActiveLayerId(response.layer.id)
         setSelected(null)
       } catch (reason) {
         notify?.({
@@ -437,10 +520,40 @@ export function OverlayProvider({
       if (!datasetId || demoMode) return
       await api.deleteOverlay(datasetId, layerId)
       if (selected?.layerId === layerId) setSelected(null)
+      if (activeLayerId === layerId) setActiveLayerId('')
+      setPickTarget((current) => (current?.layerId === layerId ? null : current))
       notify?.({ tone: 'info', title: 'SHP 레이어 등록을 제거했습니다', message: '업로드 원본은 보존됩니다.' })
       await refresh()
     },
-    [datasetId, demoMode, notify, refresh, selected?.layerId],
+    [activeLayerId, datasetId, demoMode, notify, refresh, selected?.layerId],
+  )
+
+  const updateLayerMetadata = useCallback(
+    async (layerId: string, patch: { name?: string; color?: string }) => {
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!datasetId || !layer || demoMode) return
+      try {
+        const response = await api.patchOverlay(datasetId, layerId, {
+          ...patch,
+          expected_metadata_revision: layer.metadata_revision ?? 1,
+        })
+        setLayers((current) =>
+          current.map((candidate) =>
+            candidate.id === response.layer.id ? response.layer : candidate,
+          ),
+        )
+        notify?.({ tone: 'success', title: 'SHP 레이어 표시 설정을 저장했습니다.' })
+      } catch (reason) {
+        await refresh()
+        notify?.({
+          tone: 'error',
+          title: 'SHP 레이어 표시 설정을 저장하지 못했습니다.',
+          message: reason instanceof Error ? reason.message : undefined,
+        })
+        throw reason
+      }
+    },
+    [datasetId, demoMode, layers, notify, refresh],
   )
 
   const toggleLayer = useCallback(
@@ -463,21 +576,31 @@ export function OverlayProvider({
   )
 
   const selectFeature = useCallback(
-    (selection: OverlaySelection | null) => {
+    (selection: OverlaySelection | null, options?: OverlaySelectionOptions) => {
       setSelected(selection)
       if (!selection) {
         selectionRequestRef.current += 1
         setSelectedDatasetDetail(null)
         return
       }
+      setActiveLayerId(selection.layerId)
       setSelectedDatasetDetail(null)
       if (selection) {
-        window.dispatchEvent(
-          new CustomEvent('mms-overlay-selected', { detail: { datasetId, selection } }),
-        )
+        if (!visibleLayerIdsRef.current.has(selection.layerId)) {
+          setVisibleLayerIds((current) => new Set(current).add(selection.layerId))
+          const layer = layers.find((candidate) => candidate.id === selection.layerId)
+          if (layer && !features[selection.layerId]?.wgs84 && !features[selection.layerId]?.loadingWgs84) {
+            void loadFeaturePage(layer, 'wgs84', requestGeneration.current)
+          }
+        }
+        if (options?.navigate !== false) {
+          window.dispatchEvent(
+            new CustomEvent('mms-overlay-selected', { detail: { datasetId, selection } }),
+          )
+        }
       }
     },
-    [datasetId],
+    [datasetId, features, layers, loadFeaturePage],
   )
 
   const selectedLayer = useMemo(
@@ -538,6 +661,46 @@ export function OverlayProvider({
     [features, selected, selectedDatasetDetail],
   )
 
+  const createFeature = useCallback(
+    async (layerId: string, payload: Omit<OverlayFeatureCreateRequest, 'expected_revision'>) => {
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!datasetId || !layer || demoMode) return
+      const currentRevision =
+        features[layerId]?.dataset?.revision ??
+        features[layerId]?.wgs84?.revision ??
+        layer.revision
+      setCreatingFeature(true)
+      try {
+        const response = await api.createOverlayFeature(datasetId, layerId, {
+          ...payload,
+          expected_revision: currentRevision,
+        })
+        const nextSelection = { layerId, featureId: response.feature.id }
+        selectFeature(nextSelection)
+        if (response.coordinate_space === 'dataset') {
+          setSelectedDatasetDetail({ ...nextSelection, feature: response.feature })
+        }
+        const generation = requestGeneration.current
+        const reloadDataset = Boolean(features[layerId]?.dataset)
+        await Promise.all([
+          loadFeaturePage(layer, 'wgs84', generation),
+          ...(reloadDataset ? [loadFeaturePage(layer, 'dataset', generation)] : []),
+        ])
+        notify?.({ tone: 'success', title: '신규 SHP 피처를 추가했습니다' })
+      } catch (reason) {
+        notify?.({
+          tone: 'error',
+          title: '신규 SHP 피처를 추가하지 못했습니다',
+          message: reason instanceof Error ? reason.message : undefined,
+        })
+        throw reason
+      } finally {
+        setCreatingFeature(false)
+      }
+    },
+    [datasetId, demoMode, features, layers, loadFeaturePage, notify, selectFeature],
+  )
+
   const updateSelected = useCallback(
     async (patch: {
       geometry?: { type: 'Point'; coordinates: [number, number, number?] }
@@ -579,8 +742,27 @@ export function OverlayProvider({
       coordinates: [number, number, number?],
       coordinateSpace: OverlayCoordinateSpace,
     ) => {
-      if (!selected) {
+      const target = pickTarget
+      if (!target) return
+      if (target.kind === 'create') {
+        try {
+          await createFeature(target.layerId, {
+            geometry: { type: 'Point', coordinates },
+            coordinate_space: coordinateSpace,
+          })
+          setPickTarget(null)
+        } catch {
+          // createFeature already emitted the actionable server error.
+        }
+        return
+      }
+      if (
+        !selected ||
+        selected.layerId !== target.layerId ||
+        String(selected.featureId) !== String(target.featureId)
+      ) {
         notify?.({ tone: 'info', title: '먼저 속성표에서 수정할 피처를 선택해 주세요.' })
+        setPickTarget(null)
         return
       }
       try {
@@ -588,13 +770,24 @@ export function OverlayProvider({
           geometry: { type: 'Point', coordinates },
           coordinate_space: coordinateSpace,
         })
-        setPickMode(false)
+        setPickTarget(null)
       } catch {
         // updateSelected already emitted the actionable server error.
       }
     },
-    [notify, selected, updateSelected],
+    [createFeature, notify, pickTarget, selected, updateSelected],
   )
+
+  const copySelectedLocation = useCallback(async () => {
+    if (!selected || !selectedLayer) {
+      notify?.({ tone: 'info', title: '위치를 복사할 SHP 피처를 먼저 선택해 주세요.' })
+      return
+    }
+    await createFeature(selected.layerId, {
+      copy_geometry_from: selected.featureId,
+      coordinate_space: 'dataset',
+    })
+  }, [createFeature, notify, selected, selectedLayer])
 
   const deleteSelected = useCallback(async () => {
     if (!datasetId || !selected || !selectedLayer || demoMode) return
@@ -602,6 +795,7 @@ export function OverlayProvider({
     await api.deleteOverlayFeature(datasetId, selected.layerId, selected.featureId, currentRevision)
     setSelected(null)
     setSelectedDatasetDetail(null)
+    setPickTarget(null)
     notify?.({ tone: 'info', title: '선택한 SHP 피처를 삭제했습니다' })
     const generation = requestGeneration.current
     const reloadDataset = Boolean(features[selected.layerId]?.dataset)
@@ -653,6 +847,8 @@ export function OverlayProvider({
       layers,
       features,
       visibleLayerIds,
+      activeLayerId,
+      setActiveLayerId,
       selected,
       selectedLayer,
       selectedFeature,
@@ -661,22 +857,31 @@ export function OverlayProvider({
       datasetFeatures,
       loading,
       uploading,
+      creatingFeature,
       pickMode,
+      pickTarget,
       setPickMode,
+      beginCreatePoint,
       refresh,
       ensureDatasetFeatures,
       loadMoreDatasetFeatures,
       upload,
+      updateLayerMetadata,
       removeLayer,
       toggleLayer,
       selectFeature,
       updateSelected,
       applyPickedCoordinate,
+      copySelectedLocation,
       deleteSelected,
       layerColor,
     }),
     [
       applyPickedCoordinate,
+      activeLayerId,
+      beginCreatePoint,
+      copySelectedLocation,
+      creatingFeature,
       datasetFeatures,
       datasetId,
       deleteSelected,
@@ -688,6 +893,7 @@ export function OverlayProvider({
       loadMoreDatasetFeatures,
       mapFeatures,
       pickMode,
+      pickTarget,
       refresh,
       removeLayer,
       selected,
@@ -695,8 +901,10 @@ export function OverlayProvider({
       selectedFeature,
       selectedLayer,
       selectFeature,
+      setPickMode,
       toggleLayer,
       updateSelected,
+      updateLayerMetadata,
       upload,
       uploading,
       visibleLayerIds,

@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   assertVWorldSdk,
+  cameraTargetForSceneMode,
   cameraTargetForCoordinates,
   pickedEntityId,
+  renderVWorldOverlay,
   renderVWorldScene,
+  selectedFrameDistanceScale,
   startVWorldMap,
   type VWorldCustomDataSource,
   type VWorldRuntime,
@@ -55,6 +58,15 @@ function fakeRuntime(collection = new FakeCollection()): {
     ) {}
   }
 
+  class FakeNearFarScalar {
+    constructor(
+      readonly near: number,
+      readonly nearValue: number,
+      readonly far: number,
+      readonly farValue: number,
+    ) {}
+  }
+
   const source = { entities: collection } as unknown as VWorldCustomDataSource
   const runtime = {
     Cesium: {
@@ -65,6 +77,7 @@ function fakeRuntime(collection = new FakeCollection()): {
         fromCssColorString: (value: string) => new FakeColor(value),
       },
       PolygonHierarchy: FakePolygonHierarchy,
+      NearFarScalar: FakeNearFarScalar,
       HeightReference: { CLAMP_TO_GROUND: 'ground' },
       ClassificationType: { BOTH: 'both' },
     },
@@ -73,6 +86,32 @@ function fakeRuntime(collection = new FakeCollection()): {
 }
 
 describe('VWorld WebGL 3.0 adapter', () => {
+  it('derives safe north-up 2D and perspective 3D camera targets', () => {
+    const target = { lon: 127, lat: 37, height: 420, heading: 35, tilt: -62 }
+
+    expect(cameraTargetForSceneMode(target, '2d')).toEqual({
+      lon: 127,
+      lat: 37,
+      height: 650,
+      heading: 0,
+      tilt: -90,
+    })
+    expect(cameraTargetForSceneMode({ ...target, tilt: -90 }, '3d')).toEqual({
+      lon: 127,
+      lat: 37,
+      height: 420,
+      heading: 35,
+      tilt: -65,
+    })
+  })
+
+  it('keeps the selected-frame distance scale compact at every camera distance', () => {
+    const scale = selectedFrameDistanceScale()
+    expect(scale).toEqual({ near: 60, nearValue: 0.9, far: 25_000, farValue: 0.3 })
+    expect(15 * scale.nearValue).toBeLessThan(16)
+    expect(15 * scale.farValue).toBeLessThan(5)
+  })
+
   it('rejects an API key/domain mismatch with the official loader message', () => {
     expect(() =>
       assertVWorldSdk({
@@ -238,7 +277,13 @@ describe('VWorld WebGL 3.0 adapter', () => {
     })
 
     expect(collection.values.map((entity) => entity.id)).toEqual(
-      expect.arrayContaining(['route:0:halo', 'route:0', 'frame:0', 'overlay:0']),
+      expect.arrayContaining([
+        'route:0:halo',
+        'route:0',
+        'frame:0:selected-halo',
+        'frame:0',
+        'overlay:0',
+      ]),
     )
     expect(collection.suspendCount).toBe(1)
     expect(collection.resumeCount).toBe(1)
@@ -248,9 +293,50 @@ describe('VWorld WebGL 3.0 adapter', () => {
     ).toHaveLength(1)
 
     targets.get('frame:0')?.()
+    targets.get('frame:0:selected-halo')?.()
     targets.get('overlay:0')?.()
+    expect(onFrame).toHaveBeenCalledTimes(2)
     expect(onFrame).toHaveBeenCalledWith('frame-1')
     expect(onOverlay).toHaveBeenCalledWith('layer-a', 'feature-7')
+    const selectedFrame = collection.values.find((entity) => entity.id === 'frame:0')
+    const selectedHalo = collection.values.find((entity) => entity.id === 'frame:0:selected-halo')
+    expect((selectedFrame?.point as { pixelSize?: number }).pixelSize).toBe(8)
+    expect((selectedHalo?.point as { pixelSize?: number }).pixelSize).toBe(15)
+    expect((selectedFrame?.point as { scaleByDistance?: unknown }).scaleByDistance).toMatchObject(
+      selectedFrameDistanceScale(),
+    )
+  })
+
+  it('maps every rendered SHP entity back to its hover properties', () => {
+    const { runtime, source } = fakeRuntime()
+    const hoverTargets = new Map()
+    renderVWorldOverlay(
+      runtime,
+      source,
+      {
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          id: 'feature-7',
+          properties: {
+            __overlay_layer_id: 'layer-a',
+            __overlay_feature_id: 'feature-7',
+            NAME: '주의 표지',
+          },
+          geometry: {
+            type: 'LineString',
+            coordinates: [[127, 37], [127.1, 37.1]],
+          },
+        }],
+      },
+      vi.fn(),
+      hoverTargets,
+    )
+    expect(hoverTargets.get('overlay:0')).toMatchObject({
+      layerId: 'layer-a',
+      featureId: 'feature-7',
+      properties: { NAME: '주의 표지' },
+    })
   })
 
   it('extracts Cesium entity ids from scene picks', () => {

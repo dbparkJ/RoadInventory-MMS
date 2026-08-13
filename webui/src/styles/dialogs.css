@@ -836,8 +836,16 @@ button.file-row:hover {
   font-size: 7px;
 }
 
+.run-card-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .danger-action,
-.result-action {
+.result-action,
+.delete-run-action {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -851,6 +859,15 @@ button.file-row:hover {
 
 .result-action {
   color: #5ea793;
+}
+
+.delete-run-action {
+  color: #c88791;
+}
+
+.delete-run-action:disabled {
+  cursor: wait;
+  opacity: 0.58;
 }
 
 .queue-empty {

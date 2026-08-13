@@ -105,7 +105,7 @@ from .shp_writer import (
     write_shapefile,
 )
 
-RESULT_SCHEMA_VERSION = 17
+RESULT_SCHEMA_VERSION = 18
 DATASET_SIGNATURE_VERSION = 1
 PANORAMA_ALIGNMENT_QA_ESTIMATOR_VERSION = 1
 PANORAMA_ALIGNMENT_QA_CACHE_VERSION = 1
@@ -7136,6 +7136,13 @@ def process_image_task(
                 "class_name": str(candidate["class_name"]),
                 "confidence": float(candidate["confidence"]),
                 "bbox_xyxy": [float(value) for value in candidate["bbox_xyxy"]],
+                # Every detector path (full panorama, perspective tiles, and
+                # the flat forward view) is normalized back into source
+                # equirectangular pixels before this durable result is written.
+                "bbox_coordinate_space": "panorama_equirectangular_pixels",
+                "bbox_mapping_version": 1,
+                "panorama_width": int(candidate.get("panorama_width") or image_rgb.shape[1]),
+                "panorama_height": int(image_rgb.shape[0]),
                 "mask_polygon": candidate["mask_polygon"],
                 "detection_sources": list(candidate.get("detection_sources", [])),
                 "image_crop_path": None,

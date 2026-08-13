@@ -36,6 +36,16 @@ const RESULTS: RunResults = {
     },
   ],
   file_count: 1,
+  archives: {
+    all: {
+      url: '/api/runs/run-42/archive?scope=all',
+      filename: 'run-42-all-results.zip',
+    },
+    detected_images: {
+      url: '/api/runs/run-42/archive?scope=detected-images',
+      filename: 'run-42-detected-images.zip',
+    },
+  },
 }
 
 const IMPORTED_LAYER: OverlayLayer = {
@@ -53,21 +63,50 @@ afterEach(() => {
 })
 
 describe('RunResultsDialog', () => {
-  it('renders the managed output location and uses server download URLs', async () => {
+  it('offers the two server archives from one ZIP menu without individual SHP downloads', async () => {
     vi.spyOn(api, 'runResults').mockResolvedValue(RESULTS)
 
-    render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
+    const { container } = render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
 
     expect(await screen.findByText('runs/run-42/output')).toBeInTheDocument()
     expect(screen.queryByText('[object Object]')).not.toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /ZIP 받기/ })).toHaveAttribute(
+    expect(screen.queryByRole('link', { name: /ZIP 받기/ })).not.toBeInTheDocument()
+    expect(container.querySelector(`a[href*="/shapefile?"]`)).not.toBeInTheDocument()
+
+    const trigger = screen.getByRole('button', { name: /ZIP 받기/ })
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(trigger)
+
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('menu', { name: 'ZIP 종류 선택' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /전체 산출물/ })).toHaveAttribute(
       'href',
-      '/api/runs/run-42/shapefile?path=shp%2Fdetected_signs.shp',
+      '/api/runs/run-42/archive?scope=all',
     )
-    expect(screen.getByRole('link', { name: /detected_signs\.dbf/ })).toHaveAttribute(
+    expect(screen.getByRole('menuitem', { name: /검출된 사진/ })).toHaveAttribute(
       'href',
-      '/api/runs/run-42/artifacts/shp/detected_signs.dbf',
+      '/api/runs/run-42/archive?scope=detected-images',
     )
+    expect(screen.queryByRole('link', { name: /detected_signs\.dbf/ })).not.toBeInTheDocument()
+    expect(container.querySelector('.result-shapefile-list')).toBeInTheDocument()
+  })
+
+  it('closes the ZIP menu with Escape or an outside pointer and restores trigger focus', async () => {
+    vi.spyOn(api, 'runResults').mockResolvedValue(RESULTS)
+    render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
+    const trigger = await screen.findByRole('button', { name: /ZIP 받기/ })
+
+    fireEvent.click(trigger)
+    const firstOption = screen.getByRole('menuitem', { name: /전체 산출물/ })
+    expect(firstOption).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+
+    fireEvent.click(trigger)
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
 
   it('opens an imported layer for its dataset and disables duplicate imports', async () => {

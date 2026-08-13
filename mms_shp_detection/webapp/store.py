@@ -128,6 +128,7 @@ class WebStore:
                     return_code INTEGER,
                     error TEXT,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    dismissed INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
@@ -149,6 +150,18 @@ class WebStore:
                 connection.execute(
                     "ALTER TABLE datasets ADD COLUMN registered INTEGER NOT NULL DEFAULT 1"
                 )
+            run_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if "dismissed" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS runs_dismissed_created "
+                "ON runs(dismissed, created_at)"
+            )
 
     @staticmethod
     def dataset_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -366,6 +379,49 @@ class WebStore:
                 "SELECT * FROM frames WHERE dataset_id=? AND id=?",
                 (dataset_id, frame_id),
             ).fetchone()
+        return self.frame_from_row(row)
+
+    def locate_frame(
+        self,
+        dataset_id: str,
+        *,
+        image_name: str | None = None,
+        dataset_position: tuple[float, float] | None = None,
+    ) -> dict[str, Any] | None:
+        """Find the source frame for an imported detection or nearby SHP point."""
+
+        normalized_image_name = str(image_name or "").strip().casefold()
+        with self.connection() as connection:
+            row = None
+            if normalized_image_name:
+                row = connection.execute(
+                    """
+                    SELECT * FROM frames
+                    WHERE dataset_id=?
+                      AND lower(json_extract(task_json, '$.image_name'))=?
+                    ORDER BY ordinal
+                    LIMIT 1
+                    """,
+                    (dataset_id, normalized_image_name),
+                ).fetchone()
+            if row is None and dataset_position is not None:
+                x, y = dataset_position
+                row = connection.execute(
+                    """
+                    SELECT * FROM frames
+                    WHERE dataset_id=?
+                      AND json_type(task_json, '$.origin[0]') IN ('integer', 'real')
+                      AND json_type(task_json, '$.origin[1]') IN ('integer', 'real')
+                    ORDER BY
+                      ((CAST(json_extract(task_json, '$.origin[0]') AS REAL)-?) *
+                       (CAST(json_extract(task_json, '$.origin[0]') AS REAL)-?)) +
+                      ((CAST(json_extract(task_json, '$.origin[1]') AS REAL)-?) *
+                       (CAST(json_extract(task_json, '$.origin[1]') AS REAL)-?)),
+                      ordinal
+                    LIMIT 1
+                    """,
+                    (dataset_id, x, x, y, y),
+                ).fetchone()
         return self.frame_from_row(row)
 
     def list_frames(
@@ -605,6 +661,7 @@ class WebStore:
         item["request"] = _loads(item.pop("request_json", None), {})
         item["resolved"] = _loads(item.pop("resolved_json", None), {})
         item["cancel_requested"] = bool(item["cancel_requested"])
+        item["dismissed"] = bool(item.get("dismissed", 0))
         return item
 
     def create_run(self, run: dict[str, Any]) -> None:
@@ -637,9 +694,75 @@ class WebStore:
     def list_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (int(limit),)
+                "SELECT * FROM runs WHERE dismissed=0 "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
             ).fetchall()
         return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def list_completed_runs_for_dataset(
+        self,
+        dataset_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return newest durable results, including runs hidden from the queue."""
+
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE dataset_id=? AND status='completed'
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (dataset_id, int(limit)),
+            ).fetchall()
+        return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def dismiss_terminal_run(
+        self,
+        run_id: str,
+        now: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Hide a completed/failed run without deleting its durable artifacts.
+
+        The status check and visibility update share one immediate transaction so
+        a concurrent lifecycle transition cannot turn an active job into a hidden
+        one. Repeated requests are idempotent and keep direct run lookup intact.
+        """
+
+        allowed = ("completed", "failed", "interrupted")
+        with self.connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return "missing", None
+            if str(row["status"]) not in allowed:
+                return "conflict", self.run_from_row(row)
+            if not bool(row["dismissed"]):
+                cursor = connection.execute(
+                    """
+                    UPDATE runs SET dismissed=1,updated_at=?
+                    WHERE id=? AND dismissed=0
+                      AND status IN ('completed','failed','interrupted')
+                    """,
+                    (now, run_id),
+                )
+                if not cursor.rowcount:
+                    current = connection.execute(
+                        "SELECT * FROM runs WHERE id=?", (run_id,)
+                    ).fetchone()
+                    if current is None:
+                        return "missing", None
+                    if str(current["status"]) not in allowed:
+                        return "conflict", self.run_from_row(current)
+            dismissed = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            return "dismissed", self.run_from_row(dismissed)
 
     def list_runs_with_statuses(
         self,
@@ -651,7 +774,8 @@ class WebStore:
         placeholders = ",".join("?" for _ in selected)
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT * FROM runs WHERE status IN ({placeholders}) ORDER BY created_at",
+                f"SELECT * FROM runs WHERE dismissed=0 "
+                f"AND status IN ({placeholders}) ORDER BY created_at",
                 selected,
             ).fetchall()
         return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
@@ -686,7 +810,8 @@ class WebStore:
         with self.connection() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM runs WHERE status='queued' AND cancel_requested=0
+                SELECT * FROM runs
+                WHERE status='queued' AND cancel_requested=0 AND dismissed=0
                 ORDER BY created_at LIMIT 1
                 """
             ).fetchone()
@@ -708,7 +833,8 @@ class WebStore:
                 return None
             row = connection.execute(
                 """
-                SELECT * FROM runs WHERE status='queued' AND cancel_requested=0
+                SELECT * FROM runs
+                WHERE status='queued' AND cancel_requested=0 AND dismissed=0
                 ORDER BY created_at LIMIT 1
                 """
             ).fetchone()

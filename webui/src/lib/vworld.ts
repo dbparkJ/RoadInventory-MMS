@@ -91,6 +91,12 @@ interface CesiumNamespace {
   }
   CustomDataSource: new (name?: string) => VWorldCustomDataSource
   PolygonHierarchy: new (positions: unknown[], holes?: unknown[]) => unknown
+  NearFarScalar?: new (
+    near: number,
+    nearValue: number,
+    far: number,
+    farValue: number,
+  ) => unknown
   HeightReference: {
     CLAMP_TO_GROUND: unknown
   }
@@ -130,6 +136,23 @@ export interface VWorldSceneInput {
   overlay: FeatureCollection
   onFrame: (frameId: string) => void
   onOverlay: (layerId: string, featureId: string) => void
+}
+
+export interface VWorldOverlayHoverTarget {
+  layerId: string
+  featureId: string
+  properties: Record<string, unknown>
+}
+
+export interface VWorldDistanceScale {
+  near: number
+  nearValue: number
+  far: number
+  farValue: number
+}
+
+export function selectedFrameDistanceScale(): VWorldDistanceScale {
+  return { near: 60, nearValue: 0.9, far: 25_000, farValue: 0.3 }
 }
 
 export function assertVWorldSdk(frameWindow: Window): {
@@ -249,6 +272,37 @@ export function moveVWorldMap(runtime: VWorldRuntime, target: CameraTarget): voi
   runtime.map.moveTo(createCameraPosition(runtime.vw, target))
 }
 
+export function cameraTargetForSceneMode(
+  target: CameraTarget,
+  mode: '2d' | '3d',
+): CameraTarget {
+  if (mode === '2d') {
+    return {
+      ...target,
+      height: Math.max(650, target.height),
+      heading: 0,
+      tilt: -90,
+    }
+  }
+  return {
+    ...target,
+    heading: target.heading ?? 0,
+    tilt: target.tilt === -90 || target.tilt === undefined ? -65 : target.tilt,
+  }
+}
+
+export function setVWorldSceneMode(
+  runtime: VWorldRuntime,
+  mode: '2d' | '3d',
+  target: CameraTarget,
+): void {
+  // VWorld WebGL 3.0 does not document Cesium's raw morphTo2D as a supported
+  // runtime API. Calling it leaves VWorld terrain primitives without their
+  // expected longitude metadata. A north-up nadir camera provides the 2D
+  // inspection view while keeping the supported VWorld 3D scene intact.
+  moveVWorldMap(runtime, cameraTargetForSceneMode(target, mode))
+}
+
 export function resizeVWorldMap(runtime: VWorldRuntime, width: number, height: number): void {
   runtime.map.updateSize(width, height)
   runtime.viewer.forceResize?.()
@@ -339,10 +393,11 @@ export function renderVWorldOverlay(
   source: VWorldCustomDataSource,
   overlay: FeatureCollection,
   onOverlay: (layerId: string, featureId: string) => void,
+  hoverTargets?: Map<string, VWorldOverlayHoverTarget>,
 ): ReadonlyMap<string, () => void> {
   const clickTargets = new Map<string, () => void>()
   replaceEntities(source.entities, () =>
-    appendOverlay(runtime, source.entities, overlay, onOverlay, clickTargets),
+    appendOverlay(runtime, source.entities, overlay, onOverlay, clickTargets, hoverTargets),
   )
   return clickTargets
 }
@@ -408,11 +463,26 @@ function appendFrames(
     const inRange = propertyNumber(feature, 'in_range') === 1
     const trackColor = propertyString(feature, 'track_color', '#579cf2')
     const entityId = `frame:${index}`
+    if (selected) {
+      const haloId = `${entityId}:selected-halo`
+      if (
+        addPoint(runtime, entities, feature.geometry.coordinates, haloId, {
+          color: '#ffd166',
+          size: 15,
+          outlineColor: '#ffffff',
+          outlineWidth: 2,
+          distanceScale: selectedFrameDistanceScale(),
+        })
+      ) {
+        clickTargets.set(haloId, () => onFrame(frameId))
+      }
+    }
     const added = addPoint(runtime, entities, feature.geometry.coordinates, entityId, {
-      color: selected ? '#ffffff' : trackColor,
-      size: selected ? 16 : 7,
-      outlineColor: selected ? trackColor : inRange ? '#ffffff' : '#09261f',
-      outlineWidth: selected ? 4 : inRange ? 3 : 1,
+      color: selected ? '#07111f' : trackColor,
+      size: selected ? 8 : 7,
+      outlineColor: selected ? '#ffd166' : inRange ? '#ffffff' : '#09261f',
+      outlineWidth: selected ? 2 : inRange ? 3 : 1,
+      distanceScale: selected ? selectedFrameDistanceScale() : undefined,
     })
     if (added) clickTargets.set(entityId, () => onFrame(frameId))
   })
@@ -424,6 +494,7 @@ function appendOverlay(
   overlay: FeatureCollection,
   onOverlay: (layerId: string, featureId: string) => void,
   clickTargets: Map<string, () => void>,
+  hoverTargets?: Map<string, VWorldOverlayHoverTarget>,
 ): void {
   overlay.features.forEach((feature, featureIndex) => {
     const layerId = propertyString(feature, '__overlay_layer_id', '')
@@ -435,13 +506,21 @@ function appendOverlay(
     if (!feature.geometry || !layerId || !featureId) return
     const selected = propertyNumber(feature, '__overlay_selected') === 1
     const color = propertyString(feature, '__overlay_color', '#ffb84d')
+    const hoverTarget: VWorldOverlayHoverTarget = {
+      layerId,
+      featureId,
+      properties: { ...(feature.properties ?? {}) },
+    }
     addOverlayGeometry(
       runtime,
       entities,
       feature.geometry,
       `overlay:${featureIndex}`,
       { color, selected },
-      (entityId) => clickTargets.set(entityId, () => onOverlay(layerId, featureId)),
+      (entityId) => {
+        clickTargets.set(entityId, () => onOverlay(layerId, featureId))
+        hoverTargets?.set(entityId, hoverTarget)
+      },
     )
   })
 }
@@ -556,7 +635,13 @@ function addPoint(
   entities: VWorldEntityCollection,
   coordinates: Position,
   id: string,
-  style: { color: string; size: number; outlineColor: string; outlineWidth: number },
+  style: {
+    color: string
+    size: number
+    outlineColor: string
+    outlineWidth: number
+    distanceScale?: VWorldDistanceScale
+  },
 ): boolean {
   const position = toCartesian(runtime, coordinates)
   if (!position) return false
@@ -570,6 +655,16 @@ function addPoint(
       outlineWidth: style.outlineWidth,
       heightReference: runtime.Cesium.HeightReference.CLAMP_TO_GROUND,
       disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      ...(style.distanceScale && runtime.Cesium.NearFarScalar
+        ? {
+            scaleByDistance: new runtime.Cesium.NearFarScalar(
+              style.distanceScale.near,
+              style.distanceScale.nearValue,
+              style.distanceScale.far,
+              style.distanceScale.farValue,
+            ),
+          }
+        : {}),
     },
   })
   return true

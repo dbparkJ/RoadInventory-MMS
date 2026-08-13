@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -98,6 +101,57 @@ def write_bundle(path: Path) -> None:
 
 
 class WebAppRunSafetyTests(unittest.TestCase):
+    def test_run_visibility_column_migrates_an_existing_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as state_text:
+            database = Path(state_text) / "registry.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE runs (
+                        id TEXT PRIMARY KEY,
+                        dataset_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        resolved_json TEXT NOT NULL,
+                        work_relative TEXT NOT NULL,
+                        pid INTEGER,
+                        return_code INTEGER,
+                        error TEXT,
+                        cancel_requested INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runs(
+                        id,dataset_id,status,request_json,resolved_json,
+                        work_relative,created_at,updated_at
+                    ) VALUES('legacy-run','dataset-a','completed','{}','{}',
+                             'legacy-run',?,?)
+                    """,
+                    (NOW, NOW),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = WebStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+                }
+            finally:
+                connection.close()
+            self.assertIn("dismissed", columns)
+            self.assertFalse(store.get_run("legacy-run")["dismissed"])  # type: ignore[index]
+
     def test_tqdm_output_drives_web_progress(self) -> None:
         log = "MMS multi-model:  12%|# | 24/200 [00:10<01:03]\r"
         self.assertEqual(_progress_from_log("running", log), 12.0)
@@ -201,6 +255,228 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 explicit = client.get("/api/runs/run-complete/results")
                 self.assertEqual(explicit.status_code, 200)
                 self.assertEqual(explicit.json()["file_count"], 2)
+
+    def test_terminal_runs_can_be_dismissed_without_deleting_artifacts(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            state = Path(state_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=state,
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            allowed = {
+                "run-completed": "completed",
+                "run-failed": "failed",
+                "run-interrupted": "interrupted",
+            }
+            markers: dict[str, Path] = {}
+            for run_id, run_status in allowed.items():
+                seed_run(app.state.store, run_id)
+                marker = state / "runs" / run_id / "output" / "result.txt"
+                marker.parent.mkdir(parents=True)
+                marker.write_text(f"artifact:{run_id}", encoding="utf-8")
+                markers[run_id] = marker
+                app.state.store.update_run(
+                    run_id,
+                    NOW,
+                    status=run_status,
+                    finished_at=NOW,
+                )
+            for run_id, run_status in {
+                "run-queued": "queued",
+                "run-cancelled": "cancelled",
+            }.items():
+                seed_run(app.state.store, run_id)
+                if run_status != "queued":
+                    app.state.store.update_run(
+                        run_id,
+                        NOW,
+                        status=run_status,
+                        finished_at=NOW,
+                    )
+
+            with TestClient(app) as client:
+                for run_id in allowed:
+                    response = client.delete(f"/api/runs/{run_id}")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertTrue(response.json()["dismissed"])
+                    self.assertTrue(response.json()["artifacts_preserved"])
+                    self.assertTrue(markers[run_id].is_file())
+                    self.assertTrue(app.state.store.get_run(run_id)["dismissed"])  # type: ignore[index]
+                    # Dismissal is idempotent and the direct audit URL survives.
+                    self.assertEqual(client.delete(f"/api/runs/{run_id}").status_code, 200)
+                    self.assertEqual(client.get(f"/api/runs/{run_id}").status_code, 200)
+                    self.assertEqual(
+                        client.get(f"/api/runs/{run_id}/results").status_code,
+                        200,
+                    )
+
+                visible = {item["id"] for item in client.get("/api/runs").json()["items"]}
+                boot_visible = {
+                    item["id"] for item in client.get("/api/bootstrap").json()["recent_runs"]
+                }
+                self.assertTrue(set(allowed).isdisjoint(visible))
+                self.assertTrue(set(allowed).isdisjoint(boot_visible))
+                self.assertEqual(client.delete("/api/runs/run-queued").status_code, 409)
+                self.assertEqual(client.delete("/api/runs/run-cancelled").status_code, 409)
+                self.assertEqual(client.delete("/api/runs/missing").status_code, 404)
+
+    def test_run_archives_are_complete_filtered_and_path_redacted(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as external_text,
+        ):
+            root = Path(root_text)
+            state = Path(state_text)
+            config = WebAppConfig(
+                project_root=Path(__file__).resolve().parents[1],
+                state_dir=state,
+                allowed_roots=[root],
+                enable_run_worker=False,
+                # Archive membership must not inherit result-list pagination.
+                max_result_files=1,
+            )
+            app = create_app(config)
+            seed_dataset(app.state.store)
+            seed_run(
+                app.state.store,
+                "run-archive",
+                require_execution_contract=True,
+            )
+            manifest = seed_manifest(app, "run-archive", root)
+            output = state / "runs" / "run-archive" / "output"
+            published = output / "shp" / "detected_signs.shp"
+            stale = output / "shp" / "stale_previous.shp"
+            write_bundle(published)
+            write_bundle(stale)
+
+            detected_one = output / "model_a" / "image_crops" / "track" / "one.jpg"
+            detected_two = output / "model_b" / "image_crops" / "track" / "two.png"
+            forward = output / "forward_views" / "track" / "frame.jpg"
+            point_preview = output / "model_a" / "point_previews" / "track" / "preview.png"
+            structured = output / "model_a" / "txt" / "frame.txt"
+            log = output / "model_a" / "logs" / "secret.txt"
+            unsupported = output / "model_a" / "payload.bin"
+            for path, payload in (
+                (detected_one, b"jpeg-one"),
+                (detected_two, b"png-two"),
+                (forward, b"jpeg-forward"),
+                (point_preview, b"png-preview"),
+                (log, b"private-log"),
+                (unsupported, b"unsupported"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+            structured.parent.mkdir(parents=True, exist_ok=True)
+            structured.write_text(
+                json.dumps(
+                    {
+                        "dataset": str(root / "private" / "frame.jpg"),
+                        "model": r"Z:\\private-models\\secret.pt",
+                        "file_uri": "file:///etc/passwd",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            external = Path(external_text) / "external.jpg"
+            external.write_bytes(b"must-not-leak")
+            linked = output / "model_a" / "image_crops" / "track" / "linked.jpg"
+            linked_created = False
+            try:
+                linked.symlink_to(external)
+                linked_created = True
+            except OSError:
+                pass
+
+            manifest.set_outputs(
+                {
+                    "root": ".",
+                    "shapefiles": ["shp/detected_signs.shp"],
+                    "models_manifest": None,
+                }
+            )
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            manifest.transition(JobStatus.SUCCEEDED)
+            app.state.store.update_run(
+                "run-archive",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+            seed_run(app.state.store, "run-active")
+
+            with TestClient(app) as client:
+                results = client.get("/api/runs/run-archive/results")
+                self.assertEqual(results.status_code, 200, results.text)
+                archives = results.json()["archives"]
+                self.assertEqual(
+                    archives["all"]["url"],
+                    "/api/runs/run-archive/archive?scope=all",
+                )
+                self.assertEqual(
+                    archives["detected_images"]["url"],
+                    "/api/runs/run-archive/archive?scope=detected-images",
+                )
+
+                all_response = client.get(archives["all"]["url"])
+                self.assertEqual(all_response.status_code, 200, all_response.text)
+                self.assertEqual(all_response.headers["content-type"], "application/zip")
+                with zipfile.ZipFile(io.BytesIO(all_response.content)) as archive:
+                    all_names = set(archive.namelist())
+                    self.assertIn("model_a/image_crops/track/one.jpg", all_names)
+                    self.assertIn("model_b/image_crops/track/two.png", all_names)
+                    self.assertIn("forward_views/track/frame.jpg", all_names)
+                    self.assertIn("model_a/point_previews/track/preview.png", all_names)
+                    self.assertIn("model_a/txt/frame.txt", all_names)
+                    self.assertIn("shp/detected_signs.shp", all_names)
+                    self.assertFalse(any("stale_previous" in name for name in all_names))
+                    self.assertFalse(any("/logs/" in f"/{name}" for name in all_names))
+                    self.assertNotIn("model_a/payload.bin", all_names)
+                    if linked_created:
+                        self.assertNotIn(
+                            "model_a/image_crops/track/linked.jpg",
+                            all_names,
+                        )
+                    redacted = archive.read("model_a/txt/frame.txt").decode("utf-8")
+                    self.assertNotIn(str(root), redacted)
+                    self.assertNotIn("private-models", redacted)
+                    self.assertNotIn("file:///etc/passwd", redacted)
+                    self.assertIn("<server", redacted)
+
+                images_response = client.get(archives["detected_images"]["url"])
+                self.assertEqual(images_response.status_code, 200, images_response.text)
+                with zipfile.ZipFile(io.BytesIO(images_response.content)) as archive:
+                    self.assertEqual(
+                        set(archive.namelist()),
+                        {
+                            "model_a/image_crops/track/one.jpg",
+                            "model_b/image_crops/track/two.png",
+                        },
+                    )
+
+                self.assertEqual(
+                    client.get("/api/runs/run-active/archive?scope=all").status_code,
+                    409,
+                )
+                self.assertEqual(
+                    client.get("/api/runs/missing/archive?scope=all").status_code,
+                    404,
+                )
+                self.assertEqual(
+                    client.get(
+                        "/api/runs/run-archive/archive?scope=unsupported"
+                    ).status_code,
+                    422,
+                )
 
     def test_shapefile_and_manifest_discovery_bypasses_artifact_page_limit(
         self,

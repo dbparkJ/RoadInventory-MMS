@@ -17,9 +17,16 @@ describe('resolveMapTrackScope', () => {
   })
 
   it('honours the persistent all-track display setting', () => {
-    expect(resolveMapTrackScope('track-2', 'track-2', 'track-1', true)).toEqual({
+    expect(resolveMapTrackScope(undefined, 'track-2', 'track-1', true)).toEqual({
       showAllTracks: true,
       effectiveTrackId: undefined,
+    })
+  })
+
+  it('keeps an explicit track isolated even when the all-track preference was saved', () => {
+    expect(resolveMapTrackScope('track-2', 'track-1', 'track-1', true)).toEqual({
+      showAllTracks: false,
+      effectiveTrackId: 'track-2',
     })
   })
 })

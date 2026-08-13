@@ -471,6 +471,54 @@ def _panorama_axes(
     )
 
 
+@router.get("/datasets/{dataset_id}/frames/{frame_id}/panorama-projection")
+def panorama_projection_metadata(
+    dataset_id: str,
+    frame_id: str,
+    request: Request,
+    yaw_offset_deg: float | None = Query(None, ge=-180.0, le=180.0),
+    pitch_offset_deg: float | None = Query(None, ge=-45.0, le=45.0),
+) -> dict[str, Any]:
+    """Return the calibrated frame basis used for interactive panorama projection."""
+
+    require_ready_dataset(request, dataset_id)
+    frame = request.app.state.store.get_frame(dataset_id, frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    resolved_yaw = (
+        float(request.app.state.panorama_yaw_offset_deg)
+        if yaw_offset_deg is None
+        else yaw_offset_deg
+    )
+    resolved_pitch = (
+        float(request.app.state.panorama_pitch_offset_deg)
+        if pitch_offset_deg is None
+        else pitch_offset_deg
+    )
+    try:
+        origin = np.asarray(frame["task"].get("origin"), dtype=np.float64)
+        if origin.shape != (3,) or not np.all(np.isfinite(origin)):
+            raise ValueError("Frame has no valid dataset-space origin.")
+        forward, right, up = _panorama_axes(
+            frame["task"],
+            yaw_offset_deg=resolved_yaw,
+            pitch_offset_deg=resolved_pitch,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "frame_id": frame_id,
+        "coordinate_space": "dataset",
+        "projection": "normalized_equirectangular",
+        "origin": origin.tolist(),
+        "forward": forward.tolist(),
+        "right": right.tolist(),
+        "up": up.tolist(),
+        "yaw_offset_deg": resolved_yaw,
+        "pitch_offset_deg": resolved_pitch,
+    }
+
+
 def _nearest_per_panorama_cell(
     u: np.ndarray,
     v: np.ndarray,

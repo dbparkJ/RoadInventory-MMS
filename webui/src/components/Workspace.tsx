@@ -4,19 +4,22 @@ import {
   CircleGauge,
   CloudOff,
   Eye,
+  EyeOff,
   Image,
   Keyboard,
   Layers3,
   Map,
-  PanelRightClose,
-  PanelRightOpen,
+  Shapes,
+  Table2,
   X,
 } from 'lucide-react'
-import { lazy, Suspense, useEffect, useRef, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react'
 import { frameNavigationDirection } from '../lib/frameNavigation'
+import type { PanoramaHoverProjection } from '../lib/panoramaProjection'
 import { DEFAULT_USER_SETTINGS, type UserSettings, type UserSettingsPatch } from '../lib/userSettings'
 import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
+import { useOptionalOverlayWorkspace } from './OverlayContext'
 
 const MapView = lazy(() =>
   import('../views/MapView').then((module) => ({ default: module.MapView })),
@@ -33,10 +36,12 @@ interface WorkspaceProps {
   route: RoutePoint[]
   routeLoading: boolean
   demoMode: boolean
+  detectionRevisionKey?: string
   panoramaOpen: boolean
   pointCloudOpen: boolean
   hasMoreFrames: boolean
-  inspectorOpen: boolean
+  /** @deprecated 작업 설정은 통합 설정 패널로 이동했습니다. */
+  inspectorOpen?: boolean
   detached?: boolean
   settings?: UserSettings
   externalAction?: ReactNode
@@ -44,8 +49,10 @@ interface WorkspaceProps {
   onTogglePointCloud: () => void
   onFrameChange: (frame: Frame) => void
   onMoveFrame: (direction: -1 | 1) => void
-  onToggleInspector: () => void
+  /** @deprecated 작업 설정은 통합 설정 패널로 이동했습니다. */
+  onToggleInspector?: () => void
   onOpenSource: () => void
+  onOpenOverlay?: () => void
   onUseDemo: () => void
   onSettingsChange?: (patch: UserSettingsPatch) => void
 }
@@ -59,26 +66,32 @@ export function Workspace({
   route,
   routeLoading,
   demoMode,
+  detectionRevisionKey = '',
   panoramaOpen,
   pointCloudOpen,
   hasMoreFrames,
-  inspectorOpen,
+  detached = false,
   settings = DEFAULT_USER_SETTINGS,
   externalAction,
   onTogglePanorama,
   onTogglePointCloud,
   onFrameChange,
   onMoveFrame,
-  onToggleInspector,
   onOpenSource,
+  onOpenOverlay,
   onUseDemo,
   onSettingsChange,
 }: WorkspaceProps) {
+  const overlay = useOptionalOverlayWorkspace()
   const panoramaPanelRef = useRef<DetachablePanelHandle>(null)
   const pointCloudPanelRef = useRef<DetachablePanelHandle>(null)
+  const [mapMode, setMapMode] = useState<'2d' | '3d'>('2d')
+  const [hoveredPanoramaPoint, setHoveredPanoramaPoint] = useState<PanoramaHoverProjection | null>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
   const canMovePrevious = currentIndex > 0
   const canMoveNext = currentIndex >= 0 && (currentIndex < frames.length - 1 || hasMoreFrames)
+
+  useEffect(() => setHoveredPanoramaPoint(null), [frame?.id])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -102,7 +115,7 @@ export function Workspace({
       panoramaPanelRef.current?.returnToMain()
       return
     }
-    // window.open must run synchronously in this click to avoid popup blockers.
+    // Open synchronously from the click so browser popup blockers permit it.
     if (panoramaPanelRef.current?.detach()) onTogglePanorama()
   }
 
@@ -163,14 +176,6 @@ export function Workspace({
             </span>
           )}
           {externalAction}
-          <button
-            type="button"
-            className="icon-button"
-            onClick={onToggleInspector}
-            title={inspectorOpen ? '작업 설정 닫기' : '작업 설정 열기'}
-          >
-            {inspectorOpen ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
-          </button>
         </div>
       </header>
 
@@ -195,6 +200,7 @@ export function Workspace({
           <>
             <Suspense fallback={<ViewerLoading label="지도 엔진 준비 중" />}>
               <MapView
+                key={detached ? 'popup' : 'main'}
                 route={route}
                 frames={frames}
                 selectedFrame={frame}
@@ -202,9 +208,41 @@ export function Workspace({
                 showAllTracks={settings.showAllMapTracks}
                 frameRange={frameRange}
                 loading={routeLoading}
+                mapMode={mapMode}
+                onMapModeChange={setMapMode}
                 onSelectFrame={onFrameChange}
               />
             </Suspense>
+
+            {Boolean(overlay?.layers.length) && (
+              <section className="overlay-quick-controls" aria-label="메인 SHP 레이어 표시 설정">
+                <header>
+                  <span><Shapes size={14} /> 검출 레이어</span>
+                  <button type="button" onClick={onOpenOverlay} title="SHP 속성표 열기">
+                    <Table2 size={13} /> 속성표
+                  </button>
+                </header>
+                <div>
+                  {overlay?.layers.map((layer) => {
+                    const visible = overlay.visibleLayerIds.has(layer.id)
+                    return (
+                      <button
+                        type="button"
+                        key={layer.id}
+                        className={visible ? 'active' : ''}
+                        aria-pressed={visible}
+                        onClick={() => overlay.toggleLayer(layer.id)}
+                        title={`${layer.name} ${visible ? '숨기기' : '표시'}`}
+                      >
+                        <i style={{ background: overlay.layerColor(layer.id) }} />
+                        <span>{layer.name}</span>
+                        {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                      </button>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
 
             <DetachablePanel
               ref={panoramaPanelRef}
@@ -216,15 +254,15 @@ export function Workspace({
                 if (!isDetached && panoramaOpen) onTogglePanorama()
               }}
             >
-              {() =>
+              {({ returnToMain }) =>
                 panoramaOpen ? (
-                  <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 팝업">
+                  <section className="viewer-overlay-card panorama-pane" aria-label="파노라마 뷰어">
                     <header className="viewer-pane-header">
                       <span><Image size={14} /> 파노라마</span>
                       <div className="viewer-pane-actions">
                         <button
                           type="button"
-                          onClick={() => panoramaPanelRef.current?.returnToMain()}
+                          onClick={returnToMain}
                           aria-label="파노라마 닫기"
                           title="파노라마 닫기"
                         >
@@ -238,10 +276,13 @@ export function Workspace({
                           datasetId={dataset.id}
                           frame={frame}
                           demoMode={demoMode}
+                          detectionRevisionKey={detectionRevisionKey}
                           forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
                           quality={settings.panoramaDefaultQuality}
                           pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
                           panoramaOpacity={settings.panoramaImageOpacity}
+                          maxOverlayDistanceM={settings.detectionVisibilityDistanceM}
+                          linkedHoverPoint={hoveredPanoramaPoint}
                           onQualityChange={(quality) =>
                             onSettingsChange?.({ panoramaDefaultQuality: quality })
                           }
@@ -272,15 +313,15 @@ export function Workspace({
                 if (!isDetached && pointCloudOpen) onTogglePointCloud()
               }}
             >
-              {() =>
+              {({ returnToMain }) =>
                 pointCloudOpen ? (
-                  <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 팝업">
+                  <section className="viewer-overlay-card pointcloud-pane" aria-label="3D 포인트 뷰어">
                     <header className="viewer-pane-header">
                       <span><Layers3 size={14} /> 3D 포인트</span>
                       <div className="viewer-pane-actions">
                         <button
                           type="button"
-                          onClick={() => pointCloudPanelRef.current?.returnToMain()}
+                          onClick={returnToMain}
                           aria-label="3D 포인트 닫기"
                           title="3D 포인트 닫기"
                         >
@@ -290,7 +331,12 @@ export function Workspace({
                     </header>
                     <div className="viewer-pane-content">
                       <Suspense fallback={<ViewerLoading label="3D 엔진 준비 중" />}>
-                        <PointCloudView datasetId={dataset.id} frame={frame} demoMode={demoMode} />
+                        <PointCloudView
+                          datasetId={dataset.id}
+                          frame={frame}
+                          demoMode={demoMode}
+                          onHoverPanoramaPoint={setHoveredPanoramaPoint}
+                        />
                       </Suspense>
                     </div>
                   </section>

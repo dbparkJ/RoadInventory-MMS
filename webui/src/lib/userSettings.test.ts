@@ -18,6 +18,7 @@ describe('user settings', () => {
         panoramaPointOverlayEnabled: true,
         panoramaPointOverlayOpacity: -3,
         panoramaDefaultQuality: 'original',
+        detectionVisibilityDistanceM: 900,
         showAllMapTracks: 'yes',
       }),
     ).toEqual({
@@ -25,6 +26,7 @@ describe('user settings', () => {
       panoramaPointOverlayEnabled: true,
       panoramaImageOpacity: 0,
       panoramaDefaultQuality: 'high',
+      detectionVisibilityDistanceM: 200,
       showAllMapTracks: false,
     })
   })

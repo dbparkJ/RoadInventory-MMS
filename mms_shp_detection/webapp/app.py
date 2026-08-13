@@ -21,6 +21,7 @@ from starlette.responses import Response
 
 from .datasets import public_dataset, utc_now
 from .datasets import router as datasets_router
+from .detections import router as detections_router
 from .media import router as media_router
 from .optimizer import router as optimizer_router
 from .overlays import router as overlays_router
@@ -225,6 +226,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             request.url.path == "/"
             or request.url.path.endswith("/index.html")
             or request.url.path.endswith("/vworld-map.html")
+            or request.url.path.endswith("/vworld-2d-map.html")
         ):
             response.headers["Cache-Control"] = "no-cache"
         return response
@@ -488,6 +490,7 @@ def create_app(
     app.state.media_owner_tasks = set()
     app.state.panorama_semaphore = asyncio.Semaphore(config.max_panorama_previews)
     app.state.point_preview_semaphore = asyncio.Semaphore(config.max_point_previews)
+    app.state.run_archive_semaphore = asyncio.Semaphore(2)
     (
         app.state.panorama_yaw_offset_deg,
         app.state.panorama_pitch_offset_deg,
@@ -506,6 +509,7 @@ def create_app(
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.include_router(datasets_router)
+    app.include_router(detections_router)
     app.include_router(media_router)
     app.include_router(overlays_router)
     app.include_router(optimizer_router)

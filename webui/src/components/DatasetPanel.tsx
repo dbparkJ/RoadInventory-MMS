@@ -12,14 +12,13 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   RotateCcw,
-  Search,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import type { DatasetSummary, Frame, FrameRange } from '../types'
-import { formatCount, formatDistance, formatFrameTimestamp } from '../lib/format'
+import { formatCount, formatDistance } from '../lib/format'
 import { TRACK_COLORS } from '../lib/route'
-import { DetachablePanel } from './DetachablePanel'
+import { DatasetOverlayBrowser } from './DatasetOverlayBrowser'
 
 const DATASET_STATUS: Record<DatasetSummary['status'], string> = {
   ready: '인덱스 준비됨',
@@ -38,6 +37,7 @@ interface DatasetPanelProps {
   frameTotal: number
   hasMoreFrames: boolean
   frameRange: FrameRange | null
+  focusOverlayLayerId?: string
   removingDataset?: boolean
   externalAction?: ReactNode
   collapsed?: boolean
@@ -58,41 +58,23 @@ export function DatasetPanel({
   datasets,
   selectedDataset,
   selectedTrack,
-  frames,
   selectedFrame,
-  framesLoading,
-  framesLoadingMore,
-  frameTotal,
-  hasMoreFrames,
   frameRange,
+  focusOverlayLayerId,
   removingDataset = false,
   externalAction,
   collapsed = false,
   onDatasetChange,
   onTrackChange,
-  onFrameChange,
   onSetFrameRangeStart,
   onSetFrameRangeEnd,
   onFrameRangeChange,
   onClearFrameRange,
-  onLoadMoreFrames,
   onOpenSource,
   onRemoveDataset,
   onToggleCollapsed,
 }: DatasetPanelProps) {
-  const [query, setQuery] = useState('')
   const [rangeDraft, setRangeDraft] = useState<[string, string]>(['', ''])
-  const [framesCollapsed, setFramesCollapsed] = useState(false)
-  const [framesDetached, setFramesDetached] = useState(false)
-  const visibleFrames = useMemo(() => {
-    const normalized = query.trim().toLowerCase()
-    if (!normalized) return frames
-    return frames.filter(
-      (frame) =>
-        frame.id.toLowerCase().includes(normalized) ||
-        String(frame.index + 1).includes(normalized),
-    )
-  }, [frames, query])
   const frameLimit = Math.max(1, selectedDataset?.frame_count ?? 1)
   const parsedRange = rangeDraft.map((value) => Number(value)) as [number, number]
   const rangeDraftValid = parsedRange.every(
@@ -238,56 +220,12 @@ export function DatasetPanel({
             </div>
           </section>
 
-          <DetachablePanel
-            id={`frames-${selectedDataset.id}`}
-            title="프레임 및 작업 구간"
-            placeholderClassName={`frame-panel-slot ${
-              framesCollapsed && !framesDetached ? 'is-collapsed' : ''
-            }`}
-            onDetachedChange={setFramesDetached}
-          >
-            {({ action, detached }) => {
-              const contentCollapsed = framesCollapsed && !detached
-              return (
-              <section className={`frame-section ${contentCollapsed ? 'collapsed' : ''}`}>
-                <div className="section-label">
-                  <span>프레임</span>
-                  <span className="section-label-actions">
-                    <small>
-                      {frames.length.toLocaleString('ko-KR')} / {frameTotal.toLocaleString('ko-KR')} loaded
-                    </small>
-                    {action}
-                    {!detached && (
-                      <button
-                        type="button"
-                        className="icon-button section-collapse-button"
-                        onClick={() => setFramesCollapsed((value) => !value)}
-                        title={contentCollapsed ? '프레임 컴포넌트 복원' : '프레임 컴포넌트 최소화'}
-                        aria-label={contentCollapsed ? '프레임 컴포넌트 복원' : '프레임 컴포넌트 최소화'}
-                        aria-expanded={!contentCollapsed}
-                      >
-                        {contentCollapsed ? <ChevronDown size={14} /> : <ChevronDown size={14} className="collapse-chevron-open" />}
-                      </button>
-                    )}
-                  </span>
-                </div>
-                {!contentCollapsed && (
-                  <>
-            <label className="search-box">
-              <Search size={14} />
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="불러온 프레임에서 번호 또는 ID 검색"
-                aria-label="프레임 검색"
-              />
-            </label>
-            {query && (
-              <small className="search-scope-note">
-                현재 불러온 {frames.length.toLocaleString('ko-KR')}개 기준 · 필요하면 아래에서 더 불러오세요.
-              </small>
-            )}
-            <div className="frame-range-picker">
+          <section className="dataset-range-section" aria-label="실행 프레임 범위">
+            <div className="section-label">
+              <span>실행 프레임 범위</span>
+              <small>지도 또는 A/D 키로 현재 프레임 이동</small>
+            </div>
+            <div className="frame-range-picker compact">
               <div className="frame-range-inputs">
                 <label>
                   <span>시작 프레임</span>
@@ -387,75 +325,9 @@ export function DatasetPanel({
                 </code>
               </div>
             </div>
-                <div className="frame-list" aria-busy={framesLoading}>
-              {framesLoading && !frames.length
-                ? Array.from({ length: 5 }, (_, index) => (
-                    <div className="frame-skeleton" key={index}>
-                      <span />
-                      <div>
-                        <i />
-                        <i />
-                      </div>
-                    </div>
-                  ))
-                : visibleFrames.map((frame) => (
-                    <button
-                      type="button"
-                      key={frame.id}
-                      className={`frame-row ${selectedFrame?.id === frame.id ? 'active' : ''} ${
-                        frameRange && frame.index >= frameRange[0] && frame.index <= frameRange[1]
-                          ? 'in-range'
-                          : ''
-                      }`}
-                      title="클릭하여 이동 · Shift+클릭하여 현재 프레임까지 작업 범위 선택"
-                      onClick={(event) => {
-                        if (event.shiftKey && selectedFrame) {
-                          onFrameRangeChange([
-                            Math.min(selectedFrame.index, frame.index),
-                            Math.max(selectedFrame.index, frame.index),
-                          ])
-                        }
-                        onFrameChange(frame)
-                      }}
-                    >
-                      <span className="frame-index">{String(frame.index + 1).padStart(4, '0')}</span>
-                      <span className="frame-meta">
-                        <strong>
-                          {formatFrameTimestamp(frame.timestamp)}
-                        </strong>
-                        <small>{frame.id}</small>
-                      </span>
-                      <span className="frame-assets">
-                        {frame.has_panorama && <Camera size={13} />}
-                        {frame.has_points && <Layers3 size={13} />}
-                      </span>
-                    </button>
-                  ))}
-              {hasMoreFrames && (
-                <button
-                  type="button"
-                  className="frame-load-more"
-                  disabled={framesLoadingMore}
-                  onClick={onLoadMoreFrames}
-                >
-                  {framesLoadingMore ? <LoaderCircle size={14} className="spin" /> : <ChevronDown size={14} />}
-                  {framesLoadingMore ? '프레임 불러오는 중' : '프레임 더 불러오기'}
-                  <small>다음 240개</small>
-                </button>
-              )}
-              {!hasMoreFrames && frames.length > 0 && (
-                <div className="frame-list-end">전체 프레임을 불러왔습니다.</div>
-              )}
-              {!framesLoading && !visibleFrames.length && (
-                <div className="list-empty">조건에 맞는 프레임이 없습니다.</div>
-              )}
-                </div>
-                  </>
-                )}
-              </section>
-              )
-            }}
-          </DetachablePanel>
+          </section>
+
+          <DatasetOverlayBrowser focusLayerId={focusOverlayLayerId} />
         </>
       ) : (
         <div className="panel-empty">

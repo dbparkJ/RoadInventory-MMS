@@ -16,6 +16,7 @@ const LAYER: OverlayLayer = {
   geometry_type: 'Point',
   feature_count: 7,
   revision: 4,
+  metadata_revision: 1,
 }
 
 function feature(id: string, coordinate: number, label = id): OverlayFeature {
@@ -82,6 +83,11 @@ function WorkspaceProbe() {
         {String(overlay.selectedDatasetFeature?.properties.label ?? 'not-selected')}
       </output>
       <output data-testid="pick-mode">{overlay.pickMode ? 'on' : 'off'}</output>
+      <output data-testid="pick-target">{overlay.pickTarget?.kind ?? 'none'}</output>
+      <output data-testid="active-layer">{overlay.activeLayerId || 'none'}</output>
+      <output data-testid="layer-name">{overlay.layers[0]?.name ?? 'none'}</output>
+      <output data-testid="layer-color">{overlay.layerColor(LAYER.id)}</output>
+      <output data-testid="selected-id">{String(overlay.selected?.featureId ?? 'none')}</output>
       <button type="button" onClick={() => void overlay.ensureDatasetFeatures(LAYER.id)}>
         ensure dataset
       </button>
@@ -93,6 +99,35 @@ function WorkspaceProbe() {
         onClick={() => overlay.selectFeature({ layerId: LAYER.id, featureId: 'outside-42' })}
       >
         select outside
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          overlay.selectFeature(
+            { layerId: LAYER.id, featureId: 'outside-42' },
+            { navigate: false },
+          )
+        }
+      >
+        select details only
+      </button>
+      <button type="button" onClick={() => overlay.beginCreatePoint(LAYER.id)}>
+        begin create
+      </button>
+      <button
+        type="button"
+        onClick={() => void overlay.applyPickedCoordinate([127.1, 37.2], 'wgs84')}
+      >
+        apply coordinate
+      </button>
+      <button type="button" onClick={() => void overlay.copySelectedLocation()}>
+        copy location
+      </button>
+      <button
+        type="button"
+        onClick={() => void overlay.updateLayerMetadata(LAYER.id, { name: '새 이름', color: '#112233' })}
+      >
+        update layer metadata
       </button>
       <input aria-label="속성 입력" />
     </div>
@@ -143,6 +178,44 @@ afterEach(() => {
 })
 
 describe('OverlayProvider feature loading', () => {
+  it('can select a feature for attribute details without triggering frame navigation', async () => {
+    mockFeaturePages()
+    mockOutsideFeature()
+    const navigationListener = vi.fn()
+    window.addEventListener('mms-overlay-selected', navigationListener)
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'select details only' }))
+
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+    expect(navigationListener).not.toHaveBeenCalled()
+    window.removeEventListener('mms-overlay-selected', navigationListener)
+  })
+
+  it('updates the shared persisted layer name and color with metadata revision', async () => {
+    mockFeaturePages()
+    const updatedLayer: OverlayLayer = {
+      ...LAYER,
+      name: '새 이름',
+      color: '#112233',
+      metadata_revision: 2,
+    }
+    const patchOverlay = vi.spyOn(api, 'patchOverlay').mockResolvedValue({ layer: updatedLayer })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'update layer metadata' }))
+
+    await waitFor(() => expect(screen.getByTestId('layer-name')).toHaveTextContent('새 이름'))
+    expect(screen.getByTestId('layer-color')).toHaveTextContent('#112233')
+    expect(patchOverlay).toHaveBeenCalledWith('dataset-1', LAYER.id, {
+      name: '새 이름',
+      color: '#112233',
+      expected_metadata_revision: 1,
+    })
+  })
+
   it('loads only WGS84 during refresh and lazily loads dataset coordinates on ensure', async () => {
     const overlayFeatures = mockFeaturePages()
     renderWorkspace()
@@ -234,5 +307,65 @@ describe('OverlayProvider pick-mode shortcuts', () => {
 
     fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
     expect(screen.getByTestId('pick-mode')).toHaveTextContent('off')
+  })
+
+  it('creates a Point at the picked WGS84 coordinate and selects the server-assigned ID', async () => {
+    mockFeaturePages()
+    const created = feature('f_000000008', 127.1, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: [{ name: 'label', type: 'C' }],
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: feature('f_000000008', 8, ''),
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: [{ name: 'label', type: 'C' }],
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin create' }))
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+    fireEvent.click(screen.getByRole('button', { name: 'apply coordinate' }))
+
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('f_000000008'))
+    expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
+      geometry: { type: 'Point', coordinates: [127.1, 37.2] },
+      coordinate_space: 'wgs84',
+      expected_revision: LAYER.revision,
+    })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+  })
+
+  it('copies only the selected feature geometry through the server-side copy action', async () => {
+    mockFeaturePages()
+    mockOutsideFeature()
+    const copied = feature('f_000000008', 42, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: copied,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: [{ name: 'label', type: 'C' }],
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'copy location' }))
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
+      copy_geometry_from: 'outside-42',
+      coordinate_space: 'dataset',
+      expected_revision: LAYER.revision,
+    })
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('f_000000008'))
   })
 })

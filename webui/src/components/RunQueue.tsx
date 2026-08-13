@@ -6,6 +6,7 @@ import {
   Clock3,
   Download,
   LoaderCircle,
+  Trash2,
   XCircle,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -75,13 +76,30 @@ export function RunQueue({
   open,
   onClose,
   onCancel,
+  onDelete,
 }: {
   runs: RunRecord[]
   open: boolean
   onClose: () => void
   onCancel: (id: string) => void
+  onDelete: (id: string) => void | Promise<void>
 }) {
   const [resultRun, setResultRun] = useState<RunRecord | null>(null)
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
+
+  const deleteRun = async (run: RunRecord) => {
+    const ownerWindow = document.defaultView ?? window
+    const confirmed = ownerWindow.confirm(
+      `${run.dataset_name ?? run.dataset_id} 실행 기록을 목록에서 제거할까요?\n\n검출 산출물과 서버 파일은 삭제되지 않습니다.`,
+    )
+    if (!confirmed) return
+    setDeletingRunId(run.id)
+    try {
+      await onDelete(run.id)
+    } finally {
+      setDeletingRunId((current) => (current === run.id ? null : current))
+    }
+  }
   return (
     <>
       {open && <button type="button" className="drawer-scrim" onClick={onClose} aria-label="실행 큐 닫기" />}
@@ -111,7 +129,14 @@ export function RunQueue({
         </div>
         <div className="run-list">
           {runs.map((run) => (
-            <RunCard key={run.id} run={run} onCancel={onCancel} onOpenResults={setResultRun} />
+            <RunCard
+              key={run.id}
+              run={run}
+              deleting={deletingRunId === run.id}
+              onCancel={onCancel}
+              onDelete={() => void deleteRun(run)}
+              onOpenResults={setResultRun}
+            />
           ))}
           {!runs.length && (
             <div className="queue-empty">
@@ -129,11 +154,15 @@ export function RunQueue({
 
 function RunCard({
   run,
+  deleting,
   onCancel,
+  onDelete,
   onOpenResults,
 }: {
   run: RunRecord
+  deleting: boolean
   onCancel: (id: string) => void
+  onDelete: () => void
   onOpenResults: (run: RunRecord) => void
 }) {
   const meta = statusMeta(run)
@@ -173,18 +202,32 @@ function RunCard({
       </div>
       <footer>
         <code>{run.id.slice(0, 18)}</code>
-        {active && run.status !== 'cancelling' && (
-          <button type="button" className="danger-action" onClick={() => onCancel(run.id)}>
-            <Ban size={13} />
-            취소
-          </button>
-        )}
-        {run.status === 'completed' && (
-          <button type="button" className="result-action" onClick={() => onOpenResults(run)}>
-            <Download size={13} />
-            결과 보기·받기
-          </button>
-        )}
+        <span className="run-card-actions">
+          {active && run.status !== 'cancelling' && (
+            <button type="button" className="danger-action" onClick={() => onCancel(run.id)}>
+              <Ban size={13} />
+              취소
+            </button>
+          )}
+          {run.status === 'completed' && (
+            <button type="button" className="result-action" onClick={() => onOpenResults(run)}>
+              <Download size={13} />
+              결과 보기·받기
+            </button>
+          )}
+          {(run.status === 'completed' || run.status === 'failed') && (
+            <button
+              type="button"
+              className="delete-run-action"
+              disabled={deleting}
+              aria-label={`${run.dataset_name ?? run.dataset_id} 실행 기록 삭제`}
+              onClick={onDelete}
+            >
+              {deleting ? <LoaderCircle size={13} className="spin" /> : <Trash2 size={13} />}
+              {deleting ? '제거 중' : '삭제'}
+            </button>
+          )}
+        </span>
       </footer>
     </article>
   )

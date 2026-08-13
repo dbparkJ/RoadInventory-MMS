@@ -8,16 +8,19 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import uuid
+import zipfile
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import yaml
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
 
 from mms_shp_detection.config import (
     PipelineConfig,
@@ -97,6 +100,7 @@ SHAPEFILE_BUNDLE_SUFFIXES = {
     ".wkt2",
 }
 RESULT_MANIFEST_NAMES = {"run_manifest.json", "models_manifest.json"}
+DETECTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 class RunRequest(BaseModel):
@@ -485,6 +489,26 @@ def _requires_run_execution_contract(run: dict[str, Any]) -> bool:
     )
 
 
+def _completed_results_are_downloadable(app: Any, run: dict[str, Any]) -> bool:
+    """Return whether a run may expose its completed output collection."""
+
+    if run.get("status") != "completed":
+        return False
+    manifest, manifest_problem = _read_run_manifest(app, run)
+    if _requires_run_execution_contract(run) or manifest is not None:
+        return (
+            _succeeded_manifest_contract_problem(
+                app,
+                run,
+                manifest,
+                manifest_problem,
+            )
+            is None
+        )
+    # Runs created before the durable execution contract remain downloadable.
+    return True
+
+
 def _output_path_identity(value: str) -> str:
     """Match filesystem case semantics while keeping manifest paths portable."""
 
@@ -607,6 +631,152 @@ def _redact_manifest_value(
         basename = re.split(r"[\\/]", stripped.rstrip("\\/"))[-1]
         return f"<server>/{basename}" if basename else "<server>"
     return redacted
+
+
+def _is_junction(path: Path) -> bool:
+    try:
+        return bool(getattr(path, "is_junction", lambda: False)())
+    except OSError:
+        return True
+
+
+def _temporary_run_download_dir(app: Any, run_id: str) -> Path:
+    root = app.state.config.state_dir / "downloads"
+    root.mkdir(parents=True, exist_ok=True)
+    prefix_id = re.sub(r"[^0-9A-Za-z._-]+", "_", run_id)[:48] or "run"
+    return Path(tempfile.mkdtemp(prefix=f"archive-{prefix_id}-", dir=root))
+
+
+def _archive_filename(run_id: str, scope: str) -> str:
+    safe_id = re.sub(r"[^0-9A-Za-z._-]+", "_", run_id).strip("._-") or "run"
+    safe_id = safe_id[:96]
+    label = "detected-images" if scope == "detected-images" else "all-results"
+    return f"{safe_id}-{label}.zip"
+
+
+def _redacted_archive_text(
+    app: Any,
+    run: dict[str, Any],
+    artifact: Path,
+) -> bytes | None:
+    """Read one bounded JSON/TXT artifact using the public redaction policy."""
+
+    size_limit = (
+        MAX_RUN_MANIFEST_BYTES
+        if artifact.name.casefold() in RESULT_MANIFEST_NAMES
+        else MAX_PUBLIC_STRUCTURED_ARTIFACT_BYTES
+    )
+    try:
+        with artifact.open("rb") as handle:
+            size = int(os.fstat(handle.fileno()).st_size)
+            if size <= 0 or size > size_limit:
+                return None
+            payload = handle.read(size_limit + 1)
+        if len(payload) > size_limit:
+            return None
+        decoded = payload.decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    try:
+        document = json.loads(decoded)
+    except json.JSONDecodeError:
+        if artifact.suffix.casefold() == ".json":
+            return None
+        return _redact(app, decoded, run).encode("utf-8")
+    redacted = _redact_manifest_value(app, document, run)
+    return json.dumps(redacted, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _write_run_archive(
+    app: Any,
+    run: dict[str, Any],
+    scope: Literal["all", "detected-images"],
+    zip_path: Path,
+) -> None:
+    """Create one public archive without following output links or exposing logs."""
+
+    work = _run_work_dir(app, run)
+    output = resolve_under_root(
+        work,
+        "output",
+        must_exist=True,
+        expect_directory=True,
+        reject_symlinks=True,
+    )
+    if output.is_symlink() or _is_junction(output):
+        raise UnsafePath("Run output directory is linked or unsafe.")
+
+    published_paths = _published_shapefile_paths(app, run)
+    models_manifest_policy = _published_models_manifest_policy(app, run)
+    pending: list[tuple[Path, bool]] = [(output, False)]
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        allowZip64=True,
+    ) as archive:
+        while pending:
+            directory, inside_image_crops = pending.pop()
+            try:
+                with os.scandir(directory) as iterator:
+                    entries = sorted(iterator, key=lambda item: item.name.casefold())
+            except OSError:
+                continue
+            for entry in entries:
+                candidate = Path(entry.path)
+                try:
+                    if entry.is_symlink() or _is_junction(candidate):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name.casefold() == "logs":
+                            continue
+                        pending.append(
+                            (
+                                candidate,
+                                inside_image_crops
+                                or entry.name.casefold() == "image_crops",
+                            )
+                        )
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+
+                suffix = candidate.suffix.casefold()
+                if suffix not in SAFE_RESULT_SUFFIXES:
+                    continue
+                if scope == "detected-images" and (
+                    not inside_image_crops or suffix not in DETECTED_IMAGE_SUFFIXES
+                ):
+                    continue
+                try:
+                    relative = candidate.relative_to(output).as_posix()
+                    artifact = resolve_under_root(
+                        output,
+                        relative,
+                        must_exist=True,
+                        expect_directory=False,
+                        reject_symlinks=True,
+                    )
+                except (OSError, UnsafePath, ValueError):
+                    continue
+                if artifact.is_symlink() or _is_junction(artifact):
+                    continue
+                if not _is_published_shapefile_component(relative, published_paths):
+                    continue
+                if not _is_published_models_manifest(relative, models_manifest_policy):
+                    continue
+                try:
+                    if suffix in {".json", ".txt"}:
+                        redacted = _redacted_archive_text(app, run, artifact)
+                        if redacted is None:
+                            continue
+                        archive.writestr(relative, redacted)
+                    else:
+                        archive.write(artifact, arcname=relative)
+                except OSError:
+                    continue
 
 
 def _sync_manifest_terminal(
@@ -938,17 +1108,7 @@ def _result_summary(
     publish_shapefiles: bool | None = None,
 ) -> dict[str, Any] | None:
     if publish_shapefiles is None:
-        manifest, manifest_problem = _read_run_manifest(app, run)
-        publish_shapefiles = run.get("status") == "completed" and (
-            (
-                _succeeded_manifest_contract_problem(
-                    app, run, manifest, manifest_problem
-                )
-                is None
-            )
-            if _requires_run_execution_contract(run) or manifest is not None
-            else True
-        )
+        publish_shapefiles = _completed_results_are_downloadable(app, run)
     try:
         output = _run_work_dir(app, run) / "output"
     except Exception:
@@ -1054,6 +1214,21 @@ def _result_summary(
             }
         )
     summary["shapefiles"] = shapefiles
+    if publish_shapefiles:
+        run_id = str(run["id"])
+        safe_id = re.sub(r"[^0-9A-Za-z._-]+", "_", run_id).strip("._-") or "run"
+        safe_id = safe_id[:96]
+        quoted_id = quote(run_id, safe="")
+        summary["archives"] = {
+            "all": {
+                "url": f"/api/runs/{quoted_id}/archive?scope=all",
+                "filename": f"{safe_id}-all-results.zip",
+            },
+            "detected_images": {
+                "url": f"/api/runs/{quoted_id}/archive?scope=detected-images",
+                "filename": f"{safe_id}-detected-images.zip",
+            },
+        }
     manifests = [
         path for path in result_paths if path.name.casefold() in RESULT_MANIFEST_NAMES
     ]
@@ -1854,6 +2029,49 @@ def get_results(run_id: str, request: Request) -> dict[str, Any]:
     return _result_summary(request.app, run) or {"files": [], "file_count": 0}
 
 
+@router.get("/runs/{run_id}/archive")
+async def download_run_archive(
+    run_id: str,
+    request: Request,
+    scope: Literal["all", "detected-images"] = Query("all"),
+) -> FileResponse:
+    run = request.app.state.store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if not _completed_results_are_downloadable(request.app, run):
+        raise HTTPException(
+            status_code=409,
+            detail="Run results are not ready for archive download.",
+        )
+    temp_dir: Path | None = None
+    try:
+        temp_dir = _temporary_run_download_dir(request.app, run_id)
+        filename = _archive_filename(run_id, scope)
+        zip_path = temp_dir / filename
+        async with request.app.state.run_archive_semaphore:
+            await asyncio.to_thread(
+                _write_run_archive,
+                request.app,
+                run,
+                scope,
+                zip_path,
+            )
+    except (FileNotFoundError, NotADirectoryError, OSError, UnsafePath, ValueError) as exc:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=404, detail="Run output is unavailable.") from exc
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=filename,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+        background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
+    )
+
+
 @router.get("/runs/{run_id}/artifacts")
 async def get_artifact(run_id: str, path: str, request: Request) -> Response:
     run = request.app.state.store.get_run(run_id)
@@ -1935,6 +2153,27 @@ async def get_artifact(run_id: str, path: str, request: Request) -> Response:
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@router.delete("/runs/{run_id}")
+def dismiss_run(run_id: str, request: Request) -> dict[str, Any]:
+    outcome, _run = request.app.state.store.dismiss_terminal_run(run_id, utc_now())
+    if outcome == "missing":
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if outcome == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail="Only completed or failed runs can be removed from the queue list.",
+        )
+    return {
+        "id": run_id,
+        "dismissed": True,
+        "artifacts_preserved": True,
+        "detail": (
+            "Run removed from the queue list. Its output artifacts remain available "
+            "by direct run URL."
+        ),
+    }
 
 
 async def _event_stream(request: Request, run_id: str) -> AsyncIterator[str]:

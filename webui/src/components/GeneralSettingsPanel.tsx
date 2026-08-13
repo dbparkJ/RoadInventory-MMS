@@ -139,6 +139,25 @@ export function GeneralSettingsPanel({
             />
             <small>포인트는 선명하게 유지하고 배경 영상만 흐리게 조절합니다.</small>
           </label>
+
+          <label className="general-settings-slider">
+            <span>
+              <strong>검출 표시 거리</strong>
+              <output>{Math.round(settings.detectionVisibilityDistanceM)} m</output>
+            </span>
+            <input
+              type="range"
+              aria-label="파노라마 검출 표시 거리"
+              min={5}
+              max={200}
+              step={5}
+              value={settings.detectionVisibilityDistanceM}
+              onChange={(event) =>
+                onChange({ detectionVisibilityDistanceM: Number(event.target.value) })
+              }
+            />
+            <small>현재 프레임에서 이 거리보다 먼 검출점과 클래스 표시는 숨깁니다.</small>
+          </label>
         </section>
 
         <section className="general-settings-section" aria-labelledby="map-settings-title">

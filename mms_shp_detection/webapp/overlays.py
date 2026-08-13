@@ -58,6 +58,8 @@ SUPPORTED_SIDECARS = {
 REQUIRED_SIDECARS = {".shp", ".shx", ".dbf"}
 ZIP_RATIO_LIMIT = 200
 MANIFEST_MAX_BYTES = 2 * 1024**2
+RAW_DETECTION_RESULT_MAX_BYTES = 16 * 1024**2
+RAW_DETECTION_BOX_LIMIT = 2_000
 ENCODING_ALIASES = {
     "UTF-8": "utf-8",
     "UTF8": "utf-8",
@@ -98,6 +100,23 @@ class FeaturePatch(BaseModel):
     expected_revision: int | None = Field(None, ge=1)
 
 
+class FeatureCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    geometry: dict[str, Any] | None = None
+    coordinate_space: Literal["dataset", "wgs84"] = "dataset"
+    copy_geometry_from: str | None = Field(None, min_length=1, max_length=160)
+    expected_revision: int | None = Field(None, ge=1)
+
+
+class OverlayLayerPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(None, max_length=120)
+    color: str | None = Field(None, max_length=7)
+    expected_metadata_revision: int = Field(ge=1)
+
+
 class ResultImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -122,6 +141,26 @@ def _clean_layer_name(value: str | None, fallback: str) -> str:
     candidate = "".join(character for character in candidate if ord(character) >= 32)
     candidate = candidate.replace("/", "_").replace("\\", "_").strip(" .")
     return (candidate or "SHP overlay")[:120]
+
+
+def _validated_layer_name(value: str | None) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        raise ValueError("Overlay layer name cannot be empty.")
+    if len(candidate) > 120:
+        raise ValueError("Overlay layer name cannot exceed 120 characters.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in candidate):
+        raise ValueError("Overlay layer name cannot contain control characters.")
+    if "/" in candidate or "\\" in candidate:
+        raise ValueError("Overlay layer name cannot contain path separators.")
+    return candidate
+
+
+def _validated_layer_color(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", candidate) is None:
+        raise ValueError("Overlay layer color must use #RRGGBB format.")
+    return candidate
 
 
 def _overlay_root(app: Any, dataset_id: str) -> Path:
@@ -189,6 +228,168 @@ def _read_manifest(
     return value
 
 
+def _image_stem(value: Any) -> str:
+    name = str(value or "").strip().split("?", 1)[0].split("#", 1)[0]
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _raw_detection_boxes_for_frame(
+    app: Any,
+    manifest: dict[str, Any],
+    frame_task: dict[str, Any],
+    feature_ids_by_detection_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Read the current frame's bounded raw YOLO result for an imported result layer.
+
+    The final ``detected_signs.shp`` is spatially deduplicated and therefore keeps
+    only a representative observation for an object.  Its DBF cannot describe
+    the boxes seen in every source panorama.  The per-frame pipeline result is
+    the canonical, already server-managed source for those 2-D observations, so
+    expose only its safe scalar detection fields alongside the projected SHP.
+    """
+
+    if manifest.get("source_kind") != "run_result":
+        return []
+    reference = str(manifest.get("source_reference") or "")
+    parts = reference.split(":", 2)
+    if len(parts) != 3 or parts[0] != "run":
+        return []
+    run_id, raw_source_path = parts[1], parts[2]
+    try:
+        source_path = PurePosixPath(
+            normalize_relative_path(raw_source_path, allow_empty=False)
+        )
+    except (TypeError, UnsafePath, ValueError):
+        return []
+    if (
+        source_path.name.casefold() != "detected_signs.shp"
+        or source_path.parent.name.casefold() != "shp"
+    ):
+        return []
+    run = app.state.store.get_run(run_id)
+    if (
+        run is None
+        or run.get("dataset_id") != manifest.get("dataset_id")
+        or run.get("status") != "completed"
+    ):
+        return []
+    image_name = str(frame_task.get("image_name") or "").strip()
+    image_stem = str(frame_task.get("image_stem") or "").strip() or Path(image_name).stem
+    record_name = str(frame_task.get("record_name") or "").strip()
+    if not image_name or not image_stem or not record_name:
+        return []
+    model_root = source_path.parent.parent
+    # Stable for repeated imports of the same run/model output, but opaque so
+    # no server path or user-supplied run identifier is exposed to the client.
+    detection_source_id = opaque_id(
+        "det-src", run_id, model_root.as_posix(), length=32
+    )
+    relative_parts = [*model_root.parts, "txt", record_name, f"{image_stem}.txt"]
+    try:
+        result_relative = normalize_relative_path(
+            PurePosixPath(*relative_parts).as_posix(), allow_empty=False
+        )
+        runs_root = app.state.config.state_dir / "runs"
+        work_dir = resolve_under_root(
+            runs_root,
+            run["work_relative"],
+            must_exist=True,
+            expect_directory=True,
+            reject_symlinks=True,
+        )
+        result_path = resolve_under_root(
+            work_dir,
+            f"output/{result_relative}",
+            must_exist=True,
+            expect_directory=False,
+            reject_symlinks=True,
+        )
+        if result_path.stat().st_size > RAW_DETECTION_RESULT_MAX_BYTES:
+            return []
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        TypeError,
+        UnsafePath,
+        ValueError,
+    ):
+        return []
+    if not isinstance(payload, dict) or _image_stem(payload.get("image_name")) != _image_stem(image_name):
+        return []
+    detections = payload.get("detections")
+    if not isinstance(detections, list):
+        return []
+
+    from mms_shp_detection.shp_writer import make_detection_id
+
+    boxes: list[dict[str, Any]] = []
+    for detection in detections[:RAW_DETECTION_BOX_LIMIT]:
+        if not isinstance(detection, dict):
+            continue
+        raw_bbox = detection.get("bbox_xyxy")
+        if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+            continue
+        try:
+            bbox = [float(value) for value in raw_bbox]
+            panorama_width = float(detection.get("panorama_width"))
+            panorama_height = float(detection.get("panorama_height"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not all(math.isfinite(value) for value in bbox)
+            or not math.isfinite(panorama_width)
+            or not math.isfinite(panorama_height)
+            or panorama_width <= 0
+            or panorama_height <= 0
+            or bbox[2] <= bbox[0]
+            or bbox[3] <= bbox[1]
+        ):
+            continue
+        detection_image = str(
+            detection.get("image_name") or payload.get("image_name") or image_name
+        )
+        if _image_stem(detection_image) != _image_stem(image_name):
+            continue
+        try:
+            detection_index = int(detection.get("detection_index") or len(boxes) + 1)
+        except (TypeError, ValueError):
+            detection_index = len(boxes) + 1
+        detection_id = make_detection_id(
+            payload.get("record_name") or frame_task.get("record_name"),
+            detection_image,
+            detection_index,
+        )
+        properties = {
+            "class_id": detection.get("class_id"),
+            "class_nm": detection.get("class_name"),
+            "conf": detection.get("confidence"),
+            "det_id": detection_id,
+            "det_index": detection_index,
+            "img_name": detection_image,
+            "bbox_l": bbox[0],
+            "bbox_t": bbox[1],
+            "bbox_r": bbox[2],
+            "bbox_b": bbox[3],
+            "pano_w": panorama_width,
+            "pano_h": panorama_height,
+            "accepted": detection.get("accepted_for_shp"),
+        }
+        item: dict[str, Any] = {
+            "source_id": detection_source_id,
+            "observation_id": detection_id,
+            "properties": properties,
+        }
+        feature_id = feature_ids_by_detection_id.get(detection_id.casefold())
+        if feature_id is not None:
+            item["feature_id"] = feature_id
+        boxes.append(item)
+    return boxes
+
+
 @contextmanager
 def _feature_db(
     layer_dir: Path, *, write: bool = False
@@ -238,6 +439,8 @@ def _public_layer(layer_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "id": layer_id,
         "dataset_id": dataset_id,
         "name": manifest["name"],
+        "color": manifest.get("color"),
+        "metadata_revision": int(manifest.get("metadata_revision", 1)),
         "source_kind": manifest["source_kind"],
         "source_crs": manifest["source_crs"],
         "source_encoding": manifest.get("source_encoding", "utf-8"),
@@ -656,6 +859,8 @@ def _import_bundle(
         "id": layer_id,
         "dataset_id": dataset["id"],
         "name": _clean_layer_name(name, stem),
+        "color": None,
+        "metadata_revision": 1,
         "source_kind": source_kind,
         "source_reference": source_reference,
         "source_files": sorted(
@@ -854,6 +1059,18 @@ def _from_wgs84_transformer(dataset_crs: str) -> Any:
     return Transformer.from_crs("EPSG:4326", dataset_crs, always_xy=True)
 
 
+def _normalize_point_geometry(geometry: dict[str, Any]) -> dict[str, Any]:
+    if geometry.get("type") != "Point":
+        raise ValueError("Only Point feature coordinates can be supplied.")
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, (list, tuple)) or not 2 <= len(coordinates) <= 3:
+        raise ValueError("Point coordinates must be [x, y] or [x, y, z].")
+    result = [float(item) for item in coordinates]
+    if not all(math.isfinite(item) for item in result):
+        raise ValueError("Point coordinates must be finite numbers.")
+    return {"type": "Point", "coordinates": result}
+
+
 def _validate_point_geometry(
     geometry: dict[str, Any],
     *,
@@ -861,19 +1078,13 @@ def _validate_point_geometry(
 ) -> dict[str, Any]:
     if old_geometry is None or old_geometry.get("type") != "Point":
         raise ValueError("Only existing Point feature coordinates can be edited.")
-    if geometry.get("type") != "Point":
-        raise ValueError("Only Point feature coordinates can be edited.")
-    coordinates = geometry.get("coordinates")
-    if not isinstance(coordinates, (list, tuple)) or not 2 <= len(coordinates) <= 3:
-        raise ValueError("Point coordinates must be [x, y] or [x, y, z].")
-    result = [float(item) for item in coordinates]
-    if not all(math.isfinite(item) for item in result):
-        raise ValueError("Point coordinates must be finite numbers.")
+    normalized = _normalize_point_geometry(geometry)
+    result = normalized["coordinates"]
     if len(result) == 2 and old_geometry and old_geometry.get("type") == "Point":
         old_coordinates = old_geometry.get("coordinates")
         if isinstance(old_coordinates, list) and len(old_coordinates) >= 3:
             result.append(float(old_coordinates[2]))
-    return {"type": "Point", "coordinates": result}
+    return normalized
 
 
 def _coerce_property(
@@ -916,6 +1127,53 @@ def _coerce_property(
     if len(encoded) > int(field.get("size") or 254):
         raise ValueError(f"{field['name']} exceeds its SHP field length.")
     return text
+
+
+def _automatic_id_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next(
+        (field for field in fields if str(field.get("name", "")).casefold() == "id"),
+        None,
+    )
+
+
+def _blank_properties_with_next_id(
+    connection: sqlite3.Connection,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    fields = list(manifest["fields"])
+    properties = {str(field["name"]): None for field in fields}
+    id_field = _automatic_id_field(fields)
+    if id_field is None:
+        return properties
+    field_type = str(id_field.get("type", "C")).upper()
+    if field_type not in {"C", "N", "F"}:
+        raise ValueError("The SHP ID field must be a text or numeric field.")
+    field_name = str(id_field["name"])
+    maximum = 0.0
+    rows = connection.execute("SELECT properties_json FROM features")
+    for row in rows:
+        value = json.loads(row["properties_json"]).get(field_name)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            maximum = max(maximum, number)
+    next_id = math.floor(maximum) + 1
+    properties[field_name] = _coerce_property(
+        str(next_id) if field_type == "C" else next_id,
+        id_field,
+        encoding=str(manifest.get("source_encoding", "utf-8")),
+    )
+    return properties
+
+
+def _next_feature_identity(connection: sqlite3.Connection) -> tuple[str, int]:
+    row = connection.execute("SELECT MAX(ordinal) FROM features").fetchone()
+    ordinal = (int(row[0]) + 1) if row is not None and row[0] is not None else 0
+    return f"f_{ordinal + 1:09d}", ordinal
 
 
 def _updated_revision(
@@ -987,7 +1245,13 @@ def _write_edited_bundle(
                 else:
                     writer.shape(geometry)
                 writer.record(
-                    *(properties.get(field["name"]) for field in manifest["fields"])
+                    *(
+                        ""
+                        if properties.get(field["name"]) is None
+                        and str(field.get("type", "C")).upper() in {"C", "M"}
+                        else properties.get(field["name"])
+                        for field in manifest["fields"]
+                    )
                 )
     finally:
         writer.close()
@@ -1150,6 +1414,102 @@ def get_overlay(dataset_id: str, layer_id: str, request: Request) -> dict[str, A
         raise HTTPException(status_code=404, detail="Overlay layer not found.") from exc
 
 
+@router.patch("/datasets/{dataset_id}/overlays/{layer_id}")
+async def patch_overlay(
+    dataset_id: str,
+    layer_id: str,
+    payload: OverlayLayerPatch,
+    request: Request,
+) -> dict[str, Any]:
+    """Update display-only layer metadata without rewriting the SHP source."""
+
+    require_ready_dataset(request, dataset_id)
+    supplied_fields = payload.model_fields_set
+    if not ({"name", "color"} & supplied_fields):
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of name or color must be supplied.",
+        )
+    try:
+        next_name = (
+            _validated_layer_name(payload.name) if "name" in supplied_fields else None
+        )
+        next_color = (
+            _validated_layer_color(payload.color) if "color" in supplied_fields else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    lock = _layer_lock(request.app, dataset_id, layer_id)
+    async with lock:
+        try:
+            layer_dir = _layer_directory(request.app, dataset_id, layer_id)
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(
+                status_code=404, detail="Overlay layer not found."
+            ) from exc
+
+        try:
+            # The asyncio lock only coordinates requests handled by this app
+            # process.  Holding the feature-store write transaction while the
+            # manifest is re-read and replaced also serializes metadata CAS
+            # updates across multiple ASGI workers.
+            with _feature_db(layer_dir, write=True):
+                try:
+                    manifest = _read_manifest(layer_dir)
+                    if manifest.get("dataset_id") != dataset_id:
+                        raise FileNotFoundError("Overlay layer not found.")
+                except (
+                    FileNotFoundError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    raise HTTPException(
+                        status_code=404, detail="Overlay layer not found."
+                    ) from exc
+
+                current_revision = int(manifest.get("metadata_revision", 1))
+                if payload.expected_metadata_revision != current_revision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Overlay layer metadata changed after it was loaded. "
+                            "Refresh the layer and retry."
+                        ),
+                    )
+                if next_name is not None:
+                    manifest["name"] = next_name
+                if next_color is not None:
+                    manifest["color"] = next_color
+                manifest["metadata_revision"] = current_revision + 1
+                manifest["metadata_updated_at"] = utc_now()
+                try:
+                    atomic_replace_bytes(
+                        layer_dir / "manifest.json", _json_bytes(manifest)
+                    )
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Overlay layer metadata could not be saved.",
+                    ) from exc
+        except HTTPException:
+            raise
+        except (sqlite3.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Overlay layer metadata is busy. Retry the request.",
+            ) from exc
+
+    return {"layer": _public_layer(layer_dir, manifest)}
+
+
 @router.delete("/datasets/{dataset_id}/overlays/{layer_id}")
 async def unregister_overlay(
     dataset_id: str,
@@ -1163,23 +1523,31 @@ async def unregister_overlay(
     async with lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
-            manifest = _read_manifest(layer_dir, include_unregistered=True)
-            if (
-                manifest.get("dataset_id") != dataset_id
-                or manifest.get("registered", True) is False
-            ):
-                raise FileNotFoundError("Overlay layer not found.")
-            manifest["registered"] = False
-            manifest["removed_at"] = utc_now()
-            atomic_replace_bytes(layer_dir / "manifest.json", _json_bytes(manifest))
             archive_root = _overlay_archive_root(request.app, dataset_id)
             archived = archive_root / layer_id
             if archived.exists():
                 raise FileExistsError("Overlay archive entry already exists.")
+            # Marking the layer unregistered under the same cross-process
+            # SQLite lock used by metadata PATCH prevents a concurrent worker
+            # from updating a manifest that is about to be archived.  The DB
+            # handle is closed before moving the directory for Windows.
+            with _feature_db(layer_dir, write=True):
+                manifest = _read_manifest(layer_dir, include_unregistered=True)
+                if (
+                    manifest.get("dataset_id") != dataset_id
+                    or manifest.get("registered", True) is False
+                ):
+                    raise FileNotFoundError("Overlay layer not found.")
+                manifest["registered"] = False
+                manifest["removed_at"] = utc_now()
+                atomic_replace_bytes(
+                    layer_dir / "manifest.json", _json_bytes(manifest)
+                )
             layer_dir.replace(archived)
         except (
             FileNotFoundError,
             OSError,
+            sqlite3.Error,
             TypeError,
             ValueError,
             json.JSONDecodeError,
@@ -1369,6 +1737,140 @@ def get_overlay_feature(
         "revision": revision,
         "coordinate_space": coordinate_space,
         "crs": "EPSG:4326" if coordinate_space == "wgs84" else manifest["dataset_crs"],
+        "fields": manifest["fields"],
+    }
+
+
+@router.post(
+    "/datasets/{dataset_id}/overlays/{layer_id}/features",
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_overlay_feature(
+    dataset_id: str,
+    layer_id: str,
+    payload: FeatureCreate,
+    request: Request,
+) -> dict[str, Any]:
+    require_ready_dataset(request, dataset_id)
+    if (payload.geometry is None) == (payload.copy_geometry_from is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Supply exactly one of geometry or copy_geometry_from.",
+        )
+    lock = _layer_lock(request.app, dataset_id, layer_id)
+    async with lock:
+        try:
+            layer_dir = _layer_directory(request.app, dataset_id, layer_id)
+            manifest = _read_manifest(layer_dir)
+            with _feature_db(layer_dir, write=True) as connection:
+                if _active_count(connection) >= request.app.state.config.max_overlay_features:
+                    raise OverlayTooLarge(
+                        "SHP feature count exceeds the configured overlay limit."
+                    )
+                revision = _updated_revision(connection, payload.expected_revision)
+                if payload.copy_geometry_from is not None:
+                    source_row = connection.execute(
+                        "SELECT * FROM features WHERE id=? AND deleted=0",
+                        (payload.copy_geometry_from,),
+                    ).fetchone()
+                    if source_row is None:
+                        raise FileNotFoundError("Source overlay feature not found.")
+                    geometry = _decode_feature(source_row)["geometry"]
+                    if geometry is None:
+                        raise ValueError("A feature without geometry cannot be copied.")
+                else:
+                    if str(manifest["geometry_type"]) != "Point":
+                        raise ValueError(
+                            "Map-click feature creation is available only for Point layers."
+                        )
+                    geometry = _normalize_point_geometry(payload.geometry or {})
+                    if payload.coordinate_space == "wgs84":
+                        longitude, latitude = geometry["coordinates"][:2]
+                        if not (-180.0 <= longitude <= 180.0 and -90.0 <= latitude <= 90.0):
+                            raise ValueError("WGS84 Point coordinates are outside valid bounds.")
+                        geometry = _transform_geometry(
+                            geometry,
+                            _from_wgs84_transformer(manifest["dataset_crs"]),
+                        )
+                properties = _blank_properties_with_next_id(connection, manifest)
+                feature_id, ordinal = _next_feature_identity(connection)
+                x, y, z = _point_columns(geometry)
+                now = utc_now()
+                after = {
+                    "type": "Feature",
+                    "id": feature_id,
+                    "geometry": geometry,
+                    "properties": properties,
+                }
+                connection.execute(
+                    """
+                    INSERT INTO features(
+                        id,ordinal,geometry_json,properties_json,
+                        point_x,point_y,point_z,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        feature_id,
+                        ordinal,
+                        _json_bytes(geometry).decode("utf-8"),
+                        _json_bytes(properties).decode("utf-8"),
+                        x,
+                        y,
+                        z,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE metadata SET value=? WHERE key='revision'", (str(revision),)
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit(revision,action,feature_id,before_json,after_json,created_at)
+                    VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        revision,
+                        "create",
+                        feature_id,
+                        None,
+                        _json_bytes(after).decode("utf-8"),
+                        now,
+                    ),
+                )
+        except RuntimeError as exc:
+            if str(exc).startswith("revision:"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Overlay was edited by another request.",
+                        "current_revision": int(str(exc).split(":", 1)[1]),
+                    },
+                ) from exc
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (
+            OSError,
+            ProjError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            sqlite3.Error,
+        ) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    public_feature = _transform_feature(
+        after,
+        _to_wgs84_transformer(manifest["dataset_crs"])
+        if payload.coordinate_space == "wgs84"
+        else None,
+    )
+    return {
+        "feature": public_feature,
+        "revision": revision,
+        "coordinate_space": payload.coordinate_space,
+        "crs": "EPSG:4326"
+        if payload.coordinate_space == "wgs84"
+        else manifest["dataset_crs"],
         "fields": manifest["fields"],
     }
 
@@ -1632,6 +2134,7 @@ def project_overlay_on_panorama(
                     limit * 2,
                 ),
             ).fetchall()
+        row_properties = [json.loads(row["properties_json"]) for row in rows]
         if rows:
             points = np.asarray(
                 [
@@ -1665,11 +2168,22 @@ def project_overlay_on_panorama(
                     "depth": float(depth[index]),
                     "dataset_position": points[index].tolist(),
                     "z_inferred": row["point_z"] is None,
-                    "properties": json.loads(row["properties_json"]),
+                    "properties": row_properties[index],
                 }
             )
             if len(projected) >= limit:
                 break
+        feature_ids_by_detection_id = {
+            str(properties.get("det_id")).casefold(): str(row["id"])
+            for row, properties in zip(rows, row_properties, strict=True)
+            if properties.get("det_id") not in {None, ""}
+        }
+        detection_boxes = _raw_detection_boxes_for_frame(
+            request.app,
+            manifest,
+            frame["task"],
+            feature_ids_by_detection_id,
+        )
     except (
         FileNotFoundError,
         OSError,
@@ -1687,6 +2201,7 @@ def project_overlay_on_panorama(
         "revision": revision,
         "items": projected,
         "count": len(projected),
+        "detection_boxes": detection_boxes,
         "yaw_offset_deg": resolved_yaw,
         "pitch_offset_deg": resolved_pitch,
     }

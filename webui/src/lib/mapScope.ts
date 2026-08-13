@@ -14,7 +14,10 @@ export function resolveMapTrackScope(
   firstRouteTrackId: string | undefined,
   alwaysShowAllTracks: boolean,
 ): MapTrackScope {
-  const showAllTracks = alwaysShowAllTracks || selectedTrackId === ''
+  // An explicit track selection always wins. This prevents a persisted
+  // "show all" preference from leaving track 01 visible while reviewing a
+  // different track.
+  const showAllTracks = !selectedTrackId && (alwaysShowAllTracks || selectedTrackId === '')
   return {
     showAllTracks,
     effectiveTrackId: showAllTracks

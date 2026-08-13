@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { errorMessageFromPayload } from './api'
+import { describe, expect, it, vi } from 'vitest'
+import { api, errorMessageFromPayload } from './api'
 
 describe('errorMessageFromPayload', () => {
   it('renders FastAPI validation arrays as actionable field messages', () => {
@@ -22,5 +22,145 @@ describe('errorMessageFromPayload', () => {
     expect(
       errorMessageFromPayload({ message: '업로드 세션이 만료되었습니다.', detail: 'ignored' }, 'fallback'),
     ).toBe('업로드 세션이 만료되었습니다.')
+  })
+})
+
+describe('overlay feature creation', () => {
+  it('posts map coordinates and the optimistic revision to the layer feature collection', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          feature: {
+            type: 'Feature',
+            id: 'f_000000003',
+            geometry: { type: 'Point', coordinates: [127, 37] },
+            properties: { ID: 3 },
+          },
+          revision: 2,
+          coordinate_space: 'wgs84',
+          crs: 'EPSG:4326',
+          fields: [{ name: 'ID', type: 'N' }],
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    await api.createOverlayFeature('dataset/a', 'layer 1', {
+      geometry: { type: 'Point', coordinates: [127, 37] },
+      coordinate_space: 'wgs84',
+      expected_revision: 1,
+    })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const [url, options] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/datasets/dataset%2Fa/overlays/layer%201/features')
+    expect(options?.method).toBe('POST')
+    expect(JSON.parse(String(options?.body))).toEqual({
+      geometry: { type: 'Point', coordinates: [127, 37] },
+      coordinate_space: 'wgs84',
+      expected_revision: 1,
+    })
+
+    fetchMock.mockRestore()
+  })
+})
+
+describe('overlay layer metadata', () => {
+  it('patches the display name and color with an optimistic metadata revision', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          layer: {
+            id: 'layer 1',
+            dataset_id: 'dataset/a',
+            name: '현장 지주',
+            color: '#123456',
+            metadata_revision: 3,
+            geometry_type: 'Point',
+            feature_count: 2,
+            revision: 1,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.patchOverlay('dataset/a', 'layer 1', {
+        name: '현장 지주',
+        color: '#123456',
+        expected_metadata_revision: 2,
+      })
+
+      expect(fetchMock).toHaveBeenCalledOnce()
+      const [url, options] = fetchMock.mock.calls[0]
+      expect(url).toBe('/api/datasets/dataset%2Fa/overlays/layer%201')
+      expect(options?.method).toBe('PATCH')
+      expect(JSON.parse(String(options?.body))).toEqual({
+        name: '현장 지주',
+        color: '#123456',
+        expected_metadata_revision: 2,
+      })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('run API', () => {
+  it('encodes the run id and dismisses it with DELETE', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'run/a ?',
+          dismissed: true,
+          artifacts_preserved: true,
+          detail: 'preserved',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await expect(api.deleteRun('run/a ?')).resolves.toMatchObject({
+        dismissed: true,
+        artifacts_preserved: true,
+      })
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/runs/run%2Fa%20%3F',
+        expect.objectContaining({ method: 'DELETE' }),
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('frame detections API', () => {
+  it('requests YOLO boxes by dataset and frame without an SHP layer id', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          dataset_id: 'dataset/a',
+          frame_id: 'frame 1',
+          coordinate_space: 'panorama_equirectangular_pixels',
+          projection: 'equirectangular',
+          items: [],
+          count: 0,
+          model_count: 2,
+          truncated: false,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.frameDetections('dataset/a', 'frame 1')
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/frames/frame%201/detections',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
   })
 })

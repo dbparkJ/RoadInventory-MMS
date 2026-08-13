@@ -100,6 +100,7 @@ export interface Frame {
   id: string
   index: number
   track_id: string
+  image_name?: string
   timestamp: string
   coordinate: Coordinate | null
   heading?: number
@@ -256,12 +257,23 @@ export interface RunOutputLocation {
   results_url: string
 }
 
+export interface RunArchiveLink {
+  url: string
+  filename: string
+}
+
+export interface RunArchives {
+  all: RunArchiveLink
+  detected_images: RunArchiveLink
+}
+
 export interface RunResults {
   files: RunResultFile[]
   file_count: number
   truncated?: boolean
   output_location?: RunOutputLocation
   shapefiles?: RunResultShapefile[]
+  archives?: RunArchives
   feature_counts?: Record<string, number>
   status?: string
 }
@@ -273,6 +285,8 @@ export interface OverlayLayer {
   id: string
   dataset_id: string
   name: string
+  color?: string | null
+  metadata_revision?: number
   source_kind?: string
   source_crs?: string
   dataset_crs?: string
@@ -312,6 +326,13 @@ export interface OverlayFeature {
   properties: Record<string, unknown>
 }
 
+export interface OverlayFeatureCreateRequest {
+  geometry?: { type: 'Point'; coordinates: [number, number, number?] }
+  coordinate_space?: OverlayCoordinateSpace
+  copy_geometry_from?: string | number
+  expected_revision?: number
+}
+
 export interface OverlayFeatureCollection {
   type: 'FeatureCollection'
   features: OverlayFeature[]
@@ -346,6 +367,43 @@ export interface PanoramaOverlayFeature {
   dataset_position: [number, number, number]
   z_inferred?: boolean
   properties?: Record<string, unknown>
+}
+
+export interface PanoramaDetectionBoxObservation {
+  source_id: string
+  source_name?: string
+  observation_id: string
+  feature_id?: string | number
+  properties: Record<string, unknown>
+}
+
+export interface FrameDetectionResponse {
+  dataset_id: string
+  frame_id: string
+  coordinate_space: 'panorama_equirectangular_pixels'
+  projection: 'equirectangular'
+  items: PanoramaDetectionBoxObservation[]
+  count: number
+  model_count: number
+  truncated: boolean
+}
+
+export interface PanoramaProjectionMetadata {
+  frame_id: string
+  coordinate_space: 'dataset'
+  projection: 'normalized_equirectangular'
+  origin: [number, number, number]
+  forward: [number, number, number]
+  right: [number, number, number]
+  up: [number, number, number]
+  yaw_offset_deg: number
+  pitch_offset_deg: number
+}
+
+export interface FrameLocateResponse {
+  frame: Frame
+  page_offset: number
+  match: 'image_name' | 'nearest_position'
 }
 
 export interface RunEvent {

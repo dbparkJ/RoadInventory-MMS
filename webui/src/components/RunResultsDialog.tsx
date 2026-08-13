@@ -1,20 +1,8 @@
-import { Download, FileArchive, FolderOpen, Import, LoaderCircle, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { ChevronDown, Download, FileArchive, FolderOpen, Images, Import, LoaderCircle, PackageOpen, X } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { api, buildApiUrl } from '../lib/api'
 import type { RunRecord, RunResults } from '../types'
 import './RunResultsDialog.css'
-
-function formatBytes(value: number): string {
-  if (!Number.isFinite(value) || value < 1_024) return `${Math.max(0, value || 0)} B`
-  const units = ['KB', 'MB', 'GB']
-  let size = value / 1_024
-  let unit = units[0]
-  for (let index = 1; index < units.length && size >= 1_024; index += 1) {
-    size /= 1_024
-    unit = units[index]
-  }
-  return `${size.toFixed(size >= 10 ? 1 : 2)} ${unit}`
-}
 
 export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onClose: () => void }) {
   const [results, setResults] = useState<RunResults | null>(null)
@@ -22,6 +10,10 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
   const [error, setError] = useState<string | null>(null)
   const [importingPath, setImportingPath] = useState<string | null>(null)
   const [importedPath, setImportedPath] = useState<string | null>(null)
+  const [archiveMenuOpen, setArchiveMenuOpen] = useState(false)
+  const archiveMenuId = useId()
+  const archiveMenuRef = useRef<HTMLDivElement>(null)
+  const archiveTriggerRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (!run) {
@@ -30,6 +22,7 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
     }
     const controller = new AbortController()
     setImportedPath(null)
+    setArchiveMenuOpen(false)
     setLoading(true)
     setError(null)
     void api
@@ -45,6 +38,27 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
       })
     return () => controller.abort()
   }, [run])
+
+  useEffect(() => {
+    if (!archiveMenuOpen) return
+    const ownerDocument = archiveMenuRef.current?.ownerDocument ?? document
+    const closeForOutsidePointer = (event: PointerEvent) => {
+      if (!archiveMenuRef.current?.contains(event.target as Node)) setArchiveMenuOpen(false)
+    }
+    const closeForEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setArchiveMenuOpen(false)
+      archiveTriggerRef.current?.focus()
+    }
+    ownerDocument.addEventListener('pointerdown', closeForOutsidePointer)
+    ownerDocument.addEventListener('keydown', closeForEscape)
+    archiveMenuRef.current?.querySelector<HTMLAnchorElement>('[role="menuitem"]')?.focus()
+    return () => {
+      ownerDocument.removeEventListener('pointerdown', closeForOutsidePointer)
+      ownerDocument.removeEventListener('keydown', closeForEscape)
+    }
+  }, [archiveMenuOpen])
 
   if (!run) return null
 
@@ -87,45 +101,67 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
                 <strong>서버 결과 위치</strong>
                 <code>{results.output_location?.relative_path ?? `runs/${run.id}/output`}</code>
               </span>
+              <div className="result-archive-menu" ref={archiveMenuRef}>
+                <button
+                  ref={archiveTriggerRef}
+                  type="button"
+                  className="button primary result-archive-trigger"
+                  aria-haspopup="menu"
+                  aria-expanded={archiveMenuOpen}
+                  aria-controls={archiveMenuOpen ? archiveMenuId : undefined}
+                  disabled={!results.archives}
+                  title={results.archives ? '받을 ZIP 종류 선택' : '압축 다운로드를 준비할 수 없습니다.'}
+                  onClick={() => setArchiveMenuOpen((open) => !open)}
+                >
+                  <Download size={14} /> ZIP 받기 <ChevronDown size={13} />
+                </button>
+                {archiveMenuOpen && results.archives && (
+                  <div id={archiveMenuId} className="result-archive-options" role="menu" aria-label="ZIP 종류 선택">
+                    <a
+                      role="menuitem"
+                      href={buildApiUrl(results.archives.all.url)}
+                      download={results.archives.all.filename}
+                      onClick={() => setArchiveMenuOpen(false)}
+                    >
+                      <PackageOpen size={17} />
+                      <span><strong>전체 산출물</strong><small>공개 가능한 산출물을 폴더 구조 그대로 받습니다.</small></span>
+                    </a>
+                    <a
+                      role="menuitem"
+                      href={buildApiUrl(results.archives.detected_images.url)}
+                      download={results.archives.detected_images.filename}
+                      onClick={() => setArchiveMenuOpen(false)}
+                    >
+                      <Images size={17} />
+                      <span><strong>검출된 사진</strong><small>검출 결과의 image_crops 이미지만 받습니다.</small></span>
+                    </a>
+                  </div>
+                )}
+              </div>
             </div>
 
             <section className="result-shapefiles">
               <h3><FileArchive size={16} /> SHP 결과</h3>
-              {(results.shapefiles ?? []).map((shapefile) => (
-                <article key={shapefile.path}>
-                  <span>
-                    <strong>{shapefile.name}</strong>
-                    <small>{shapefile.path}</small>
-                  </span>
-                  <a className="button secondary" href={buildApiUrl(shapefile.download_url)} download>
-                    <Download size={14} /> ZIP 받기
-                  </a>
-                  <button
-                    type="button"
-                    className="button primary"
-                    disabled={importingPath !== null || importedPath === shapefile.path}
-                    onClick={() => void importShapefile(shapefile.path, shapefile.name)}
-                  >
-                    {importingPath === shapefile.path ? <LoaderCircle size={14} className="spin" /> : <Import size={14} />}
-                    {importedPath === shapefile.path ? '검수 레이어에 추가됨' : '검수 레이어로 열기'}
-                  </button>
-                </article>
-              ))}
-              {!results.shapefiles?.length && <p>완성된 SHP 묶음이 없습니다.</p>}
-            </section>
-
-            <section className="result-file-list">
-              <h3>전체 산출물 <small>{results.file_count.toLocaleString('ko-KR')}개</small></h3>
-              <div>
-                {results.files.map((file) => (
-                  <a href={buildApiUrl(file.url)} key={file.path} download>
-                    <span><strong>{file.name}</strong><small>{file.path}</small></span>
-                    <em>{formatBytes(file.size)}</em>
-                    <Download size={14} />
-                  </a>
+              <div className="result-shapefile-list">
+                {(results.shapefiles ?? []).map((shapefile) => (
+                  <article key={shapefile.path}>
+                    <span>
+                      <strong>{shapefile.name}</strong>
+                      <small>{shapefile.path}</small>
+                    </span>
+                    <button
+                      type="button"
+                      className="button primary"
+                      disabled={importingPath !== null || importedPath === shapefile.path}
+                      onClick={() => void importShapefile(shapefile.path, shapefile.name)}
+                    >
+                      {importingPath === shapefile.path ? <LoaderCircle size={14} className="spin" /> : <Import size={14} />}
+                      {importedPath === shapefile.path ? '검수 레이어에 추가됨' : '검수 레이어로 열기'}
+                    </button>
+                  </article>
                 ))}
+                {!results.shapefiles?.length && <p>완성된 SHP 묶음이 없습니다.</p>}
               </div>
-              {results.truncated && <p>파일 수가 많아 일부만 표시했습니다.</p>}
             </section>
           </div>
         )}

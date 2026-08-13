@@ -7,6 +7,7 @@ export interface UserSettings {
   panoramaPointOverlayEnabled: boolean
   panoramaImageOpacity: number
   panoramaDefaultQuality: PanoramaQuality
+  detectionVisibilityDistanceM: number
   showAllMapTracks: boolean
 }
 
@@ -21,6 +22,9 @@ export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = Object.freeze({
   // measurements legible without hiding either source.
   panoramaImageOpacity: 0.65,
   panoramaDefaultQuality: 'high',
+  // Keep panorama detections local to the current vehicle pose so distant
+  // objects do not pile up at the same viewing angle.
+  detectionVisibilityDistanceM: 45,
   // A dense delivery can contain many overlapping routes. Keep only the
   // active track visible until an operator explicitly asks for all tracks.
   showAllMapTracks: false,
@@ -61,6 +65,12 @@ export function sanitizeUserSettings(value: unknown): UserSettings {
     panoramaDefaultQuality: isPanoramaQuality(candidate.panoramaDefaultQuality)
       ? candidate.panoramaDefaultQuality
       : DEFAULT_USER_SETTINGS.panoramaDefaultQuality,
+    detectionVisibilityDistanceM: finiteNumber(
+      candidate.detectionVisibilityDistanceM,
+      DEFAULT_USER_SETTINGS.detectionVisibilityDistanceM,
+      5,
+      200,
+    ),
     showAllMapTracks:
       typeof candidate.showAllMapTracks === 'boolean'
         ? candidate.showAllMapTracks

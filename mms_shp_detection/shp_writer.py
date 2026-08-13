@@ -1073,6 +1073,12 @@ def write_shapefile(
             x = float(item["x"])
             y = float(item["y"])
             z = float(item["z"])
+            raw_bbox = item.get("bbox_xyxy")
+            bbox = (
+                tuple(_finite_float(value) for value in raw_bbox)
+                if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4
+                else (None, None, None, None)
+            )
             yield (
                 x,
                 y,
@@ -1101,6 +1107,13 @@ def write_shapefile(
                     str(item.get("pointcloud_source") or "")[:8],
                     str(item.get("calibration_sha256") or "")[:12],
                     str(item.get("run_fingerprint") or "")[:12],
+                    *bbox,
+                    int(item["panorama_width"])
+                    if item.get("panorama_width") is not None
+                    else None,
+                    int(item["panorama_height"])
+                    if item.get("panorama_height") is not None
+                    else None,
                 ),
             )
     fields = (
@@ -1123,6 +1136,12 @@ def write_shapefile(
         ("pc_src", "C", 8, 0),
         ("calib_id", "C", 12, 0),
         ("run_id", "C", 12, 0),
+        ("bbox_l", "F", 18, 4),
+        ("bbox_t", "F", 18, 4),
+        ("bbox_r", "F", 18, 4),
+        ("bbox_b", "F", 18, 4),
+        ("pano_w", "N", 10, 0),
+        ("pano_h", "N", 10, 0),
     )
     _write_pointz_table(shp_path, fields, prepared_rows())
     write_crs_sidecars(shp_path, crs_wkt)

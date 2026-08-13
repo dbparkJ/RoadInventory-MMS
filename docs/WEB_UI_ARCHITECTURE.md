@@ -13,6 +13,9 @@
   `artifact_id`만 전달합니다.
 - 지도·파노라마·점군은 같은 `frame_id`를 공유하므로 한 화면에서 선택 상태가
   동기화됩니다.
+- 포인트뷰에서 호버한 로컬 XYZ는 프레임별 보정 카메라 축으로 파노라마 UV에 투영해
+  별도 팝업 사이에서도 같은 위치를 가리킵니다. 지도·파노라마·점군의 SHP 호버는
+  공용 속성 툴팁으로 연결합니다.
 - 전역 `config.yaml`은 수정하지 않습니다. 실행마다 확정된 설정 snapshot과 출력·캐시
   폴더를 따로 만듭니다.
 
@@ -20,7 +23,7 @@
 
 ```text
 React/Vite 작업자 UI
-  ├─ same-origin iframe의 VWorld WebGL 3.0 지도와 주행 경로
+  ├─ same-origin iframe의 VWorld 2D 일반지도/WebGL 3.0 지도와 주행 경로
   ├─ 지연 로딩 360° 파노라마
   └─ 점 예산 기반 Three.js 점군
           │ REST + SSE
@@ -63,6 +66,8 @@ worker를 독립 프로세스로 배치할 수 있습니다.
   데이터셋별 MMSO 파생 캐시는 512 MiB 상한에서 오래된 항목부터 정리합니다.
 - 프레임 이동 시 전역 GNSS heading을 영상 yaw로 다시 적용하지 않고 image-space 정면으로
   복귀합니다. 장비 장착 편차는 브라우저별 정면 보정각으로 조정합니다.
+- 검출 SHP에 원본 영상명과 YOLO bbox/panorama 크기 속성이 있으면 현재 영상에 맞는
+  클래스 박스를 구면 오버레이에 표시합니다.
 
 ### 점군
 
@@ -87,17 +92,27 @@ worker를 독립 프로세스로 배치할 수 있습니다.
 - 겹친 노선으로 인한 과밀 표시를 막기 위해 기본 지도에는 선택 트랙 또는 현재 프레임의
   트랙만 표시합니다. 사용자가 일반 설정에서 명시적으로 켠 경우에만 전체 트랙을 함께
   표시합니다.
-- 지도는 VWorld WebGL 3.0 SDK의 `document.write()` 로더와 전역 `vw`/`ws3d` 상태를
-  React 문서에서 격리하기 위해 same-origin iframe에서 실행합니다. 기존 지도
+- 지도는 VWorld 공식 `Base` WMTS 일반 도로지도만 기본으로 사용하고 OSM fallback 없이 WebGL 3.0 지도를
+  선택적으로 전환합니다. 두 SDK의 `document.write()` 로더와 전역 `vw`/`ws3d` 상태는
+  React 문서에서 격리하기 위해 각각 same-origin iframe에서 실행합니다. 기존 지도
   style URL을 bootstrap 설정으로 받지 않으며, bootstrap은
   `{"provider":"vworld","engine":"webgl","version":"3.0"}` 메타데이터만 제공합니다.
 - VWorld 인증키와 현재 origin은 SDK loader query에 전달됩니다. 인증키는
   브라우저에 노출되는 개발용 클라이언트 값으로 취급하고, 배포 origin을
   VWorld 인증키 설정과 일치시켜야 합니다. iframe 크기가 바뀌면 VWorld
   `map.updateSize(...)`와 Cesium resize를 함께 호출합니다.
-- 경로·선택 구간·프레임·SHP는 서로 다른 Cesium `CustomDataSource`로 관리합니다.
-  한 종류가 바뀔 때 다른 피처를 재생성하지 않으며, 대량 entity 교체 중에는
+- 공간 데이터 뷰어를 새 창으로 분리하거나 기본 창으로 되돌릴 때 지도 컴포넌트를
+  명시적으로 재마운트해, 문서 이동으로 파기된 iframe browsing context를 재사용하지 않습니다.
+- 경로·선택 구간·프레임·SHP는 3D에서는 서로 다른 Cesium `CustomDataSource`, 2D에서는
+  서로 다른 OpenLayers `VectorSource`로 관리합니다. 한 종류가 바뀔 때 다른 피처를
+  재생성하지 않으며, 대량 Cesium entity 교체 중에는
   `EntityCollection.suspendEvents()`/`resumeEvents()`로 변경 알림을 묶습니다.
+- 왼쪽 데이터 탐색기에는 별도 프레임 목록과 속성표 대신 검색 가능한 SHP 레이어 목록과
+  표시 켜기/끄기만 둡니다. 프레임 이동은 지도·뷰어 내비게이터와 A/D 키로 수행하고,
+  실행 범위 입력은 데이터 탐색기에 compact 형태로 유지합니다. 전체 속성표, 신규 Point
+  위치 지정, geometry-only 복사, 레이어 이름·색상 편집은 `SHP 관리` 패널에 모읍니다.
+  저장된 레이어 색상은 공유 overlay context를 통해 지도·파노라마·포인트뷰에 동일하게
+  적용됩니다.
 
 ## 데이터 등록과 업로드
 
@@ -146,6 +161,13 @@ XY/Z 오차, REVIEW 비율을 목적함수로 사용하는 trial runner가 필�
 
 작업 취소는 해당 subprocess만 종료합니다. 원본 데이터는 건드리지 않으며 이미 생성된
 부분 산출물은 고유 output 폴더에 남겨 원인 분석에 사용할 수 있습니다.
+
+완료·실패 실행의 큐 삭제는 산출물 삭제가 아닌 `dismissed` 가시성 변경입니다. SQLite의
+상태 확인과 가시성 갱신을 한 트랜잭션에서 수행하며, 작업 폴더와 직접 결과 URL은 감사와
+재다운로드를 위해 보존합니다. 전체 산출물과 검출 사진은 각각 서버가 생성하는 단일 ZIP로
+제공합니다. ZIP 생성은 요청 스레드 밖에서 제한적으로 실행하고, 로그·지원하지 않는 형식·
+심볼릭 링크/정션을 제외하며 JSON/TXT의 서버 절대경로를 개별 artifact API와 동일하게
+마스킹합니다. 검출 사진 ZIP은 `image_crops`만 포함합니다.
 
 ## 서버 배포 체크리스트
 

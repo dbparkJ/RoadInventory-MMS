@@ -16,6 +16,7 @@ from mms_shp_detection.config import (
     config_sha256,
 )
 from mms_shp_detection.domain.models import JobStatus, PipelineErrorInfo, StageResult
+from mms_shp_detection.infrastructure import manifest_writer
 from mms_shp_detection.infrastructure.manifest_writer import (
     PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES,
     RunManifestStore,
@@ -88,6 +89,71 @@ class RunManifestContractTests(unittest.TestCase):
         return PipelineConfig.from_namespace(
             argparse.Namespace(data_root=Path("data"), output_dir=Path("output"))
         )
+
+    def test_manifest_write_retries_a_transient_windows_reader_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RunManifestStore(Path(temp_dir) / "run_manifest.json")
+            real_replace = os.replace
+            attempts = 0
+
+            def transient_reader_lock(source: Path, target: Path) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    error = PermissionError(5, "manifest is temporarily locked")
+                    error.winerror = 5  # type: ignore[attr-defined]
+                    raise error
+                real_replace(source, target)
+
+            with (
+                mock.patch(
+                    "mms_shp_detection.infrastructure.manifest_writer._is_transient_windows_replace_error",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "mms_shp_detection.infrastructure.manifest_writer.os.replace",
+                    side_effect=transient_reader_lock,
+                ),
+                mock.patch("mms_shp_detection.infrastructure.manifest_writer.time.sleep"),
+            ):
+                document = store.create(
+                    job_id="job-reader-lock",
+                    config=self._config(),
+                    input_root=Path(temp_dir),
+                )
+
+            self.assertEqual(attempts, 2)
+            self.assertEqual(document["job_id"], "job-reader-lock")
+
+    def test_manifest_write_falls_back_when_a_share_denies_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "run_manifest.json"
+            store = RunManifestStore(path)
+            access_denied = PermissionError(5, "share does not grant rename rights")
+            access_denied.winerror = 5  # type: ignore[attr-defined]
+
+            with (
+                mock.patch(
+                    "mms_shp_detection.infrastructure.manifest_writer._is_transient_windows_replace_error",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "mms_shp_detection.infrastructure.manifest_writer.os.replace",
+                    side_effect=access_denied,
+                ) as replace,
+                mock.patch("mms_shp_detection.infrastructure.manifest_writer.time.sleep"),
+            ):
+                store.create(
+                    job_id="job-restricted-share",
+                    config=self._config(),
+                    input_root=Path(temp_dir),
+                )
+
+            self.assertEqual(
+                replace.call_count,
+                len(manifest_writer._WINDOWS_REPLACE_RETRY_DELAYS_SECONDS) + 1,
+            )
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["job_id"], "job-restricted-share")
 
     def test_manifest_lifecycle_is_atomic_and_records_stage_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

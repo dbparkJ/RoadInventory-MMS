@@ -3,9 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../lib/api'
 import type { Frame } from '../types'
 import PanoramaView, {
+  deduplicatePanoramaDetectionBoxes,
   nearestPanoramaPointIndex,
+  panoramaDetectionBox,
+  panoramaDetectionBoxContainsUv,
+  panoramaDetectionPointRadius,
   panoramaForwardYaw,
+  panoramaOverlayAtUv,
   panoramaRequestWidth,
+  reconcilePanoramaDetectionBoxes,
+  type RenderPanoramaDetectionBox,
+  type RenderPanoramaOverlayPoint,
 } from './PanoramaView'
 
 const threeSpies = vi.hoisted(() => ({
@@ -141,6 +149,16 @@ vi.mock('../lib/api', () => ({
   api: {
     panorama: vi.fn(() => new Promise(() => undefined)),
     panoramaPoints: vi.fn(() => new Promise(() => undefined)),
+    frameDetections: vi.fn(() => Promise.resolve({
+      dataset_id: 'dataset-1',
+      frame_id: 'frame-12',
+      coordinate_space: 'panorama_equirectangular_pixels',
+      projection: 'equirectangular',
+      items: [],
+      count: 0,
+      model_count: 0,
+      truncated: false,
+    })),
   },
 }))
 
@@ -149,6 +167,7 @@ const FRAME: Frame = {
   index: 12,
   track_id: 'track-1',
   timestamp: '2026-08-03T09:30:00.000Z',
+  image_name: 'frame-12.jpg',
   coordinate: { lon: 126.978, lat: 37.5665 },
   has_panorama: true,
   has_points: true,
@@ -197,6 +216,16 @@ beforeEach(() => {
   threeSpies.textureDisposed.mockClear()
   vi.mocked(api.panorama).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.panoramaPoints).mockReset().mockImplementation(() => new Promise(() => undefined))
+  vi.mocked(api.frameDetections).mockReset().mockResolvedValue({
+    dataset_id: 'dataset-1',
+    frame_id: 'frame-12',
+    coordinate_space: 'panorama_equirectangular_pixels',
+    projection: 'equirectangular',
+    items: [],
+    count: 0,
+    model_count: 0,
+    truncated: false,
+  })
   vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
   vi.stubGlobal('cancelAnimationFrame', vi.fn())
   Object.defineProperty(URL, 'createObjectURL', {
@@ -213,6 +242,14 @@ beforeEach(() => {
       return {
         createImageData: () => ({ data: new Uint8ClampedArray(4) }),
         putImageData: vi.fn(),
+        beginPath: vi.fn(),
+        arc: vi.fn(),
+        fill: vi.fn(),
+        stroke: vi.fn(),
+        strokeRect: vi.fn(),
+        fillRect: vi.fn(),
+        fillText: vi.fn(),
+        measureText: vi.fn(() => ({ width: 50 })),
       } as unknown as CanvasRenderingContext2D
     }) as HTMLCanvasElement['getContext'],
   )
@@ -251,6 +288,179 @@ describe('nearestPanoramaPointIndex', () => {
     ])
     expect(nearestPanoramaPointIndex(0.01, 0.5, coordinates, 2, 0.03)).toBe(0)
     expect(nearestPanoramaPointIndex(0.2, 0.2, coordinates, 2, 0.03)).toBeNull()
+  })
+})
+
+describe('panoramaDetectionBox', () => {
+  it('builds an image-matched class box and ignores detections from other frames', () => {
+    const properties = {
+      IMG_NAME: 'captures/frame-12.jpg',
+      CLASS_NM: 'traffic_sign',
+      CONF: 0.876,
+      BBOX_L: 120,
+      BBOX_T: 80,
+      BBOX_R: 260,
+      BBOX_B: 220,
+      PANO_W: 8192,
+      PANO_H: 4096,
+    }
+
+    expect(panoramaDetectionBox(properties, 'frame-12.jpg')).toEqual({
+      left: 120,
+      top: 80,
+      right: 260,
+      bottom: 220,
+      panoramaWidth: 8192,
+      panoramaHeight: 4096,
+      label: 'traffic_sign 88%',
+    })
+    expect(panoramaDetectionBox(properties, 'frame-13.jpg')).toBeNull()
+  })
+
+  it('accepts pipeline and uploaded bbox aliases plus extension-only image differences', () => {
+    expect(panoramaDetectionBox({
+      IMAGE_PATH: 'captures/frame-12.jpeg',
+      BBOX_XYXY: '[120, 80, 260, 220]',
+      IMAGE_WIDTH: 8192,
+      IMAGE_HEIGHT: 4096,
+      CLASS_NAME: 'traffic_light',
+      CONFIDENCE: 91.2,
+    }, 'FRAME-12.JPG')).toEqual({
+      left: 120,
+      top: 80,
+      right: 260,
+      bottom: 220,
+      panoramaWidth: 8192,
+      panoramaHeight: 4096,
+      label: 'traffic_light 91%',
+    })
+  })
+
+  it('hit-tests a detection box across the panorama seam', () => {
+    const box = {
+      left: 790,
+      top: 100,
+      right: 830,
+      bottom: 180,
+      panoramaWidth: 800,
+      panoramaHeight: 400,
+      label: 'sign',
+    }
+    expect(panoramaDetectionBoxContainsUv(box, 0.01, 0.35)).toBe(true)
+    expect(panoramaDetectionBoxContainsUv(box, 0.5, 0.35)).toBe(false)
+  })
+
+  it('uses smaller panorama detection markers while preserving selection emphasis', () => {
+    expect(panoramaDetectionPointRadius(false, 10)).toBe(2)
+    expect(panoramaDetectionPointRadius(false, 30)).toBe(1.5)
+    expect(panoramaDetectionPointRadius(true, 30)).toBe(3.5)
+  })
+
+  it('deduplicates raw observations and lets unlinked boxes expose a preview hit', () => {
+    const box: RenderPanoramaDetectionBox = {
+      sourceId: 'source-model-a',
+      observationId: 'det-1',
+      layerId: 'layer-1',
+      layerName: '검출 결과',
+      properties: { class_nm: 'traffic_sign', conf: 0.91 },
+      color: '#ffb84d',
+      selected: false,
+      detectionBox: {
+        left: 400,
+        top: 150,
+        right: 500,
+        bottom: 250,
+        panoramaWidth: 1000,
+        panoramaHeight: 500,
+        label: 'traffic_sign 91%',
+      },
+    }
+    expect(deduplicatePanoramaDetectionBoxes([
+      box,
+      { ...box, layerId: 'duplicate-import' },
+    ])).toEqual([box])
+    expect(deduplicatePanoramaDetectionBoxes([
+      box,
+      { ...box, sourceId: 'source-model-b', layerId: 'different-model' },
+    ])).toHaveLength(2)
+    expect(panoramaOverlayAtUv([], 0.45, 0.4, [box])).toEqual({
+      layerName: '검출 결과',
+      featureId: 'det-1',
+      properties: { class_nm: 'traffic_sign', conf: 0.91 },
+    })
+
+    const linked = { ...box, featureId: 'feature-7' }
+    expect(panoramaOverlayAtUv([] as RenderPanoramaOverlayPoint[], 0.45, 0.4, [linked])).toMatchObject({
+      layerId: 'layer-1',
+      featureId: 'feature-7',
+    })
+  })
+
+  it('reconciles a raw box with its visible SHP representative for Details', () => {
+    const detectionBox = {
+      left: 400,
+      top: 150,
+      right: 500,
+      bottom: 250,
+      panoramaWidth: 1000,
+      panoramaHeight: 500,
+      label: 'traffic_sign 91%',
+    }
+    const raw: RenderPanoramaDetectionBox = {
+      sourceId: 'source-model-a',
+      observationId: 'det-1',
+      layerName: 'YOLO · model-a.pt',
+      properties: {
+        det_id: 'det-1',
+        model_nm: 'model-a.pt',
+        img_name: 'frame-12.jpg',
+        class_nm: 'traffic_sign',
+      },
+      color: '#ffb84d',
+      selected: false,
+      detectionBox,
+    }
+    const representative: RenderPanoramaOverlayPoint = {
+      feature_id: 'feature-7',
+      layerId: 'layer-1',
+      layerName: 'Detected signs',
+      u: 0.45,
+      v: 0.4,
+      depth: 12,
+      dataset_position: [1, 2, 3],
+      properties: {
+        det_id: 'DET-1',
+        model_nm: 'model-a.pt',
+        img_name: 'frame-12.jpg',
+        class_nm: 'traffic_sign',
+        asset_id: 'asset-7',
+      },
+      color: '#22c55e',
+      selected: false,
+      detectionBox: { ...detectionBox, left: 400.0001 },
+    }
+    const unrelated = {
+      ...raw,
+      observationId: 'det-2',
+      properties: { ...raw.properties, det_id: 'det-2' },
+    }
+
+    const reconciled = reconcilePanoramaDetectionBoxes(
+      [raw, unrelated],
+      [representative],
+    )
+    expect(reconciled[0]).toMatchObject({
+      layerId: 'layer-1',
+      layerName: 'Detected signs',
+      featureId: 'feature-7',
+      properties: { asset_id: 'asset-7' },
+    })
+    expect(reconciled[1].layerId).toBeUndefined()
+    expect(reconciled[1].featureId).toBeUndefined()
+    expect(panoramaOverlayAtUv([], 0.45, 0.4, reconciled)).toMatchObject({
+      layerId: 'layer-1',
+      featureId: 'feature-7',
+    })
   })
 })
 
@@ -333,6 +543,73 @@ describe('PanoramaView frame navigation', () => {
 })
 
 describe('PanoramaView media lifecycle', () => {
+  it('loads and renders frame YOLO boxes without any SHP layer', async () => {
+    vi.mocked(api.frameDetections).mockResolvedValue({
+      dataset_id: 'dataset-1',
+      frame_id: 'frame-12',
+      coordinate_space: 'panorama_equirectangular_pixels',
+      projection: 'equirectangular',
+      items: [{
+        source_id: 'det-src_model-a',
+        source_name: 'traffic-sign.pt',
+        observation_id: 'det-1',
+        properties: {
+          img_name: 'frame-12.jpg',
+          class_nm: 'traffic_sign',
+          bbox_l: 400,
+          bbox_t: 150,
+          bbox_r: 500,
+          bbox_b: 250,
+          pano_w: 1000,
+          pano_h: 500,
+        },
+      }],
+      count: 1,
+      model_count: 1,
+      truncated: false,
+    })
+
+    const { container } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
+    )
+
+    await waitFor(() => {
+      expect(api.frameDetections).toHaveBeenCalledWith(
+        'dataset-1',
+        'frame-12',
+        expect.any(AbortSignal),
+      )
+      expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
+    })
+  })
+
+  it('reloads detections for the same frame when a run completes', async () => {
+    const { rerender } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={FRAME}
+        demoMode={false}
+        detectionRevisionKey="run-1:running"
+      />,
+    )
+
+    await waitFor(() => expect(api.frameDetections).toHaveBeenCalledTimes(1))
+    rerender(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={FRAME}
+        demoMode={false}
+        detectionRevisionKey="run-1:completed"
+      />,
+    )
+
+    await waitFor(() => expect(api.frameDetections).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.frameDetections).mock.calls[1]?.slice(0, 2)).toEqual([
+      'dataset-1',
+      'frame-12',
+    ])
+  })
+
   it('keeps one renderer and panorama texture while overlay data and image opacity change', async () => {
     vi.mocked(api.panorama).mockResolvedValue({ kind: 'url', value: '/panorama/frame-12.webp' })
     vi.mocked(api.panoramaPoints).mockResolvedValue(mmsoPayload())

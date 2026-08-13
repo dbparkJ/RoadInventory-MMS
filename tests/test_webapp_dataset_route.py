@@ -13,6 +13,87 @@ from mms_shp_detection.webapp.store import WebStore
 
 
 class WebAppDatasetRouteTests(unittest.TestCase):
+    def test_locate_frame_prefers_source_image_and_falls_back_to_nearest_pose(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            now = "2026-01-01T00:00:00+00:00"
+            store = app.state.store
+            store.upsert_scanning_dataset(
+                dataset_id="d_locate",
+                name="locate",
+                root_id="root",
+                relative_path="delivery",
+                crs="EPSG:32652",
+                now=now,
+            )
+            store.finish_dataset_scan(
+                "d_locate",
+                frames=[
+                    {
+                        "id": "frame-a",
+                        "ordinal": 0,
+                        "track_id": "track-01",
+                        "task": {
+                            "image_name": "Frame-A.jpg",
+                            "origin": [300_000.0, 4_100_000.0, 10.0],
+                        },
+                        "longitude": 126.75,
+                        "latitude": 37.03,
+                        "altitude": 10.0,
+                        "heading": 90.0,
+                    },
+                    {
+                        "id": "frame-b",
+                        "ordinal": 150,
+                        "track_id": "track-02",
+                        "task": {
+                            "image_name": "Frame-B.jpg",
+                            "origin": [300_100.0, 4_100_100.0, 11.0],
+                        },
+                        "longitude": 126.751,
+                        "latitude": 37.031,
+                        "altitude": 11.0,
+                        "heading": 95.0,
+                    },
+                ],
+                tracks=[
+                    {"id": "track-01", "name": "Track 01", "frame_count": 1},
+                    {"id": "track-02", "name": "Track 02", "frame_count": 1},
+                ],
+                bbox=None,
+                warnings=[],
+                now=now,
+            )
+
+            with TestClient(app) as client:
+                by_image = client.post(
+                    "/api/datasets/d_locate/frames/locate",
+                    json={
+                        "image_name": "frame-b.JPG",
+                        "dataset_position": [300_000.0, 4_100_000.0],
+                    },
+                )
+                self.assertEqual(by_image.status_code, 200, by_image.text)
+                self.assertEqual(by_image.json()["frame"]["id"], "frame-b")
+                self.assertEqual(by_image.json()["match"], "image_name")
+                self.assertEqual(by_image.json()["page_offset"], 30)
+
+                by_position = client.post(
+                    "/api/datasets/d_locate/frames/locate",
+                    json={
+                        "image_name": "missing.jpg",
+                        "dataset_position": [300_001.0, 4_100_002.0],
+                    },
+                )
+                self.assertEqual(by_position.status_code, 200, by_position.text)
+                self.assertEqual(by_position.json()["frame"]["id"], "frame-a")
+                self.assertEqual(by_position.json()["match"], "nearest_position")
+
     def test_route_sampler_is_budgeted_and_keeps_track_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as state_text:
             store = WebStore(Path(state_text) / "registry.sqlite3")

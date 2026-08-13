@@ -178,6 +178,46 @@ class LeicaDatasetTests(unittest.TestCase):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_browser_hover_projection_golden_vector(self) -> None:
+        forward, right, up = build_camera_axes(
+            (0.36, 0.48, 0.8),
+            (0.1, -0.2, 0.97),
+        )
+        forward, right, up = apply_panorama_angular_offsets(
+            forward,
+            right,
+            up,
+            yaw_offset_deg=7.5,
+            pitch_offset_deg=-3.25,
+        )
+        u, v, distance = project_points_equirectangular(
+            np.asarray([[12.5, -4.25, 3.75]], dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            forward,
+            right,
+            up,
+            1,
+            1,
+        )
+        np.testing.assert_allclose(
+            forward,
+            [0.2513908552200246, 0.5704266631901495, 0.7819309815025215],
+            atol=1e-14,
+        )
+        np.testing.assert_allclose(
+            right,
+            [0.9438822364991671, -0.32328659609298477, -0.06761730849376985],
+            atol=1e-14,
+        )
+        np.testing.assert_allclose(
+            up,
+            [-0.21421708973159675, -0.7550491366185139, 0.6196868884836615],
+            atol=1e-14,
+        )
+        self.assertAlmostEqual(float(u[0]), 0.7061724312999704, places=14)
+        self.assertAlmostEqual(float(v[0]), 0.43329805654137143, places=14)
+        self.assertAlmostEqual(float(distance[0]), 13.724977231310804, places=14)
+
     def test_equirectangular_pixel_ray_round_trip(self) -> None:
         forward, right, up = build_camera_axes((0.1, 0.98, 0.05), (0.0, 0.0, 1.0))
         for pixel_x, pixel_y in ((0.0, 1760.0), (3520.0, 1760.0), (7039.0, 100.0)):
@@ -425,6 +465,9 @@ class CrsPropagationTests(unittest.TestCase):
                         "pointcloud_source": "las",
                         "calibration_sha256": "a" * 64,
                         "run_fingerprint": "b" * 64,
+                        "bbox_xyxy": [120.0, 80.0, 260.0, 220.0],
+                        "panorama_width": 8192,
+                        "panorama_height": 4096,
                     }
                 ],
                 shp_path,
@@ -435,6 +478,10 @@ class CrsPropagationTests(unittest.TestCase):
             self.assertEqual(record["pose_fmt"], "leica-sphere")
             self.assertEqual(record["calib_id"], "a" * 12)
             self.assertEqual(record["run_id"], "b" * 12)
+            self.assertEqual(record["bbox_l"], 120.0)
+            self.assertEqual(record["bbox_b"], 220.0)
+            self.assertEqual(record["pano_w"], 8192)
+            self.assertEqual(record["pano_h"], 4096)
             reader.close()
 
     def test_failed_sidecar_write_does_not_replace_existing_bundle(self) -> None:

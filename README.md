@@ -19,7 +19,7 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 - 콘솔 상태바/처리율/ETA 표시와 전체 파일 로그 저장
 - Windows/Linux 공용 가상환경 자동 구성 및 PyTorch/CUDA smoke test
 - 서버 폴더·재개 가능한 업로드, 작업 구간, 수치 입력/자동 설정을 묶은 웹 작업실
-- VWorld WebGL 3.0 지도, 360° 파노라마, 점 예산 기반 3D 점군의 동기화된 검수 화면
+- VWorld 2D 일반지도와 WebGL 3.0 지도, 360° 파노라마, 점 예산 기반 3D 점군의 동기화된 검수 화면
 
 수집업체에 전달할 입력 데이터 요구사항은 [docs/MMS_DATA_SPEC.md](docs/MMS_DATA_SPEC.md)에 정리되어 있습니다. 환경 구성 세부사항은 [ENV_SETUP.md](ENV_SETUP.md)를 참고하십시오. 현재 실행 흐름과 개선 상태는 [현재 아키텍처](docs/current_architecture.md)와 [아키텍처 개선 보고서](docs/ARCHITECTURE_IMPROVEMENT_REPORT.md)에서 확인할 수 있습니다.
 
@@ -40,7 +40,7 @@ MMS 파노라마에서 YOLO-seg로 도로표지를 찾고, 같은 좌표계의 L
 | `scripts/verify_environment.py` | PyTorch/CUDA/NMS/주요 패키지 smoke test |
 | `mms_shp_detection/` | 데이터 탐색, 투영, 점군, 지주, SHP 구현 |
 | `mms_shp_detection/webapp/` | 데이터 등록·preview·업로드·GPU 작업 큐 API |
-| `webui/` | React/VWorld WebGL 3.0/Three.js 작업자 UI |
+| `webui/` | React/VWorld 2D·WebGL 3.0/Three.js 작업자 UI |
 | `tests/` | 설정·투영·점군·지주·SHP 회귀 테스트 |
 | `docs/MMS_DATA_SPEC.md` | MMS 수집업체 전달용 데이터 명세 |
 | `docs/WEB_UI_ARCHITECTURE.md` | 대용량 로딩, 서버 배치, 보안·운영 설계 |
@@ -82,8 +82,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1 --dry-run
   --storage-root \\nas\MMS\archive
 ```
 
-지도는 same-origin iframe에서 VWorld WebGL 3.0 SDK를 로드하며
-외부 지도 style URL 설정을 사용하지 않습니다. SDK 인증키는
+지도는 same-origin iframe에서 VWorld 공식 `Base` WMTS 일반 도로지도만 기본으로
+로드하며 OSM fallback 없이 필요할 때 WebGL 3.0 3D 지도로 전환합니다. 외부 지도 style URL 설정은
+사용하지 않습니다. SDK 인증키는
 브라우저 loader 요청에 포함되는 클라이언트 값이며, VWorld에 등록된
 origin에서 사용해야 합니다. 허용 저장소는 운영체제의 경로 구분자로 나눈
 `MMS_WEB_STORAGE_ROOTS` 환경변수로 설정할 수 있습니다. 이 앱에는 자체 로그인

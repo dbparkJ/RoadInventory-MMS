@@ -14,6 +14,8 @@ const LAYER: OverlayLayer = {
   geometry_type: 'Point',
   feature_count: 2,
   revision: 3,
+  color: '#2bcfa8',
+  metadata_revision: 2,
 }
 
 function collection(features: OverlayFeature[], total = features.length): OverlayFeatureCollection {
@@ -61,6 +63,8 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
       },
     },
     visibleLayerIds: new Set([LAYER.id]),
+    activeLayerId: LAYER.id,
+    setActiveLayerId: vi.fn(),
     selected: selectedFeature ? { layerId: LAYER.id, featureId: selectedFeature.id } : null,
     selectedLayer: selectedFeature ? LAYER : null,
     selectedFeature: null,
@@ -69,17 +73,22 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
     datasetFeatures: [],
     loading: false,
     uploading: false,
+    creatingFeature: false,
     pickMode: false,
+    pickTarget: null,
     setPickMode: vi.fn(),
+    beginCreatePoint: vi.fn(),
     refresh: vi.fn().mockResolvedValue(undefined),
     ensureDatasetFeatures: vi.fn().mockResolvedValue(undefined),
     loadMoreDatasetFeatures: vi.fn().mockResolvedValue(undefined),
     upload: vi.fn().mockResolvedValue(undefined),
+    updateLayerMetadata: vi.fn().mockResolvedValue(undefined),
     removeLayer: vi.fn().mockResolvedValue(undefined),
     toggleLayer: vi.fn(),
     selectFeature: vi.fn(),
     updateSelected: vi.fn().mockResolvedValue(undefined),
     applyPickedCoordinate: vi.fn().mockResolvedValue(undefined),
+    copySelectedLocation: vi.fn().mockResolvedValue(undefined),
     deleteSelected: vi.fn().mockResolvedValue(undefined),
     layerColor: vi.fn(() => '#2bcfa8'),
   }
@@ -95,6 +104,40 @@ afterEach(() => {
 })
 
 describe('OverlayPanel feature editing', () => {
+  it('edits the selected layer display name and shared color', async () => {
+    const overlay = overlayWorkspace(pointFeature())
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayPanel onClose={vi.fn()} />)
+
+    fireEvent.change(screen.getByRole('textbox', { name: '선택 레이어 이름' }), {
+      target: { value: '  현장 지주  ' },
+    })
+    fireEvent.change(screen.getByLabelText('선택 레이어 색상'), {
+      target: { value: '#123456' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /이름·색상 저장/ }))
+
+    await waitFor(() =>
+      expect(overlay.updateLayerMetadata).toHaveBeenCalledWith(LAYER.id, {
+        name: '현장 지주',
+        color: '#123456',
+      }),
+    )
+  })
+
+  it('consumes an imported layer focus once without overriding later layer changes', async () => {
+    const overlay = overlayWorkspace(pointFeature())
+    useOverlayWorkspace.mockReturnValue(overlay)
+    const view = render(<OverlayPanel focusLayerId={LAYER.id} onClose={vi.fn()} />)
+
+    await waitFor(() => expect(overlay.setActiveLayerId).toHaveBeenCalledWith(LAYER.id))
+    expect(overlay.setActiveLayerId).toHaveBeenCalledTimes(1)
+
+    useOverlayWorkspace.mockReturnValue({ ...overlay, layers: [{ ...LAYER, revision: 4 }] })
+    view.rerender(<OverlayPanel focusLayerId={LAYER.id} onClose={vi.fn()} />)
+    expect(overlay.setActiveLayerId).toHaveBeenCalledTimes(1)
+  })
+
   it('saves a 2D Point as [x, y] without a null Z coordinate', async () => {
     const overlay = overlayWorkspace(pointFeature())
     useOverlayWorkspace.mockReturnValue(overlay)
@@ -154,5 +197,44 @@ describe('OverlayPanel feature editing', () => {
 
     expect(await screen.findByText('서버에서 피처 삭제를 거부했습니다.')).toBeInTheDocument()
     expect(overlay.deleteSelected).toHaveBeenCalledOnce()
+  })
+
+  it('renders every loaded row and SHP field without truncating the attribute table', () => {
+    const overlay = overlayWorkspace(pointFeature())
+    const fields = Array.from({ length: 8 }, (_, index) => ({ name: `field_${index + 1}`, type: 'C' }))
+    const features = Array.from({ length: 501 }, (_, index): OverlayFeature => ({
+      type: 'Feature',
+      id: `point-${index + 1}`,
+      geometry: { type: 'Point', coordinates: [index, index + 1] },
+      properties: Object.fromEntries(fields.map((field) => [field.name, `${field.name}-${index}`])),
+    }))
+    overlay.features[LAYER.id].dataset = {
+      ...collection(features),
+      fields,
+    }
+    overlay.selected = null
+    overlay.selectedLayer = null
+    overlay.selectedDatasetFeature = null
+    useOverlayWorkspace.mockReturnValue(overlay)
+
+    render(<OverlayPanel onClose={vi.fn()} />)
+
+    expect(screen.getByRole('columnheader', { name: 'field_8' })).toBeInTheDocument()
+    expect(screen.getByText('point-501')).toBeInTheDocument()
+    expect(screen.queryByText(/첫 500행/)).not.toBeInTheDocument()
+  })
+
+  it('starts map-click creation and duplicates only the selected geometry through context actions', async () => {
+    const overlay = overlayWorkspace(pointFeature())
+    const onClose = vi.fn()
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayPanel onClose={onClose} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /신규 포인트/ }))
+    expect(overlay.beginCreatePoint).toHaveBeenCalledWith(LAYER.id)
+    expect(onClose).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByRole('button', { name: /위치만 복사/ }))
+    await waitFor(() => expect(overlay.copySelectedLocation).toHaveBeenCalledOnce())
   })
 })

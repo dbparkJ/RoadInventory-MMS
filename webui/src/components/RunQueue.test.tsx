@@ -1,9 +1,12 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RunRecord, RunStatus } from '../types'
 import { RunQueue } from './RunQueue'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 function run(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
@@ -22,7 +25,7 @@ describe('RunQueue', () => {
     const unknown = run({ status: 'toString' as RunStatus, progress: Number.NaN })
 
     const { container } = render(
-      <RunQueue runs={[unknown]} open onClose={vi.fn()} onCancel={vi.fn()} />,
+      <RunQueue runs={[unknown]} open onClose={vi.fn()} onCancel={vi.fn()} onDelete={vi.fn()} />,
     )
 
     expect(screen.getByText('알 수 없는 상태')).toBeInTheDocument()
@@ -39,7 +42,7 @@ describe('RunQueue', () => {
       progress: 22,
     })
 
-    render(<RunQueue runs={[retrying]} open onClose={vi.fn()} onCancel={vi.fn()} />)
+    render(<RunQueue runs={[retrying]} open onClose={vi.fn()} onCancel={vi.fn()} onDelete={vi.fn()} />)
 
     expect(screen.getByText('재시도 중')).toBeInTheDocument()
     expect(screen.getByText('load_or_build_spatial_index')).toBeInTheDocument()
@@ -53,6 +56,7 @@ describe('RunQueue', () => {
         open
         onClose={vi.fn()}
         onCancel={vi.fn()}
+        onDelete={vi.fn()}
       />,
     )
 
@@ -66,10 +70,37 @@ describe('RunQueue', () => {
         open
         onClose={vi.fn()}
         onCancel={vi.fn()}
+        onDelete={vi.fn()}
       />,
     )
 
     expect(screen.getByText('시작 중')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '취소' })).toBeInTheDocument()
+  })
+
+  it('removes only completed and failed runs after confirmation', async () => {
+    const onDelete = vi.fn().mockResolvedValue(undefined)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(
+      <RunQueue
+        runs={[
+          run({ id: 'run-complete', status: 'completed' }),
+          run({ id: 'run-failed', status: 'failed' }),
+          run({ id: 'run-cancelled', status: 'cancelled' }),
+          run({ id: 'run-running', status: 'running' }),
+        ]}
+        open
+        onClose={vi.fn()}
+        onCancel={vi.fn()}
+        onDelete={onDelete}
+      />,
+    )
+
+    const deleteButtons = screen.getAllByRole('button', { name: /실행 기록 삭제/ })
+    expect(deleteButtons).toHaveLength(2)
+    fireEvent.click(deleteButtons[0])
+
+    await waitFor(() => expect(onDelete).toHaveBeenCalledWith('run-complete'))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('산출물과 서버 파일은 삭제되지 않습니다'))
   })
 })

@@ -1,14 +1,19 @@
 import type {
   BootstrapResponse,
   DatasetDetail,
+  FrameDetectionResponse,
+  FrameLocateResponse,
   FramePage,
   OverlayCoordinateSpace,
   OverlayEncoding,
   OverlayFeature,
   OverlayFeatureCollection,
+  OverlayFeatureCreateRequest,
   OverlayFeatureDetail,
   OverlayLayer,
   PanoramaOverlayFeature,
+  PanoramaDetectionBoxObservation,
+  PanoramaProjectionMetadata,
   RouteResponse,
   RunEvent,
   RunRecord,
@@ -244,6 +249,19 @@ export const api = {
     )
   },
 
+  locateFrame(
+    id: string,
+    payload: { image_name?: string; dataset_position?: [number, number] },
+    signal?: AbortSignal,
+  ) {
+    return json<FrameLocateResponse>(`/api/datasets/${encodeURIComponent(id)}/frames/locate`, {
+      method: 'POST',
+      ...jsonBody(payload),
+      signal,
+      timeout: 30_000,
+    })
+  },
+
   overlays(id: string, signal?: AbortSignal) {
     return json<{ items: OverlayLayer[] }>(`/api/datasets/${encodeURIComponent(id)}/overlays`, {
       signal,
@@ -327,6 +345,17 @@ export const api = {
     )
   },
 
+  createOverlayFeature(
+    datasetId: string,
+    layerId: string,
+    payload: OverlayFeatureCreateRequest,
+  ) {
+    return json<OverlayFeatureDetail>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features`,
+      { method: 'POST', ...jsonBody(payload), timeout: 30_000 },
+    )
+  },
+
   patchOverlayFeature(
     datasetId: string,
     layerId: string,
@@ -359,6 +388,21 @@ export const api = {
     )
   },
 
+  patchOverlay(
+    datasetId: string,
+    layerId: string,
+    payload: {
+      name?: string
+      color?: string
+      expected_metadata_revision: number
+    },
+  ) {
+    return json<{ layer: OverlayLayer }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}`,
+      { method: 'PATCH', ...jsonBody(payload), timeout: 30_000 },
+    )
+  },
+
   deleteOverlay(datasetId: string, layerId: string) {
     return json<{ deleted: boolean }>(
       `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}`,
@@ -377,6 +421,7 @@ export const api = {
     layerId: string,
     frameId: string,
     signal?: AbortSignal,
+    maxDistance?: number,
   ) {
     return json<{
       layer_id: string
@@ -386,10 +431,28 @@ export const api = {
       revision: number
       items: PanoramaOverlayFeature[]
       count: number
+      detection_boxes?: PanoramaDetectionBoxObservation[]
       yaw_offset_deg: number
       pitch_offset_deg: number
     }>(
-      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/project/${encodeURIComponent(frameId)}`,
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/project/${encodeURIComponent(frameId)}`,
+        { max_distance: maxDistance },
+      ),
+      { signal, timeout: 30_000 },
+    )
+  },
+
+  panoramaProjectionMetadata(datasetId: string, frameId: string, signal?: AbortSignal) {
+    return json<PanoramaProjectionMetadata>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/panorama-projection`,
+      { signal, timeout: 30_000 },
+    )
+  },
+
+  frameDetections(datasetId: string, frameId: string, signal?: AbortSignal) {
+    return json<FrameDetectionResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/detections`,
       { signal, timeout: 30_000 },
     )
   },
@@ -533,6 +596,17 @@ export const api = {
     return json<RunRecord>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
       ...jsonBody({}),
+    })
+  },
+
+  deleteRun(runId: string) {
+    return json<{
+      id: string
+      dismissed: boolean
+      artifacts_preserved: boolean
+      detail: string
+    }>(`/api/runs/${encodeURIComponent(runId)}`, {
+      method: 'DELETE',
     })
   },
 

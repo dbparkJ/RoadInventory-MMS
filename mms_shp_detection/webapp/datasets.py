@@ -47,6 +47,30 @@ class ScanRequest(BaseModel):
             raise ValueError(str(exc)) from exc
 
 
+class FrameLocateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    image_name: str | None = None
+    dataset_position: tuple[float, float] | None = None
+
+    @field_validator("image_name")
+    @classmethod
+    def normalize_image_name(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    @field_validator("dataset_position")
+    @classmethod
+    def validate_dataset_position(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if not all(math.isfinite(float(coordinate)) for coordinate in value):
+            raise ValueError("dataset_position must contain finite X/Y coordinates.")
+        return (float(value[0]), float(value[1]))
+
+
 def normalize_crs(value: str | int | dict[str, Any] | None) -> str:
     if value is None or value == "":
         raise ValueError(
@@ -789,6 +813,42 @@ async def get_frames(
         "limit": limit,
         "total": total,
         "next_offset": next_offset,
+    }
+
+
+@router.post("/datasets/{dataset_id}/frames/locate")
+def locate_frame(
+    dataset_id: str,
+    payload: FrameLocateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Resolve a SHP detection to its source image, falling back to nearest pose."""
+
+    require_ready_dataset(request, dataset_id)
+    if payload.image_name is None and payload.dataset_position is None:
+        raise HTTPException(
+            status_code=422,
+            detail="image_name or dataset_position is required.",
+        )
+    frame = None
+    match = "image_name"
+    if payload.image_name is not None:
+        frame = request.app.state.store.locate_frame(
+            dataset_id,
+            image_name=payload.image_name,
+        )
+    if frame is None and payload.dataset_position is not None:
+        frame = request.app.state.store.locate_frame(
+            dataset_id,
+            dataset_position=payload.dataset_position,
+        )
+        match = "nearest_position"
+    if frame is None:
+        raise HTTPException(status_code=404, detail="A matching MMS frame was not found.")
+    return {
+        "frame": public_frame(frame),
+        "page_offset": max(0, int(frame["ordinal"]) - 120),
+        "match": match,
     }
 
 

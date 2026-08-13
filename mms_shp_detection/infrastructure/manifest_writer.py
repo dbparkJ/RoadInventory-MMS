@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -58,6 +59,12 @@ _TERMINAL_JOB_STATUSES = {
     JobStatus.FAILED,
     JobStatus.CANCELLED,
 }
+
+_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS = (0.025, 0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def _is_transient_windows_replace_error(exc: PermissionError) -> bool:
+    return os.name == "nt" and getattr(exc, "winerror", None) in {5, 32}
 
 
 def utc_now() -> datetime:
@@ -358,6 +365,13 @@ class RunManifestStore:
         return self.path.is_file()
 
     def read(self) -> dict[str, Any]:
+        # Readers participate in the same cross-process lock as writers. This
+        # prevents a polling web client from holding run_manifest.json open at
+        # the exact moment a Windows worker atomically replaces it.
+        with self._thread_lock, _exclusive_file_lock(self.lock_path):
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> dict[str, Any]:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -442,7 +456,7 @@ class RunManifestStore:
             raise ValueError("Cannot create invalid run manifest: " + "; ".join(errors))
         with self._thread_lock, _exclusive_file_lock(self.lock_path):
             if self.path.is_file():
-                existing = self.read()
+                existing = self._read_unlocked()
                 mismatches: list[str] = []
                 if existing["job_id"] != str(job_id):
                     mismatches.append(
@@ -493,7 +507,7 @@ class RunManifestStore:
         with self._thread_lock, _exclusive_file_lock(self.lock_path):
             if not self.path.is_file():
                 return None
-            document = self.read()
+            document = self._read_unlocked()
             if document["job_id"] == next_job_id:
                 return None
             status = JobStatus(document["status"])
@@ -572,7 +586,7 @@ class RunManifestStore:
         _allow_failed_retry: bool = False,
     ) -> dict[str, Any]:
         with self._thread_lock, _exclusive_file_lock(self.lock_path):
-            document = self.read()
+            document = self._read_unlocked()
             before = copy.deepcopy(document)
             current = JobStatus(document["status"])
             mutation(document)
@@ -955,7 +969,7 @@ class RunManifestStore:
 
     def write_summary(self) -> tuple[Path, Path]:
         with self._thread_lock, _exclusive_file_lock(self.lock_path):
-            document = self.read()
+            document = self._read_unlocked()
             summary_json = self.path.with_name("run_summary.json")
             summary_md = self.path.with_name("run_summary.md")
             summary = {
@@ -1017,6 +1031,32 @@ class RunManifestStore:
                 handle.write(rendered)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            for retry_index in range(len(_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS) + 1):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError as exc:
+                    # On Windows a concurrent dashboard read (or virus scanner)
+                    # can briefly open the destination without FILE_SHARE_DELETE.
+                    # The uniquely-named temp file is already durable, so retrying
+                    # only this final rename is safe and keeps a transient reader
+                    # from terminating a model post-processing consumer.
+                    if not _is_transient_windows_replace_error(exc):
+                        raise
+                    if retry_index >= len(_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS):
+                        # Some SMB shares permit creating and updating files but
+                        # permanently deny the delete/rename right required by
+                        # os.replace. Keep the detection consumer alive by using
+                        # a durable in-place update as the final compatibility
+                        # fallback. The store lock still serializes all writers.
+                        try:
+                            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                                handle.write(rendered)
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                        except OSError:
+                            raise exc
+                        break
+                    time.sleep(_WINDOWS_REPLACE_RETRY_DELAYS_SECONDS[retry_index])
         finally:
             temporary.unlink(missing_ok=True)

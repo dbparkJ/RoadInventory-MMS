@@ -94,32 +94,24 @@ describe('DatasetPanel frame range selection', () => {
     expect(onFrameRangeChange).toHaveBeenCalledWith([4, 11])
   })
 
-  it('selects the range from the current frame through a Shift-clicked frame', () => {
-    const onFrameChange = vi.fn()
-    const onFrameRangeChange = vi.fn()
-    renderPanel({ onFrameChange, onFrameRangeChange, selectedFrame: FRAMES[0] })
+  it('uses the map-selected frame as either execution range boundary', () => {
+    const onSetFrameRangeStart = vi.fn()
+    const onSetFrameRangeEnd = vi.fn()
+    renderPanel({ onSetFrameRangeStart, onSetFrameRangeEnd, selectedFrame: FRAMES[1] })
 
-    const targetRow = screen.getByText('frame-31').closest('button')
-    expect(targetRow).not.toBeNull()
-    fireEvent.click(targetRow!, { shiftKey: true })
+    fireEvent.click(screen.getByRole('button', { name: '현재 프레임 21을 실행 범위 시작으로 지정' }))
+    fireEvent.click(screen.getByRole('button', { name: '현재 프레임 21을 실행 범위 끝으로 지정' }))
 
-    expect(onFrameRangeChange).toHaveBeenCalledOnce()
-    expect(onFrameRangeChange).toHaveBeenCalledWith([10, 30])
-    expect(onFrameChange).toHaveBeenCalledWith(FRAMES[2])
+    expect(onSetFrameRangeStart).toHaveBeenCalledWith(20)
+    expect(onSetFrameRangeEnd).toHaveBeenCalledWith(20)
   })
 
-  it('minimizes and restores the frame component without losing the panel', () => {
+  it('removes the frame list while retaining compact execution range controls', () => {
     renderPanel()
 
-    fireEvent.click(screen.getByRole('button', { name: '프레임 컴포넌트 최소화' }))
-    expect(screen.queryByRole('spinbutton', { name: '실행 시작 프레임 번호' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '프레임 컴포넌트 복원' })).toHaveAttribute(
-      'aria-expanded',
-      'false',
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: '프레임 컴포넌트 복원' }))
     expect(screen.getByRole('spinbutton', { name: '실행 시작 프레임 번호' })).toBeInTheDocument()
+    expect(screen.queryByText('frame-11')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /프레임 컴포넌트/ })).not.toBeInTheDocument()
   })
 
   it('offers a compact data explorer rail controlled by the parent layout', () => {

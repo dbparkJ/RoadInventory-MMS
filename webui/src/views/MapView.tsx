@@ -1,6 +1,11 @@
-import { AlertTriangle, Crosshair, Layers, LoaderCircle, Navigation2, RotateCcw } from 'lucide-react'
+import { AlertTriangle, Box, Crosshair, Layers, LoaderCircle, Map as MapIcon, Navigation2, RotateCcw } from 'lucide-react'
 import type { FeatureCollection } from 'geojson'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  openOverlayFeatureDetails,
+  OverlayHoverTooltip,
+  type OverlayHoverState,
+} from '../components/OverlayHoverTooltip'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { resolveMapTrackScope } from '../lib/mapScope'
 import {
@@ -20,12 +25,29 @@ import {
   renderVWorldRoute,
   renderVWorldRouteRange,
   resizeVWorldMap,
+  setVWorldSceneMode,
   startVWorldMap,
   VWORLD_CONTAINER_ID,
   VWORLD_IFRAME_URL,
   type VWorldCustomDataSource,
+  type VWorldOverlayHoverTarget,
   type VWorldRuntime,
 } from '../lib/vworld'
+import {
+  createVWorld2DDataSource,
+  destroyVWorld2DMap,
+  fitVWorld2DMap,
+  handleVWorld2DClick,
+  moveVWorld2DMap,
+  removeVWorld2DDataSource,
+  renderVWorld2DCollection,
+  startVWorld2DMap,
+  vworld2DOverlayHoverTarget,
+  VWORLD_2D_CONTAINER_ID,
+  VWORLD_2D_IFRAME_URL,
+  type VWorld2DDataSource,
+  type VWorld2DRuntime,
+} from '../lib/vworld2d'
 import type { Frame, FrameRange, RoutePoint } from '../types'
 
 interface MapViewProps {
@@ -36,6 +58,8 @@ interface MapViewProps {
   showAllTracks?: boolean
   frameRange?: FrameRange | null
   loading: boolean
+  mapMode: '2d' | '3d'
+  onMapModeChange: (mode: '2d' | '3d') => void
   onSelectFrame: (frame: Frame) => void
 }
 
@@ -44,11 +68,23 @@ interface VWorldBoot {
   promise: Promise<VWorldRuntime>
 }
 
+interface VWorld2DBoot {
+  frameWindow: Window
+  promise: Promise<VWorld2DRuntime>
+}
+
 interface VWorldSources {
   route: VWorldCustomDataSource
   routeRange: VWorldCustomDataSource
   frames: VWorldCustomDataSource
   overlay: VWorldCustomDataSource
+}
+
+interface VWorld2DSources {
+  route: VWorld2DDataSource
+  routeRange: VWorld2DDataSource
+  frames: VWorld2DDataSource
+  overlay: VWorld2DDataSource
 }
 
 async function createVWorldSources(runtime: VWorldRuntime): Promise<VWorldSources> {
@@ -71,6 +107,31 @@ async function createVWorldSources(runtime: VWorldRuntime): Promise<VWorldSource
   }
 }
 
+function createVWorld2DSources(runtime: VWorld2DRuntime): VWorld2DSources {
+  return {
+    route: createVWorld2DDataSource(runtime),
+    routeRange: createVWorld2DDataSource(runtime),
+    frames: createVWorld2DDataSource(runtime),
+    overlay: createVWorld2DDataSource(runtime),
+  }
+}
+
+export type FrameNavigationIntent = 'selection-change' | 'current-frame-button'
+
+export function frameNavigationTarget(
+  frame: Frame | null,
+  intent: FrameNavigationIntent,
+) {
+  if (intent !== 'current-frame-button' || !frame?.coordinate) return null
+  return {
+    lon: frame.coordinate.lon,
+    lat: frame.coordinate.lat,
+    height: 280,
+    heading: -(frame.heading ?? 0),
+    tilt: -62,
+  }
+}
+
 export function MapView({
   route,
   frames,
@@ -79,31 +140,48 @@ export function MapView({
   showAllTracks = false,
   frameRange,
   loading,
+  mapMode,
+  onMapModeChange,
   onSelectFrame,
 }: MapViewProps) {
+  const mapRootRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const iframe2DRef = useRef<HTMLIFrameElement>(null)
   const bootRef = useRef<VWorldBoot | null>(null)
+  const boot2DRef = useRef<VWorld2DBoot | null>(null)
   const runtimeRef = useRef<VWorldRuntime | null>(null)
-  const dataSourcesRef = useRef<VWorldSources | null>(null)
+  const runtime2DRef = useRef<VWorld2DRuntime | null>(null)
+  const sourcesRef = useRef<VWorldSources | null>(null)
+  const sources2DRef = useRef<VWorld2DSources | null>(null)
   const frameClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
   const overlayClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
+  const overlayHoverTargetsRef = useRef<ReadonlyMap<string, VWorldOverlayHoverTarget>>(new Map())
   const onSelectRef = useRef(onSelectFrame)
   const framesRef = useRef(frames)
   const fittedRouteRef = useRef('')
-  const selectedFrameRef = useRef<string | null>(null)
   const initialCameraRef = useRef(
     cameraTargetForCoordinates(route.map((point) => [point.lon, point.lat] as const)),
   )
-  const [ready, setReady] = useState(false)
+  const [ready3D, setReady3D] = useState(false)
+  const [ready2D, setReady2D] = useState(false)
   const [highContrast, setHighContrast] = useState(false)
   const [mapError, setMapError] = useState<string | null>(null)
+  const [mapHover, setMapHover] = useState<OverlayHoverState | null>(null)
+  const [pinnedMapHover, setPinnedMapHover] = useState<OverlayHoverState | null>(null)
+  const mapHoverRef = useRef<OverlayHoverState | null>(null)
+  const pinnedMapHoverRef = useRef<OverlayHoverState | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
   const overlay = useOptionalOverlayWorkspace()
   const overlayRef = useRef(overlay)
+  const mapModeRef = useRef(mapMode)
 
   onSelectRef.current = onSelectFrame
   framesRef.current = frames
   overlayRef.current = overlay
+  mapModeRef.current = mapMode
+  mapHoverRef.current = mapHover
+  pinnedMapHoverRef.current = pinnedMapHover
+  const ready = mapMode === '2d' ? ready2D : ready3D
 
   const overlayGeoJson = useMemo<FeatureCollection>(
     () => ({
@@ -112,6 +190,13 @@ export function MapView({
     }),
     [overlay?.mapFeatures],
   )
+  const selectedOverlayCoordinate = useMemo(() => {
+    const geometry = overlay?.selectedFeature?.geometry
+    if (geometry?.type !== 'Point' || !Array.isArray(geometry.coordinates)) return null
+    const lon = Number(geometry.coordinates[0])
+    const lat = Number(geometry.coordinates[1])
+    return Number.isFinite(lon) && Number.isFinite(lat) ? { lon, lat } : null
+  }, [overlay?.selectedFeature])
   const overlayMapTotal = (overlay?.layers ?? []).reduce(
     (sum, layer) =>
       overlay?.visibleLayerIds.has(layer.id)
@@ -194,13 +279,21 @@ export function MapView({
   }, [displayAllTracks, effectiveTrackId, frameIndexes, frameRange, route])
 
   useEffect(() => {
+    if (mapMode !== '3d') return
     const iframe = iframeRef.current
     if (!iframe) return
     let cancelled = false
     let installing = false
     let runtime: VWorldRuntime | null = null
-    let dataSources: VWorldSources | null = null
+    let sources: VWorldSources | null = null
     let resizeObserver: ResizeObserver | null = null
+    let hoverCanvas: HTMLCanvasElement | null = null
+    let hoverAnimationFrame = 0
+    let pendingHover: { x: number; y: number } | null = null
+    let mapPointerMoveHandler: ((event: PointerEvent) => void) | null = null
+    let mapPointerLeaveHandler: (() => void) | null = null
+    let mapKeyDownDocument: Document | null = null
+    let mapKeyDownHandler: ((event: KeyboardEvent) => void) | null = null
     let mapClickHandler:
       | ((
           windowPosition: unknown,
@@ -227,26 +320,57 @@ export function MapView({
         }
         runtime = await bootRef.current.promise
         if (cancelled) return
-        dataSources = await createVWorldSources(runtime)
+        sources = await createVWorldSources(runtime)
         if (cancelled) {
-          Object.values(dataSources).forEach((source) =>
-            removeVWorldDataSource(runtime!, source),
-          )
+          Object.values(sources).forEach((source) => removeVWorldDataSource(runtime!, source))
           return
         }
-
         runtimeRef.current = runtime
-        dataSourcesRef.current = dataSources
+        sourcesRef.current = sources
         mapClickHandler = (windowPosition, _ecefPosition, cartographic) => {
           if (!runtime) return
           try {
             const entityId = pickedEntityId(runtime.viewer.scene.pick(windowPosition))
+            const hoverTarget = entityId
+              ? overlayHoverTargetsRef.current.get(entityId)
+              : undefined
+            if (hoverTarget) {
+              const transient = mapHoverRef.current
+              const x = Number((windowPosition as { x?: unknown })?.x ?? 0)
+              const y = Number((windowPosition as { y?: unknown })?.y ?? 0)
+              setPinnedMapHover(
+                transient?.layerId === hoverTarget.layerId &&
+                  String(transient.featureId) === String(hoverTarget.featureId)
+                  ? transient
+                  : {
+                      layerId: hoverTarget.layerId,
+                      layerName: overlayRef.current?.layers.find(
+                        (layer) => layer.id === hoverTarget.layerId,
+                      )?.name ?? hoverTarget.layerId,
+                      featureId: hoverTarget.featureId,
+                      properties: hoverTarget.properties,
+                      x: Number.isFinite(x) ? x : 0,
+                      y: Number.isFinite(y) ? y : 0,
+                      viewportWidth: iframe.clientWidth,
+                      viewportHeight: iframe.clientHeight,
+                    },
+              )
+              return
+            }
+            setPinnedMapHover(null)
+            setMapHover(null)
             const target = entityId
-              ? overlayClickTargetsRef.current.get(entityId) ??
-                frameClickTargetsRef.current.get(entityId)
+              ? frameClickTargetsRef.current.get(entityId)
               : undefined
             if (target) {
               target()
+              return
+            }
+            const overlayTarget = entityId
+              ? overlayClickTargetsRef.current.get(entityId)
+              : undefined
+            if (overlayTarget) {
+              overlayTarget()
               return
             }
           } catch {
@@ -266,6 +390,61 @@ export function MapView({
         }
         runtime.map.onClick.addEventListener(mapClickHandler)
 
+        hoverCanvas = runtime.viewer.scene.canvas
+        const updateHover = () => {
+          hoverAnimationFrame = 0
+          const pending = pendingHover
+          pendingHover = null
+          if (!runtime || !pending) return
+          let target: VWorldOverlayHoverTarget | undefined
+          try {
+            const entityId = pickedEntityId(
+              runtime.viewer.scene.pick({ x: pending.x, y: pending.y }),
+            )
+            target = entityId ? overlayHoverTargetsRef.current.get(entityId) : undefined
+          } catch {
+            target = undefined
+          }
+          if (!target) {
+            setMapHover(null)
+            return
+          }
+          const layerName = overlayRef.current?.layers.find(
+            (layer) => layer.id === target?.layerId,
+          )?.name ?? target.layerId
+          setMapHover({
+            layerId: target.layerId,
+            layerName,
+            featureId: target.featureId,
+            properties: target.properties,
+            x: pending.x,
+            y: pending.y,
+            viewportWidth: iframe.clientWidth,
+            viewportHeight: iframe.clientHeight,
+          })
+        }
+        mapPointerMoveHandler = (event) => {
+          if (pinnedMapHoverRef.current) return
+          pendingHover = { x: event.offsetX, y: event.offsetY }
+          if (!hoverAnimationFrame) {
+            hoverAnimationFrame = frameWindow.requestAnimationFrame(updateHover)
+          }
+        }
+        mapPointerLeaveHandler = () => {
+          pendingHover = null
+          if (!pinnedMapHoverRef.current) setMapHover(null)
+        }
+        hoverCanvas.addEventListener('pointermove', mapPointerMoveHandler)
+        hoverCanvas.addEventListener('pointerleave', mapPointerLeaveHandler)
+        mapKeyDownDocument = frameWindow.document
+        mapKeyDownHandler = (event) => {
+          if (event.key !== 'Escape' || !pinnedMapHoverRef.current) return
+          event.preventDefault()
+          setPinnedMapHover(null)
+          setMapHover(null)
+        }
+        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
+
         const resize = () => {
           if (!runtime) return
           resizeVWorldMap(runtime, iframe.clientWidth, iframe.clientHeight)
@@ -274,12 +453,12 @@ export function MapView({
         resizeObserver.observe(iframe)
         frameWindow.requestAnimationFrame(resize)
         setMapError(null)
-        setReady(true)
+        setReady3D(true)
       } catch (reason) {
         if (cancelled) return
         installing = false
         const message = reason instanceof Error ? reason.message : 'VWorld 지도를 초기화하지 못했습니다.'
-        setReady(false)
+        setReady3D(false)
         setMapError(message)
       }
     }
@@ -292,6 +471,16 @@ export function MapView({
       cancelled = true
       iframe.removeEventListener('load', onLoad)
       resizeObserver?.disconnect()
+      if (hoverCanvas && mapPointerMoveHandler) {
+        hoverCanvas.removeEventListener('pointermove', mapPointerMoveHandler)
+      }
+      if (hoverCanvas && mapPointerLeaveHandler) {
+        hoverCanvas.removeEventListener('pointerleave', mapPointerLeaveHandler)
+      }
+      if (hoverAnimationFrame) iframe.contentWindow?.cancelAnimationFrame(hoverAnimationFrame)
+      if (mapKeyDownDocument && mapKeyDownHandler) {
+        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler)
+      }
       if (runtime && mapClickHandler) {
         try {
           runtime.map.onClick.removeEventListener(mapClickHandler)
@@ -299,8 +488,8 @@ export function MapView({
           // The isolated iframe may already be leaving the document.
         }
       }
-      if (runtime && dataSources) {
-        Object.values(dataSources).forEach((source) => removeVWorldDataSource(runtime!, source))
+      if (runtime && sources) {
+        Object.values(sources).forEach((source) => removeVWorldDataSource(runtime!, source))
       }
       try {
         runtime?.map.clear()
@@ -308,148 +497,374 @@ export function MapView({
         // Removing the iframe releases the VWorld singleton and WebGL context.
       }
       if (runtimeRef.current === runtime) runtimeRef.current = null
-      if (dataSourcesRef.current === dataSources) dataSourcesRef.current = null
+      if (sourcesRef.current === sources) sourcesRef.current = null
       frameClickTargetsRef.current = new Map()
       overlayClickTargetsRef.current = new Map()
+      overlayHoverTargetsRef.current = new Map()
+      setMapHover(null)
+      setReady3D(false)
     }
-  }, [reloadToken])
+  }, [mapMode, reloadToken])
+
+  useEffect(() => {
+    if (mapMode !== '2d') return
+    const iframe = iframe2DRef.current
+    if (!iframe) return
+    let cancelled = false
+    let installing = false
+    let runtime: VWorld2DRuntime | null = null
+    let sources: VWorld2DSources | null = null
+    let resizeObserver: ResizeObserver | null = null
+    let mapClickHandler: ((event: { pixel?: unknown; coordinate?: unknown }) => void) | null = null
+    let mapPointerMoveHandler: ((event: { pixel?: unknown; coordinate?: unknown }) => void) | null = null
+    let mapKeyDownDocument: Document | null = null
+    let mapKeyDownHandler: ((event: KeyboardEvent) => void) | null = null
+
+    const install = async () => {
+      if (installing || cancelled) return
+      const frameWindow = iframe.contentWindow
+      if (!frameWindow || !iframe.contentDocument?.getElementById(VWORLD_2D_CONTAINER_ID)) return
+      installing = true
+      try {
+        if (!boot2DRef.current || boot2DRef.current.frameWindow !== frameWindow) {
+          boot2DRef.current = {
+            frameWindow,
+            promise: startVWorld2DMap(
+              frameWindow,
+              VWORLD_2D_CONTAINER_ID,
+              initialCameraRef.current,
+            ),
+          }
+        }
+        runtime = await boot2DRef.current.promise
+        // React Strict Mode can immediately clean up the first effect and let
+        // the second effect reuse this same boot promise. Do not destroy the
+        // shared runtime from the cancelled continuation; the active effect or
+        // iframe removal owns its lifecycle.
+        if (cancelled) return
+        sources = createVWorld2DSources(runtime)
+        if (cancelled) {
+          Object.values(sources).forEach((source) => removeVWorld2DDataSource(runtime!, source))
+          return
+        }
+        runtime2DRef.current = runtime
+        sources2DRef.current = sources
+        mapClickHandler = (event) => {
+          if (!runtime) return
+          const hoverTarget = vworld2DOverlayHoverTarget(runtime, event)
+          if (hoverTarget) {
+            const layerName = overlayRef.current?.layers.find(
+              (layer) => layer.id === hoverTarget.layerId,
+            )?.name ?? hoverTarget.layerId
+            const transient = mapHoverRef.current
+            setPinnedMapHover(
+              transient?.layerId === hoverTarget.layerId &&
+                String(transient.featureId) === String(hoverTarget.featureId)
+                ? transient
+                : {
+                    layerId: hoverTarget.layerId,
+                    layerName,
+                    featureId: hoverTarget.featureId,
+                    properties: hoverTarget.properties,
+                    x: hoverTarget.pixel[0],
+                    y: hoverTarget.pixel[1],
+                    viewportWidth: iframe.clientWidth,
+                    viewportHeight: iframe.clientHeight,
+                  },
+            )
+            return
+          }
+          setPinnedMapHover(null)
+          setMapHover(null)
+          handleVWorld2DClick(
+            runtime,
+            event,
+            {
+              onFrame: (frameId) => {
+                const frame = framesRef.current.find((candidate) => candidate.id === frameId)
+                if (frame) onSelectRef.current(frame)
+              },
+              onOverlay: (layerId, featureId) => {
+                overlayRef.current?.selectFeature({ layerId, featureId })
+              },
+            },
+            (coordinate) => {
+              const current = overlayRef.current
+              if (current?.pickMode) void current.applyPickedCoordinate(coordinate, 'wgs84')
+            },
+          )
+        }
+        runtime.map.on('singleclick', mapClickHandler)
+        mapPointerMoveHandler = (event) => {
+          if (!runtime) return
+          if (pinnedMapHoverRef.current) return
+          const target = vworld2DOverlayHoverTarget(runtime, event)
+          if (!target) {
+            setMapHover(null)
+            return
+          }
+          const layerName = overlayRef.current?.layers.find(
+            (layer) => layer.id === target.layerId,
+          )?.name ?? target.layerId
+          setMapHover({
+            layerId: target.layerId,
+            layerName,
+            featureId: target.featureId,
+            properties: target.properties,
+            x: target.pixel[0],
+            y: target.pixel[1],
+            viewportWidth: iframe.clientWidth,
+            viewportHeight: iframe.clientHeight,
+          })
+        }
+        runtime.map.on('pointermove', mapPointerMoveHandler)
+        mapKeyDownDocument = frameWindow.document
+        mapKeyDownHandler = (event) => {
+          if (event.key !== 'Escape' || !pinnedMapHoverRef.current) return
+          event.preventDefault()
+          setPinnedMapHover(null)
+          setMapHover(null)
+        }
+        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
+
+        const resize = () => runtime?.map.updateSize()
+        resizeObserver = new ResizeObserver(resize)
+        resizeObserver.observe(iframe)
+        frameWindow.requestAnimationFrame(resize)
+        setMapError(null)
+        setReady2D(true)
+      } catch (reason) {
+        if (cancelled) return
+        installing = false
+        setReady2D(false)
+        setMapError(
+          reason instanceof Error ? reason.message : 'VWorld 2D 일반지도를 초기화하지 못했습니다.',
+        )
+      }
+    }
+
+    const onLoad = () => void install()
+    iframe.addEventListener('load', onLoad)
+    if (iframe.contentDocument?.readyState === 'complete') void install()
+
+    return () => {
+      cancelled = true
+      iframe.removeEventListener('load', onLoad)
+      resizeObserver?.disconnect()
+      if (mapKeyDownDocument && mapKeyDownHandler) {
+        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler)
+      }
+      if (runtime && mapClickHandler) {
+        try {
+          runtime.map.un('singleclick', mapClickHandler)
+        } catch {
+          // The isolated 2D frame may already be leaving the document.
+        }
+      }
+      if (runtime && mapPointerMoveHandler) {
+        try {
+          runtime.map.un('pointermove', mapPointerMoveHandler)
+        } catch {
+          // The isolated 2D frame may already be leaving the document.
+        }
+      }
+      if (runtime && sources) {
+        Object.values(sources).forEach((source) => removeVWorld2DDataSource(runtime!, source))
+      }
+      if (runtime) destroyVWorld2DMap(runtime)
+      if (runtime2DRef.current === runtime) runtime2DRef.current = null
+      if (sources2DRef.current === sources) sources2DRef.current = null
+      setMapHover(null)
+      setReady2D(false)
+    }
+  }, [mapMode, reloadToken])
 
   useEffect(() => {
     const runtime = runtimeRef.current
-    const source = dataSourcesRef.current?.route
-    if (!runtime || !source || !ready) return
+    const source = sourcesRef.current?.route
+    if (!runtime || !source || !ready3D) return
     try {
       renderVWorldRoute(runtime, source, routeGeoJson)
     } catch (reason) {
-      setMapError(
-        reason instanceof Error ? reason.message : 'VWorld 지도 도형을 표시하지 못했습니다.',
-      )
+      setMapError(reason instanceof Error ? reason.message : 'VWorld 이동 경로를 갱신하지 못했습니다.')
     }
-  }, [ready, routeGeoJson])
+  }, [ready3D, routeGeoJson])
 
   useEffect(() => {
     const runtime = runtimeRef.current
-    const source = dataSourcesRef.current?.routeRange
-    if (!runtime || !source || !ready) return
+    const source = sourcesRef.current?.routeRange
+    if (!runtime || !source || !ready3D) return
     try {
       renderVWorldRouteRange(runtime, source, routeRangeGeoJson)
     } catch (reason) {
-      setMapError(
-        reason instanceof Error ? reason.message : 'VWorld 선택 구간을 표시하지 못했습니다.',
-      )
+      setMapError(reason instanceof Error ? reason.message : 'VWorld 선택 구간을 갱신하지 못했습니다.')
     }
-  }, [ready, routeRangeGeoJson])
+  }, [ready3D, routeRangeGeoJson])
 
   useEffect(() => {
     const runtime = runtimeRef.current
-    const source = dataSourcesRef.current?.frames
-    if (!runtime || !source || !ready) return
+    const source = sourcesRef.current?.frames
+    if (!runtime || !source || !ready3D) return
     try {
-      frameClickTargetsRef.current = renderVWorldFrames(
-        runtime,
-        source,
-        frameGeoJson,
-        (frameId) => {
-          const frame = framesRef.current.find((candidate) => candidate.id === frameId)
-          if (frame) onSelectRef.current(frame)
-        },
-      )
+      frameClickTargetsRef.current = renderVWorldFrames(runtime, source, frameGeoJson, (frameId) => {
+        const frame = framesRef.current.find((candidate) => candidate.id === frameId)
+        if (frame) onSelectRef.current(frame)
+      })
     } catch (reason) {
-      setMapError(
-        reason instanceof Error ? reason.message : 'VWorld 프레임을 표시하지 못했습니다.',
-      )
+      setMapError(reason instanceof Error ? reason.message : 'VWorld 프레임을 갱신하지 못했습니다.')
     }
-  }, [frameGeoJson, ready])
+  }, [frameGeoJson, ready3D])
 
   useEffect(() => {
     const runtime = runtimeRef.current
-    const source = dataSourcesRef.current?.overlay
-    if (!runtime || !source || !ready) return
+    const source = sourcesRef.current?.overlay
+    if (!runtime || !source || !ready3D) return
     try {
-      overlayClickTargetsRef.current = renderVWorldOverlay(
-        runtime,
-        source,
-        overlayGeoJson,
-        (layerId, featureId) => {
-          overlayRef.current?.selectFeature({ layerId, featureId })
-        },
-      )
+      const hoverTargets = new Map<string, VWorldOverlayHoverTarget>()
+      overlayClickTargetsRef.current = renderVWorldOverlay(runtime, source, overlayGeoJson, (layerId, featureId) => {
+        overlayRef.current?.selectFeature({ layerId, featureId })
+      }, hoverTargets)
+      overlayHoverTargetsRef.current = hoverTargets
     } catch (reason) {
-      setMapError(
-        reason instanceof Error ? reason.message : 'VWorld SHP 피처를 표시하지 못했습니다.',
-      )
+      setMapError(reason instanceof Error ? reason.message : 'VWorld SHP를 갱신하지 못했습니다.')
     }
-  }, [overlayGeoJson, ready])
+  }, [overlayGeoJson, ready3D])
 
   useEffect(() => {
-    const runtime = runtimeRef.current
-    if (!runtime || !ready || visibleRoute.length === 0) return
+    const runtime = runtime2DRef.current
+    const source = sources2DRef.current?.route
+    if (!runtime || !source || !ready2D) return
+    renderVWorld2DCollection(runtime, source, routeGeoJson, 'route')
+  }, [ready2D, routeGeoJson])
+
+  useEffect(() => {
+    const runtime = runtime2DRef.current
+    const source = sources2DRef.current?.routeRange
+    if (!runtime || !source || !ready2D) return
+    renderVWorld2DCollection(runtime, source, routeRangeGeoJson, 'route-range')
+  }, [ready2D, routeRangeGeoJson])
+
+  useEffect(() => {
+    const runtime = runtime2DRef.current
+    const source = sources2DRef.current?.frames
+    if (!runtime || !source || !ready2D) return
+    renderVWorld2DCollection(runtime, source, frameGeoJson, 'frame')
+  }, [frameGeoJson, ready2D])
+
+  useEffect(() => {
+    const runtime = runtime2DRef.current
+    const source = sources2DRef.current?.overlay
+    if (!runtime || !source || !ready2D) return
+    renderVWorld2DCollection(runtime, source, overlayGeoJson, 'overlay')
+  }, [overlayGeoJson, ready2D])
+
+  useEffect(() => {
+    if (!ready || visibleRoute.length === 0) return
     const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
     if (fittedRouteRef.current === routeKey) return
     fittedRouteRef.current = routeKey
-    moveVWorldMap(
-      runtime,
-      cameraTargetForCoordinates(
-        visibleRoute.map((point) => [point.lon, point.lat] as const),
-      ),
-    )
-  }, [displayAllTracks, effectiveTrackId, ready, visibleRoute])
+    const coordinates = visibleRoute.map((point) => [point.lon, point.lat] as const)
+    if (mapMode === '2d') {
+      const runtime = runtime2DRef.current
+      if (runtime) fitVWorld2DMap(runtime, coordinates)
+    } else {
+      const runtime = runtimeRef.current
+      if (runtime) setVWorldSceneMode(runtime, '3d', cameraTargetForCoordinates(coordinates))
+    }
+  }, [displayAllTracks, effectiveTrackId, mapMode, ready, visibleRoute])
 
   useEffect(() => {
-    const runtime = runtimeRef.current
-    if (!selectedFrame?.coordinate) {
-      selectedFrameRef.current = null
-      return
+    if (!ready || !selectedOverlayCoordinate) return
+    const target = {
+      ...selectedOverlayCoordinate,
+      height: mapMode === '2d' ? 650 : 180,
+      heading: 0,
+      tilt: mapMode === '2d' ? -90 : -64,
     }
-    if (selectedFrameRef.current === null) {
-      selectedFrameRef.current = selectedFrame.id
-      return
+    if (mapMode === '2d') {
+      const runtime = runtime2DRef.current
+      if (runtime) moveVWorld2DMap(runtime, target)
+    } else {
+      const runtime = runtimeRef.current
+      if (runtime) moveVWorldMap(runtime, target)
     }
-    if (!runtime || !ready || selectedFrameRef.current === selectedFrame.id) return
-    selectedFrameRef.current = selectedFrame.id
-    moveVWorldMap(runtime, {
-      lon: selectedFrame.coordinate.lon,
-      lat: selectedFrame.coordinate.lat,
-      height: 420,
-      heading: -(selectedFrame.heading ?? 0),
-      tilt: -65,
-    })
-  }, [ready, selectedFrame])
+  }, [mapMode, ready, selectedOverlayCoordinate])
 
   const recenter = () => {
-    const runtime = runtimeRef.current
-    if (!selectedFrame?.coordinate || !runtime) return
-    moveVWorldMap(runtime, {
-      lon: selectedFrame.coordinate.lon,
-      lat: selectedFrame.coordinate.lat,
-      height: 280,
-      heading: -(selectedFrame.heading ?? 0),
-      tilt: -62,
-    })
+    const target = frameNavigationTarget(selectedFrame, 'current-frame-button')
+    if (!target) return
+    if (mapMode === '2d') {
+      const runtime = runtime2DRef.current
+      if (runtime) moveVWorld2DMap(runtime, target)
+    } else {
+      const runtime = runtimeRef.current
+      if (runtime) setVWorldSceneMode(runtime, '3d', target)
+    }
   }
 
   const retry = () => {
     bootRef.current = null
+    boot2DRef.current = null
     fittedRouteRef.current = ''
     setMapError(null)
-    setReady(false)
+    setReady3D(false)
+    setReady2D(false)
     setReloadToken((value) => value + 1)
+  }
+
+  const changeMapMode = (mode: '2d' | '3d') => {
+    if (mode === mapMode) return
+    fittedRouteRef.current = ''
+    setMapError(null)
+    setMapHover(null)
+    setPinnedMapHover(null)
+    onMapModeChange(mode)
   }
 
   return (
     <div
+      ref={mapRootRef}
       className={`map-view ${highContrast ? 'high-contrast-mode' : ''}`}
-      data-map-provider="vworld-webgl-3.0"
+      data-map-provider={mapMode === '2d' ? 'vworld-2d-2.0' : 'vworld-webgl-3.0'}
       data-track-scope={displayAllTracks ? 'all' : effectiveTrackId ?? 'none'}
       data-route-feature-count={routeGeoJson.features.length}
       data-overlay-feature-count={overlayGeoJson.features.length}
+      data-map-mode={mapMode}
     >
-      <iframe
-        key={reloadToken}
-        ref={iframeRef}
-        className="map-container vworld-map-frame"
-        src={`${VWORLD_IFRAME_URL}?reload=${reloadToken}`}
-        title="VWorld WebGL 3D 지도"
+      {mapMode === '3d' && (
+        <iframe
+          key={`3d-${reloadToken}`}
+          ref={iframeRef}
+          className="map-container vworld-map-frame"
+          src={`${VWORLD_IFRAME_URL}?reload=${reloadToken}`}
+          title="VWorld WebGL 3D 지도"
+        />
+      )}
+      {mapMode === '2d' && (
+        <iframe
+          key={`2d-${reloadToken}`}
+          ref={iframe2DRef}
+          className="map-container vworld-map-frame"
+          src={`${VWORLD_2D_IFRAME_URL}?reload=${reloadToken}`}
+          title="VWorld 2D 일반지도"
+        />
+      )}
+      <OverlayHoverTooltip
+        hover={pinnedMapHover ?? mapHover}
+        pinned={Boolean(pinnedMapHover)}
+        onClose={() => {
+          setPinnedMapHover(null)
+          setMapHover(null)
+        }}
+        onDetails={(state) => {
+          const current = overlayRef.current
+          if (!current || !state.layerId) return
+          current.selectFeature(
+            { layerId: state.layerId, featureId: state.featureId },
+            { navigate: false },
+          )
+          openOverlayFeatureDetails(current.datasetId, state)
+        }}
       />
       {(!ready || loading) && !mapError && (
         <div className="map-loading" role="status">
@@ -470,6 +885,26 @@ export function MapView({
         </div>
       )}
       <div className="map-tools">
+        <div className="map-mode-switch" role="group" aria-label="지도 2D 3D 전환">
+          <button
+            type="button"
+            className={mapMode === '2d' ? 'active' : ''}
+            aria-pressed={mapMode === '2d'}
+            onClick={() => changeMapMode('2d')}
+            title="VWorld 2D 일반 도로지도"
+          >
+            <MapIcon size={16} /> 2D
+          </button>
+          <button
+            type="button"
+            className={mapMode === '3d' ? 'active' : ''}
+            aria-pressed={mapMode === '3d'}
+            onClick={() => changeMapMode('3d')}
+            title="VWorld 3D 지형"
+          >
+            <Box size={16} /> 3D
+          </button>
+        </div>
         <button type="button" onClick={recenter} disabled={!ready || !selectedFrame?.coordinate}>
           <Crosshair size={16} />
           현재 프레임
@@ -480,7 +915,9 @@ export function MapView({
         </button>
       </div>
       <div className="map-legend">
-        <span className="map-provider-badge">VWorld 3D</span>
+        <span className="map-provider-badge">
+          VWorld {mapMode === '2d' ? '2D 일반지도' : '3D'}
+        </span>
         <span>
           <i
             className="legend-route"

@@ -1,5 +1,6 @@
 import {
   Crosshair,
+  Copy,
   Download,
   Eye,
   EyeOff,
@@ -7,6 +8,7 @@ import {
   Layers3,
   LoaderCircle,
   MapPin,
+  Plus,
   RefreshCcw,
   Save,
   Table2,
@@ -14,7 +16,7 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { api } from '../lib/api'
 import type { OverlayEncoding, OverlayFeature, OverlayField } from '../types'
 import { useOverlayWorkspace } from './OverlayContext'
@@ -87,28 +89,41 @@ export function OverlayPanel({
   const [name, setName] = useState('')
   const [crs, setCrs] = useState('')
   const [encoding, setEncoding] = useState<OverlayEncoding>('auto')
-  const [activeLayerId, setActiveLayerId] = useState('')
   const [query, setQuery] = useState('')
   const [coordinateDraft, setCoordinateDraft] = useState(['', '', ''])
   const [propertyDraft, setPropertyDraft] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
+  const [metadataSaving, setMetadataSaving] = useState(false)
+  const [layerNameDraft, setLayerNameDraft] = useState('')
+  const [layerColorDraft, setLayerColorDraft] = useState('#2bcfa8')
   const [validationError, setValidationError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [uploadOpen, setUploadOpen] = useState(overlay.layers.length === 0)
+  const previousLayerCountRef = useRef(overlay.layers.length)
+  const appliedFocusLayerRef = useRef<string | undefined>(undefined)
 
   useEffect(() => {
-    if (overlay.selected?.layerId) {
-      setActiveLayerId(overlay.selected.layerId)
+    if (!focusLayerId) {
+      appliedFocusLayerRef.current = undefined
       return
     }
-    if (focusLayerId && overlay.layers.some((layer) => layer.id === focusLayerId)) {
-      setActiveLayerId(focusLayerId)
-      return
+    if (
+      appliedFocusLayerRef.current !== focusLayerId &&
+      overlay.layers.some((layer) => layer.id === focusLayerId)
+    ) {
+      appliedFocusLayerRef.current = focusLayerId
+      overlay.setActiveLayerId(focusLayerId)
     }
-    if (!overlay.layers.some((layer) => layer.id === activeLayerId)) {
-      setActiveLayerId(overlay.layers[0]?.id ?? '')
-    }
-  }, [activeLayerId, focusLayerId, overlay.layers, overlay.selected?.layerId])
+  }, [focusLayerId, overlay.layers, overlay.setActiveLayerId])
 
+  useEffect(() => {
+    const previousCount = previousLayerCountRef.current
+    previousLayerCountRef.current = overlay.layers.length
+    if (!overlay.layers.length) setUploadOpen(true)
+    else if (previousCount === 0) setUploadOpen(false)
+  }, [overlay.layers.length])
+
+  const activeLayerId = overlay.activeLayerId
   const activeLayer = overlay.layers.find((layer) => layer.id === activeLayerId) ?? null
   const datasetCollection = activeLayer
     ? overlay.features[activeLayer.id]?.dataset ?? null
@@ -137,17 +152,24 @@ export function OverlayPanel({
         .some((value) => value.toLocaleLowerCase('ko-KR').includes(normalized)),
     )
   }, [collection, query])
-  const shown = filtered.slice(0, 500)
-  const selected = overlay.selectedDatasetFeature
+  const shown = filtered
+  const selected =
+    overlay.selected?.layerId === activeLayerId ? overlay.selectedDatasetFeature : null
   const selectedIsPoint = selected?.geometry?.type === 'Point'
+  const movingSelected = overlay.pickTarget?.kind === 'move'
+
+  useEffect(() => {
+    setLayerNameDraft(activeLayer?.name ?? '')
+    setLayerColorDraft(activeLayer ? overlay.layerColor(activeLayer.id) : '#2bcfa8')
+  }, [activeLayer?.color, activeLayer?.id, activeLayer?.name, overlay.layerColor])
 
   useEffect(() => {
     if (activeLayerId) void overlay.ensureDatasetFeatures(activeLayerId)
   }, [activeLayerId, overlay.ensureDatasetFeatures])
 
   useEffect(() => {
-    if (selected && !selectedIsPoint && overlay.pickMode) overlay.setPickMode(false)
-  }, [overlay.pickMode, overlay.setPickMode, selected, selectedIsPoint])
+    if (selected && !selectedIsPoint && movingSelected) overlay.setPickMode(false)
+  }, [movingSelected, overlay.setPickMode, selected, selectedIsPoint])
 
   useEffect(() => {
     const coordinates = pointCoordinates(selected)
@@ -175,6 +197,7 @@ export function OverlayPanel({
       setFiles([])
       setName('')
       setCrs('')
+      setUploadOpen(false)
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : 'SHP 레이어를 등록하지 못했습니다.')
     }
@@ -186,6 +209,33 @@ export function OverlayPanel({
       await action()
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : '요청을 처리하지 못했습니다.')
+    }
+  }
+
+  const saveLayerMetadata = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!activeLayer) return
+    const nextName = layerNameDraft.trim()
+    const nextColor = layerColorDraft.toLowerCase()
+    if (!nextName) {
+      setActionError('레이어 이름을 입력해 주세요.')
+      return
+    }
+    if (!/^#[0-9a-f]{6}$/.test(nextColor)) {
+      setActionError('레이어 색상은 #RRGGBB 형식이어야 합니다.')
+      return
+    }
+    setMetadataSaving(true)
+    setActionError(null)
+    try {
+      await overlay.updateLayerMetadata(activeLayer.id, {
+        name: nextName,
+        color: nextColor,
+      })
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : '레이어 표시 설정을 저장하지 못했습니다.')
+    } finally {
+      setMetadataSaving(false)
     }
   }
 
@@ -251,6 +301,17 @@ export function OverlayPanel({
           <h2>SHP 레이어 · 속성표</h2>
         </div>
         <div className="overlay-panel-actions">
+          {overlay.layers.length > 0 && (
+            <button
+              type="button"
+              className={`button ${uploadOpen ? 'secondary' : 'primary'} compact overlay-add-layer`}
+              aria-expanded={uploadOpen}
+              aria-controls="overlay-upload-form"
+              onClick={() => setUploadOpen((value) => !value)}
+            >
+              <Plus size={15} /> {uploadOpen ? '업로드 닫기' : 'SHP 추가'}
+            </button>
+          )}
           {externalAction}
           <button type="button" className="icon-button" onClick={onClose} aria-label="SHP 패널 닫기">
             <X size={17} />
@@ -258,7 +319,7 @@ export function OverlayPanel({
         </div>
       </header>
 
-      <form className="overlay-upload" onSubmit={(event) => void submitUpload(event)}>
+      {uploadOpen && <form id="overlay-upload-form" className="overlay-upload" onSubmit={(event) => void submitUpload(event)}>
         <label className="overlay-file-drop">
           <Upload size={18} />
           <span>
@@ -292,8 +353,18 @@ export function OverlayPanel({
           레이어 등록
         </button>
         <small className="source-preserved">업로드 원본은 보존되고 수정 내용은 별도 편집본에 저장됩니다.</small>
-        {actionError && <small className="overlay-action-error">{actionError}</small>}
-      </form>
+      </form>}
+
+      {actionError && (
+        <small className="overlay-action-error overlay-global-error" role="alert">
+          {actionError}
+        </small>
+      )}
+      {overlay.pickTarget?.kind === 'create' && (
+        <small className="pick-instruction overlay-create-instruction" role="status">
+          지도·파노라마·3D 포인트 뷰에서 신규 피처 위치를 클릭하세요. Esc로 취소할 수 있습니다.
+        </small>
+      )}
 
       <div className="overlay-workspace-grid">
         <aside className="overlay-layer-list">
@@ -301,12 +372,50 @@ export function OverlayPanel({
             <span><Layers3 size={14} /> 레이어</span>
             <small>{overlay.layers.length}</small>
           </header>
+          {activeLayer && (
+            <form className="overlay-layer-settings" onSubmit={(event) => void saveLayerMetadata(event)}>
+              <label>
+                <span>레이어 이름</span>
+                <input
+                  aria-label="선택 레이어 이름"
+                  value={layerNameDraft}
+                  maxLength={120}
+                  onChange={(event) => setLayerNameDraft(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>표시 색상</span>
+                <span className="overlay-layer-color-input">
+                  <input
+                    type="color"
+                    aria-label="선택 레이어 색상"
+                    value={layerColorDraft}
+                    onChange={(event) => setLayerColorDraft(event.target.value)}
+                  />
+                  <code>{layerColorDraft.toUpperCase()}</code>
+                </span>
+              </label>
+              <button
+                type="submit"
+                className="button secondary compact"
+                disabled={
+                  metadataSaving ||
+                  (!layerNameDraft.trim() ||
+                    (layerNameDraft.trim() === activeLayer.name &&
+                      layerColorDraft.toLowerCase() === overlay.layerColor(activeLayer.id).toLowerCase()))
+                }
+              >
+                {metadataSaving ? <LoaderCircle className="spin" size={13} /> : <Save size={13} />}
+                이름·색상 저장
+              </button>
+            </form>
+          )}
           {overlay.layers.map((layer) => {
             const visible = overlay.visibleLayerIds.has(layer.id)
             const layerState = overlay.features[layer.id]
             return (
               <article key={layer.id} className={activeLayerId === layer.id ? 'active' : ''}>
-                <button type="button" className="overlay-layer-main" onClick={() => setActiveLayerId(layer.id)}>
+                <button type="button" className="overlay-layer-main" onClick={() => overlay.setActiveLayerId(layer.id)}>
                   <i style={{ background: overlay.layerColor(layer.id) }} />
                   <span>
                     <strong>{layer.name}</strong>
@@ -327,8 +436,15 @@ export function OverlayPanel({
                   </span>
                 </button>
                 <div>
-                  <button type="button" onClick={() => overlay.toggleLayer(layer.id)} title={visible ? '숨기기' : '표시'}>
+                  <button
+                    type="button"
+                    className={`layer-visibility-toggle ${visible ? 'active' : ''}`}
+                    aria-pressed={visible}
+                    onClick={() => overlay.toggleLayer(layer.id)}
+                    title={visible ? '지도·파노라마에서 숨기기' : '지도·파노라마에 표시'}
+                  >
                     {visible ? <Eye size={14} /> : <EyeOff size={14} />}
+                    {visible ? '표시 중' : '숨김'}
                   </button>
                   {layerState?.error && (
                     <button
@@ -366,6 +482,19 @@ export function OverlayPanel({
         <div className="overlay-table-area">
           <div className="overlay-table-toolbar">
             <span><Table2 size={14} /> 속성표</span>
+            <button
+              type="button"
+              className={`button compact ${overlay.pickTarget?.kind === 'create' && overlay.pickTarget.layerId === activeLayerId ? 'primary' : 'secondary'}`}
+              disabled={!activeLayer || activeLayer.geometry_type !== 'Point' || overlay.creatingFeature}
+              title={activeLayer?.geometry_type === 'Point' ? '뷰에서 클릭한 위치에 신규 Point 피처 추가' : 'Point 레이어에서만 신규 위치를 클릭해 추가할 수 있습니다.'}
+              onClick={() => {
+                if (!activeLayer || activeLayer.geometry_type !== 'Point') return
+                overlay.beginCreatePoint(activeLayer.id)
+                onClose()
+              }}
+            >
+              <Plus size={13} /> 신규 포인트
+            </button>
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="피처 검색" />
             <small>
               {filtered.length.toLocaleString('ko-KR')}
@@ -383,7 +512,7 @@ export function OverlayPanel({
                   <th>X</th>
                   <th>Y</th>
                   <th>Z</th>
-                  {fields.slice(0, 6).map((field) => <th key={field}>{field}</th>)}
+                  {fields.map((field) => <th key={field}>{field}</th>)}
                 </tr>
               </thead>
               <tbody>
@@ -396,19 +525,20 @@ export function OverlayPanel({
                     <tr
                       key={String(feature.id)}
                       className={isSelected ? 'selected' : ''}
+                      title="한 번 클릭해 선택 · 두 번 클릭해 지도와 파노라마로 이동"
                       onClick={() => overlay.selectFeature({ layerId: activeLayerId, featureId: feature.id })}
+                      onDoubleClick={onClose}
                     >
                       <td>{String(feature.id)}</td>
                       <td>{coordinates?.[0]?.toFixed(3) ?? '—'}</td>
                       <td>{coordinates?.[1]?.toFixed(3) ?? '—'}</td>
                       <td>{coordinates?.[2]?.toFixed(3) ?? '—'}</td>
-                      {fields.slice(0, 6).map((field) => <td key={field}>{displayValue(feature.properties[field])}</td>)}
+                      {fields.map((field) => <td key={field}>{displayValue(feature.properties[field])}</td>)}
                     </tr>
                   )
                 })}
               </tbody>
             </table>
-            {filtered.length > shown.length && <p className="overlay-table-limit">성능을 위해 검색 결과 중 첫 500행을 표시합니다.</p>}
             {moreFeaturesAvailable && datasetCollection && (
               <button
                 type="button"
@@ -456,14 +586,14 @@ export function OverlayPanel({
               </div>
               <button
                 type="button"
-                className={`button ${overlay.pickMode ? 'primary' : 'secondary'} overlay-pick-button`}
+                className={`button ${movingSelected ? 'primary' : 'secondary'} overlay-pick-button`}
                 disabled={!selectedIsPoint}
-                onClick={() => overlay.setPickMode(!overlay.pickMode)}
+                onClick={() => overlay.setPickMode(!movingSelected)}
               >
                 <Crosshair size={15} />
-                {overlay.pickMode ? '위치 지정 취소' : '뷰에서 실제 포인트 선택 (P)'}
+                {movingSelected ? '위치 지정 취소' : '뷰에서 실제 포인트 선택 (P)'}
               </button>
-              {overlay.pickMode && (
+              {movingSelected && (
                 <p className="pick-instruction">지도 위치 또는 파노라마/3D의 점군을 클릭하세요. Esc로 취소할 수 있습니다.</p>
               )}
               {!selectedIsPoint && (
@@ -504,6 +634,16 @@ export function OverlayPanel({
                 <button type="button" className="button primary" disabled={saving} onClick={() => void saveSelected()}>
                   {saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}
                   변경 저장
+                </button>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={overlay.creatingFeature || !selected.geometry}
+                  title="현재 피처의 위치만 복사하고 ID 외 속성은 공란으로 신규 추가"
+                  onClick={() => void performAction(overlay.copySelectedLocation)}
+                >
+                  {overlay.creatingFeature ? <LoaderCircle className="spin" size={14} /> : <Copy size={14} />}
+                  위치만 복사
                 </button>
                 <button
                   type="button"

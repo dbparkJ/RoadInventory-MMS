@@ -2,20 +2,23 @@ import {
   Bell,
   CircleHelp,
   CloudOff,
-  Database,
   ListChecks,
   Menu,
   Plus,
+  ScanSearch,
   Server,
   Settings2,
   Shapes,
+  SlidersHorizontal,
+  X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Brand } from './components/Brand'
 import { ActivityPanel, HelpPanel } from './components/ActivityHelpPanels'
 import { DatasetPanel } from './components/DatasetPanel'
-import { DetachablePanel } from './components/DetachablePanel'
+import { DetachablePanel, type DetachablePanelHandle } from './components/DetachablePanel'
 import { GeneralSettingsPanel } from './components/GeneralSettingsPanel'
+import { OVERLAY_DETAILS_EVENT } from './components/OverlayHoverTooltip'
 import { OverlayProvider } from './components/OverlayContext'
 import { OverlayPanel } from './components/OverlayPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
@@ -39,6 +42,7 @@ import type {
   Frame,
   FrameRange,
   ManualParameters,
+  OverlayFeature,
   RoutePoint,
   RunEvent,
   RunRecord,
@@ -64,10 +68,9 @@ function App() {
   const [routeLoading, setRouteLoading] = useState(false)
   const [panoramaOpen, setPanoramaOpen] = useState(false)
   const [pointCloudOpen, setPointCloudOpen] = useState(false)
-  const [inspectorOpen, setInspectorOpen] = useState(true)
-  const [inspectorDetached, setInspectorDetached] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDetached, setSettingsDetached] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<'general' | 'process'>('general')
   const [overlayOpen, setOverlayOpen] = useState(false)
   const [overlayDetached, setOverlayDetached] = useState(false)
   const [overlayFocusLayerId, setOverlayFocusLayerId] = useState('')
@@ -85,11 +88,24 @@ function App() {
   const [notificationLog, setNotificationLog] = useState<Toast[]>([])
   const { settings, updateSettings, resetSettings } = useUserSettings()
   const frameScopeRef = useRef('')
+  const pendingFrameFocusRef = useRef<{
+    datasetId: string
+    frame: Frame
+    offset: number
+  } | null>(null)
+  const overlayFocusRequestRef = useRef(0)
+  const overlayFocusControllerRef = useRef<AbortController | null>(null)
+  const overlayPanelRef = useRef<DetachablePanelHandle>(null)
+  const [frameFocusToken, setFrameFocusToken] = useState(0)
   frameScopeRef.current = `${datasetId}::${trackId}`
 
   const selectedDataset = datasets.find((dataset) => dataset.id === datasetId) ?? null
   const activeRuns = runs.filter((run) =>
     ['queued', 'preparing', 'running', 'cancelling'].includes(run.status),
+  )
+  const detectionRevisionKey = useMemo(
+    () => completedDetectionRevision(runs, datasetId),
+    [datasetId, runs],
   )
 
   const toast = useCallback((entry: Omit<Toast, 'id'>) => {
@@ -130,17 +146,125 @@ function App() {
         setTrackId('')
       }
       if (detail.layerId) setOverlayFocusLayerId(detail.layerId)
-      setOverlayOpen(true)
+      setDataPanelCollapsed(false)
     }
     window.addEventListener('mms-overlay-changed', openImportedOverlay)
     return () => window.removeEventListener('mms-overlay-changed', openImportedOverlay)
   }, [datasets])
 
   useEffect(() => {
-    const openSelectedOverlay = () => setOverlayOpen(true)
+    const openOverlayDetails = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          datasetId?: string
+          layerId?: string
+          featureId?: string | number
+        }>
+      ).detail
+      if (!detail?.layerId) return
+      if (
+        detail.datasetId &&
+        detail.datasetId !== datasetId &&
+        datasets.some((dataset) => dataset.id === detail.datasetId)
+      ) {
+        setDatasetId(detail.datasetId)
+        setTrackId('')
+      }
+      setOverlayFocusLayerId(detail.layerId)
+      setDataPanelCollapsed(false)
+      setOverlayOpen(true)
+      if (overlayDetached) overlayPanelRef.current?.focus()
+      else (document.defaultView ?? window).focus()
+    }
+    window.addEventListener(OVERLAY_DETAILS_EVENT, openOverlayDetails)
+    return () => window.removeEventListener(OVERLAY_DETAILS_EVENT, openOverlayDetails)
+  }, [datasetId, datasets, overlayDetached])
+
+  useEffect(() => {
+    const openSelectedOverlay = (event: Event) => {
+      setDataPanelCollapsed(false)
+      const detail = (
+        event as CustomEvent<{
+          datasetId?: string
+          selection?: { layerId: string; featureId: string | number }
+        }>
+      ).detail
+      if (
+        demoMode ||
+        !detail?.datasetId ||
+        detail.datasetId !== datasetId ||
+        !detail.selection
+      ) {
+        return
+      }
+      const requestId = overlayFocusRequestRef.current + 1
+      overlayFocusRequestRef.current = requestId
+      overlayFocusControllerRef.current?.abort()
+      const controller = new AbortController()
+      overlayFocusControllerRef.current = controller
+      void api
+        .overlayFeature(
+          detail.datasetId,
+          detail.selection.layerId,
+          detail.selection.featureId,
+          'dataset',
+          controller.signal,
+        )
+        .then((response) => {
+          const datasetPosition = overlayPointXY(response.feature)
+          const imageName = overlayImageName(response.feature.properties)
+          if (!datasetPosition && !imageName) {
+            // Road-ledger line/polygon layers are still valid table and map
+            // selections even though they have no single panorama target.
+            return null
+          }
+          return api.locateFrame(
+            detail.datasetId!,
+            {
+              ...(imageName ? { image_name: imageName } : {}),
+              ...(datasetPosition ? { dataset_position: datasetPosition } : {}),
+            },
+            controller.signal,
+          )
+        })
+        .then((located) => {
+          if (
+            !located ||
+            controller.signal.aborted ||
+            overlayFocusRequestRef.current !== requestId
+          ) return
+          pendingFrameFocusRef.current = {
+            datasetId: detail.datasetId!,
+            frame: located.frame,
+            offset: located.page_offset,
+          }
+          setFrameRange(null)
+          setTrackId(located.frame.track_id)
+          setSelectedFrame(located.frame)
+          setPanoramaOpen(true)
+          setFrameFocusToken((value) => value + 1)
+        })
+        .catch((reason: unknown) => {
+          if (controller.signal.aborted || overlayFocusRequestRef.current !== requestId) return
+          toast({
+            tone: 'error',
+            title: 'SHP 피처와 MMS 프레임을 연결하지 못했습니다',
+            message: reason instanceof Error ? reason.message : undefined,
+          })
+        })
+        .finally(() => {
+          if (overlayFocusControllerRef.current === controller) {
+            overlayFocusControllerRef.current = null
+          }
+        })
+    }
     window.addEventListener('mms-overlay-selected', openSelectedOverlay)
-    return () => window.removeEventListener('mms-overlay-selected', openSelectedOverlay)
-  }, [])
+    return () => {
+      window.removeEventListener('mms-overlay-selected', openSelectedOverlay)
+      overlayFocusControllerRef.current?.abort()
+      overlayFocusControllerRef.current = null
+    }
+  }, [datasetId, demoMode, toast])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -180,24 +304,34 @@ function App() {
       return
     }
     const controller = new AbortController()
+    const pendingFocus =
+      pendingFrameFocusRef.current?.datasetId === datasetId &&
+      pendingFrameFocusRef.current.frame.track_id === trackId
+        ? pendingFrameFocusRef.current
+        : null
+    const requestOffset = pendingFocus?.offset ?? 0
     setFrames([])
-    setSelectedFrame(null)
+    if (!pendingFocus) setSelectedFrame(null)
     setFrameNextOffset(null)
     setFrameTotal(0)
     setFramesLoadingMore(false)
     setFramesLoading(true)
     const frameRequest = demoMode
-      ? Promise.resolve(getDemoFrames(0, 240, trackId || undefined))
-      : api.frames(datasetId, 0, 240, trackId || undefined, controller.signal)
+      ? Promise.resolve(getDemoFrames(requestOffset, 240, trackId || undefined))
+      : api.frames(datasetId, requestOffset, 240, trackId || undefined, controller.signal)
     void frameRequest
       .then((page) => {
         setFrames(page.items)
         setFrameTotal(page.total)
         setFrameNextOffset(resolveNextOffset(page))
         setSelectedFrame((current) => {
+          if (pendingFocus) return page.items.find((frame) => frame.id === pendingFocus.frame.id) ?? pendingFocus.frame
           if (current && page.items.some((frame) => frame.id === current.id)) return current
           return page.items[0] ?? null
         })
+        if (pendingFocus && pendingFrameFocusRef.current === pendingFocus) {
+          pendingFrameFocusRef.current = null
+        }
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
@@ -214,7 +348,7 @@ function App() {
         if (!controller.signal.aborted) setFramesLoading(false)
       })
     return () => controller.abort()
-  }, [datasetId, demoMode, selectedDataset?.status, toast, trackId])
+  }, [datasetId, demoMode, frameFocusToken, selectedDataset?.status, toast, trackId])
 
   const loadMoreFrames = useCallback(async (): Promise<Frame[]> => {
     if (!datasetId || frameNextOffset === null || framesLoadingMore) return []
@@ -424,6 +558,26 @@ function App() {
     }
   }
 
+  const dismissRun = async (id: string) => {
+    try {
+      const detail = demoMode
+        ? '데모 실행 기록을 목록에서 제거했습니다. 산출물은 삭제하지 않았습니다.'
+        : (await api.deleteRun(id)).detail
+      setRuns((current) => current.filter((run) => run.id !== id))
+      toast({
+        tone: 'success',
+        title: '실행 기록을 목록에서 제거했습니다',
+        message: detail,
+      })
+    } catch (reason) {
+      toast({
+        tone: 'error',
+        title: '실행 기록을 제거하지 못했습니다',
+        message: reason instanceof Error ? reason.message : undefined,
+      })
+    }
+  }
+
   const acceptDataset = (dataset: DatasetDetail) => {
     setDemoMode(false)
     setConnectionIssue(null)
@@ -484,11 +638,7 @@ function App() {
 
   return (
     <OverlayProvider datasetId={datasetId} demoMode={demoMode} notify={toast}>
-      <div
-        className={`app-shell ${inspectorOpen ? '' : 'inspector-collapsed'} ${
-          dataPanelCollapsed ? 'data-collapsed' : ''
-        }`}
-      >
+      <div className={`app-shell ${dataPanelCollapsed ? 'data-collapsed' : ''}`}>
       <header className="topbar">
         <div className="topbar-left">
           <button type="button" className="icon-button mobile-menu">
@@ -508,20 +658,34 @@ function App() {
           <button
             type="button"
             className="queue-button overlay-button"
-            title="SHP 레이어와 검출 결과 검수"
-            aria-label="SHP 검수 열기"
+            title="SHP 업로드와 고급 편집 관리"
+            aria-label="SHP 관리 열기"
             aria-expanded={overlayOpen || overlayDetached}
             onClick={() => setOverlayOpen(true)}
           >
             <Shapes size={17} />
-            SHP 검수
+            SHP 관리
+          </button>
+          <button
+            type="button"
+            className="button primary compact detection-start-button"
+            onClick={() => {
+              setSettingsSection('process')
+              setSettingsOpen(true)
+            }}
+          >
+            <ScanSearch size={16} />
+            자동 검출
           </button>
           <button
             type="button"
             className="queue-button settings-button"
             title="일반 설정"
             aria-label="일반 설정 열기"
-            onClick={() => setSettingsOpen(true)}
+            onClick={() => {
+              setSettingsSection('general')
+              setSettingsOpen(true)
+            }}
           >
             <Settings2 size={17} />
             설정
@@ -587,6 +751,7 @@ function App() {
               frameTotal={frameTotal}
               hasMoreFrames={frameNextOffset !== null}
               frameRange={frameRange}
+              focusOverlayLayerId={overlayFocusLayerId}
               removingDataset={removingDatasetId === selectedDataset?.id}
               externalAction={action}
               collapsed={detached ? false : dataPanelCollapsed}
@@ -634,10 +799,10 @@ function App() {
               route={route}
               routeLoading={routeLoading}
               demoMode={demoMode}
+              detectionRevisionKey={detectionRevisionKey}
               panoramaOpen={panoramaOpen}
               pointCloudOpen={pointCloudOpen}
               hasMoreFrames={frameNextOffset !== null}
-              inspectorOpen={inspectorOpen}
               detached={detached}
               settings={settings}
               externalAction={action}
@@ -645,37 +810,13 @@ function App() {
               onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
               onFrameChange={setSelectedFrame}
               onMoveFrame={moveFrame}
-              onToggleInspector={() => setInspectorOpen((value) => !value)}
               onOpenSource={() => setSourceOpen(true)}
+              onOpenOverlay={() => setOverlayOpen(true)}
               onUseDemo={useDemo}
               onSettingsChange={updateSettings}
             />
           )}
         </DetachablePanel>
-        {(inspectorOpen || inspectorDetached) && (
-          <DetachablePanel
-            id="process-setup"
-            title="작업 설정"
-            placeholderClassName="inspector-slot"
-            hostHidden={!inspectorOpen && inspectorDetached}
-            onDetachedChange={(detached) => {
-              setInspectorDetached(detached)
-              if (!detached) setInspectorOpen(true)
-            }}
-          >
-            {({ action }) => (
-              <OptimizationPanel
-                dataset={selectedDataset}
-                selectedTrack={trackId}
-                frameRange={frameRange}
-                busy={submitting}
-                externalAction={action}
-                onStart={startRun}
-                onOptimize={optimize}
-              />
-            )}
-          </DetachablePanel>
-        )}
       </div>
 
       {(settingsOpen || settingsDetached) && (
@@ -692,18 +833,68 @@ function App() {
             placeholderClassName="settings-panel-slot"
             onDetachedChange={setSettingsDetached}
           >
-            {({ action, detached, returnToMain }) => (
-              <GeneralSettingsPanel
-                settings={settings}
-                externalAction={action}
-                onChange={updateSettings}
-                onReset={resetSettings}
-                onClose={() => {
-                  if (detached) returnToMain()
-                  setSettingsOpen(false)
-                }}
-              />
-            )}
+            {({ action, detached, returnToMain }) => {
+              const closeSettings = () => {
+                if (detached) returnToMain()
+                setSettingsOpen(false)
+              }
+              return (
+                <section className="settings-workspace" aria-label="설정 및 작업 설정">
+                  <nav className="settings-workspace-tabs" aria-label="설정 항목">
+                    <button
+                      type="button"
+                      className={settingsSection === 'general' ? 'active' : ''}
+                      aria-pressed={settingsSection === 'general'}
+                      onClick={() => setSettingsSection('general')}
+                    >
+                      <Settings2 size={15} /> 일반 설정
+                    </button>
+                    <button
+                      type="button"
+                      className={settingsSection === 'process' ? 'active' : ''}
+                      aria-pressed={settingsSection === 'process'}
+                      onClick={() => setSettingsSection('process')}
+                    >
+                      <SlidersHorizontal size={15} /> 작업 설정
+                    </button>
+                  </nav>
+                  <div className="settings-workspace-content">
+                    {settingsSection === 'general' ? (
+                      <GeneralSettingsPanel
+                        settings={settings}
+                        externalAction={action}
+                        onChange={updateSettings}
+                        onReset={resetSettings}
+                        onClose={closeSettings}
+                      />
+                    ) : (
+                      <OptimizationPanel
+                        dataset={selectedDataset}
+                        selectedTrack={trackId}
+                        frameRange={frameRange}
+                        busy={submitting}
+                        externalAction={
+                          <>
+                            {action}
+                            <button
+                              type="button"
+                              className="icon-button"
+                              aria-label="작업 설정 닫기"
+                              title="작업 설정 닫기"
+                              onClick={closeSettings}
+                            >
+                              <X size={16} />
+                            </button>
+                          </>
+                        }
+                        onStart={startRun}
+                        onOptimize={optimize}
+                      />
+                    )}
+                  </div>
+                </section>
+              )
+            }}
           </DetachablePanel>
         </div>
       )}
@@ -717,6 +908,7 @@ function App() {
           }}
         >
           <DetachablePanel
+            ref={overlayPanelRef}
             id="shp-overlay-manager"
             title="SHP 레이어 · 속성표"
             placeholderClassName="overlay-panel-slot"
@@ -808,11 +1000,25 @@ function App() {
         onDatasetReady={acceptDataset}
         onUseDemo={useDemo}
       />
-      <RunQueue runs={runs} open={queueOpen} onClose={() => setQueueOpen(false)} onCancel={cancelRun} />
+      <RunQueue
+        runs={runs}
+        open={queueOpen}
+        onClose={() => setQueueOpen(false)}
+        onCancel={cancelRun}
+        onDelete={dismissRun}
+      />
       <ToastRegion toasts={toasts} dismiss={dismissToast} />
       </div>
     </OverlayProvider>
   )
+}
+
+export function completedDetectionRevision(runs: RunRecord[], datasetId: string): string {
+  return runs
+    .filter((run) => run.dataset_id === datasetId && run.status === 'completed')
+    .map((run) => `${run.created_at}:${run.id}:${run.finished_at ?? ''}`)
+    .sort()
+    .join('|')
 }
 
 function updateRunFromEvent(current: RunRecord[], runId: string, event: RunEvent): RunRecord[] {
@@ -841,6 +1047,24 @@ function updateRunFromEvent(current: RunRecord[], runId: string, event: RunEvent
         : {}),
     }
   })
+}
+
+function overlayImageName(properties: Record<string, unknown>): string | undefined {
+  const aliases = new Set(['img_name', 'image_name', 'image', 'filename'])
+  const match = Object.entries(properties).find(([key, value]) => {
+    return aliases.has(key.toLocaleLowerCase('en-US')) && String(value ?? '').trim().length > 0
+  })
+  return match ? String(match[1]).trim().split(/[\\/]/).at(-1) : undefined
+}
+
+function overlayPointXY(feature: OverlayFeature): [number, number] | undefined {
+  if (feature.geometry?.type !== 'Point' || !Array.isArray(feature.geometry.coordinates)) {
+    return undefined
+  }
+  const [x, y] = feature.geometry.coordinates
+  return Number.isFinite(Number(x)) && Number.isFinite(Number(y))
+    ? [Number(x), Number(y)]
+    : undefined
 }
 
 function resolveNextOffset(page: {

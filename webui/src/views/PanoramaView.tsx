@@ -15,9 +15,15 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import demoPanorama from '../assets/demo-panorama.svg'
+import {
+  openOverlayFeatureDetails,
+  OverlayHoverTooltip,
+  type OverlayHoverState,
+} from '../components/OverlayHoverTooltip'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
+import { panoramaUvToSpherePosition, type PanoramaHoverProjection } from '../lib/panoramaProjection'
 import type { PanoramaQuality } from '../lib/userSettings'
 import type { Frame, PanoramaOverlayFeature, PanoramaPointPayload } from '../types'
 
@@ -101,15 +107,199 @@ function createPanoramaPointTexture(
   return texture
 }
 
-interface RenderPanoramaOverlayPoint extends PanoramaOverlayFeature {
+export interface RenderPanoramaOverlayPoint extends PanoramaOverlayFeature {
   layerId: string
+  layerName: string
   color: string
   selected: boolean
+  detectionBox?: PanoramaDetectionBox | null
+}
+
+export interface RenderPanoramaDetectionBox {
+  sourceId: string
+  observationId: string
+  featureId?: string | number
+  layerId?: string
+  layerName: string
+  properties: Record<string, unknown>
+  color: string
+  selected: boolean
+  detectionBox: PanoramaDetectionBox
+}
+
+const DETECTION_SOURCE_COLORS = ['#ffb84d', '#4dd9ff', '#ff6f91', '#7ee787', '#c59cff']
+
+export function panoramaDetectionSourceColor(sourceId: string): string {
+  let hash = 0
+  for (let index = 0; index < sourceId.length; index += 1) {
+    hash = ((hash * 31) + sourceId.charCodeAt(index)) >>> 0
+  }
+  return DETECTION_SOURCE_COLORS[hash % DETECTION_SOURCE_COLORS.length]
+}
+
+export interface PanoramaOverlayHit {
+  layerId?: string
+  layerName: string
+  featureId: string | number
+  properties: Record<string, unknown>
+}
+
+export function panoramaDetectionPointRadius(selected: boolean, depth: number): number {
+  if (selected) return 3.5
+  return depth < 20 ? 2 : 1.5
+}
+
+export interface PanoramaDetectionBox {
+  left: number
+  top: number
+  right: number
+  bottom: number
+  panoramaWidth: number
+  panoramaHeight: number
+  label: string
+}
+
+function propertyValue(
+  properties: Record<string, unknown> | undefined,
+  ...names: string[]
+): unknown {
+  if (!properties) return undefined
+  const normalized = new Map(
+    Object.entries(properties).map(([key, value]) => [key.toLocaleLowerCase('en-US'), value]),
+  )
+  for (const name of names) {
+    const value = normalized.get(name.toLocaleLowerCase('en-US'))
+    if (value !== undefined && value !== null && value !== '') return value
+  }
+  return undefined
+}
+
+function finiteProperty(
+  properties: Record<string, unknown> | undefined,
+  ...names: string[]
+): number | null {
+  const value = Number(propertyValue(properties, ...names))
+  return Number.isFinite(value) ? value : null
+}
+
+function baseImageName(value: unknown): string {
+  return String(value ?? '')
+    .trim()
+    .split(/[?#]/, 1)[0]
+    .split(/[\\/]/)
+    .at(-1)
+    ?.normalize('NFC')
+    .toLocaleLowerCase('en-US') ?? ''
+}
+
+function imageNamesMatch(source: unknown, current: unknown): boolean {
+  const sourceName = baseImageName(source)
+  const currentName = baseImageName(current)
+  if (!sourceName || !currentName) return false
+  if (sourceName === currentName) return true
+  const sourceStem = sourceName.replace(/\.[^.]+$/, '')
+  const currentStem = currentName.replace(/\.[^.]+$/, '')
+  return sourceStem === currentStem
+}
+
+function finiteTuple(value: unknown): [number, number, number, number] | null {
+  let candidate = value
+  if (typeof candidate === 'string') {
+    const text = candidate.trim()
+    if (!text) return null
+    try {
+      candidate = JSON.parse(text)
+    } catch {
+      candidate = text.split(/[\s,;]+/)
+    }
+  }
+  if (!Array.isArray(candidate) || candidate.length !== 4) return null
+  const tuple = candidate.map(Number)
+  return tuple.every(Number.isFinite)
+    ? tuple as [number, number, number, number]
+    : null
+}
+
+export function panoramaDetectionBox(
+  properties: Record<string, unknown> | undefined,
+  currentImageName?: string,
+): PanoramaDetectionBox | null {
+  const sourceImage = baseImageName(
+    propertyValue(
+      properties,
+      'img_name',
+      'image_name',
+      'image',
+      'filename',
+      'image_path',
+      'img_path',
+      'source_image',
+    ),
+  )
+  if (currentImageName && sourceImage && !imageNamesMatch(sourceImage, currentImageName)) return null
+  const tuple = finiteTuple(propertyValue(properties, 'bbox_xyxy', 'bbox', 'box_xyxy'))
+  const left = tuple?.[0] ?? finiteProperty(properties, 'bbox_l', 'bbox_left', 'x1', 'xmin')
+  const top = tuple?.[1] ?? finiteProperty(properties, 'bbox_t', 'bbox_top', 'y1', 'ymin')
+  const right = tuple?.[2] ?? finiteProperty(properties, 'bbox_r', 'bbox_right', 'x2', 'xmax')
+  const bottom = tuple?.[3] ?? finiteProperty(properties, 'bbox_b', 'bbox_bottom', 'y2', 'ymax')
+  const panoramaWidth = finiteProperty(
+    properties,
+    'pano_w',
+    'panorama_width',
+    'image_width',
+    'img_width',
+    'img_w',
+    'orig_w',
+    'width_px',
+  )
+  const panoramaHeight = finiteProperty(
+    properties,
+    'pano_h',
+    'panorama_height',
+    'image_height',
+    'img_height',
+    'img_h',
+    'orig_h',
+    'height_px',
+  )
+  if (
+    left === null ||
+    top === null ||
+    right === null ||
+    bottom === null ||
+    panoramaWidth === null ||
+    panoramaHeight === null ||
+    panoramaWidth <= 0 ||
+    panoramaHeight <= 0 ||
+    right <= left ||
+    bottom <= top
+  ) {
+    return null
+  }
+  const className = String(
+    propertyValue(properties, 'class_nm', 'class_name', 'class', 'label') ?? '검출 객체',
+  )
+  const confidence = finiteProperty(properties, 'conf', 'confidence')
+  const confidencePercent = confidence === null
+    ? null
+    : confidence <= 1
+      ? confidence * 100
+      : confidence
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    panoramaWidth,
+    panoramaHeight,
+    label: confidencePercent === null ? className : `${className} ${Math.round(confidencePercent)}%`,
+  }
 }
 
 function createPanoramaOverlayTexture(
   ownerDocument: Document,
   points: RenderPanoramaOverlayPoint[],
+  detectionBoxes: RenderPanoramaDetectionBox[],
 ): THREE.CanvasTexture {
   const width = 2048
   const height = 1024
@@ -119,19 +309,48 @@ function createPanoramaOverlayTexture(
   const context = canvas.getContext('2d')
   if (!context) throw new Error('SHP 오버레이 캔버스를 만들 수 없습니다.')
 
+  const boxes = [
+    ...points.filter((point) => point.detectionBox),
+    ...detectionBoxes,
+  ]
+  boxes.forEach((point) => {
+    const box = point.detectionBox
+    if (!box) return
+    const left = (box.left / box.panoramaWidth) * width
+    const top = (box.top / box.panoramaHeight) * height
+    const boxWidth = ((box.right - box.left) / box.panoramaWidth) * width
+    const boxHeight = ((box.bottom - box.top) / box.panoramaHeight) * height
+    if (boxWidth <= 0 || boxHeight <= 0 || boxWidth > width * 0.75) return
+    context.lineWidth = point.selected ? 5 : 3
+    context.strokeStyle = point.selected ? '#ffffff' : point.color
+    context.font = `700 ${point.selected ? 18 : 15}px Pretendard, sans-serif`
+    context.textBaseline = 'bottom'
+    ;[-width, 0, width].forEach((shift) => {
+      const x = left + shift
+      if (x + boxWidth < 0 || x > width) return
+      context.strokeRect(x, top, boxWidth, boxHeight)
+      const labelWidth = Math.min(boxWidth, context.measureText(box.label).width + 12)
+      const labelTop = Math.max(0, top - 24)
+      context.fillStyle = point.selected ? '#ffffff' : point.color
+      context.fillRect(x, labelTop, labelWidth, 24)
+      context.fillStyle = '#061018'
+      context.fillText(box.label, x + 6, labelTop + 20, Math.max(0, labelWidth - 10))
+    })
+  })
+
   points.forEach((point) => {
     const x = (((point.u % 1) + 1) % 1) * width
     const y = Math.min(1, Math.max(0, point.v)) * height
-    const radius = point.selected ? 11 : point.depth < 20 ? 8 : 6
+    const radius = panoramaDetectionPointRadius(point.selected, point.depth)
     context.beginPath()
-    context.arc(x, y, radius + 3, 0, Math.PI * 2)
+    context.arc(x, y, radius + 1.25, 0, Math.PI * 2)
     context.fillStyle = point.selected ? '#ffffff' : 'rgba(7, 17, 31, 0.9)'
     context.fill()
     context.beginPath()
     context.arc(x, y, radius, 0, Math.PI * 2)
     context.fillStyle = point.color
     context.fill()
-    context.lineWidth = 2
+    context.lineWidth = 1
     context.strokeStyle = '#ffffff'
     context.stroke()
   })
@@ -149,6 +368,186 @@ function wrappedUVDistanceSquared(u: number, v: number, targetU: number, targetV
   const directU = Math.abs(u - targetU)
   const wrappedU = Math.min(directU, 1 - Math.min(1, directU))
   return wrappedU * wrappedU + (v - targetV) * (v - targetV)
+}
+
+export function panoramaDetectionBoxContainsUv(
+  box: PanoramaDetectionBox,
+  u: number,
+  v: number,
+): boolean {
+  const x = (((u % 1) + 1) % 1) * box.panoramaWidth
+  const y = Math.min(1, Math.max(0, v)) * box.panoramaHeight
+  if (y < box.top || y > box.bottom) return false
+  return [-box.panoramaWidth, 0, box.panoramaWidth].some((shift) => {
+    const shiftedX = x + shift
+    return shiftedX >= box.left && shiftedX <= box.right
+  })
+}
+
+export function panoramaOverlayAtUv(
+  points: RenderPanoramaOverlayPoint[],
+  u: number,
+  v: number,
+  detectionBoxes: RenderPanoramaDetectionBox[] = [],
+): PanoramaOverlayHit | null {
+  let boxed: PanoramaOverlayHit | null = null
+  let boxedArea = Number.POSITIVE_INFINITY
+  detectionBoxes.forEach((observation) => {
+    if (!panoramaDetectionBoxContainsUv(observation.detectionBox, u, v)) return
+    const area = (
+      (observation.detectionBox.right - observation.detectionBox.left)
+      * (observation.detectionBox.bottom - observation.detectionBox.top)
+    )
+    if (area < boxedArea) {
+      boxed = {
+        ...(observation.featureId === undefined ? {} : { layerId: observation.layerId }),
+        layerName: observation.layerName,
+        featureId: observation.featureId ?? observation.observationId,
+        properties: observation.properties,
+      }
+      boxedArea = area
+    }
+  })
+  points.forEach((point) => {
+    const box = point.detectionBox
+    if (!box || !panoramaDetectionBoxContainsUv(box, u, v)) return
+    const area = (box.right - box.left) * (box.bottom - box.top)
+    if (area < boxedArea) {
+      boxed = {
+        layerId: point.layerId,
+        layerName: point.layerName,
+        featureId: point.feature_id,
+        properties: point.properties ?? {},
+      }
+      boxedArea = area
+    }
+  })
+  if (boxed) return boxed
+
+  let nearest: PanoramaOverlayHit | null = null
+  let nearestDistance = 0.025 ** 2
+  points.forEach((point) => {
+    const distance = wrappedUVDistanceSquared(u, v, point.u, point.v)
+    if (distance <= nearestDistance) {
+      nearestDistance = distance
+      nearest = {
+        layerId: point.layerId,
+        layerName: point.layerName,
+        featureId: point.feature_id,
+        properties: point.properties ?? {},
+      }
+    }
+  })
+  return nearest
+}
+
+export function deduplicatePanoramaDetectionBoxes(
+  boxes: RenderPanoramaDetectionBox[],
+): RenderPanoramaDetectionBox[] {
+  const seen = new Set<string>()
+  return boxes.filter((box) => {
+    const { left, top, right, bottom, panoramaWidth, panoramaHeight, label } = box.detectionBox
+    // The same run/model result SHP can be opened more than once. Collapse
+    // identical observations across those layers, while retaining coincident
+    // detections produced by a different model or run.
+    const key = [
+      box.sourceId,
+      box.observationId,
+      left,
+      top,
+      right,
+      bottom,
+      panoramaWidth,
+      panoramaHeight,
+      label,
+    ].join(':')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function normalizedPropertyText(
+  properties: Record<string, unknown> | undefined,
+  ...names: string[]
+): string {
+  return String(propertyValue(properties, ...names) ?? '')
+    .trim()
+    .normalize('NFC')
+    .toLocaleLowerCase('en-US')
+}
+
+function optionalPropertiesMatch(
+  left: Record<string, unknown> | undefined,
+  right: Record<string, unknown> | undefined,
+  ...names: string[]
+): boolean {
+  const leftValue = normalizedPropertyText(left, ...names)
+  const rightValue = normalizedPropertyText(right, ...names)
+  return !leftValue || !rightValue || leftValue === rightValue
+}
+
+function panoramaDetectionBoxesMatch(
+  left: PanoramaDetectionBox,
+  right: PanoramaDetectionBox,
+): boolean {
+  const width = Math.max(left.panoramaWidth, right.panoramaWidth)
+  const height = Math.max(left.panoramaHeight, right.panoramaHeight)
+  if (
+    Math.abs(left.panoramaWidth - right.panoramaWidth) > Math.max(1, width * 0.0001)
+    || Math.abs(left.panoramaHeight - right.panoramaHeight) > Math.max(1, height * 0.0001)
+  ) return false
+  const tolerance = Math.max(1, width * 0.0001, height * 0.0001)
+  if (
+    Math.abs(left.top - right.top) > tolerance
+    || Math.abs(left.bottom - right.bottom) > tolerance
+  ) return false
+  return [-width, 0, width].some((shift) => (
+    Math.abs(left.left + shift - right.left) <= tolerance
+    && Math.abs(left.right + shift - right.right) <= tolerance
+  ))
+}
+
+/**
+ * Attach a raw per-model observation to its representative visible SHP
+ * feature. The raw box remains the sole visual rectangle, but hit-testing can
+ * still open the layer's feature details. Coincident observations from another
+ * model are not linked unless their identity/metadata is compatible.
+ */
+export function reconcilePanoramaDetectionBoxes(
+  boxes: RenderPanoramaDetectionBox[],
+  points: RenderPanoramaOverlayPoint[],
+): RenderPanoramaDetectionBox[] {
+  return boxes.map((box) => {
+    const detectionId = normalizedPropertyText(box.properties, 'det_id', 'detection_id')
+    const representative = points.find((point) => {
+      const properties = point.properties
+      const pointDetectionId = normalizedPropertyText(properties, 'det_id', 'detection_id')
+      if (detectionId && pointDetectionId && detectionId !== pointDetectionId) return false
+      if (!optionalPropertiesMatch(box.properties, properties, 'model_nm', 'model_name')) return false
+      if (!optionalPropertiesMatch(box.properties, properties, 'img_name', 'image_name')) return false
+      if (!optionalPropertiesMatch(box.properties, properties, 'class_nm', 'class_name')) return false
+
+      const boxesMatch = point.detectionBox
+        ? panoramaDetectionBoxesMatch(box.detectionBox, point.detectionBox)
+        : false
+      if (detectionId && pointDetectionId) {
+        return point.detectionBox ? boxesMatch : true
+      }
+      return boxesMatch
+    })
+    if (!representative) return box
+    return {
+      ...box,
+      featureId: representative.feature_id,
+      layerId: representative.layerId,
+      layerName: representative.layerName,
+      properties: {
+        ...box.properties,
+        ...(representative.properties ?? {}),
+      },
+    }
+  })
 }
 
 export function nearestPanoramaPointIndex(
@@ -186,6 +585,7 @@ export default function PanoramaView({
   datasetId,
   frame,
   demoMode,
+  detectionRevisionKey = '',
   onPreviousFrame,
   onNextFrame,
   hasPreviousFrame = true,
@@ -195,12 +595,15 @@ export default function PanoramaView({
   onQualityChange,
   pointOverlayEnabled: controlledPointOverlayEnabled,
   panoramaOpacity: controlledPanoramaOpacity,
+  maxOverlayDistanceM = 45,
+  linkedHoverPoint = null,
   onPointOverlayEnabledChange,
   onPanoramaOpacityChange,
 }: {
   datasetId: string
   frame: Frame | null
   demoMode: boolean
+  detectionRevisionKey?: string
   onPreviousFrame?: () => void
   onNextFrame?: () => void
   hasPreviousFrame?: boolean
@@ -210,11 +613,18 @@ export default function PanoramaView({
   onQualityChange?: (quality: PanoramaQuality) => void
   pointOverlayEnabled?: boolean
   panoramaOpacity?: number
+  maxOverlayDistanceM?: number
+  linkedHoverPoint?: PanoramaHoverProjection | null
   onPointOverlayEnabledChange?: (enabled: boolean) => void
   onPanoramaOpacityChange?: (opacity: number) => void
 }) {
   const overlay = useOptionalOverlayWorkspace()
   const stageRef = useRef<HTMLDivElement>(null)
+  const linkedPointMarkerRef = useRef<HTMLDivElement>(null)
+  const linkedHoverPointRef = useRef(linkedHoverPoint)
+  const currentFrameIdRef = useRef(frame?.id)
+  const hoverFrameRef = useRef(0)
+  const pendingHoverRef = useRef<{ x: number; y: number } | null>(null)
   const [source, setSource] = useState<string | null>(demoMode ? demoPanorama : null)
   const [loading, setLoading] = useState(!demoMode)
   const [error, setError] = useState<string | null>(null)
@@ -230,17 +640,26 @@ export default function PanoramaView({
   const [pointError, setPointError] = useState<string | null>(null)
   const [pointReloadKey, setPointReloadKey] = useState(0)
   const [overlayProjection, setOverlayProjection] = useState<RenderPanoramaOverlayPoint[]>([])
+  const [detectionBoxes, setDetectionBoxes] = useState<RenderPanoramaDetectionBox[]>([])
+  const [detectionLoading, setDetectionLoading] = useState(false)
+  const [detectionError, setDetectionError] = useState<string | null>(null)
   const [overlayLoading, setOverlayLoading] = useState(false)
   const [pickFeedback, setPickFeedback] = useState<string | null>(null)
+  const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
+  const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
   const runtimeRef = useRef<PanoramaRuntime | null>(null)
   const quality = controlledQuality ?? localQuality
   const pointOverlayEnabled = controlledPointOverlayEnabled ?? localPointOverlayEnabled
   const panoramaOpacity = controlledPanoramaOpacity ?? localPanoramaOpacity
   const pointPayloadRequired = pointOverlayEnabled || Boolean(overlay?.pickMode)
-  const hasVisualOverlay = pointOverlayEnabled || overlayProjection.length > 0
-  const effectivePanoramaOpacity = hasVisualOverlay ? panoramaOpacity : 1
+  const hasVisualOverlay = pointOverlayEnabled || overlayProjection.length > 0 || detectionBoxes.length > 0
+  // SHP markers are already composited with a transparent texture. Only the
+  // dense point-cloud overlay may dim the camera image at the user's request.
+  const effectivePanoramaOpacity = pointOverlayEnabled ? panoramaOpacity : 1
   const panoramaOpacityRef = useRef(effectivePanoramaOpacity)
   panoramaOpacityRef.current = effectivePanoramaOpacity
+  linkedHoverPointRef.current = linkedHoverPoint
+  currentFrameIdRef.current = frame?.id
   const viewRef = useRef({ fov, yaw, pitch })
   viewRef.current = { fov, yaw, pitch }
   const [dragStart, setDragStart] = useState<{ x: number; y: number; yaw: number; pitch: number } | null>(
@@ -249,7 +668,10 @@ export default function PanoramaView({
   const [reloadKey, setReloadKey] = useState(0)
   const overlayActionsRef = useRef({
     pickMode: false,
-    selectFeature: (_selection: { layerId: string; featureId: string | number } | null) => {},
+    selectFeature: (
+      _selection: { layerId: string; featureId: string | number } | null,
+      _options?: { navigate?: boolean },
+    ) => {},
     applyPickedCoordinate: async (
       _coordinates: [number, number, number?],
       _coordinateSpace: 'dataset',
@@ -274,6 +696,12 @@ export default function PanoramaView({
     .join('|')
 
   useEffect(() => {
+    const ownerWindow = stageRef.current?.ownerDocument.defaultView
+    if (hoverFrameRef.current && ownerWindow) ownerWindow.cancelAnimationFrame(hoverFrameRef.current)
+    hoverFrameRef.current = 0
+    pendingHoverRef.current = null
+    setOverlayHover(null)
+    setPinnedOverlayHover(null)
     setFov(72)
     setYaw(panoramaForwardYaw(forwardOffsetDeg))
     setPitch(0)
@@ -317,19 +745,46 @@ export default function PanoramaView({
     scene.add(panoramaMesh)
     runtimeRef.current = { scene, camera, renderer, panoramaMesh, panoramaMaterial }
 
+    const ownerWindow = host.ownerDocument.defaultView ?? window
+    const markerPosition = new THREE.Vector3()
+    const cameraForward = new THREE.Vector3()
     let raf = 0
     const draw = () => {
       const phi = THREE.MathUtils.degToRad(90 - viewRef.current.pitch)
       const theta = THREE.MathUtils.degToRad(viewRef.current.yaw)
       camera.fov = viewRef.current.fov
       camera.updateProjectionMatrix()
-      camera.lookAt(
-        10 * Math.sin(phi) * Math.cos(theta),
-        10 * Math.cos(phi),
-        10 * Math.sin(phi) * Math.sin(theta),
+      cameraForward.set(
+        Math.sin(phi) * Math.cos(theta),
+        Math.cos(phi),
+        Math.sin(phi) * Math.sin(theta),
       )
+      camera.lookAt(cameraForward.x * 10, cameraForward.y * 10, cameraForward.z * 10)
       renderer.render(scene, camera)
-      raf = requestAnimationFrame(draw)
+      const marker = linkedPointMarkerRef.current
+      const linked = linkedHoverPointRef.current
+      const spherePosition = linked && linked.frameId === currentFrameIdRef.current
+        ? panoramaUvToSpherePosition(linked.u, linked.v)
+        : null
+      if (marker && spherePosition) {
+        markerPosition.set(...spherePosition)
+        const inFront = markerPosition.dot(cameraForward) > 0
+        markerPosition.project(camera)
+        const visible =
+          inFront &&
+          markerPosition.z >= -1 &&
+          markerPosition.z <= 1 &&
+          Math.abs(markerPosition.x) <= 1.05 &&
+          Math.abs(markerPosition.y) <= 1.05
+        marker.hidden = !visible
+        if (visible) {
+          marker.style.left = `${(markerPosition.x * 0.5 + 0.5) * renderer.domElement.clientWidth}px`
+          marker.style.top = `${(-markerPosition.y * 0.5 + 0.5) * renderer.domElement.clientHeight}px`
+        }
+      } else if (marker) {
+        marker.hidden = true
+      }
+      raf = ownerWindow.requestAnimationFrame(draw)
     }
     draw()
 
@@ -342,7 +797,7 @@ export default function PanoramaView({
     })
     observer.observe(host)
     return () => {
-      cancelAnimationFrame(raf)
+      ownerWindow.cancelAnimationFrame(raf)
       observer.disconnect()
       if (runtimeRef.current?.scene === scene) runtimeRef.current = null
       panoramaGeometry.dispose()
@@ -473,13 +928,16 @@ export default function PanoramaView({
               layer.id,
               frame.id,
               controller.signal,
+              maxOverlayDistanceM,
             )
             const color = overlayLayerColor?.(layer.id) ?? '#ffb84d'
             groups[index] = response.items.map((item) => ({
               ...item,
               layerId: layer.id,
+              layerName: layer.name,
               color,
               selected: false,
+              detectionBox: panoramaDetectionBox(item.properties, frame.image_name),
             }))
           } catch (reason) {
             if (!controller.signal.aborted) errors.push(reason)
@@ -513,25 +971,96 @@ export default function PanoramaView({
     frame,
     overlayLayerColor,
     overlayProjectionRevisionKey,
+    maxOverlayDistanceM,
     visibleOverlayLayers,
   ])
+
+  useEffect(() => {
+    if (!frame || demoMode) {
+      setDetectionBoxes([])
+      setDetectionLoading(false)
+      setDetectionError(null)
+      return
+    }
+    const controller = new AbortController()
+    setDetectionBoxes([])
+    setDetectionLoading(true)
+    setDetectionError(null)
+    void api.frameDetections(datasetId, frame.id, controller.signal)
+      .then((response) => {
+        if (controller.signal.aborted) return
+        const boxes = response.items.flatMap((observation) => {
+          const detectionBox = panoramaDetectionBox(observation.properties, frame.image_name)
+          if (!detectionBox) return []
+          return [{
+            sourceId: observation.source_id,
+            observationId: observation.observation_id,
+            featureId: observation.feature_id,
+            layerName: observation.source_name
+              ? `YOLO · ${observation.source_name}`
+              : 'YOLO 검출',
+            properties: observation.properties,
+            color: panoramaDetectionSourceColor(observation.source_id),
+            selected: false,
+            detectionBox,
+          } satisfies RenderPanoramaDetectionBox]
+        })
+        setDetectionBoxes(deduplicatePanoramaDetectionBoxes(boxes))
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setDetectionError(
+            reason instanceof Error ? reason.message : 'YOLO 검출 박스를 불러오지 못했습니다.',
+          )
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetectionLoading(false)
+      })
+    return () => controller.abort()
+  }, [datasetId, demoMode, detectionRevisionKey, frame])
+
+  const reconciledDetectionBoxes = useMemo(
+    () => reconcilePanoramaDetectionBoxes(detectionBoxes, overlayProjection),
+    [detectionBoxes, overlayProjection],
+  )
 
   const renderedOverlayProjection = useMemo(
     () =>
       overlayProjection.map((point) => ({
         ...point,
         selected: `${point.layerId}:${point.feature_id}` === selectedOverlayKey,
+        // The frame endpoint contains every raw model observation. Retain a
+        // representative SHP bbox only as a fallback for external/legacy data.
+        detectionBox: detectionBoxes.length ? null : point.detectionBox,
       })),
-    [overlayProjection, selectedOverlayKey],
+    [detectionBoxes.length, overlayProjection, selectedOverlayKey],
+  )
+
+  const renderedDetectionBoxes = useMemo(
+    () => reconciledDetectionBoxes.map((box) => ({
+      ...box,
+      selected: box.layerId !== undefined && box.featureId !== undefined
+        && `${box.layerId}:${box.featureId}` === selectedOverlayKey,
+    })),
+    [reconciledDetectionBoxes, selectedOverlayKey],
   )
 
   useEffect(() => {
     const runtime = runtimeRef.current
     const host = stageRef.current
-    if (!runtime || !host || !renderedOverlayProjection.length) return
+    if (
+      !runtime
+      || !host
+      || (!renderedOverlayProjection.length && !renderedDetectionBoxes.length)
+    ) return
     const geometry = new THREE.SphereGeometry(9.92, 64, 40)
     geometry.scale(-1, 1, 1)
-    const texture = createPanoramaOverlayTexture(host.ownerDocument, renderedOverlayProjection)
+    const texture = createPanoramaOverlayTexture(
+      host.ownerDocument,
+      renderedOverlayProjection,
+      renderedDetectionBoxes,
+    )
     const material = new THREE.MeshBasicMaterial({
       map: texture,
       transparent: true,
@@ -549,7 +1078,7 @@ export default function PanoramaView({
       material.dispose()
       texture.dispose()
     }
-  }, [renderedOverlayProjection])
+  }, [renderedDetectionBoxes, renderedOverlayProjection])
 
   useEffect(() => {
     if (!frame || !pointPayloadRequired) {
@@ -676,11 +1205,11 @@ export default function PanoramaView({
     onPanoramaOpacityChange?.(opacity)
   }
 
-  const selectAtPointer = async (clientX: number, clientY: number) => {
+  const panoramaUvAtPointer = (clientX: number, clientY: number) => {
     const runtime = runtimeRef.current
-    if (!runtime || !frame) return
+    if (!runtime) return null
     const bounds = runtime.renderer.domElement.getBoundingClientRect()
-    if (!bounds.width || !bounds.height) return
+    if (!bounds.width || !bounds.height) return null
     const pointer = new THREE.Vector2(
       ((clientX - bounds.left) / bounds.width) * 2 - 1,
       -((clientY - bounds.top) / bounds.height) * 2 + 1,
@@ -688,9 +1217,61 @@ export default function PanoramaView({
     const raycaster = new THREE.Raycaster()
     raycaster.setFromCamera(pointer, runtime.camera)
     const intersection = raycaster.intersectObject(runtime.panoramaMesh, false)[0]
-    if (!intersection?.uv) return
-    const u = ((intersection.uv.x % 1) + 1) % 1
-    const v = 1 - intersection.uv.y
+    if (!intersection?.uv) return null
+    return {
+      u: ((intersection.uv.x % 1) + 1) % 1,
+      v: 1 - intersection.uv.y,
+      bounds,
+    }
+  }
+
+  const clearOverlayHover = () => {
+    const ownerWindow = stageRef.current?.ownerDocument.defaultView
+    if (hoverFrameRef.current && ownerWindow) ownerWindow.cancelAnimationFrame(hoverFrameRef.current)
+    hoverFrameRef.current = 0
+    pendingHoverRef.current = null
+    setOverlayHover(null)
+  }
+
+  const scheduleOverlayHover = (clientX: number, clientY: number) => {
+    const ownerWindow = stageRef.current?.ownerDocument.defaultView
+    if (!ownerWindow) return
+    pendingHoverRef.current = { x: clientX, y: clientY }
+    if (hoverFrameRef.current) return
+    hoverFrameRef.current = ownerWindow.requestAnimationFrame(() => {
+      hoverFrameRef.current = 0
+      const pending = pendingHoverRef.current
+      pendingHoverRef.current = null
+      if (!pending) return
+      const projected = panoramaUvAtPointer(pending.x, pending.y)
+      if (!projected) {
+        setOverlayHover(null)
+        return
+      }
+      const entry = panoramaOverlayAtUv(
+        renderedOverlayProjection,
+        projected.u,
+        projected.v,
+        renderedDetectionBoxes,
+      )
+      setOverlayHover(entry ? {
+        layerId: entry.layerId,
+        layerName: entry.layerName,
+        featureId: entry.featureId,
+        properties: entry.properties ?? {},
+        x: pending.x - projected.bounds.left,
+        y: pending.y - projected.bounds.top,
+        viewportWidth: projected.bounds.width,
+        viewportHeight: projected.bounds.height,
+      } : null)
+    })
+  }
+
+  const selectAtPointer = async (clientX: number, clientY: number) => {
+    if (!frame) return
+    const projected = panoramaUvAtPointer(clientX, clientY)
+    if (!projected) return
+    const { u, v } = projected
     const actions = overlayActionsRef.current
 
     if (actions.pickMode) {
@@ -724,20 +1305,21 @@ export default function PanoramaView({
       return
     }
 
-    let nearest: RenderPanoramaOverlayPoint | null = null
-    let nearestDistance = 0.025 ** 2
-    renderedOverlayProjection.forEach((point) => {
-      const distance = wrappedUVDistanceSquared(u, v, point.u, point.v)
-      if (distance <= nearestDistance) {
-        nearestDistance = distance
-        nearest = point
-      }
-    })
+    const nearest = panoramaOverlayAtUv(renderedOverlayProjection, u, v, renderedDetectionBoxes)
     if (nearest) {
-      actions.selectFeature({
-        layerId: (nearest as RenderPanoramaOverlayPoint).layerId,
-        featureId: (nearest as RenderPanoramaOverlayPoint).feature_id,
+      setOverlayHover(null)
+      setPinnedOverlayHover({
+        layerId: nearest.layerId,
+        layerName: nearest.layerName,
+        featureId: nearest.featureId,
+        properties: nearest.properties ?? {},
+        x: clientX - projected.bounds.left,
+        y: clientY - projected.bounds.top,
+        viewportWidth: projected.bounds.width,
+        viewportHeight: projected.bounds.height,
       })
+    } else {
+      setPinnedOverlayHover(null)
     }
   }
 
@@ -753,19 +1335,24 @@ export default function PanoramaView({
       data-forward-offset={forwardOffsetDeg}
       data-point-count={pointPayload?.pointCount ?? 0}
       data-shp-point-count={renderedOverlayProjection.length}
+      data-yolo-box-count={renderedDetectionBoxes.length}
       data-panorama-opacity={effectivePanoramaOpacity}
       onPointerDown={(event) => {
         if (!source) return
+        clearOverlayHover()
         event.currentTarget.focus({ preventScroll: true })
         event.currentTarget.setPointerCapture(event.pointerId)
         setDragStart({ x: event.clientX, y: event.clientY, yaw, pitch })
       }}
       onPointerMove={(event) => {
-        if (!dragStart) return
-        setYaw(dragStart.yaw - (event.clientX - dragStart.x) * 0.12)
-        setPitch(
-          Math.max(-78, Math.min(78, dragStart.pitch + (event.clientY - dragStart.y) * 0.1)),
-        )
+        if (dragStart) {
+          setYaw(dragStart.yaw - (event.clientX - dragStart.x) * 0.12)
+          setPitch(
+            Math.max(-78, Math.min(78, dragStart.pitch + (event.clientY - dragStart.y) * 0.1)),
+          )
+        } else {
+          scheduleOverlayHover(event.clientX, event.clientY)
+        }
       }}
       onPointerUp={(event) => {
         const clicked = Boolean(
@@ -774,12 +1361,38 @@ export default function PanoramaView({
         setDragStart(null)
         if (clicked) void selectAtPointer(event.clientX, event.clientY)
       }}
-      onPointerCancel={() => setDragStart(null)}
+      onPointerCancel={() => {
+        setDragStart(null)
+        clearOverlayHover()
+      }}
+      onPointerLeave={clearOverlayHover}
       onWheel={(event) => {
         event.preventDefault()
         changeZoom(event.deltaY > 0 ? 4 : -4)
       }}
     >
+      <div
+        ref={linkedPointMarkerRef}
+        className="panorama-linked-point"
+        aria-hidden="true"
+        hidden
+      />
+      <OverlayHoverTooltip
+        hover={pinnedOverlayHover ?? overlayHover}
+        pinned={Boolean(pinnedOverlayHover)}
+        onClose={() => {
+          setPinnedOverlayHover(null)
+          setOverlayHover(null)
+        }}
+        onDetails={pinnedOverlayHover?.layerId ? (hover) => {
+          if (!hover.layerId) return
+          overlayActionsRef.current.selectFeature({
+            layerId: hover.layerId,
+            featureId: hover.featureId,
+          }, { navigate: false })
+          openOverlayFeatureDetails(datasetId, hover)
+        } : undefined}
+      />
       {frame && onPreviousFrame && (
         <button
           type="button"
@@ -853,10 +1466,18 @@ export default function PanoramaView({
           )}
         </div>
       )}
-      {(overlayLoading || pickFeedback) && (
-        <div className={`panorama-point-status shp-status ${pickFeedback ? 'error' : ''}`}>
-          {overlayLoading ? <LoaderCircle size={13} className="spin" /> : <Crosshair size={13} />}
-          <span>{pickFeedback ?? 'SHP 포인트를 파노라마에 맞추는 중'}</span>
+      {(overlayLoading || pickFeedback || detectionLoading || detectionError) && (
+        <div className={`panorama-point-status shp-status ${pickFeedback || detectionError ? 'error' : ''}`}>
+          {overlayLoading || detectionLoading
+            ? <LoaderCircle size={13} className="spin" />
+            : <Crosshair size={13} />}
+          <span>
+            {pickFeedback
+              ?? detectionError
+              ?? (overlayLoading
+                ? 'SHP 포인트를 파노라마에 맞추는 중'
+                : 'YOLO 검출 박스를 불러오는 중')}
+          </span>
         </div>
       )}
       <div
@@ -906,6 +1527,11 @@ export default function PanoramaView({
         {renderedOverlayProjection.length > 0 && (
           <span title="현재 파노라마에 투영된 SHP 포인트">
             <MapPin size={14} /> SHP {renderedOverlayProjection.length.toLocaleString('ko-KR')}
+          </span>
+        )}
+        {renderedDetectionBoxes.length > 0 && (
+          <span title="현재 파노라마의 원본 YOLO 검출 박스">
+            <ScanLine size={14} /> YOLO {renderedDetectionBoxes.length.toLocaleString('ko-KR')}
           </span>
         )}
         {overlay?.pickMode && (

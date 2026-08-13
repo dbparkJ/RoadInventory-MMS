@@ -373,6 +373,15 @@ class WebAppMediaTests(unittest.TestCase):
             app.state.point_reader = _StaticReader(xyz, [[7, 8, 9]])
 
             with TestClient(app) as client:
+                projection = client.get(
+                    f"/api/datasets/{dataset_id}/frames/{frame_id}/panorama-projection",
+                    params={"yaw_offset_deg": 0.0, "pitch_offset_deg": 0.0},
+                )
+                self.assertEqual(projection.status_code, 200, projection.text)
+                self.assertEqual(projection.json()["origin"], [0.0, 0.0, 0.0])
+                self.assertEqual(projection.json()["forward"], [0.0, 1.0, 0.0])
+                self.assertEqual(projection.json()["right"], [1.0, 0.0, 0.0])
+                self.assertEqual(projection.json()["up"], [0.0, 0.0, 1.0])
                 response = client.get(
                     f"/api/datasets/{dataset_id}/panorama-points/{frame_id}",
                     params={"budget": 1000, "yaw_offset_deg": 0.0},
