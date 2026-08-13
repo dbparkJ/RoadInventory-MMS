@@ -4,13 +4,35 @@ import {
   capturePointCloudViewState,
   captureHeadingDirection,
   closestPointHitIndex,
+  DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
   pointCloudDetectionPointSize,
+  pointCloudBudgetsForMaximum,
+  pointCloudDetectionWireframePositions,
+  pointCloudDetectionsFromObservations,
+  pointCloudHoverState,
+  POINT_CLOUD_BUDGETS,
   restorePointCloudViewState,
+  type RenderOverlayPoint,
 } from './PointCloudView'
 
 describe('PointCloudView camera continuity', () => {
+  it('uses 250k as the minimum and offers 500k and 1m previews', () => {
+    expect(DEFAULT_POINT_CLOUD_BUDGET).toBe(250_000)
+    expect(POINT_CLOUD_BUDGETS.map((entry) => entry.value)).toEqual([
+      250_000,
+      500_000,
+      1_000_000,
+    ])
+    expect(POINT_CLOUD_BUDGETS.at(-1)?.label).toContain('100만')
+    expect(pointCloudBudgetsForMaximum(250_000).map((entry) => entry.value)).toEqual([
+      250_000,
+    ])
+    expect(pointCloudBudgetsForMaximum(500_000).at(-1)?.value).toBe(500_000)
+    expect(pointCloudBudgetsForMaximum(1_000_000).at(-1)?.value).toBe(1_000_000)
+  })
+
   it('restores camera angle, orbit target, and zoom for the next frame', () => {
     const camera = new THREE.PerspectiveCamera(52, 1, 0.05, 2_000)
     const target = new THREE.Vector3(-1.25, 4.5, 2.1)
@@ -47,6 +69,195 @@ describe('PointCloudView camera continuity', () => {
   it('keeps detected SHP points visibly larger than the previous sub-metre marker', () => {
     expect(pointCloudDetectionPointSize(false)).toBeGreaterThan(0.5)
     expect(pointCloudDetectionPointSize(true)).toBeGreaterThan(pointCloudDetectionPointSize(false))
+  })
+
+  it('renders only accepted finite YOLO 3D positions within 25m and preserves SHP details', () => {
+    const overlayPoint: RenderOverlayPoint = {
+      layerId: 'layer-1',
+      layerName: 'Detected signs',
+      featureId: 'feature-7',
+      color: '#22c55e',
+      position: [10.1, 0, 2],
+      selected: true,
+      properties: {
+        det_id: 'DET-1',
+        model_nm: 'model-a.pt',
+        img_name: 'frame-1.jpg',
+        class_nm: 'sign',
+        asset_id: 'asset-7',
+      },
+    }
+    const points = pointCloudDetectionsFromObservations([
+      {
+        source_id: 'source-a',
+        source_name: 'model-a.pt',
+        observation_id: 'det-1',
+        dataset_position: [1010, 2000, 32],
+        properties: {
+          det_id: 'det-1',
+          model_nm: 'model-a.pt',
+          img_name: 'frame-1.jpg',
+          class_nm: 'sign',
+        },
+      },
+      {
+        source_id: 'source-b',
+        observation_id: 'det-far',
+        dataset_position: [1030, 2000, 30],
+        properties: { det_id: 'det-far' },
+      },
+      {
+        source_id: 'source-c',
+        observation_id: 'det-unlocated',
+        properties: { det_id: 'det-unlocated' },
+      },
+    ], [1000, 2000, 30], [overlayPoint])
+
+    expect(points).toHaveLength(1)
+    expect(points[0]).toMatchObject({
+      position: [10, 0, 2],
+      layerId: 'layer-1',
+      featureId: 'feature-7',
+      layerName: 'Detected signs',
+      selected: true,
+      properties: { asset_id: 'asset-7' },
+    })
+    expect(points[0].tooltipColor).toBe('#22c55e')
+  })
+
+  it('does not link Details when same det_id has incompatible image or class metadata', () => {
+    const representative: RenderOverlayPoint = {
+      layerId: 'layer-1',
+      layerName: 'Detected signs',
+      featureId: 'feature-7',
+      color: '#22c55e',
+      position: [10, 0, 2],
+      selected: false,
+      properties: {
+        det_id: 'det-1',
+        model_nm: 'model-a.pt',
+        img_name: 'other-frame.jpg',
+        class_nm: 'traffic_light',
+      },
+    }
+    const points = pointCloudDetectionsFromObservations([{
+      source_id: 'source-a',
+      observation_id: 'det-1',
+      dataset_position: [1010, 2000, 32],
+      properties: {
+        det_id: 'det-1',
+        model_nm: 'model-a.pt',
+        img_name: 'frame-1.jpg',
+        class_nm: 'traffic_sign',
+      },
+    }], [1000, 2000, 30], [representative])
+
+    expect(points).toHaveLength(1)
+    expect(points[0].layerId).toBeUndefined()
+    expect(points[0].featureId).toBeUndefined()
+  })
+
+  it('keeps one model color even when observations come from different source paths', () => {
+    const observations = ['run-a/model.pt', 'run-b/model.pt'].map((sourceId, index) => ({
+      source_id: sourceId,
+      model_id: 'model-stable-id',
+      observation_id: `det-${index}`,
+      dataset_position: [1001 + index, 2000, 30] as [number, number, number],
+      properties: { class_nm: 'traffic_sign' },
+    }))
+
+    const points = pointCloudDetectionsFromObservations(observations, [1000, 2000, 30], [])
+
+    expect(points).toHaveLength(2)
+    expect(points[0].color).toBe(points[1].color)
+  })
+
+  it('does not drop accepted detections after the first 512 observations', () => {
+    const observations = Array.from({ length: 600 }, (_, index) => ({
+      source_id: 'source-a',
+      observation_id: `det-${index}`,
+      dataset_position: [1001 + (index % 5), 2000, 30] as [number, number, number],
+      properties: { det_id: `det-${index}` },
+    }))
+    expect(
+      pointCloudDetectionsFromObservations(observations, [1000, 2000, 30], []),
+    ).toHaveLength(600)
+  })
+
+  it('batches every detection cube into one line-segment position buffer', () => {
+    const positions = pointCloudDetectionWireframePositions([
+      {
+        sourceId: 'source-a',
+        observationId: 'det-1',
+        layerName: 'YOLO',
+        color: '#ffb84d',
+        position: [10, 20, 30],
+        selected: false,
+        properties: {},
+      },
+      {
+        sourceId: 'source-b',
+        observationId: 'det-2',
+        layerName: 'YOLO',
+        color: '#4dd9ff',
+        position: [0, 0, 0],
+        selected: true,
+        properties: {},
+      },
+    ])
+
+    expect(positions).toHaveLength(2 * 12 * 2 * 3)
+    expect(Math.min(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(9.65)
+    expect(Math.max(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(30.35)
+    expect(Math.min(...positions.slice(12 * 2 * 3))).toBeCloseTo(-0.45)
+    expect(Math.max(...positions.slice(12 * 2 * 3))).toBeCloseTo(0.45)
+  })
+
+  it('preserves model and SHP layer colors in transient and pinned hover state', () => {
+    const viewport = { x: 10, y: 20, viewportWidth: 800, viewportHeight: 600 }
+    const detection = pointCloudHoverState({
+      sourceId: 'model-a',
+      observationId: 'det-1',
+      layerName: 'YOLO · model-a',
+      color: '#4dd9ff',
+      position: [1, 2, 3],
+      selected: false,
+      properties: { class_nm: 'traffic_sign' },
+    }, viewport)
+    const overlay = pointCloudHoverState({
+      layerId: 'layer-1',
+      layerName: '표지 레이어',
+      featureId: 'feature-7',
+      color: '#22c55e',
+      position: [1, 2, 3],
+      selected: false,
+      properties: { class_nm: 'traffic_sign' },
+    }, viewport)
+
+    expect(detection).toMatchObject({
+      featureId: 'det-1',
+      layerColor: '#4dd9ff',
+      ...viewport,
+    })
+    expect(overlay).toMatchObject({
+      layerId: 'layer-1',
+      featureId: 'feature-7',
+      layerColor: '#22c55e',
+      ...viewport,
+    })
+
+    expect(pointCloudHoverState({
+      sourceId: 'model-a',
+      observationId: 'det-linked',
+      layerId: 'layer-1',
+      layerName: '표지 레이어',
+      featureId: 'feature-7',
+      color: '#4dd9ff',
+      tooltipColor: '#22c55e',
+      position: [1, 2, 3],
+      selected: false,
+      properties: {},
+    }, viewport)).toMatchObject({ layerColor: '#22c55e' })
   })
 
   it('provides deterministic calibrated axes for demo cross-view hover', () => {

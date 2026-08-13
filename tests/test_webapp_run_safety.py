@@ -326,6 +326,193 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 self.assertEqual(client.delete("/api/runs/run-cancelled").status_code, 409)
                 self.assertEqual(client.delete("/api/runs/missing").status_code, 404)
 
+    def test_latest_completed_dataset_run_ignores_queue_visibility(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            state = Path(state_text)
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=state,
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "run-durable-result")
+            app.state.store.update_run(
+                "run-durable-result",
+                NOW,
+                status="completed",
+                return_code=0,
+                finished_at=NOW,
+            )
+
+            with TestClient(app) as client:
+                dismissed = client.delete("/api/runs/run-durable-result")
+                self.assertEqual(dismissed.status_code, 200, dismissed.text)
+                self.assertNotIn(
+                    "run-durable-result",
+                    {item["id"] for item in client.get("/api/runs").json()["items"]},
+                )
+
+                with mock.patch.object(
+                    app.state.store,
+                    "list_completed_runs_for_dataset",
+                    wraps=app.state.store.list_completed_runs_for_dataset,
+                ) as list_completed:
+                    response = client.get(
+                        "/api/datasets/dataset-a/runs/latest-completed"
+                    )
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["run"]["id"], "run-durable-result")
+                self.assertEqual(response.json()["run"]["status"], "completed")
+                list_completed.assert_called_once_with("dataset-a", limit=1)
+
+    def test_latest_completed_dataset_run_ignores_recent_queue_page_limit(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            old_created_at = "2026-07-01T00:00:00+00:00"
+            app.state.store.create_run(
+                {
+                    "id": "run-outside-recent-page",
+                    "dataset_id": "dataset-a",
+                    "request": {},
+                    "resolved": {},
+                    "work_relative": "run-outside-recent-page",
+                    "created_at": old_created_at,
+                    "updated_at": old_created_at,
+                }
+            )
+            app.state.store.update_run(
+                "run-outside-recent-page",
+                old_created_at,
+                status="completed",
+                return_code=0,
+                finished_at=old_created_at,
+            )
+            for index in range(51):
+                created_at = f"2026-08-01T00:{index:02d}:00+00:00"
+                app.state.store.create_run(
+                    {
+                        "id": f"run-recent-{index:02d}",
+                        "dataset_id": "dataset-a",
+                        "request": {},
+                        "resolved": {},
+                        "work_relative": f"run-recent-{index:02d}",
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                    }
+                )
+
+            with TestClient(app) as client:
+                recent_ids = {
+                    item["id"] for item in client.get("/api/runs").json()["items"]
+                }
+                self.assertNotIn("run-outside-recent-page", recent_ids)
+                response = client.get(
+                    "/api/datasets/dataset-a/runs/latest-completed"
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(
+                    response.json()["run"]["id"],
+                    "run-outside-recent-page",
+                )
+
+    def test_latest_completed_dataset_run_uses_completion_time_not_creation_time(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            runs = (
+                (
+                    "run-created-first-finished-last",
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T03:00:00+00:00",
+                ),
+                (
+                    "run-created-last-finished-first",
+                    "2026-08-01T01:00:00+00:00",
+                    "2026-08-01T02:00:00+00:00",
+                ),
+            )
+            for run_id, created_at, finished_at in runs:
+                app.state.store.create_run(
+                    {
+                        "id": run_id,
+                        "dataset_id": "dataset-a",
+                        "request": {},
+                        "resolved": {},
+                        "work_relative": run_id,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                    }
+                )
+                app.state.store.update_run(
+                    run_id,
+                    finished_at,
+                    status="completed",
+                    return_code=0,
+                    finished_at=finished_at,
+                )
+
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/datasets/dataset-a/runs/latest-completed"
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(
+                response.json()["run"]["id"],
+                "run-created-first-finished-last",
+            )
+
+    def test_latest_completed_dataset_run_has_null_and_missing_dataset_states(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+
+            with TestClient(app) as client:
+                empty = client.get("/api/datasets/dataset-a/runs/latest-completed")
+                self.assertEqual(empty.status_code, 200, empty.text)
+                self.assertIsNone(empty.json()["run"])
+                self.assertEqual(
+                    client.get(
+                        "/api/datasets/missing/runs/latest-completed"
+                    ).status_code,
+                    404,
+                )
+
     def test_run_archives_are_complete_filtered_and_path_redacted(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

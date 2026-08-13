@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ComponentProps } from 'react'
 import type { DatasetSummary, Frame } from '../types'
+import { formatCount } from '../lib/format'
 import { DatasetPanel } from './DatasetPanel'
 
 const DATASET: DatasetSummary = {
@@ -126,7 +127,55 @@ describe('DatasetPanel frame range selection', () => {
       'data-collapsed',
       'true',
     )
-    expect(screen.getByRole('button', { name: '작업 데이터 패널 복원' })).toBeInTheDocument()
+    const restoreButton = screen.getByRole('button', { name: '작업 데이터 패널 복원' })
+    expect(restoreButton).toBeInTheDocument()
+    fireEvent.click(restoreButton.querySelector('svg') as SVGElement)
+    expect(onToggleCollapsed).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('DATA')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('DATA'))
+    expect(onToggleCollapsed).toHaveBeenCalledTimes(3)
     expect(screen.queryByRole('combobox', { name: '데이터셋 선택' })).not.toBeInTheDocument()
+  })
+
+  it('opens the custom dataset list when either row icon is clicked', () => {
+    const { container } = renderPanel()
+    const trigger = screen.getByRole('combobox', { name: '데이터셋 선택' })
+    const icons = container.querySelectorAll('.dataset-select svg')
+
+    expect(icons).toHaveLength(2)
+    fireEvent.click(icons[0] as SVGElement)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('listbox', { name: '작업 데이터 목록' })).toBeInTheDocument()
+
+    fireEvent.click(trigger)
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+
+    fireEvent.click(icons[1] as SVGElement)
+    expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('shows useful metadata and changes datasets from the custom list', () => {
+    const onDatasetChange = vi.fn()
+    const secondDataset: DatasetSummary = {
+      ...DATASET,
+      id: 'dataset-2',
+      name: 'Second delivery',
+      status: 'indexing',
+      frame_count: 240,
+      point_count: 125_000,
+    }
+    renderPanel({ datasets: [DATASET, secondDataset], onDatasetChange })
+
+    fireEvent.click(screen.getByRole('combobox', { name: '데이터셋 선택' }))
+    const option = screen.getByRole('option', { name: /Second delivery/ })
+    expect(option).toHaveTextContent(`240 프레임 · ${formatCount(125_000)} pts`)
+    expect(option).toHaveTextContent('인덱싱 중')
+    fireEvent.click(option)
+
+    expect(onDatasetChange).toHaveBeenCalledWith('dataset-2')
+    expect(screen.getByRole('combobox', { name: '데이터셋 선택' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
   })
 })

@@ -5,6 +5,7 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
+import { useOptionalOverlayWorkspace } from './OverlayContext'
 
 export const OVERLAY_DETAILS_EVENT = 'mms-overlay-open-details'
 export const OVERLAY_HOVER_PREVIEW_LIMIT = 4
@@ -27,10 +28,47 @@ export interface OverlayHoverState {
   layerName: string
   featureId: string | number
   properties: Record<string, unknown>
+  layerColor?: string
   x: number
   y: number
   viewportWidth: number
   viewportHeight: number
+}
+
+const OVERLAY_CLASS_NAME_KEYS = [
+  'class_nm',
+  'class_name',
+  'class',
+  'label',
+  'name',
+  'obj_type',
+] as const
+
+export function overlayHoverClassName(
+  properties: Record<string, unknown>,
+  featureId: string | number,
+): string {
+  const normalized = new Map(
+    Object.entries(properties).map(([key, value]) => [
+      key.trim().toLocaleLowerCase('en-US'),
+      value,
+    ]),
+  )
+  for (const key of OVERLAY_CLASS_NAME_KEYS) {
+    const value = normalized.get(key)
+    if (value === null || value === undefined) continue
+    const label = String(value).trim()
+    if (label) return label
+  }
+  return `피처 #${String(featureId)}`
+}
+
+export function overlayHoverLayerColor(
+  properties: Record<string, unknown>,
+  workspaceColor?: string,
+): string {
+  const candidate = String(workspaceColor ?? properties.__overlay_color ?? '').trim()
+  return /^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(candidate) ? candidate : '#78909f'
 }
 
 export function overlayPropertyEntries(properties: Record<string, unknown>) {
@@ -105,6 +143,7 @@ export function OverlayHoverTooltip({
   onDetails?: (hover: OverlayHoverState) => void
 }) {
   const tooltipRef = useRef<HTMLElement>(null)
+  const overlay = useOptionalOverlayWorkspace()
   useEffect(() => {
     if (!hover || !pinned || !onClose) return
     const ownerDocument = tooltipRef.current?.ownerDocument ?? document
@@ -136,6 +175,12 @@ export function OverlayHoverTooltip({
   const allEntries = overlayPropertyEntries(hover.properties)
   const entries = overlayPropertyPreviewEntries(hover.properties)
   const hiddenCount = Math.max(0, allEntries.length - entries.length)
+  const className = overlayHoverClassName(hover.properties, hover.featureId)
+  const workspaceColor = hover.layerId ? overlay?.layerColor(hover.layerId) : undefined
+  const layerColor = overlayHoverLayerColor(
+    hover.properties,
+    hover.layerColor ?? workspaceColor,
+  )
   const stopPointer = (event: ReactPointerEvent) => event.stopPropagation()
   return (
     <aside
@@ -151,9 +196,15 @@ export function OverlayHoverTooltip({
       <header>
         <span className="overlay-hover-title">
           {pinned && <Pin size={11} aria-hidden="true" />}
-          <strong>{hover.layerName}</strong>
+          <span>
+            <strong>{className}</strong>
+            <small>#{String(hover.featureId)}</small>
+          </span>
         </span>
-        <span className="overlay-hover-id">#{String(hover.featureId)}</span>
+        <span className="overlay-hover-layer" title={hover.layerName}>
+          <i aria-hidden="true" style={{ backgroundColor: layerColor }} />
+          <span>{hover.layerName}</span>
+        </span>
         {pinned && onClose && (
           <button type="button" onClick={onClose} aria-label="고정 속성 닫기">
             <X size={12} />

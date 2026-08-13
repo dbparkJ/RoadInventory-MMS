@@ -63,15 +63,34 @@ afterEach(() => {
 })
 
 describe('RunResultsDialog', () => {
+  it('shows a selected-dataset empty state and routes to the execution queue', () => {
+    const onOpenQueue = vi.fn()
+    const runResults = vi.spyOn(api, 'runResults')
+
+    render(
+      <RunResultsDialog
+        run={null}
+        onClose={vi.fn()}
+        emptyState={{ open: true, datasetName: '강남 검출 구간', onOpenQueue }}
+      />,
+    )
+
+    expect(screen.getByText('강남 검출 구간 · 최신 완료 실행')).toBeInTheDocument()
+    expect(screen.getByText('완료된 자동 검출결과가 없습니다')).toBeInTheDocument()
+    expect(runResults).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '실행 큐 확인' }))
+    expect(onOpenQueue).toHaveBeenCalledOnce()
+  })
+
   it('offers the two server archives from one ZIP menu without individual SHP downloads', async () => {
     vi.spyOn(api, 'runResults').mockResolvedValue(RESULTS)
 
-    const { container } = render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
+    render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
 
     expect(await screen.findByText('runs/run-42/output')).toBeInTheDocument()
     expect(screen.queryByText('[object Object]')).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /ZIP 받기/ })).not.toBeInTheDocument()
-    expect(container.querySelector(`a[href*="/shapefile?"]`)).not.toBeInTheDocument()
+    expect(document.querySelector(`a[href*="/shapefile?"]`)).not.toBeInTheDocument()
 
     const trigger = screen.getByRole('button', { name: /ZIP 받기/ })
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
@@ -88,7 +107,22 @@ describe('RunResultsDialog', () => {
       '/api/runs/run-42/archive?scope=detected-images',
     )
     expect(screen.queryByRole('link', { name: /detected_signs\.dbf/ })).not.toBeInTheDocument()
-    expect(container.querySelector('.result-shapefile-list')).toBeInTheDocument()
+    expect(document.querySelector('.result-shapefile-list')).toBeInTheDocument()
+  })
+
+  it('portals the viewport layer outside a filtered trigger ancestor', () => {
+    const { container } = render(
+      <div style={{ backdropFilter: 'blur(8px)' }}>
+        <RunResultsDialog
+          run={null}
+          onClose={vi.fn()}
+          emptyState={{ open: true, datasetName: '강남 검출 구간' }}
+        />
+      </div>,
+    )
+
+    expect(container.querySelector('.result-dialog-layer')).not.toBeInTheDocument()
+    expect(document.body.querySelector(':scope > .result-dialog-layer')).toBeInTheDocument()
   })
 
   it('closes the ZIP menu with Escape or an outside pointer and restores trigger focus', async () => {

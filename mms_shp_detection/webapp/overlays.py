@@ -223,6 +223,27 @@ def _read_manifest(
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise TypeError("Overlay manifest is invalid.")
+    # Feature schema mutations are committed atomically with the feature rows,
+    # revision, and audit log in SQLite. The manifest mirrors that schema for
+    # portability, but SQLite remains authoritative across a process crash
+    # between the database commit and manifest refresh.
+    store_path = layer_dir / "features.sqlite3"
+    if store_path.is_file() and not store_path.is_symlink():
+        connection = sqlite3.connect(str(store_path), timeout=30.0)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='fields_json'"
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is not None:
+            fields = json.loads(str(row[0]))
+            if not isinstance(fields, list) or any(
+                not isinstance(field, dict) or not str(field.get("name", ""))
+                for field in fields
+            ):
+                raise TypeError("Overlay field schema is invalid.")
+            value["fields"] = fields
     if not include_unregistered and value.get("registered", True) is False:
         raise FileNotFoundError("Overlay layer not found.")
     return value
@@ -679,6 +700,7 @@ def _resolve_crs(
 def _initialize_feature_store(
     path: Path,
     rows: Iterator[tuple[Any, ...]],
+    fields: list[dict[str, Any]],
 ) -> None:
     connection = sqlite3.connect(str(path))
     try:
@@ -711,6 +733,10 @@ def _initialize_feature_store(
             """
         )
         connection.execute("INSERT INTO metadata(key,value) VALUES('revision','1')")
+        connection.execute(
+            "INSERT INTO metadata(key,value) VALUES('fields_json',?)",
+            (_json_bytes(fields).decode("utf-8"),),
+        )
         connection.executemany(
             """
             INSERT INTO features(
@@ -839,7 +865,7 @@ def _import_bundle(
                     now,
                 )
 
-        _initialize_feature_store(staging / "features.sqlite3", rows())
+        _initialize_feature_store(staging / "features.sqlite3", rows(), fields)
         shape_type = int(reader.shapeType)
     except OverlayTooLarge:
         raise
@@ -1136,6 +1162,35 @@ def _automatic_id_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:
     )
 
 
+def _deletable_overlay_field(
+    fields: list[dict[str, Any]], requested_name: str
+) -> dict[str, Any]:
+    """Resolve a user-visible DBF field that may be removed from the edit copy."""
+
+    name = requested_name.strip()
+    if not name or len(name) > 128 or any(ord(character) < 32 for character in name):
+        raise ValueError("Overlay field name is invalid.")
+    matches = [
+        field
+        for field in fields
+        if str(field.get("name", "")).casefold() == name.casefold()
+    ]
+    if len(matches) != 1:
+        raise FileNotFoundError("Overlay field not found.")
+    field = matches[0]
+    canonical_name = str(field.get("name", ""))
+    if (
+        canonical_name.casefold() == "id"
+        or canonical_name.startswith("__")
+        or bool(field.get("required"))
+        or bool(field.get("internal"))
+    ):
+        raise PermissionError("The ID, required, and internal SHP fields cannot be deleted.")
+    if len(fields) <= 1:
+        raise ValueError("The final SHP attribute field cannot be deleted.")
+    return field
+
+
 def _blank_properties_with_next_id(
     connection: sqlite3.Connection,
     manifest: dict[str, Any],
@@ -1184,6 +1239,90 @@ def _updated_revision(
     if expected is not None and expected != revision:
         raise RuntimeError(f"revision:{revision}")
     return revision + 1
+
+
+def _delete_overlay_field_from_store(
+    layer_dir: Path,
+    dataset_id: str,
+    field_name: str,
+    expected_revision: int,
+) -> tuple[dict[str, Any], str, int, list[dict[str, Any]]]:
+    """Apply the potentially large schema rewrite outside the ASGI event loop."""
+
+    manifest_path = layer_dir / "manifest.json"
+    with _feature_db(layer_dir, write=True) as connection:
+        manifest = _read_manifest(layer_dir)
+        if manifest.get("dataset_id") != dataset_id:
+            raise FileNotFoundError("Overlay layer not found.")
+        fields = list(manifest.get("fields") or [])
+        revision = _updated_revision(connection, expected_revision)
+        field = _deletable_overlay_field(fields, field_name)
+        canonical_name = str(field["name"])
+        now = utc_now()
+
+        rows = connection.execute("SELECT id,properties_json FROM features")
+        updates: list[tuple[str, str, str]] = []
+        for row in rows:
+            properties = json.loads(row["properties_json"])
+            if not isinstance(properties, dict):
+                raise TypeError("Overlay feature properties are invalid.")
+            properties.pop(canonical_name, None)
+            updates.append(
+                (_json_bytes(properties).decode("utf-8"), now, str(row["id"]))
+            )
+            if len(updates) >= 2_000:
+                connection.executemany(
+                    "UPDATE features SET properties_json=?,updated_at=? WHERE id=?",
+                    updates,
+                )
+                updates.clear()
+        if updates:
+            connection.executemany(
+                "UPDATE features SET properties_json=?,updated_at=? WHERE id=?",
+                updates,
+            )
+
+        remaining_fields = [
+            candidate
+            for candidate in fields
+            if str(candidate.get("name", "")) != canonical_name
+        ]
+        manifest["fields"] = remaining_fields
+        manifest["schema_updated_at"] = now
+        connection.execute(
+            "UPDATE metadata SET value=? WHERE key='revision'", (str(revision),)
+        )
+        connection.execute(
+            """
+            INSERT INTO metadata(key,value) VALUES('fields_json',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (_json_bytes(remaining_fields).decode("utf-8"),),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit(revision,action,feature_id,before_json,after_json,created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                revision,
+                "delete_field",
+                f"field:{canonical_name}",
+                _json_bytes({"field": field, "fields": fields}).decode("utf-8"),
+                _json_bytes(
+                    {"deleted_field": canonical_name, "fields": remaining_fields}
+                ).decode("utf-8"),
+                now,
+            ),
+        )
+
+    # This is a post-commit portability mirror. If the process stops here,
+    # _read_manifest overlays the stale JSON with SQLite's fields_json.
+    try:
+        atomic_replace_bytes(manifest_path, _json_bytes(manifest))
+    except OSError:
+        pass
+    return manifest, canonical_name, revision, remaining_fields
 
 
 def _write_edited_bundle(
@@ -1738,6 +1877,59 @@ def get_overlay_feature(
         "coordinate_space": coordinate_space,
         "crs": "EPSG:4326" if coordinate_space == "wgs84" else manifest["dataset_crs"],
         "fields": manifest["fields"],
+    }
+
+
+@router.delete("/datasets/{dataset_id}/overlays/{layer_id}/fields/{field_name}")
+async def delete_overlay_field(
+    dataset_id: str,
+    layer_id: str,
+    field_name: str,
+    request: Request,
+    expected_revision: int = Query(..., ge=1),
+) -> dict[str, Any]:
+    """Remove one DBF column from the editable copy while preserving the source bundle."""
+
+    require_ready_dataset(request, dataset_id)
+    lock = _layer_lock(request.app, dataset_id, layer_id)
+    async with lock:
+        try:
+            layer_dir = _layer_directory(request.app, dataset_id, layer_id)
+            manifest, canonical_name, revision, remaining_fields = await asyncio.to_thread(
+                _delete_overlay_field_from_store,
+                layer_dir,
+                dataset_id,
+                field_name,
+                expected_revision,
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith("revision:"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Overlay was edited by another request.",
+                        "current_revision": int(str(exc).split(":", 1)[1]),
+                    },
+                ) from exc
+            raise
+        except PermissionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (OSError, sqlite3.Error) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Overlay schema could not be saved. Retry the request.",
+            ) from exc
+
+    return {
+        "deleted_field": canonical_name,
+        "revision": revision,
+        "fields": remaining_fields,
+        "layer": _public_layer(layer_dir, manifest),
+        "source_preserved": True,
     }
 
 

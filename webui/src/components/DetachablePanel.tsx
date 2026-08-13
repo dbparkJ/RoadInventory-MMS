@@ -45,6 +45,7 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
   forwardedRef,
 ) {
   const popupRef = useRef<Window | null>(null)
+  const popupCleanupRef = useRef<(() => void) | null>(null)
   const mountRef = useRef<HTMLDivElement>(null)
   const onDetachedChangeRef = useRef(onDetachedChange)
   onDetachedChangeRef.current = onDetachedChange
@@ -67,7 +68,10 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
 
   const attach = useCallback(() => {
     const popup = popupRef.current
+    if (!popup) return
     popupRef.current = null
+    popupCleanupRef.current?.()
+    popupCleanupRef.current = null
     moveHome()
     setPortalRoot(null)
     onDetachedChangeRef.current?.(false)
@@ -108,8 +112,8 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
     root.appendChild(panelHost)
 
     // React portals keep their event tree, but native keyboard events do not cross
-    // Window boundaries. Relay only frame-navigation keys back through the opener
-    // chain so one global handler can serve every detached panel.
+    // Window boundaries. Relay frame-navigation and global overlay-edit keys
+    // through the opener chain so one canonical handler serves every popup.
     const relayFrameNavigation = (event: KeyboardEvent) => {
       const globalOverlayKey =
         !event.altKey &&
@@ -117,7 +121,7 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
         !event.metaKey &&
         !event.shiftKey &&
         !isTextEntryTarget(event.target) &&
-        (event.code === 'KeyP' || event.key === 'Escape')
+        (event.code === 'KeyP' || event.code === 'KeyN' || event.key === 'Escape')
       if (!frameNavigationDirection(event) && !globalOverlayKey) return
       event.preventDefault()
       sourceWindow.dispatchEvent(
@@ -132,7 +136,25 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
     }
     popup.addEventListener('keydown', relayFrameNavigation)
 
+    let settled = false
+    let closedPoll: number | null = null
+    const cleanupPopupListeners = () => {
+      popup.removeEventListener('keydown', relayFrameNavigation)
+      popup.removeEventListener('beforeunload', onClose)
+      popup.removeEventListener('pagehide', onClose)
+      popup.removeEventListener('unload', onClose)
+      if (closedPoll !== null) {
+        sourceWindow.clearInterval(closedPoll)
+        closedPoll = null
+      }
+      if (popupCleanupRef.current === cleanupPopupListeners) {
+        popupCleanupRef.current = null
+      }
+    }
     const onClose = () => {
+      if (settled) return
+      settled = true
+      cleanupPopupListeners()
       if (popupRef.current !== popup) return
       popupRef.current = null
       moveHome()
@@ -140,6 +162,12 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
       onDetachedChangeRef.current?.(false)
     }
     popup.addEventListener('beforeunload', onClose, { once: true })
+    popup.addEventListener('pagehide', onClose, { once: true })
+    popup.addEventListener('unload', onClose, { once: true })
+    closedPoll = sourceWindow.setInterval(() => {
+      if (popup.closed) onClose()
+    }, 250)
+    popupCleanupRef.current = cleanupPopupListeners
     popupRef.current = popup
     setPortalRoot(root)
     onDetachedChangeRef.current?.(true)
@@ -161,6 +189,8 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
     () => () => {
       const popup = popupRef.current
       popupRef.current = null
+      popupCleanupRef.current?.()
+      popupCleanupRef.current = null
       if (popup && !popup.closed) {
         popup.close()
         onDetachedChangeRef.current?.(false)

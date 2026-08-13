@@ -1,10 +1,18 @@
 import type { Feature, FeatureCollection, Geometry, Position } from 'geojson'
+import {
+  MAP_SELECTED_FEATURE_COLOR,
+  MAP_SELECTED_FRAME_COLOR,
+} from './mapSelectionColors'
 import type { CameraTarget } from './vworld'
 
 export const VWORLD_2D_IFRAME_URL = '/vworld-2d-map.html'
 export const VWORLD_2D_CONTAINER_ID = 'vmap'
 export const VWORLD_2D_BASE_WMTS_URL =
   'https://api.vworld.kr/req/wmts/1.0.0/EE4D1CA9-BEA1-3AFF-AE81-DE0B92A0E352/Base/{z}/{y}/{x}.png'
+export const VWORLD_2D_SATELLITE_WMTS_URL =
+  'https://api.vworld.kr/req/wmts/1.0.0/EE4D1CA9-BEA1-3AFF-AE81-DE0B92A0E352/Satellite/{z}/{y}/{x}.jpeg'
+
+export type VWorld2DBaseMap = 'base' | 'satellite'
 
 type VWorld2DMapClickHandler = (event: { pixel?: unknown; coordinate?: unknown }) => void
 
@@ -22,7 +30,9 @@ interface VWorld2DVectorLayer {
   setMap?(map: VWorld2DMap | null): void
 }
 
-interface VWorld2DTileLayer {}
+interface VWorld2DTileLayer {
+  setSource(source: VWorld2DXYZSource): void
+}
 
 interface VWorld2DXYZSource {}
 
@@ -34,6 +44,14 @@ interface VWorld2DView {
 }
 
 export interface VWorld2DMap {
+  /**
+   * Compatibility state consumed by VWorld's patched OpenLayers 3 wheel
+   * handler. Raw `ol.Map` does not create this property itself.
+   */
+  options?: {
+    basemapType?: 'graphic' | 'photo'
+    [key: string]: unknown
+  }
   addLayer(layer: VWorld2DVectorLayer): void
   removeLayer(layer: VWorld2DVectorLayer): void
   getView(): VWorld2DView
@@ -92,6 +110,9 @@ interface OpenLayersNamespace {
   extent: {
     boundingExtent(coordinates: unknown[]): unknown
   }
+  interaction: {
+    defaults(options?: Record<string, unknown>): unknown
+  }
 }
 
 interface VWorld2DFrameWindow extends Window {
@@ -104,6 +125,8 @@ export interface VWorld2DRuntime {
   frameWindow: VWorld2DFrameWindow
   ol: OpenLayersNamespace
   map: VWorld2DMap
+  baseLayer: VWorld2DTileLayer
+  baseMap: VWorld2DBaseMap
 }
 
 export interface VWorld2DDataSource {
@@ -141,7 +164,13 @@ export function assertVWorld2DSdk(frameWindow: Window): {
     )
   }
   const ol = candidate.ol
-  if (!ol?.Map || !ol.View || !ol.layer?.Tile || !ol.source?.XYZ) {
+  if (
+    !ol?.Map ||
+    !ol.View ||
+    !ol.layer?.Tile ||
+    !ol.source?.XYZ ||
+    typeof ol.interaction?.defaults !== 'function'
+  ) {
     throw new Error('VWorld 2D 일반지도 SDK를 불러오지 못했습니다.')
   }
   return {
@@ -155,6 +184,7 @@ export async function startVWorld2DMap(
   mapId: string,
   initialTarget: CameraTarget,
   timeoutMs = 15_000,
+  baseMap: VWorld2DBaseMap = 'base',
 ): Promise<VWorld2DRuntime> {
   const startedAt = Date.now()
   let sdk: ReturnType<typeof assertVWorld2DSdk> | null = null
@@ -179,22 +209,70 @@ export async function startVWorld2DMap(
   // vw.ol3.Map prepends a visible OSM layer even when useOSM is false. Build
   // the OpenLayers map with one official VWorld Base layer so no fallback tile
   // provider can render or issue network requests.
-  const baseSource = new ol.source.XYZ({
-    url: VWORLD_2D_BASE_WMTS_URL,
-    crossOrigin: 'anonymous',
-    minZoom: 6,
-    maxZoom: 19,
-  })
+  const baseSource = createVWorld2DBaseSource(ol, baseMap)
   const baseLayer = new ol.layer.Tile({ source: baseSource })
   const map = new ol.Map({
     target: mapId,
     layers: [baseLayer],
     view,
     controls: [],
+    // VWorld ships an OpenLayers build whose implicit interaction defaults can
+    // vary between loader versions. Declare wheel zoom explicitly and do not
+    // gate it on iframe focus, so both Base and Satellite respond while the
+    // pointer is over the map.
+    interactions: ol.interaction.defaults({
+      mouseWheelZoom: true,
+      onFocusOnly: false,
+    }),
     logo: false,
   })
+  setVWorld2DWheelCompatibility(map, baseMap)
   map.updateSize()
-  return { frameWindow: sdk.frameWindow, ol, map }
+  return { frameWindow: sdk.frameWindow, ol, map, baseLayer, baseMap }
+}
+
+/**
+ * Swap only the official VWorld raster source. The OpenLayers map, view and
+ * vector layers stay mounted so changing 2D imagery cannot reset the camera
+ * or temporarily remove route/SHP overlays.
+ */
+export function setVWorld2DBaseMap(
+  runtime: VWorld2DRuntime,
+  baseMap: VWorld2DBaseMap,
+): boolean {
+  if (runtime.baseMap === baseMap) return false
+  runtime.baseLayer.setSource(createVWorld2DBaseSource(runtime.ol, baseMap))
+  setVWorld2DWheelCompatibility(runtime.map, baseMap)
+  runtime.baseMap = baseMap
+  return true
+}
+
+function setVWorld2DWheelCompatibility(
+  map: VWorld2DMap,
+  baseMap: VWorld2DBaseMap,
+): void {
+  // The VWorld loader patches MouseWheelZoom.handleEvent and reads
+  // map.options.basemapType for native `wheel` events. Its runtime enum values
+  // are `graphic` and `photo`; leaving options undefined makes wheel zoom throw
+  // on a raw ol.Map before the view can change.
+  map.options = {
+    ...(map.options ?? {}),
+    basemapType: baseMap === 'satellite' ? 'photo' : 'graphic',
+  }
+}
+
+function createVWorld2DBaseSource(
+  ol: OpenLayersNamespace,
+  baseMap: VWorld2DBaseMap,
+): VWorld2DXYZSource {
+  return new ol.source.XYZ({
+    url: baseMap === 'satellite'
+      ? VWORLD_2D_SATELLITE_WMTS_URL
+      : VWORLD_2D_BASE_WMTS_URL,
+    crossOrigin: 'anonymous',
+    minZoom: 6,
+    maxZoom: 19,
+  })
 }
 
 export function destroyVWorld2DMap(runtime: VWorld2DRuntime): void {
@@ -391,13 +469,21 @@ function styleForFeature(
   const properties = feature.properties ?? {}
   const selected = Number(properties.selected ?? properties.__overlay_selected ?? 0) === 1
   const color = String(properties.track_color ?? properties.__overlay_color ?? '#579cf2')
+  const selectedOverlay = kind === 'overlay' && selected
+  const displayColor = selectedOverlay ? MAP_SELECTED_FEATURE_COLOR : color
   if (feature.geometry?.type === 'Point' || feature.geometry?.type === 'MultiPoint') {
     const createStyle = (radius: number) => new ol.style.Style({
         image: new ol.style.Circle({
           radius,
-          fill: new ol.style.Fill({ color: selected ? '#07111f' : color }),
+          fill: new ol.style.Fill({
+            color: selectedOverlay ? MAP_SELECTED_FEATURE_COLOR : selected ? '#07111f' : color,
+          }),
           stroke: new ol.style.Stroke({
-            color: selected ? '#ffd166' : '#ffffff',
+            color: selectedOverlay
+              ? '#fff2ec'
+              : selected
+                ? MAP_SELECTED_FRAME_COLOR
+                : '#ffffff',
             width: selected ? 2 : 1.5,
           }),
         }),
@@ -420,15 +506,18 @@ function styleForFeature(
   if (feature.geometry?.type === 'LineString' || feature.geometry?.type === 'MultiLineString') {
     return new ol.style.Style({
       stroke: new ol.style.Stroke({
-        color,
+        color: displayColor,
         width: kind === 'route-range' ? 6 : kind === 'route' ? 4 : selected ? 6 : 3,
       }),
       zIndex: kind === 'route-range' ? 12 : kind === 'route' ? 10 : selected ? 22 : 20,
     })
   }
   return new ol.style.Style({
-    stroke: new ol.style.Stroke({ color: selected ? '#ffffff' : color, width: selected ? 4 : 2 }),
-    fill: new ol.style.Fill({ color: withAlpha(color, selected ? 0.46 : 0.24) }),
+    stroke: new ol.style.Stroke({
+      color: selectedOverlay ? MAP_SELECTED_FEATURE_COLOR : color,
+      width: selected ? 4 : 2,
+    }),
+    fill: new ol.style.Fill({ color: withAlpha(displayColor, selected ? 0.52 : 0.24) }),
     zIndex: selected ? 22 : 20,
   })
 }

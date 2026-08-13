@@ -82,6 +82,15 @@ function WorkspaceProbe() {
       <output data-testid="selected-label">
         {String(overlay.selectedDatasetFeature?.properties.label ?? 'not-selected')}
       </output>
+      <output data-testid="selected-wgs-label">
+        {String(overlay.selectedFeature?.properties.label ?? 'not-selected')}
+      </output>
+      <output data-testid="map-selected-ids">
+        {overlay.mapFeatures
+          .filter((item) => Number(item.properties.__overlay_selected) === 1)
+          .map((item) => item.id)
+          .join(',') || 'none'}
+      </output>
       <output data-testid="pick-mode">{overlay.pickMode ? 'on' : 'off'}</output>
       <output data-testid="pick-target">{overlay.pickTarget?.kind ?? 'none'}</output>
       <output data-testid="active-layer">{overlay.activeLayerId || 'none'}</output>
@@ -99,6 +108,9 @@ function WorkspaceProbe() {
         onClick={() => overlay.selectFeature({ layerId: LAYER.id, featureId: 'outside-42' })}
       >
         select outside
+      </button>
+      <button type="button" onClick={() => overlay.selectFeature(null)}>
+        clear selection
       </button>
       <button
         type="button"
@@ -122,6 +134,12 @@ function WorkspaceProbe() {
       </button>
       <button type="button" onClick={() => void overlay.copySelectedLocation()}>
         copy location
+      </button>
+      <button type="button" onClick={() => void overlay.deleteSelected()}>
+        delete selected
+      </button>
+      <button type="button" onClick={() => void overlay.deleteField(LAYER.id, 'label')}>
+        delete field
       </button>
       <button
         type="button"
@@ -163,13 +181,19 @@ function mockFeaturePages() {
 }
 
 function mockOutsideFeature() {
-  return vi.spyOn(api, 'overlayFeature').mockResolvedValue({
-    feature: feature('outside-42', 42, '첫 페이지 밖 피처'),
-    revision: LAYER.revision,
-    coordinate_space: 'dataset',
-    crs: 'EPSG:5186',
-    fields: [{ name: 'label', type: 'C' }],
-  })
+  return vi.spyOn(api, 'overlayFeature').mockImplementation(
+    async (_datasetId, _layerId, _featureId, coordinateSpace) => ({
+      feature: feature(
+        'outside-42',
+        coordinateSpace === 'wgs84' ? 127.42 : 42,
+        '첫 페이지 밖 피처',
+      ),
+      revision: LAYER.revision,
+      coordinate_space: coordinateSpace,
+      crs: coordinateSpace === 'wgs84' ? 'EPSG:4326' : 'EPSG:5186',
+      fields: [{ name: 'label', type: 'C' }],
+    }),
+  )
 }
 
 afterEach(() => {
@@ -262,7 +286,7 @@ describe('OverlayProvider feature loading', () => {
     ).toBe(true)
   })
 
-  it('fetches a single dataset-coordinate detail for selection outside the loaded page', async () => {
+  it('fetches both coordinate details and merges a page-external selection into the map', async () => {
     mockFeaturePages()
     const overlayFeature = mockOutsideFeature()
     renderWorkspace()
@@ -275,14 +299,42 @@ describe('OverlayProvider feature loading', () => {
     await waitFor(() =>
       expect(screen.getByTestId('selected-label')).toHaveTextContent('첫 페이지 밖 피처'),
     )
-    expect(overlayFeature).toHaveBeenCalledOnce()
-    expect(overlayFeature).toHaveBeenCalledWith(
-      'dataset-1',
-      LAYER.id,
-      'outside-42',
-      'dataset',
-      expect.any(AbortSignal),
+    await waitFor(() => {
+      expect(screen.getByTestId('selected-wgs-label')).toHaveTextContent('첫 페이지 밖 피처')
+      expect(screen.getByTestId('map-selected-ids')).toHaveTextContent('outside-42')
+    })
+    expect(overlayFeature).toHaveBeenCalledTimes(2)
+    expect(overlayFeature.mock.calls.map((call) => call.slice(0, 4))).toEqual(
+      expect.arrayContaining([
+        ['dataset-1', LAYER.id, 'outside-42', 'dataset'],
+        ['dataset-1', LAYER.id, 'outside-42', 'wgs84'],
+      ]),
     )
+    expect(overlayFeature.mock.calls.every((call) => call[4] instanceof AbortSignal)).toBe(true)
+  })
+
+  it('aborts stale coordinate-detail requests and clears the merged map selection', async () => {
+    mockFeaturePages()
+    const signals: AbortSignal[] = []
+    vi.spyOn(api, 'overlayFeature').mockImplementation(
+      async (_datasetId, _layerId, _featureId, coordinateSpace, signal) => {
+        if (signal) signals.push(signal)
+        return await new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
+        })
+      },
+    )
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(signals).toHaveLength(2))
+    fireEvent.click(screen.getByRole('button', { name: 'clear selection' }))
+
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    expect(screen.getByTestId('selected-id')).toHaveTextContent('none')
+    expect(screen.getByTestId('selected-wgs-label')).toHaveTextContent('not-selected')
+    expect(screen.getByTestId('map-selected-ids')).toHaveTextContent('none')
   })
 })
 
@@ -307,6 +359,49 @@ describe('OverlayProvider pick-mode shortcuts', () => {
 
     fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
     expect(screen.getByTestId('pick-mode')).toHaveTextContent('off')
+  })
+
+  it('toggles new Point picking with N, ignores inputs and does not retrigger on key repeat', async () => {
+    mockFeaturePages()
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+    const input = screen.getByRole('textbox', { name: '속성 입력' })
+
+    fireEvent.keyDown(input, { key: 'n', code: 'KeyN' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN', repeat: true })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN', ctrlKey: true })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+  })
+
+  it('keeps N inactive and explains when the active SHP layer is not Point geometry', async () => {
+    const lineLayer = { ...LAYER, geometry_type: 'Polyline' }
+    vi.spyOn(api, 'overlays').mockResolvedValue({ items: [lineLayer] })
+    vi.spyOn(api, 'overlayFeatures').mockResolvedValue(WGS_FIRST)
+    const notify = vi.fn()
+    render(
+      <OverlayProvider datasetId="dataset-1" demoMode={false} notify={notify}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+      tone: 'info',
+      title: expect.stringContaining('Point 레이어'),
+    }))
   })
 
   it('creates a Point at the picked WGS84 coordinate and selects the server-assigned ID', async () => {
@@ -340,6 +435,49 @@ describe('OverlayProvider pick-mode shortcuts', () => {
       expected_revision: LAYER.revision,
     })
     expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+
+    // The stable global listener must observe the post-request state. This
+    // guards against a completed point-pick leaving N permanently bound to the
+    // previous create target.
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+  })
+
+  it('keeps global edit and frame shortcuts live after deleting the selected feature', async () => {
+    mockFeaturePages()
+    mockOutsideFeature()
+    const deleteOverlayFeature = vi.spyOn(api, 'deleteOverlayFeature').mockResolvedValue({
+      id: 'outside-42',
+      deleted: true,
+      revision: 5,
+      source_preserved: true,
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'delete selected' }))
+    await waitFor(() => expect(deleteOverlayFeature).toHaveBeenCalledOnce())
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('none'))
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    const frameNavigation = vi.fn((event: KeyboardEvent) => event.preventDefault())
+    window.addEventListener('keydown', frameNavigation)
+    try {
+      const event = new KeyboardEvent('keydown', {
+        key: 'd',
+        code: 'KeyD',
+        bubbles: true,
+        cancelable: true,
+      })
+      expect(window.dispatchEvent(event)).toBe(false)
+      expect(frameNavigation).toHaveBeenCalledOnce()
+    } finally {
+      window.removeEventListener('keydown', frameNavigation)
+    }
   })
 
   it('copies only the selected feature geometry through the server-side copy action', async () => {
@@ -367,5 +505,26 @@ describe('OverlayProvider pick-mode shortcuts', () => {
       expected_revision: LAYER.revision,
     })
     await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('f_000000008'))
+  })
+})
+
+describe('OverlayProvider schema editing', () => {
+  it('deletes a field with the current revision and refreshes the layer cache', async () => {
+    const overlayFeatures = mockFeaturePages()
+    const deleteOverlayField = vi.spyOn(api, 'deleteOverlayField').mockResolvedValue({
+      deleted_field: 'label',
+      revision: 5,
+      fields: [{ name: 'status', type: 'C' }],
+      layer: { ...LAYER, revision: 5, fields: [{ name: 'status', type: 'C' }] },
+      source_preserved: true,
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'delete field' }))
+
+    await waitFor(() => expect(deleteOverlayField).toHaveBeenCalledOnce())
+    expect(deleteOverlayField).toHaveBeenCalledWith('dataset-1', LAYER.id, 'label', LAYER.revision)
+    await waitFor(() => expect(overlayFeatures.mock.calls.length).toBeGreaterThan(1))
   })
 })

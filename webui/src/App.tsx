@@ -4,7 +4,6 @@ import {
   CloudOff,
   ListChecks,
   Menu,
-  Plus,
   ScanSearch,
   Server,
   Settings2,
@@ -13,14 +12,15 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Brand } from './components/Brand'
+import { Brand, BrandLogo } from './components/Brand'
 import { ActivityPanel, HelpPanel } from './components/ActivityHelpPanels'
 import { DatasetPanel } from './components/DatasetPanel'
 import { DetachablePanel, type DetachablePanelHandle } from './components/DetachablePanel'
 import { GeneralSettingsPanel } from './components/GeneralSettingsPanel'
+import { LatestRunResults } from './components/LatestRunResults'
 import { OVERLAY_DETAILS_EVENT } from './components/OverlayHoverTooltip'
 import { OverlayProvider } from './components/OverlayContext'
-import { OverlayPanel } from './components/OverlayPanel'
+import { OverlayAttributePanel, OverlayPanel } from './components/OverlayPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
 import { StorageDialog } from './components/StorageDialog'
@@ -68,6 +68,7 @@ function App() {
   const [routeLoading, setRouteLoading] = useState(false)
   const [panoramaOpen, setPanoramaOpen] = useState(false)
   const [pointCloudOpen, setPointCloudOpen] = useState(false)
+  const [attributeTableOpen, setAttributeTableOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDetached, setSettingsDetached] = useState(false)
   const [settingsSection, setSettingsSection] = useState<'general' | 'process'>('general')
@@ -96,6 +97,7 @@ function App() {
   const overlayFocusRequestRef = useRef(0)
   const overlayFocusControllerRef = useRef<AbortController | null>(null)
   const overlayPanelRef = useRef<DetachablePanelHandle>(null)
+  const attributeTablePanelRef = useRef<DetachablePanelHandle>(null)
   const [frameFocusToken, setFrameFocusToken] = useState(0)
   frameScopeRef.current = `${datasetId}::${trackId}`
 
@@ -119,6 +121,28 @@ function App() {
   const dismissToast = useCallback((id: string) => {
     setToasts((current) => current.filter((toastItem) => toastItem.id !== id))
   }, [])
+
+  const openAttributeTable = useCallback(() => {
+    if (attributeTablePanelRef.current?.detach()) {
+      setAttributeTableOpen(true)
+      return true
+    }
+    toast({
+      tone: 'error',
+      title: 'SHP 속성표 팝업을 열지 못했습니다',
+      message: '브라우저의 팝업 차단 설정을 확인해 주세요.',
+    })
+    return false
+  }, [toast])
+
+  const toggleAttributeTable = useCallback(() => {
+    if (attributeTableOpen) {
+      attributeTablePanelRef.current?.returnToMain()
+      setAttributeTableOpen(false)
+      return
+    }
+    openAttributeTable()
+  }, [attributeTableOpen, openAttributeTable])
 
   const useDemo = useCallback(() => {
     setBoot(demoBootstrap)
@@ -171,14 +195,11 @@ function App() {
         setTrackId('')
       }
       setOverlayFocusLayerId(detail.layerId)
-      setDataPanelCollapsed(false)
-      setOverlayOpen(true)
-      if (overlayDetached) overlayPanelRef.current?.focus()
-      else (document.defaultView ?? window).focus()
+      openAttributeTable()
     }
     window.addEventListener(OVERLAY_DETAILS_EVENT, openOverlayDetails)
     return () => window.removeEventListener(OVERLAY_DETAILS_EVENT, openOverlayDetails)
-  }, [datasetId, datasets, overlayDetached])
+  }, [datasetId, datasets, openAttributeTable])
 
   useEffect(() => {
     const openSelectedOverlay = (event: Event) => {
@@ -241,7 +262,8 @@ function App() {
           setFrameRange(null)
           setTrackId(located.frame.track_id)
           setSelectedFrame(located.frame)
-          setPanoramaOpen(true)
+          // Feature navigation may move the active frame, but popup state is
+          // owned by DetachablePanel and only changes after window.open succeeds.
           setFrameFocusToken((value) => value + 1)
         })
         .catch((reason: unknown) => {
@@ -718,10 +740,14 @@ function App() {
             실행 큐
             {activeRuns.length > 0 && <em>{activeRuns.length}</em>}
           </button>
-          <button type="button" className="button primary compact" onClick={() => setSourceOpen(true)}>
-            <Plus size={16} />
-            데이터 추가
-          </button>
+          <LatestRunResults
+            dataset={selectedDataset}
+            runs={runs}
+            demoMode={demoMode}
+            onOpenQueue={() => setQueueOpen(true)}
+          />
+          <span className="topbar-provider-separator" aria-hidden="true" />
+          <BrandLogo />
         </div>
       </header>
 
@@ -802,22 +828,44 @@ function App() {
               detectionRevisionKey={detectionRevisionKey}
               panoramaOpen={panoramaOpen}
               pointCloudOpen={pointCloudOpen}
+              maxPointBudget={boot?.capabilities?.max_point_budget ?? 250_000}
+              attributeTableOpen={attributeTableOpen}
               hasMoreFrames={frameNextOffset !== null}
               detached={detached}
               settings={settings}
               externalAction={action}
               onTogglePanorama={() => setPanoramaOpen((value) => !value)}
               onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
+              onToggleAttributeTable={toggleAttributeTable}
               onFrameChange={setSelectedFrame}
               onMoveFrame={moveFrame}
               onOpenSource={() => setSourceOpen(true)}
-              onOpenOverlay={() => setOverlayOpen(true)}
               onUseDemo={useDemo}
               onSettingsChange={updateSettings}
             />
           )}
         </DetachablePanel>
       </div>
+
+      <DetachablePanel
+        ref={attributeTablePanelRef}
+        id="shp-attribute-table"
+        title="SHP 속성표"
+        placeholderClassName="overlay-attribute-panel-slot"
+        hostHidden
+        onDetachedChange={(detached) => {
+          if (!detached) setAttributeTableOpen(false)
+        }}
+      >
+        {({ returnToMain }) =>
+          attributeTableOpen ? (
+            <OverlayAttributePanel
+              focusLayerId={overlayFocusLayerId}
+              onClose={returnToMain}
+            />
+          ) : null
+        }
+      </DetachablePanel>
 
       {(settingsOpen || settingsDetached) && (
         <div
@@ -910,7 +958,7 @@ function App() {
           <DetachablePanel
             ref={overlayPanelRef}
             id="shp-overlay-manager"
-            title="SHP 레이어 · 속성표"
+            title="SHP 레이어 관리"
             placeholderClassName="overlay-panel-slot"
             onDetachedChange={setOverlayDetached}
           >

@@ -4,6 +4,8 @@ import {
   OVERLAY_DETAILS_EVENT,
   OverlayHoverTooltip,
   openOverlayFeatureDetails,
+  overlayHoverClassName,
+  overlayHoverLayerColor,
   overlayPropertyEntries,
   overlayPropertyPreviewEntries,
 } from './OverlayHoverTooltip'
@@ -11,6 +13,61 @@ import {
 afterEach(cleanup)
 
 describe('OverlayHoverTooltip', () => {
+  it('uses the detected class as the primary title and shows a compact colored layer badge', () => {
+    const { container } = render(
+      <OverlayHoverTooltip
+        hover={{
+          layerName: 'traffic-signs',
+          featureId: 'f-7',
+          properties: { class_nm: 'warning-sign', __overlay_color: '#b58b36' },
+          x: 10,
+          y: 20,
+          viewportWidth: 800,
+          viewportHeight: 600,
+        }}
+      />,
+    )
+
+    expect(container.querySelector('.overlay-hover-title strong')).toHaveTextContent('warning-sign')
+    expect(container.querySelector('.overlay-hover-layer')).toHaveTextContent('traffic-signs')
+    expect(container.querySelector('.overlay-hover-layer i')).toHaveStyle({
+      backgroundColor: '#b58b36',
+    })
+  })
+
+  it('uses an explicit raw YOLO model color without a registered SHP layer', () => {
+    const { container } = render(
+      <OverlayHoverTooltip
+        hover={{
+          layerName: 'YOLO · traffic-sign.pt',
+          layerColor: '#ffb84d',
+          featureId: 'det-7',
+          properties: { class_nm: 'traffic_sign', conf: 0.91 },
+          x: 10,
+          y: 20,
+          viewportWidth: 800,
+          viewportHeight: 600,
+        }}
+      />,
+    )
+    expect(container.querySelector('.overlay-hover-title strong')).toHaveTextContent('traffic_sign')
+    expect(screen.getByRole('tooltip')).toHaveTextContent('conf')
+    expect(screen.getByRole('tooltip')).toHaveTextContent('0.91')
+    expect(container.querySelector('.overlay-hover-layer')).toHaveTextContent(
+      'YOLO · traffic-sign.pt',
+    )
+    expect(container.querySelector('.overlay-hover-layer i')).toHaveStyle({
+      backgroundColor: '#ffb84d',
+    })
+  })
+
+  it('resolves class aliases and rejects unsafe renderer colors', () => {
+    expect(overlayHoverClassName({ CLASS_NAME: 'pole' }, 9)).toBe('pole')
+    expect(overlayHoverClassName({}, 9)).toBe('피처 #9')
+    expect(overlayHoverLayerColor({}, '#123abc')).toBe('#123abc')
+    expect(overlayHoverLayerColor({ __overlay_color: 'url(bad)' })).toBe('#78909f')
+  })
+
   it('shows layer properties while hiding renderer metadata', () => {
     render(
       <OverlayHoverTooltip

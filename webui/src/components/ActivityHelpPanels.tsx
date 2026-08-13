@@ -199,6 +199,7 @@ export function HelpPanel({
         <dl className="shortcut-grid">
           <div><dt><kbd>A</kbd><kbd>←</kbd></dt><dd>이전 프레임</dd></div>
           <div><dt><kbd>D</kbd><kbd>→</kbd></dt><dd>다음 프레임</dd></div>
+          <div><dt><kbd>N</kbd></dt><dd>활성 Point SHP 레이어의 신규 위치 지정/취소</dd></div>
           <div><dt><kbd>P</kbd></dt><dd>선택한 SHP 피처의 실제 좌표 지정</dd></div>
           <div><dt><kbd>Esc</kbd></dt><dd>좌표 지정 또는 열린 창 닫기</dd></div>
         </dl>

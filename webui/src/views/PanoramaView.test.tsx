@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../lib/api'
 import type { Frame } from '../types'
@@ -8,6 +8,9 @@ import PanoramaView, {
   panoramaDetectionBox,
   panoramaDetectionBoxContainsUv,
   panoramaDetectionPointRadius,
+  panoramaDetectionModelKey,
+  panoramaDetectionModels,
+  panoramaDetectionStrokeWidth,
   panoramaForwardYaw,
   panoramaOverlayAtUv,
   panoramaRequestWidth,
@@ -21,6 +24,7 @@ const threeSpies = vi.hoisted(() => ({
   rendererDisposed: vi.fn(),
   textureLoads: vi.fn(),
   textureDisposed: vi.fn(),
+  canvasFillText: vi.fn(),
 }))
 
 vi.mock('three', async (importOriginal) => {
@@ -159,6 +163,15 @@ vi.mock('../lib/api', () => ({
       model_count: 0,
       truncated: false,
     })),
+    frameAddress: vi.fn(() => Promise.resolve({
+      dataset_id: 'dataset-1',
+      frame_id: 'frame-12',
+      coordinate: { lon: 126.978, lat: 37.5665 },
+      address: '서울특별시 중구 세종대로 110',
+      address_type: 'road',
+      zipcode: '04524',
+      source: 'vworld',
+    })),
   },
 }))
 
@@ -214,6 +227,7 @@ beforeEach(() => {
   threeSpies.rendererDisposed.mockClear()
   threeSpies.textureLoads.mockClear()
   threeSpies.textureDisposed.mockClear()
+  threeSpies.canvasFillText.mockClear()
   vi.mocked(api.panorama).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.panoramaPoints).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.frameDetections).mockReset().mockResolvedValue({
@@ -225,6 +239,15 @@ beforeEach(() => {
     count: 0,
     model_count: 0,
     truncated: false,
+  })
+  vi.mocked(api.frameAddress).mockReset().mockResolvedValue({
+    dataset_id: 'dataset-1',
+    frame_id: 'frame-12',
+    coordinate: { lon: 126.978, lat: 37.5665 },
+    address: '서울특별시 중구 세종대로 110',
+    address_type: 'road',
+    zipcode: '04524',
+    source: 'vworld',
   })
   vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
   vi.stubGlobal('cancelAnimationFrame', vi.fn())
@@ -248,7 +271,7 @@ beforeEach(() => {
         stroke: vi.fn(),
         strokeRect: vi.fn(),
         fillRect: vi.fn(),
-        fillText: vi.fn(),
+        fillText: threeSpies.canvasFillText,
         measureText: vi.fn(() => ({ width: 50 })),
       } as unknown as CanvasRenderingContext2D
     }) as HTMLCanvasElement['getContext'],
@@ -312,7 +335,7 @@ describe('panoramaDetectionBox', () => {
       bottom: 220,
       panoramaWidth: 8192,
       panoramaHeight: 4096,
-      label: 'traffic_sign 88%',
+      label: 'traffic_sign\nconf 88%',
     })
     expect(panoramaDetectionBox(properties, 'frame-13.jpg')).toBeNull()
   })
@@ -332,7 +355,7 @@ describe('panoramaDetectionBox', () => {
       bottom: 220,
       panoramaWidth: 8192,
       panoramaHeight: 4096,
-      label: 'traffic_light 91%',
+      label: 'traffic_light\nconf 91%',
     })
   })
 
@@ -356,6 +379,22 @@ describe('panoramaDetectionBox', () => {
     expect(panoramaDetectionPointRadius(true, 30)).toBe(3.5)
   })
 
+  it('uses thin box strokes', () => {
+    expect(panoramaDetectionStrokeWidth(false)).toBe(1.5)
+    expect(panoramaDetectionStrokeWidth(true)).toBe(3)
+  })
+
+  it('builds stable model options and retains empty models reported by the API', () => {
+    expect(panoramaDetectionModelKey('run-specific-id', 'stable-model-id')).toBe('stable-model-id')
+    expect(panoramaDetectionModels([
+      { source_id: 'source-a', model_id: 'model-id-a', source_name: 'best.pt', count: 3 },
+      { source_id: 'source-empty', model_id: 'model-id-empty', source_name: 'best.pt', count: 0 },
+    ], [])).toMatchObject([
+      { key: 'model-id-a', name: 'best.pt', count: 3 },
+      { key: 'model-id-empty', name: 'best.pt', count: 0 },
+    ])
+  })
+
   it('deduplicates raw observations and lets unlinked boxes expose a preview hit', () => {
     const box: RenderPanoramaDetectionBox = {
       sourceId: 'source-model-a',
@@ -372,7 +411,7 @@ describe('panoramaDetectionBox', () => {
         bottom: 250,
         panoramaWidth: 1000,
         panoramaHeight: 500,
-        label: 'traffic_sign 91%',
+        label: 'traffic_sign\nconf 91%',
       },
     }
     expect(deduplicatePanoramaDetectionBoxes([
@@ -387,6 +426,7 @@ describe('panoramaDetectionBox', () => {
       layerName: '검출 결과',
       featureId: 'det-1',
       properties: { class_nm: 'traffic_sign', conf: 0.91 },
+      color: '#ffb84d',
     })
 
     const linked = { ...box, featureId: 'feature-7' }
@@ -404,7 +444,7 @@ describe('panoramaDetectionBox', () => {
       bottom: 250,
       panoramaWidth: 1000,
       panoramaHeight: 500,
-      label: 'traffic_sign 91%',
+      label: 'traffic_sign\nconf 91%',
     }
     const raw: RenderPanoramaDetectionBox = {
       sourceId: 'source-model-a',
@@ -453,6 +493,7 @@ describe('panoramaDetectionBox', () => {
       layerId: 'layer-1',
       layerName: 'Detected signs',
       featureId: 'feature-7',
+      tooltipLayerColor: '#22c55e',
       properties: { asset_id: 'asset-7' },
     })
     expect(reconciled[1].layerId).toBeUndefined()
@@ -460,6 +501,7 @@ describe('panoramaDetectionBox', () => {
     expect(panoramaOverlayAtUv([], 0.45, 0.4, reconciled)).toMatchObject({
       layerId: 'layer-1',
       featureId: 'feature-7',
+      color: '#22c55e',
     })
   })
 })
@@ -484,6 +526,104 @@ describe('PanoramaView frame navigation', () => {
 
     expect(onPreviousFrame).toHaveBeenCalledTimes(1)
     expect(onNextFrame).toHaveBeenCalledTimes(1)
+  })
+
+  it('moves to the adjacent frame in the current viewing direction', () => {
+    const previous = {
+      ...FRAME,
+      id: 'frame-11',
+      index: 11,
+      coordinate: { lon: 126.978, lat: 37.5655 },
+    }
+    const forward = {
+      ...NEXT_FRAME,
+      coordinate: { lon: 126.978, lat: 37.5675 },
+    }
+    const onFrameChange = vi.fn()
+    const { container } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={{ ...FRAME, heading: 0 }}
+        frames={[previous, { ...FRAME, heading: 0 }, forward]}
+        onFrameChange={onFrameChange}
+        demoMode={false}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', {
+      name: '바라보는 방향의 인접 프레임으로 이동',
+    }))
+    expect(container.querySelector('.panorama-location-bar')).toContainElement(
+      screen.getByRole('button', { name: '바라보는 방향의 인접 프레임으로 이동' }),
+    )
+    expect(onFrameChange).toHaveBeenCalledWith(forward)
+  })
+
+  it('shows the reverse-geocoded address while retaining frame coordinates', async () => {
+    render(<PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />)
+    expect(screen.getByText('37.566500, 126.978000')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('서울특별시 중구 세종대로 110')).toBeInTheDocument()
+    })
+    expect(api.frameAddress).toHaveBeenCalledWith(
+      'dataset-1',
+      'frame-12',
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('keeps a coordinate-only location pill when no address or direction target exists', async () => {
+    vi.mocked(api.frameAddress).mockResolvedValueOnce({
+      dataset_id: 'dataset-1',
+      frame_id: 'frame-12',
+      coordinate: { lon: 126.978, lat: 37.5665 },
+      address: null,
+      address_type: null,
+      zipcode: null,
+      source: 'coordinate_fallback',
+    })
+    const { container } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={FRAME}
+        frames={[FRAME]}
+        onFrameChange={vi.fn()}
+        demoMode={false}
+      />,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('.panorama-location-bar')).toHaveTextContent(
+        '37.566500, 126.978000',
+      )
+    })
+    expect(screen.queryByRole('button', {
+      name: '바라보는 방향의 인접 프레임으로 이동',
+    })).not.toBeInTheDocument()
+  })
+
+  it('uses paginated next-frame navigation when the forward neighbor is not loaded yet', () => {
+    const previous = {
+      ...FRAME,
+      id: 'frame-11',
+      index: 11,
+      coordinate: { lon: 126.978, lat: 37.5655 },
+    }
+    const onNextFrame = vi.fn()
+    render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={{ ...FRAME, heading: 0 }}
+        frames={[previous, { ...FRAME, heading: 0 }]}
+        onFrameChange={vi.fn()}
+        onNextFrame={onNextFrame}
+        hasNextFrame
+        demoMode={false}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', {
+      name: '바라보는 방향의 인접 프레임으로 이동',
+    }))
+    expect(onNextFrame).toHaveBeenCalledOnce()
   })
 
   it('uses high quality by default and reloads with the fast quality budget', async () => {
@@ -566,6 +706,7 @@ describe('PanoramaView media lifecycle', () => {
       }],
       count: 1,
       model_count: 1,
+      models: [{ source_id: 'det-src_model-a', source_name: 'traffic-sign.pt', count: 1 }],
       truncated: false,
     })
 
@@ -579,6 +720,78 @@ describe('PanoramaView media lifecycle', () => {
         'frame-12',
         expect.any(AbortSignal),
       )
+      expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
+    })
+    expect(threeSpies.canvasFillText).not.toHaveBeenCalled()
+  })
+
+  it('filters boxes and counts by model while preserving choices across frames', async () => {
+    const detection = (sourceId: string, modelId: string, sourceName: string, left: number) => ({
+      source_id: sourceId,
+      model_id: modelId,
+      source_name: sourceName,
+      observation_id: `${sourceId}-det`,
+      properties: {
+        img_name: 'frame-12.jpg',
+        class_nm: 'traffic_sign',
+        conf: 0.91,
+        bbox_l: left,
+        bbox_t: 150,
+        bbox_r: left + 100,
+        bbox_b: 250,
+        pano_w: 1000,
+        pano_h: 500,
+      },
+    })
+    vi.mocked(api.frameDetections).mockImplementation((_datasetId, frameId) => {
+      const suffix = frameId === FRAME.id ? 'first' : 'next'
+      const items = [
+        detection(`source-a-${suffix}`, 'model-id-a', 'model-a.pt', 100),
+        detection(`source-b-${suffix}`, 'model-id-b', 'model-b.pt', 300),
+      ]
+      return Promise.resolve({
+        dataset_id: 'dataset-1',
+        frame_id: frameId,
+        coordinate_space: 'panorama_equirectangular_pixels',
+        projection: 'equirectangular',
+        items,
+        models: [
+          { source_id: `source-a-${suffix}`, model_id: 'model-id-a', source_name: 'model-a.pt', count: 1 },
+          { source_id: `source-b-${suffix}`, model_id: 'model-id-b', source_name: 'model-b.pt', count: 1 },
+          { source_id: `source-empty-${suffix}`, model_id: 'model-id-empty', source_name: 'model-empty.pt', count: 0 },
+        ],
+        count: 2,
+        model_count: 3,
+        truncated: false,
+      })
+    })
+
+    const { container, rerender } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('[data-yolo-box-count="2"]')).toBeInTheDocument()
+      expect(screen.getByLabelText('model-empty.pt 검출 표시')).toBeChecked()
+    })
+
+    fireEvent.click(screen.getByLabelText('model-a.pt 검출 표시'))
+    await waitFor(() => {
+      expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
+    })
+    fireEvent.click(screen.getByLabelText('model-b.pt 검출 표시'))
+    fireEvent.click(screen.getByLabelText('model-empty.pt 검출 표시'))
+    await waitFor(() => {
+      expect(container.querySelector('[data-yolo-box-count="0"]')).toBeInTheDocument()
+      expect(screen.getByText('0/3')).toBeInTheDocument()
+    })
+
+    rerender(<PanoramaView datasetId="dataset-1" frame={NEXT_FRAME} demoMode={false} />)
+    await waitFor(() => expect(api.frameDetections).toHaveBeenCalledTimes(2))
+    expect(screen.getByLabelText('model-a.pt 검출 표시')).not.toBeChecked()
+    expect(container.querySelector('[data-yolo-box-count="0"]')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('model-a.pt 검출 표시'))
+    await waitFor(() => {
       expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
     })
   })

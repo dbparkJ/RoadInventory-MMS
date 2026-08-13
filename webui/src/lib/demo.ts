@@ -78,6 +78,7 @@ export const demoBootstrap: BootstrapResponse = {
     upload: true,
     panorama: true,
     point_cloud: true,
+    max_point_budget: 1_000_000,
     auto_optimize: true,
   },
   recent_runs: [
@@ -126,14 +127,20 @@ export function getDemoFrames(
 }
 
 export function createDemoPointCloud(budget: number): PointCloudPayload {
-  const pointCount = Math.min(Math.max(12_000, budget), 120_000)
+  // Mirror the real preview selector so the 25만/50만/100만 density options remain
+  // meaningful in demo mode as well.
+  const pointCount = Math.min(Math.max(250_000, budget), 1_000_000)
   const positions = new Float32Array(pointCount * 3)
   const colors = new Uint8Array(pointCount * 3)
 
   for (let index = 0; index < pointCount; index += 1) {
     const offset = index * 3
     const lane = index % 7
-    const longitudinal = ((index * 0.61803398875) % 1) * 100 - 50
+    const bandRatio = index / pointCount
+    const bandPhase = (index * 0.61803398875) % 1
+    const longitudinal = bandRatio < 0.75
+      ? bandPhase * 30 - 15
+      : (bandPhase < 0.5 ? -1 : 1) * (15 + (bandPhase % 0.5) * 20)
     const lateralNoise = Math.sin(index * 12.9898) * 0.16
     let x = (lane - 3) * 1.7 + lateralNoise
     let y = longitudinal
@@ -162,7 +169,7 @@ export function createDemoPointCloud(budget: number): PointCloudPayload {
   return {
     positions,
     colors,
-    bounds: { min: [-9, -50, -1], max: [9, 50, 9] },
+    bounds: { min: [-9, -25, -1], max: [9, 25, 9] },
     pointCount,
   }
 }

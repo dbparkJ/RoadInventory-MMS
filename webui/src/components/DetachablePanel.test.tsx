@@ -1,0 +1,180 @@
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useRef, useState } from 'react'
+import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
+
+function fakePopup() {
+  const events = new EventTarget()
+  const popupDocument = document.implementation.createHTMLDocument('')
+  let closed = false
+  const popup = {
+    document: popupDocument,
+    get closed() {
+      return closed
+    },
+    KeyboardEvent: window.KeyboardEvent,
+    addEventListener: events.addEventListener.bind(events),
+    removeEventListener: events.removeEventListener.bind(events),
+    dispatchEvent: events.dispatchEvent.bind(events),
+    focus: vi.fn(),
+    close: vi.fn(() => {
+      if (closed) return
+      closed = true
+      events.dispatchEvent(new Event('beforeunload'))
+    }),
+  } as unknown as Window
+  return {
+    popup,
+    forceClose: () => {
+      closed = true
+    },
+  }
+}
+
+function Harness({ onDetachedChange }: { onDetachedChange?: (detached: boolean) => void }) {
+  const panelRef = useRef<DetachablePanelHandle>(null)
+  return (
+    <DetachablePanel
+      ref={panelRef}
+      id="relay-test"
+      title="relay test"
+      onDetachedChange={onDetachedChange}
+    >
+      {() => (
+        <button type="button" onClick={() => panelRef.current?.detach()}>
+          popup 열기
+        </button>
+      )}
+    </DetachablePanel>
+  )
+}
+
+function FeatureMutationHarness() {
+  const panelRef = useRef<DetachablePanelHandle>(null)
+  const [featurePresent, setFeaturePresent] = useState(true)
+  return (
+    <DetachablePanel ref={panelRef} id="mutation-test" title="mutation test">
+      {() => (
+        <>
+          <button type="button" onClick={() => panelRef.current?.detach()}>
+            open mutation popup
+          </button>
+          {featurePresent ? (
+            <button type="button" onClick={() => setFeaturePresent(false)}>
+              delete feature
+            </button>
+          ) : (
+            <span>feature deleted</span>
+          )}
+        </>
+      )}
+    </DetachablePanel>
+  )
+}
+
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
+
+describe('DetachablePanel keyboard relay', () => {
+  it('relays one N event from a detached window to the canonical app window', () => {
+    const { popup } = fakePopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    const onKeyDown = vi.fn()
+    window.addEventListener('keydown', onKeyDown)
+    try {
+      render(<Harness />)
+      fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
+
+      popup.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'n',
+          code: 'KeyN',
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+
+      expect(onKeyDown).toHaveBeenCalledOnce()
+      expect(onKeyDown.mock.calls[0][0]).toMatchObject({ code: 'KeyN' })
+    } finally {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  })
+
+  it('reconciles a force-closed popup and reopens it with one click', () => {
+    vi.useFakeTimers()
+    const first = fakePopup()
+    const second = fakePopup()
+    const open = vi
+      .spyOn(window, 'open')
+      .mockReturnValueOnce(first.popup)
+      .mockReturnValueOnce(second.popup)
+    const onDetachedChange = vi.fn()
+    render(<Harness onDetachedChange={onDetachedChange} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
+    expect(screen.getByLabelText('relay test 분리됨')).toBeInTheDocument()
+    expect(onDetachedChange).toHaveBeenLastCalledWith(true)
+
+    first.forceClose()
+    act(() => vi.advanceTimersByTime(250))
+
+    expect(screen.queryByLabelText('relay test 분리됨')).not.toBeInTheDocument()
+    expect(onDetachedChange.mock.calls.map(([detached]) => detached)).toEqual([true, false])
+
+    fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
+    expect(open).toHaveBeenCalledTimes(2)
+    expect(screen.getByLabelText('relay test 분리됨')).toBeInTheDocument()
+  })
+
+  it('handles overlapping lifecycle close events only once', () => {
+    const { popup } = fakePopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    const onDetachedChange = vi.fn()
+    render(<Harness onDetachedChange={onDetachedChange} />)
+    fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
+
+    act(() => {
+      popup.dispatchEvent(new Event('pagehide'))
+      popup.dispatchEvent(new Event('unload'))
+      popup.dispatchEvent(new Event('beforeunload'))
+    })
+
+    expect(onDetachedChange.mock.calls.map(([detached]) => detached)).toEqual([true, false])
+    expect(screen.queryByLabelText('relay test 분리됨')).not.toBeInTheDocument()
+  })
+
+  it('keeps A/D relay active when deleting a feature control replaces popup content', () => {
+    const { popup } = fakePopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    const onKeyDown = vi.fn((event: KeyboardEvent) => event.preventDefault())
+    window.addEventListener('keydown', onKeyDown)
+    try {
+      render(<FeatureMutationHarness />)
+      fireEvent.click(screen.getByRole('button', { name: 'open mutation popup' }))
+      const deleteButton = Array.from(popup.document.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'delete feature',
+      )
+      expect(deleteButton).toBeDefined()
+      act(() => deleteButton!.click())
+      expect(popup.document.body.textContent).toContain('feature deleted')
+
+      const nextFrame = new KeyboardEvent('keydown', {
+        key: 'd',
+        code: 'KeyD',
+        bubbles: true,
+        cancelable: true,
+      })
+      popup.dispatchEvent(nextFrame)
+
+      expect(nextFrame.defaultPrevented).toBe(true)
+      expect(onKeyDown).toHaveBeenCalledOnce()
+      expect(onKeyDown.mock.calls[0][0]).toMatchObject({ code: 'KeyD' })
+    } finally {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  })
+})

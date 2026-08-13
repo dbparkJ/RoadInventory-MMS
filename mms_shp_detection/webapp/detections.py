@@ -324,6 +324,23 @@ def _public_scalar(value: Any, *, maximum_length: int = 160) -> Any:
     return None
 
 
+def _accepted_dataset_position(detection: dict[str, Any]) -> list[float] | None:
+    """Expose only the pipeline-accepted 3-D representative point.
+
+    A 2-D panorama box alone has no trustworthy depth. Rejected candidate
+    coordinates therefore remain private rather than being presented as an
+    observed point in the 3-D viewer.
+    """
+
+    if detection.get("accepted_for_shp") is not True:
+        return None
+    try:
+        position = [float(detection[axis]) for axis in ("x", "y", "z")]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return position if all(math.isfinite(value) for value in position) else None
+
+
 def _items_from_payload(
     payload: dict[str, Any],
     *,
@@ -340,6 +357,7 @@ def _items_from_payload(
     image_name = str(frame_task.get("image_name") or "").strip()
     record_name = str(frame_task.get("record_name") or "").strip()
     source_id = opaque_id("det-src", run_id, model_key, length=32)
+    model_id = opaque_id("det-model", model_key, length=32)
     source_name = _display_model_name(payload, model_key)
     items: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
@@ -372,6 +390,7 @@ def _items_from_payload(
         if identity in seen:
             continue
         seen.add(identity)
+        dataset_position = _accepted_dataset_position(detection)
         properties = {
             "class_id": _public_scalar(detection.get("class_id")),
             "class_nm": _public_scalar(detection.get("class_name")),
@@ -389,13 +408,24 @@ def _items_from_payload(
             "bbox_space": "panorama_equirectangular_pixels",
             "bbox_mapping": mapping,
             "accepted": _public_scalar(detection.get("accepted_for_shp")),
+            **(
+                {
+                    "x": dataset_position[0],
+                    "y": dataset_position[1],
+                    "z": dataset_position[2],
+                }
+                if dataset_position is not None
+                else {}
+            ),
         }
         items.append(
             {
                 "source_id": source_id,
+                "model_id": model_id,
                 "source_name": source_name,
                 "observation_id": detection_id,
                 "properties": properties,
+                **({"dataset_position": dataset_position} if dataset_position else {}),
             }
         )
     return items, False
@@ -515,6 +545,7 @@ def frame_detections(
             break
 
     items: list[dict[str, Any]] = []
+    models: list[dict[str, Any]] = []
     items_truncated = False
     if matched_run is not None:
         for model_key, payload in payloads:
@@ -527,12 +558,23 @@ def frame_detections(
             )
             items.extend(model_items)
             items_truncated = items_truncated or model_truncated
+            models.append(
+                {
+                    "model_id": opaque_id("det-model", model_key, length=32),
+                    "source_id": opaque_id(
+                        "det-src", str(matched_run["id"]), model_key, length=32
+                    ),
+                    "source_name": _display_model_name(payload, model_key),
+                    "count": len(model_items),
+                }
+            )
     return {
         "dataset_id": dataset_id,
         "frame_id": frame_id,
         "coordinate_space": "panorama_equirectangular_pixels",
         "projection": "equirectangular",
         "items": items,
+        "models": models,
         "count": len(items),
         "model_count": len(payloads),
         "truncated": payload_scan_truncated or items_truncated,

@@ -1,4 +1,4 @@
-import { AlertTriangle, Box, Crosshair, Layers, LoaderCircle, Map as MapIcon, Navigation2, RotateCcw } from 'lucide-react'
+import { AlertTriangle, Box, Crosshair, Image as ImageIcon, Layers, LoaderCircle, Map as MapIcon, Navigation2, RotateCcw } from 'lucide-react'
 import type { FeatureCollection } from 'geojson'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -7,6 +7,11 @@ import {
   type OverlayHoverState,
 } from '../components/OverlayHoverTooltip'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
+import { frameNavigationDirection, isTextEntryTarget } from '../lib/frameNavigation'
+import {
+  MAP_SELECTED_FEATURE_COLOR,
+  MAP_SELECTED_FRAME_COLOR,
+} from '../lib/mapSelectionColors'
 import { resolveMapTrackScope } from '../lib/mapScope'
 import {
   buildRouteFeatureCollection,
@@ -33,6 +38,36 @@ import {
   type VWorldOverlayHoverTarget,
   type VWorldRuntime,
 } from '../lib/vworld'
+
+export function relayMapOverlayShortcut(event: KeyboardEvent, ownerWindow: Window): boolean {
+  const globalShortcut =
+    frameNavigationDirection(event) !== null ||
+    event.code === 'KeyN' ||
+    event.code === 'KeyP' ||
+    event.key === 'Escape'
+  if (
+    event.defaultPrevented ||
+    !globalShortcut ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    isTextEntryTarget(event.target)
+  ) {
+    return false
+  }
+  const KeyboardEventConstructor = ownerWindow.document.defaultView?.KeyboardEvent ?? KeyboardEvent
+  const relayedEvent = new KeyboardEventConstructor('keydown', {
+    key: event.key,
+    code: event.code,
+    repeat: event.repeat,
+    bubbles: true,
+    cancelable: true,
+  })
+  const handled = !ownerWindow.dispatchEvent(relayedEvent)
+  if (handled) event.preventDefault()
+  return handled
+}
 import {
   createVWorld2DDataSource,
   destroyVWorld2DMap,
@@ -41,14 +76,45 @@ import {
   moveVWorld2DMap,
   removeVWorld2DDataSource,
   renderVWorld2DCollection,
+  setVWorld2DBaseMap,
   startVWorld2DMap,
   vworld2DOverlayHoverTarget,
   VWORLD_2D_CONTAINER_ID,
   VWORLD_2D_IFRAME_URL,
+  type VWorld2DBaseMap,
   type VWorld2DDataSource,
   type VWorld2DRuntime,
 } from '../lib/vworld2d'
 import type { Frame, FrameRange, RoutePoint } from '../types'
+
+const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
+  type: 'FeatureCollection',
+  features: [],
+}
+
+export function collectionForMapLayer(
+  collection: FeatureCollection,
+  visible: boolean,
+): FeatureCollection {
+  return visible ? collection : EMPTY_FEATURE_COLLECTION
+}
+
+export type MapMode = '2d' | 'satellite' | '3d'
+
+export function isVWorld2DMapMode(mode: MapMode): mode is Exclude<MapMode, '3d'> {
+  return mode !== '3d'
+}
+
+export function vworld2DBaseMapForMode(mode: MapMode): VWorld2DBaseMap {
+  return mode === 'satellite' ? 'satellite' : 'base'
+}
+
+export function mapProviderForMode(mode: MapMode): string {
+  if (mode === '3d') return 'vworld-webgl-3.0'
+  return mode === 'satellite'
+    ? 'vworld-wmts-satellite-1.0.0'
+    : 'vworld-wmts-base-1.0.0'
+}
 
 interface MapViewProps {
   route: RoutePoint[]
@@ -56,10 +122,11 @@ interface MapViewProps {
   selectedFrame: Frame | null
   activeTrackId?: string
   showAllTracks?: boolean
+  trackLayerVisible?: boolean
   frameRange?: FrameRange | null
   loading: boolean
-  mapMode: '2d' | '3d'
-  onMapModeChange: (mode: '2d' | '3d') => void
+  mapMode: MapMode
+  onMapModeChange: (mode: MapMode) => void
   onSelectFrame: (frame: Frame) => void
 }
 
@@ -138,6 +205,7 @@ export function MapView({
   selectedFrame,
   activeTrackId,
   showAllTracks = false,
+  trackLayerVisible = true,
   frameRange,
   loading,
   mapMode,
@@ -181,7 +249,8 @@ export function MapView({
   mapModeRef.current = mapMode
   mapHoverRef.current = mapHover
   pinnedMapHoverRef.current = pinnedMapHover
-  const ready = mapMode === '2d' ? ready2D : ready3D
+  const vworld2DActive = isVWorld2DMapMode(mapMode)
+  const ready = vworld2DActive ? ready2D : ready3D
 
   const overlayGeoJson = useMemo<FeatureCollection>(
     () => ({
@@ -257,6 +326,8 @@ export function MapView({
     [frameRange, selectedFrame, trackColors, visibleFrames],
   )
 
+  const renderedFrameGeoJson = collectionForMapLayer(frameGeoJson, trackLayerVisible)
+
   const routeGeoJson = useMemo(() => {
     const collection = buildRouteFeatureCollection(route)
     if (displayAllTracks || !effectiveTrackId) return collection
@@ -277,6 +348,8 @@ export function MapView({
       ),
     }
   }, [displayAllTracks, effectiveTrackId, frameIndexes, frameRange, route])
+  const renderedRouteGeoJson = collectionForMapLayer(routeGeoJson, trackLayerVisible)
+  const renderedRouteRangeGeoJson = collectionForMapLayer(routeRangeGeoJson, trackLayerVisible)
 
   useEffect(() => {
     if (mapMode !== '3d') return
@@ -438,10 +511,13 @@ export function MapView({
         hoverCanvas.addEventListener('pointerleave', mapPointerLeaveHandler)
         mapKeyDownDocument = frameWindow.document
         mapKeyDownHandler = (event) => {
-          if (event.key !== 'Escape' || !pinnedMapHoverRef.current) return
-          event.preventDefault()
-          setPinnedMapHover(null)
-          setMapHover(null)
+          const relayed = relayMapOverlayShortcut(event, iframe.ownerDocument.defaultView ?? window)
+          if (event.key === 'Escape' && pinnedMapHoverRef.current) {
+            event.preventDefault()
+            setPinnedMapHover(null)
+            setMapHover(null)
+          }
+          if (relayed) return
         }
         mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
 
@@ -507,7 +583,7 @@ export function MapView({
   }, [mapMode, reloadToken])
 
   useEffect(() => {
-    if (mapMode !== '2d') return
+    if (!vworld2DActive) return
     const iframe = iframe2DRef.current
     if (!iframe) return
     let cancelled = false
@@ -533,6 +609,8 @@ export function MapView({
               frameWindow,
               VWORLD_2D_CONTAINER_ID,
               initialCameraRef.current,
+              15_000,
+              vworld2DBaseMapForMode(mapModeRef.current),
             ),
           }
         }
@@ -620,10 +698,13 @@ export function MapView({
         runtime.map.on('pointermove', mapPointerMoveHandler)
         mapKeyDownDocument = frameWindow.document
         mapKeyDownHandler = (event) => {
-          if (event.key !== 'Escape' || !pinnedMapHoverRef.current) return
-          event.preventDefault()
-          setPinnedMapHover(null)
-          setMapHover(null)
+          const relayed = relayMapOverlayShortcut(event, iframe.ownerDocument.defaultView ?? window)
+          if (event.key === 'Escape' && pinnedMapHoverRef.current) {
+            event.preventDefault()
+            setPinnedMapHover(null)
+            setMapHover(null)
+          }
+          if (relayed) return
         }
         mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
 
@@ -677,43 +758,49 @@ export function MapView({
       setMapHover(null)
       setReady2D(false)
     }
-  }, [mapMode, reloadToken])
+  }, [reloadToken, vworld2DActive])
+
+  useEffect(() => {
+    const runtime = runtime2DRef.current
+    if (!runtime || !ready2D || !vworld2DActive) return
+    setVWorld2DBaseMap(runtime, vworld2DBaseMapForMode(mapMode))
+  }, [mapMode, ready2D, vworld2DActive])
 
   useEffect(() => {
     const runtime = runtimeRef.current
     const source = sourcesRef.current?.route
     if (!runtime || !source || !ready3D) return
     try {
-      renderVWorldRoute(runtime, source, routeGeoJson)
+      renderVWorldRoute(runtime, source, renderedRouteGeoJson)
     } catch (reason) {
       setMapError(reason instanceof Error ? reason.message : 'VWorld 이동 경로를 갱신하지 못했습니다.')
     }
-  }, [ready3D, routeGeoJson])
+  }, [ready3D, renderedRouteGeoJson])
 
   useEffect(() => {
     const runtime = runtimeRef.current
     const source = sourcesRef.current?.routeRange
     if (!runtime || !source || !ready3D) return
     try {
-      renderVWorldRouteRange(runtime, source, routeRangeGeoJson)
+      renderVWorldRouteRange(runtime, source, renderedRouteRangeGeoJson)
     } catch (reason) {
       setMapError(reason instanceof Error ? reason.message : 'VWorld 선택 구간을 갱신하지 못했습니다.')
     }
-  }, [ready3D, routeRangeGeoJson])
+  }, [ready3D, renderedRouteRangeGeoJson])
 
   useEffect(() => {
     const runtime = runtimeRef.current
     const source = sourcesRef.current?.frames
     if (!runtime || !source || !ready3D) return
     try {
-      frameClickTargetsRef.current = renderVWorldFrames(runtime, source, frameGeoJson, (frameId) => {
+      frameClickTargetsRef.current = renderVWorldFrames(runtime, source, renderedFrameGeoJson, (frameId) => {
         const frame = framesRef.current.find((candidate) => candidate.id === frameId)
         if (frame) onSelectRef.current(frame)
       })
     } catch (reason) {
       setMapError(reason instanceof Error ? reason.message : 'VWorld 프레임을 갱신하지 못했습니다.')
     }
-  }, [frameGeoJson, ready3D])
+  }, [ready3D, renderedFrameGeoJson])
 
   useEffect(() => {
     const runtime = runtimeRef.current
@@ -734,22 +821,22 @@ export function MapView({
     const runtime = runtime2DRef.current
     const source = sources2DRef.current?.route
     if (!runtime || !source || !ready2D) return
-    renderVWorld2DCollection(runtime, source, routeGeoJson, 'route')
-  }, [ready2D, routeGeoJson])
+    renderVWorld2DCollection(runtime, source, renderedRouteGeoJson, 'route')
+  }, [ready2D, renderedRouteGeoJson])
 
   useEffect(() => {
     const runtime = runtime2DRef.current
     const source = sources2DRef.current?.routeRange
     if (!runtime || !source || !ready2D) return
-    renderVWorld2DCollection(runtime, source, routeRangeGeoJson, 'route-range')
-  }, [ready2D, routeRangeGeoJson])
+    renderVWorld2DCollection(runtime, source, renderedRouteRangeGeoJson, 'route-range')
+  }, [ready2D, renderedRouteRangeGeoJson])
 
   useEffect(() => {
     const runtime = runtime2DRef.current
     const source = sources2DRef.current?.frames
     if (!runtime || !source || !ready2D) return
-    renderVWorld2DCollection(runtime, source, frameGeoJson, 'frame')
-  }, [frameGeoJson, ready2D])
+    renderVWorld2DCollection(runtime, source, renderedFrameGeoJson, 'frame')
+  }, [ready2D, renderedFrameGeoJson])
 
   useEffect(() => {
     const runtime = runtime2DRef.current
@@ -759,41 +846,41 @@ export function MapView({
   }, [overlayGeoJson, ready2D])
 
   useEffect(() => {
-    if (!ready || visibleRoute.length === 0) return
+    if (!ready || !trackLayerVisible || visibleRoute.length === 0) return
     const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
     if (fittedRouteRef.current === routeKey) return
     fittedRouteRef.current = routeKey
     const coordinates = visibleRoute.map((point) => [point.lon, point.lat] as const)
-    if (mapMode === '2d') {
+    if (vworld2DActive) {
       const runtime = runtime2DRef.current
       if (runtime) fitVWorld2DMap(runtime, coordinates)
     } else {
       const runtime = runtimeRef.current
       if (runtime) setVWorldSceneMode(runtime, '3d', cameraTargetForCoordinates(coordinates))
     }
-  }, [displayAllTracks, effectiveTrackId, mapMode, ready, visibleRoute])
+  }, [displayAllTracks, effectiveTrackId, ready, trackLayerVisible, visibleRoute, vworld2DActive])
 
   useEffect(() => {
     if (!ready || !selectedOverlayCoordinate) return
     const target = {
       ...selectedOverlayCoordinate,
-      height: mapMode === '2d' ? 650 : 180,
+      height: vworld2DActive ? 650 : 180,
       heading: 0,
-      tilt: mapMode === '2d' ? -90 : -64,
+      tilt: vworld2DActive ? -90 : -64,
     }
-    if (mapMode === '2d') {
+    if (vworld2DActive) {
       const runtime = runtime2DRef.current
       if (runtime) moveVWorld2DMap(runtime, target)
     } else {
       const runtime = runtimeRef.current
       if (runtime) moveVWorldMap(runtime, target)
     }
-  }, [mapMode, ready, selectedOverlayCoordinate])
+  }, [ready, selectedOverlayCoordinate, vworld2DActive])
 
   const recenter = () => {
     const target = frameNavigationTarget(selectedFrame, 'current-frame-button')
     if (!target) return
-    if (mapMode === '2d') {
+    if (vworld2DActive) {
       const runtime = runtime2DRef.current
       if (runtime) moveVWorld2DMap(runtime, target)
     } else {
@@ -812,9 +899,9 @@ export function MapView({
     setReloadToken((value) => value + 1)
   }
 
-  const changeMapMode = (mode: '2d' | '3d') => {
+  const changeMapMode = (mode: MapMode) => {
     if (mode === mapMode) return
-    fittedRouteRef.current = ''
+    if (isVWorld2DMapMode(mode) !== vworld2DActive) fittedRouteRef.current = ''
     setMapError(null)
     setMapHover(null)
     setPinnedMapHover(null)
@@ -825,9 +912,10 @@ export function MapView({
     <div
       ref={mapRootRef}
       className={`map-view ${highContrast ? 'high-contrast-mode' : ''}`}
-      data-map-provider={mapMode === '2d' ? 'vworld-2d-2.0' : 'vworld-webgl-3.0'}
+      data-map-provider={mapProviderForMode(mapMode)}
       data-track-scope={displayAllTracks ? 'all' : effectiveTrackId ?? 'none'}
-      data-route-feature-count={routeGeoJson.features.length}
+      data-track-layer-visible={trackLayerVisible}
+      data-route-feature-count={renderedRouteGeoJson.features.length}
       data-overlay-feature-count={overlayGeoJson.features.length}
       data-map-mode={mapMode}
     >
@@ -840,13 +928,13 @@ export function MapView({
           title="VWorld WebGL 3D 지도"
         />
       )}
-      {mapMode === '2d' && (
+      {vworld2DActive && (
         <iframe
           key={`2d-${reloadToken}`}
           ref={iframe2DRef}
           className="map-container vworld-map-frame"
           src={`${VWORLD_2D_IFRAME_URL}?reload=${reloadToken}`}
-          title="VWorld 2D 일반지도"
+          title={mapMode === 'satellite' ? 'VWorld 위성지도' : 'VWorld 2D 일반지도'}
         />
       )}
       <OverlayHoverTooltip
@@ -885,7 +973,7 @@ export function MapView({
         </div>
       )}
       <div className="map-tools">
-        <div className="map-mode-switch" role="group" aria-label="지도 2D 3D 전환">
+        <div className="map-mode-switch" role="group" aria-label="지도 모드 선택">
           <button
             type="button"
             className={mapMode === '2d' ? 'active' : ''}
@@ -894,6 +982,15 @@ export function MapView({
             title="VWorld 2D 일반 도로지도"
           >
             <MapIcon size={16} /> 2D
+          </button>
+          <button
+            type="button"
+            className={mapMode === 'satellite' ? 'active' : ''}
+            aria-pressed={mapMode === 'satellite'}
+            onClick={() => changeMapMode('satellite')}
+            title="VWorld 공식 항공영상"
+          >
+            <ImageIcon size={16} /> 위성지도
           </button>
           <button
             type="button"
@@ -916,23 +1013,42 @@ export function MapView({
       </div>
       <div className="map-legend">
         <span className="map-provider-badge">
-          VWorld {mapMode === '2d' ? '2D 일반지도' : '3D'}
+          VWorld {mapMode === '2d' ? '2D 일반지도' : mapMode === 'satellite' ? '위성지도' : '3D'}
         </span>
-        <span>
-          <i
-            className="legend-route"
-            style={
-              !displayAllTracks && effectiveTrackId
-                ? { background: trackColors.get(effectiveTrackId) ?? TRACK_COLORS[0] }
-                : undefined
-            }
-          />
-          {displayAllTracks ? '전체 트랙' : '활성 트랙'}
-        </span>
-        <span>
-          <i className="legend-frame" />
-          MMS 프레임
-        </span>
+        {trackLayerVisible && (
+          <span>
+            <i
+              className="legend-route"
+              style={
+                !displayAllTracks && effectiveTrackId
+                  ? { background: trackColors.get(effectiveTrackId) ?? TRACK_COLORS[0] }
+                  : undefined
+              }
+            />
+            {displayAllTracks ? '전체 트랙' : '활성 트랙'}
+          </span>
+        )}
+        {trackLayerVisible && (
+          <span>
+            <i className="legend-frame" />
+            MMS 프레임
+          </span>
+        )}
+        {selectedFrame && trackLayerVisible && (
+          <span>
+            <i className="legend-selected-frame" style={{ borderColor: MAP_SELECTED_FRAME_COLOR }} />
+            선택 프레임
+          </span>
+        )}
+        {overlay?.selectedFeature && (
+          <span>
+            <i
+              className="legend-selected-feature"
+              style={{ background: MAP_SELECTED_FEATURE_COLOR }}
+            />
+            선택 피처
+          </span>
+        )}
         {overlayGeoJson.features.length > 0 && (
           <span
             title={

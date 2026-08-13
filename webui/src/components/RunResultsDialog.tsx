@@ -1,10 +1,30 @@
-import { ChevronDown, Download, FileArchive, FolderOpen, Images, Import, LoaderCircle, PackageOpen, X } from 'lucide-react'
+import { ChevronDown, CircleDashed, Download, FileArchive, FolderOpen, Images, Import, ListChecks, LoaderCircle, PackageOpen, X } from 'lucide-react'
 import { useEffect, useId, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api, buildApiUrl } from '../lib/api'
 import type { RunRecord, RunResults } from '../types'
 import './RunResultsDialog.css'
 
-export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onClose: () => void }) {
+interface ResultEmptyState {
+  open: boolean
+  datasetName?: string
+  loading?: boolean
+  error?: string | null
+  onOpenQueue?: () => void
+  onRetry?: () => void
+}
+
+export function RunResultsDialog({
+  run,
+  onClose,
+  contextLabel,
+  emptyState,
+}: {
+  run: RunRecord | null
+  onClose: () => void
+  contextLabel?: string
+  emptyState?: ResultEmptyState
+}) {
   const [results, setResults] = useState<RunResults | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -18,6 +38,8 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
   useEffect(() => {
     if (!run) {
       setResults(null)
+      setLoading(false)
+      setError(null)
       return
     }
     const controller = new AbortController()
@@ -60,9 +82,10 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
     }
   }, [archiveMenuOpen])
 
-  if (!run) return null
+  if (!run && !emptyState?.open) return null
 
   const importShapefile = async (path: string, name: string) => {
+    if (!run) return
     setImportingPath(path)
     setError(null)
     try {
@@ -80,20 +103,65 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
     }
   }
 
-  return (
+  const dialog = (
     <div className="result-dialog-layer" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section className="result-dialog" role="dialog" aria-modal="true" aria-label="검출 결과">
         <header>
           <div>
             <span className="eyebrow">DETECTION OUTPUT</span>
             <h2>검출 결과</h2>
-            <small>{run.dataset_name ?? run.dataset_id} · {run.id}</small>
+            <small>
+              {run
+                ? `${contextLabel ? `${contextLabel} · ` : ''}${run.dataset_name ?? run.dataset_id} · ${run.id}`
+                : emptyState?.datasetName
+                  ? `${emptyState.datasetName} · 최신 완료 실행`
+                  : '선택한 작업 데이터 · 최신 완료 실행'}
+            </small>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="결과 닫기"><X size={18} /></button>
         </header>
+        {!run && emptyState?.open && (
+          emptyState.loading ? (
+            <div className="result-loading" role="status">
+              <LoaderCircle className="spin" />
+              <span>최신 완료 실행을 확인하고 있습니다.</span>
+            </div>
+          ) : emptyState.error ? (
+            <div className="result-empty-state result-lookup-error" role="alert">
+              <CircleDashed size={34} aria-hidden="true" />
+              <strong>최신 검출결과를 확인하지 못했습니다</strong>
+              <p>{emptyState.error}</p>
+              {emptyState.onRetry && (
+                <button type="button" className="button secondary" onClick={emptyState.onRetry}>
+                  다시 시도
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="result-empty-state">
+              <CircleDashed size={34} aria-hidden="true" />
+              <strong>
+                {emptyState.datasetName
+                  ? '완료된 자동 검출결과가 없습니다'
+                  : '먼저 작업 데이터를 선택해 주세요'}
+              </strong>
+              <p>
+                {emptyState.datasetName
+                  ? `${emptyState.datasetName}에서 완료된 실행이 생기면 이곳에서 최신 결과를 바로 확인할 수 있습니다.`
+                  : '작업 데이터 패널에서 데이터를 선택하면 해당 데이터의 최신 완료 결과를 표시합니다.'}
+              </p>
+              {emptyState.onOpenQueue && (
+                <button type="button" className="button secondary" onClick={emptyState.onOpenQueue}>
+                  <ListChecks size={15} />
+                  실행 큐 확인
+                </button>
+              )}
+            </div>
+          )
+        )}
         {loading && <div className="result-loading"><LoaderCircle className="spin" /><span>서버 결과 목록을 확인하고 있습니다.</span></div>}
         {error && <div className="result-error">{error}</div>}
-        {results && (
+        {results && run && (
           <div className="result-dialog-body">
             <div className="result-location">
               <FolderOpen size={17} />
@@ -168,4 +236,10 @@ export function RunResultsDialog({ run, onClose }: { run: RunRecord | null; onCl
       </section>
     </div>
   )
+
+  // This dialog can be opened by a button inside the blurred top bar. A fixed
+  // descendant of a backdrop-filter element uses that element as its containing
+  // block in Chromium, which clipped the dialog above the viewport. Mounting at
+  // the document body keeps it viewport-bound regardless of the trigger location.
+  return createPortal(dialog, document.body)
 }

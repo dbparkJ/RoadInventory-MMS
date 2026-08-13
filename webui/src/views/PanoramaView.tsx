@@ -8,6 +8,7 @@ import {
   MapPin,
   Minus,
   MousePointer2,
+  Navigation,
   Plus,
   RefreshCcw,
   ScanLine,
@@ -24,8 +25,14 @@ import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
 import { panoramaUvToSpherePosition, type PanoramaHoverProjection } from '../lib/panoramaProjection'
+import { directionalPanoramaTarget, panoramaViewRelativeBearing } from '../lib/panoramaNavigation'
 import type { PanoramaQuality } from '../lib/userSettings'
-import type { Frame, PanoramaOverlayFeature, PanoramaPointPayload } from '../types'
+import type {
+  Frame,
+  PanoramaDetectionModel,
+  PanoramaOverlayFeature,
+  PanoramaPointPayload,
+} from '../types'
 
 export type { PanoramaQuality } from '../lib/userSettings'
 
@@ -123,8 +130,15 @@ export interface RenderPanoramaDetectionBox {
   layerName: string
   properties: Record<string, unknown>
   color: string
+  tooltipLayerColor?: string
   selected: boolean
   detectionBox: PanoramaDetectionBox
+  modelKey?: string
+}
+
+interface PanoramaDetectionModelOption extends PanoramaDetectionModel {
+  key: string
+  name: string
 }
 
 const DETECTION_SOURCE_COLORS = ['#ffb84d', '#4dd9ff', '#ff6f91', '#7ee787', '#c59cff']
@@ -142,11 +156,53 @@ export interface PanoramaOverlayHit {
   layerName: string
   featureId: string | number
   properties: Record<string, unknown>
+  color?: string
 }
 
 export function panoramaDetectionPointRadius(selected: boolean, depth: number): number {
   if (selected) return 3.5
   return depth < 20 ? 2 : 1.5
+}
+
+export function panoramaDetectionStrokeWidth(selected: boolean): number {
+  return selected ? 3 : 1.5
+}
+
+export function panoramaDetectionModelKey(sourceId: string, modelId?: string): string {
+  return modelId?.trim() || sourceId
+}
+
+export function panoramaDetectionModels(
+  models: PanoramaDetectionModel[] | undefined,
+  boxes: RenderPanoramaDetectionBox[],
+): PanoramaDetectionModelOption[] {
+  const grouped = new Map<string, PanoramaDetectionModelOption>()
+  if (models?.length) {
+    models.forEach((model) => {
+      const name = model.source_name?.trim() || model.source_id
+      const key = panoramaDetectionModelKey(model.source_id, model.model_id)
+      const existing = grouped.get(key)
+      if (existing) existing.count += Math.max(0, model.count || 0)
+      else grouped.set(key, { ...model, count: Math.max(0, model.count || 0), key, name })
+    })
+  } else {
+    boxes.forEach((box) => {
+      const modelName = String(propertyValue(box.properties, 'model_nm', 'model_name') ?? '')
+        .trim()
+      const name = modelName || box.layerName.replace(/^YOLO\s*[·ㆍ]\s*/u, '').trim() || box.sourceId
+      const key = box.modelKey ?? panoramaDetectionModelKey(box.sourceId)
+      const existing = grouped.get(key)
+      if (existing) existing.count += 1
+      else grouped.set(key, {
+        source_id: box.sourceId,
+        source_name: name,
+        count: 1,
+        key,
+        name,
+      })
+    })
+  }
+  return [...grouped.values()].sort((left, right) => left.name.localeCompare(right.name, 'ko'))
 }
 
 export interface PanoramaDetectionBox {
@@ -292,7 +348,9 @@ export function panoramaDetectionBox(
     bottom,
     panoramaWidth,
     panoramaHeight,
-    label: confidencePercent === null ? className : `${className} ${Math.round(confidencePercent)}%`,
+    label: confidencePercent === null
+      ? className
+      : `${className}\nconf ${Math.round(confidencePercent)}%`,
   }
 }
 
@@ -301,8 +359,10 @@ function createPanoramaOverlayTexture(
   points: RenderPanoramaOverlayPoint[],
   detectionBoxes: RenderPanoramaDetectionBox[],
 ): THREE.CanvasTexture {
-  const width = 2048
-  const height = 1024
+  // A 4K overlay texture keeps compact labels legible when the sphere is
+  // enlarged, while the equirectangular seam remains repeat-wrapped.
+  const width = 4096
+  const height = 2048
   const canvas = ownerDocument.createElement('canvas')
   canvas.width = width
   canvas.height = height
@@ -321,20 +381,12 @@ function createPanoramaOverlayTexture(
     const boxWidth = ((box.right - box.left) / box.panoramaWidth) * width
     const boxHeight = ((box.bottom - box.top) / box.panoramaHeight) * height
     if (boxWidth <= 0 || boxHeight <= 0 || boxWidth > width * 0.75) return
-    context.lineWidth = point.selected ? 5 : 3
+    context.lineWidth = panoramaDetectionStrokeWidth(point.selected)
     context.strokeStyle = point.selected ? '#ffffff' : point.color
-    context.font = `700 ${point.selected ? 18 : 15}px Pretendard, sans-serif`
-    context.textBaseline = 'bottom'
     ;[-width, 0, width].forEach((shift) => {
       const x = left + shift
       if (x + boxWidth < 0 || x > width) return
       context.strokeRect(x, top, boxWidth, boxHeight)
-      const labelWidth = Math.min(boxWidth, context.measureText(box.label).width + 12)
-      const labelTop = Math.max(0, top - 24)
-      context.fillStyle = point.selected ? '#ffffff' : point.color
-      context.fillRect(x, labelTop, labelWidth, 24)
-      context.fillStyle = '#061018'
-      context.fillText(box.label, x + 6, labelTop + 20, Math.max(0, labelWidth - 10))
     })
   })
 
@@ -404,6 +456,7 @@ export function panoramaOverlayAtUv(
         layerName: observation.layerName,
         featureId: observation.featureId ?? observation.observationId,
         properties: observation.properties,
+        color: observation.tooltipLayerColor ?? observation.color,
       }
       boxedArea = area
     }
@@ -418,6 +471,7 @@ export function panoramaOverlayAtUv(
         layerName: point.layerName,
         featureId: point.feature_id,
         properties: point.properties ?? {},
+        color: point.color,
       }
       boxedArea = area
     }
@@ -435,6 +489,7 @@ export function panoramaOverlayAtUv(
         layerName: point.layerName,
         featureId: point.feature_id,
         properties: point.properties ?? {},
+        color: point.color,
       }
     }
   })
@@ -542,6 +597,7 @@ export function reconcilePanoramaDetectionBoxes(
       featureId: representative.feature_id,
       layerId: representative.layerId,
       layerName: representative.layerName,
+      tooltipLayerColor: representative.color,
       properties: {
         ...box.properties,
         ...(representative.properties ?? {}),
@@ -588,6 +644,8 @@ export default function PanoramaView({
   detectionRevisionKey = '',
   onPreviousFrame,
   onNextFrame,
+  frames = [],
+  onFrameChange,
   hasPreviousFrame = true,
   hasNextFrame = true,
   forwardOffsetDeg = 0,
@@ -606,6 +664,8 @@ export default function PanoramaView({
   detectionRevisionKey?: string
   onPreviousFrame?: () => void
   onNextFrame?: () => void
+  frames?: Frame[]
+  onFrameChange?: (frame: Frame) => void
   hasPreviousFrame?: boolean
   hasNextFrame?: boolean
   forwardOffsetDeg?: number
@@ -641,18 +701,33 @@ export default function PanoramaView({
   const [pointReloadKey, setPointReloadKey] = useState(0)
   const [overlayProjection, setOverlayProjection] = useState<RenderPanoramaOverlayPoint[]>([])
   const [detectionBoxes, setDetectionBoxes] = useState<RenderPanoramaDetectionBox[]>([])
+  const [detectionModels, setDetectionModels] = useState<PanoramaDetectionModelOption[]>([])
+  const [disabledDetectionModelKeys, setDisabledDetectionModelKeys] = useState<Set<string>>(
+    () => new Set(),
+  )
   const [detectionLoading, setDetectionLoading] = useState(false)
   const [detectionError, setDetectionError] = useState<string | null>(null)
   const [overlayLoading, setOverlayLoading] = useState(false)
   const [pickFeedback, setPickFeedback] = useState<string | null>(null)
   const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
   const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
+  const [frameAddress, setFrameAddress] = useState<string | null>(null)
+  const [addressLoading, setAddressLoading] = useState(false)
   const runtimeRef = useRef<PanoramaRuntime | null>(null)
   const quality = controlledQuality ?? localQuality
   const pointOverlayEnabled = controlledPointOverlayEnabled ?? localPointOverlayEnabled
   const panoramaOpacity = controlledPanoramaOpacity ?? localPanoramaOpacity
   const pointPayloadRequired = pointOverlayEnabled || Boolean(overlay?.pickMode)
-  const hasVisualOverlay = pointOverlayEnabled || overlayProjection.length > 0 || detectionBoxes.length > 0
+  const visibleDetectionBoxes = useMemo(
+    () => detectionBoxes.filter((box) => {
+      const key = box.modelKey ?? panoramaDetectionModelKey(box.sourceId)
+      return !disabledDetectionModelKeys.has(key)
+    }),
+    [detectionBoxes, disabledDetectionModelKeys],
+  )
+  const hasVisualOverlay = pointOverlayEnabled
+    || overlayProjection.length > 0
+    || visibleDetectionBoxes.length > 0
   // SHP markers are already composited with a transparent texture. Only the
   // dense point-cloud overlay may dim the camera image at the user's request.
   const effectivePanoramaOpacity = pointOverlayEnabled ? panoramaOpacity : 1
@@ -707,6 +782,44 @@ export default function PanoramaView({
     setPitch(0)
     setError(null)
   }, [forwardOffsetDeg, frame?.id])
+
+  useEffect(() => {
+    if (!frame?.coordinate || demoMode) {
+      setFrameAddress(null)
+      setAddressLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setFrameAddress(null)
+    setAddressLoading(true)
+    // Frame scrubbing can cross dozens of poses per second. Debounce before
+    // hitting the real-time geocoder and abort any response from an old frame.
+    const timer = window.setTimeout(() => {
+      void api.frameAddress(datasetId, frame.id, controller.signal)
+        .then((response) => {
+          if (!controller.signal.aborted) setFrameAddress(response.address)
+        })
+        .catch(() => {
+          // Address is supplemental context. Coordinates remain visible when
+          // V-World is unavailable or has no address for this road position.
+          if (!controller.signal.aborted) setFrameAddress(null)
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setAddressLoading(false)
+        })
+    }, 300)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [datasetId, demoMode, frame?.coordinate?.lat, frame?.coordinate?.lon, frame?.id])
+
+  useEffect(() => {
+    // Visibility follows a model while the operator moves between frames, but
+    // a different dataset starts with every model visible.
+    setDisabledDetectionModelKeys(new Set())
+    setDetectionModels([])
+  }, [datasetId])
 
   useEffect(() => {
     const host = stageRef.current
@@ -978,6 +1091,7 @@ export default function PanoramaView({
   useEffect(() => {
     if (!frame || demoMode) {
       setDetectionBoxes([])
+      setDetectionModels([])
       setDetectionLoading(false)
       setDetectionError(null)
       return
@@ -1000,15 +1114,19 @@ export default function PanoramaView({
               ? `YOLO · ${observation.source_name}`
               : 'YOLO 검출',
             properties: observation.properties,
-            color: panoramaDetectionSourceColor(observation.source_id),
+            color: panoramaDetectionSourceColor(observation.model_id ?? observation.source_id),
             selected: false,
             detectionBox,
+            modelKey: panoramaDetectionModelKey(observation.source_id, observation.model_id),
           } satisfies RenderPanoramaDetectionBox]
         })
-        setDetectionBoxes(deduplicatePanoramaDetectionBoxes(boxes))
+        const deduplicatedBoxes = deduplicatePanoramaDetectionBoxes(boxes)
+        setDetectionBoxes(deduplicatedBoxes)
+        setDetectionModels(panoramaDetectionModels(response.models, deduplicatedBoxes))
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
+          setDetectionModels([])
           setDetectionError(
             reason instanceof Error ? reason.message : 'YOLO 검출 박스를 불러오지 못했습니다.',
           )
@@ -1021,8 +1139,8 @@ export default function PanoramaView({
   }, [datasetId, demoMode, detectionRevisionKey, frame])
 
   const reconciledDetectionBoxes = useMemo(
-    () => reconcilePanoramaDetectionBoxes(detectionBoxes, overlayProjection),
-    [detectionBoxes, overlayProjection],
+    () => reconcilePanoramaDetectionBoxes(visibleDetectionBoxes, overlayProjection),
+    [overlayProjection, visibleDetectionBoxes],
   )
 
   const renderedOverlayProjection = useMemo(
@@ -1032,9 +1150,9 @@ export default function PanoramaView({
         selected: `${point.layerId}:${point.feature_id}` === selectedOverlayKey,
         // The frame endpoint contains every raw model observation. Retain a
         // representative SHP bbox only as a fallback for external/legacy data.
-        detectionBox: detectionBoxes.length ? null : point.detectionBox,
+        detectionBox: detectionModels.length || detectionBoxes.length ? null : point.detectionBox,
       })),
-    [detectionBoxes.length, overlayProjection, selectedOverlayKey],
+    [detectionBoxes.length, detectionModels.length, overlayProjection, selectedOverlayKey],
   )
 
   const renderedDetectionBoxes = useMemo(
@@ -1190,6 +1308,33 @@ export default function PanoramaView({
     if (canGoNext) onNextFrame?.()
   }
 
+  const directionalTarget = frame && onFrameChange
+    ? directionalPanoramaTarget(
+        frame,
+        frames,
+        yaw,
+        panoramaForwardYaw(forwardOffsetDeg),
+      )
+    : null
+
+  const viewFacesNext = Math.cos(
+    THREE.MathUtils.degToRad(
+      panoramaViewRelativeBearing(yaw, panoramaForwardYaw(forwardOffsetDeg)),
+    ),
+  ) >= 0
+  const canUseDirectionalFallback = viewFacesNext ? canGoNext : canGoPrevious
+  const canMoveInViewDirection = Boolean(directionalTarget || canUseDirectionalFallback)
+
+  const goInViewDirection = () => {
+    if (directionalTarget) {
+      onFrameChange?.(directionalTarget.frame)
+    } else if (viewFacesNext && canGoNext) {
+      goToNextFrame()
+    } else if (!viewFacesNext && canGoPrevious) {
+      goToPreviousFrame()
+    }
+  }
+
   const changeQuality = (nextQuality: PanoramaQuality) => {
     if (controlledQuality === undefined) setLocalQuality(nextQuality)
     onQualityChange?.(nextQuality)
@@ -1199,6 +1344,20 @@ export default function PanoramaView({
     if (controlledPointOverlayEnabled === undefined) setLocalPointOverlayEnabled(enabled)
     onPointOverlayEnabledChange?.(enabled)
   }
+
+  const changeDetectionModelVisibility = (modelKey: string, enabled: boolean) => {
+    setDisabledDetectionModelKeys((current) => {
+      const next = new Set(current)
+      if (enabled) next.delete(modelKey)
+      else next.add(modelKey)
+      return next
+    })
+  }
+
+  const enabledDetectionModelCount = detectionModels.reduce(
+    (count, model) => count + (disabledDetectionModelKeys.has(model.key) ? 0 : 1),
+    0,
+  )
 
   const changePanoramaOpacity = (opacity: number) => {
     if (controlledPanoramaOpacity === undefined) setLocalPanoramaOpacity(opacity)
@@ -1259,6 +1418,7 @@ export default function PanoramaView({
         layerName: entry.layerName,
         featureId: entry.featureId,
         properties: entry.properties ?? {},
+        layerColor: entry.color,
         x: pending.x - projected.bounds.left,
         y: pending.y - projected.bounds.top,
         viewportWidth: projected.bounds.width,
@@ -1313,6 +1473,7 @@ export default function PanoramaView({
         layerName: nearest.layerName,
         featureId: nearest.featureId,
         properties: nearest.properties ?? {},
+        layerColor: nearest.color,
         x: clientX - projected.bounds.left,
         y: clientY - projected.bounds.top,
         viewportWidth: projected.bounds.width,
@@ -1421,6 +1582,39 @@ export default function PanoramaView({
           <ChevronRight aria-hidden="true" />
         </button>
       )}
+      {frame && (frame.coordinate || canMoveInViewDirection) && (
+        <div
+          className="panorama-location-bar"
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {frame.coordinate && (
+            <span className="panorama-location-address" title={frameAddress ?? undefined}>
+              <MapPin size={15} aria-hidden="true" />
+              <span>
+                {addressLoading
+                  ? '현재 주소 확인 중…'
+                  : frameAddress ?? `${frame.coordinate.lat.toFixed(6)}, ${frame.coordinate.lon.toFixed(6)}`}
+              </span>
+            </span>
+          )}
+          {canMoveInViewDirection && (
+            <>
+              {frame.coordinate && <i aria-hidden="true" />}
+              <button
+                type="button"
+                aria-label="바라보는 방향의 인접 프레임으로 이동"
+                title={directionalTarget
+                  ? `바라보는 방향으로 이동 · Frame ${directionalTarget.frame.index + 1}`
+                  : `바라보는 방향으로 ${viewFacesNext ? '다음' : '이전'} 프레임 이동`}
+                onClick={goInViewDirection}
+              >
+                <Navigation size={14} aria-hidden="true" />
+                <span>바라보는 방향으로 이동</span>
+              </button>
+            </>
+          )}
+        </div>
+      )}
       {loading && (
         <div className="viewer-loading floating">
           <LoaderCircle className="spin" size={25} />
@@ -1511,6 +1705,31 @@ export default function PanoramaView({
           <ScanLine size={14} />
           포인트
         </label>
+        {detectionModels.length > 0 && (
+          <details className="panorama-model-filter">
+            <summary title="파노라마에 표시할 YOLO 모델 선택">
+              <ScanLine size={14} />
+              YOLO 모델
+              <b>{enabledDetectionModelCount}/{detectionModels.length}</b>
+            </summary>
+            <div className="panorama-model-filter-menu" role="group" aria-label="YOLO 모델 표시">
+              {detectionModels.map((model) => (
+                <label key={model.key}>
+                  <input
+                    type="checkbox"
+                    checked={!disabledDetectionModelKeys.has(model.key)}
+                    aria-label={`${model.name} 검출 표시`}
+                    onChange={(event) => {
+                      changeDetectionModelVisibility(model.key, event.target.checked)
+                    }}
+                  />
+                  <span title={model.name}>{model.name}</span>
+                  <small>{model.count.toLocaleString('ko-KR')}</small>
+                </label>
+              ))}
+            </div>
+          </details>
+        )}
         <label className="panorama-opacity-control">
           <span>영상 투명도</span>
           <input
@@ -1529,7 +1748,7 @@ export default function PanoramaView({
             <MapPin size={14} /> SHP {renderedOverlayProjection.length.toLocaleString('ko-KR')}
           </span>
         )}
-        {renderedDetectionBoxes.length > 0 && (
+        {detectionModels.length > 0 && (
           <span title="현재 파노라마의 원본 YOLO 검출 박스">
             <ScanLine size={14} /> YOLO {renderedDetectionBoxes.length.toLocaleString('ko-KR')}
           </span>

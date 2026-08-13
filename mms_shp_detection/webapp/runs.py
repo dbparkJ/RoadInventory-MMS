@@ -2008,6 +2008,28 @@ def list_runs(
     return {"items": items, "runs": items}
 
 
+@router.get("/datasets/{dataset_id}/runs/latest-completed")
+def get_latest_completed_run_for_dataset(
+    dataset_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Return the latest durable result even when its queue row was dismissed."""
+
+    if request.app.state.store.get_dataset(dataset_id) is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    runs = request.app.state.store.list_completed_runs_for_dataset(
+        dataset_id,
+        limit=1,
+    )
+    return {
+        "run": (
+            public_run(request.app, runs[0], include_log=False)
+            if runs
+            else None
+        )
+    }
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: str, request: Request) -> dict[str, Any]:
     run = request.app.state.store.get_run(run_id)

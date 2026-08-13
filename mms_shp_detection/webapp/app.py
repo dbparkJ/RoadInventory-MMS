@@ -22,6 +22,7 @@ from starlette.responses import Response
 from .datasets import public_dataset, utc_now
 from .datasets import router as datasets_router
 from .detections import router as detections_router
+from .media import POINT_PREVIEW_MAX_BUDGET, VWORLD_DEVELOPMENT_KEY
 from .media import router as media_router
 from .optimizer import router as optimizer_router
 from .overlays import router as overlays_router
@@ -452,6 +453,7 @@ def create_app(
                 tasks = [
                     *app.state.scan_tasks.values(),
                     *app.state.catalog_tasks.values(),
+                    *app.state.address_inflight.values(),
                 ]
                 for task in tasks:
                     task.cancel()
@@ -491,6 +493,12 @@ def create_app(
     app.state.panorama_semaphore = asyncio.Semaphore(config.max_panorama_previews)
     app.state.point_preview_semaphore = asyncio.Semaphore(config.max_point_previews)
     app.state.run_archive_semaphore = asyncio.Semaphore(2)
+    app.state.address_semaphore = asyncio.Semaphore(2)
+    app.state.address_failure_cache = {}
+    app.state.address_inflight = {}
+    app.state.vworld_api_key = os.environ.get(
+        "MMS_VWORLD_API_KEY", VWORLD_DEVELOPMENT_KEY
+    ).strip()
     (
         app.state.panorama_yaw_offset_deg,
         app.state.panorama_pitch_offset_deg,
@@ -597,7 +605,7 @@ def create_app(
                 "crs_required": False,
                 "crs_auto_detection": True,
                 "max_panorama_width": 8192,
-                "max_point_budget": 250_000,
+                "max_point_budget": POINT_PREVIEW_MAX_BUDGET,
                 "upload_chunk_bytes": config.max_upload_chunk_bytes,
                 "max_overlay_upload_bytes": config.max_overlay_total_bytes,
                 "max_overlay_features": config.max_overlay_features,

@@ -145,6 +145,31 @@ separate LineString for each `track_id`, avoiding false connector lines between 
 `coordinate` may be `null` when pose CRS transformation failed. Such a frame stays usable in the
 panorama/frame list and is omitted only from map markers.
 
+`GET /api/datasets/{id}/frames/{frame_id}/address` resolves the frame's WGS84 pose to a current
+address for panorama context. A delivery-supplied `road_address`/`address` is preferred. Otherwise
+the server proxies V-World Geocoder API 2.0 because that API does not expose browser CORS headers;
+it tries `ROAD`, then `PARCEL`, with a short timeout, a two-request concurrency limit, and a bounded
+32-coordinate in-flight backlog; excess demand falls back to coordinates immediately. The
+browser waits 300 ms after a frame change and aborts stale requests. V-World's usage terms prohibit
+storing real-time geocoder responses in a separate database, so successful results are not written
+to SQLite or disk; only concurrent identical requests are coalesced in memory. Failure responses
+use a 30-second in-memory suppression window and return `address: null`, leaving coordinates as the
+UI fallback.
+The governing service reference is the official [V-World Geocoder API 2.0
+GetAddress guide](https://www.vworld.kr/dev/v4dv_geocoderguide2_s002.do).
+
+```json
+{
+  "dataset_id": "ds_01",
+  "frame_id": "frame-0001",
+  "coordinate": { "lon": 126.978, "lat": 37.566 },
+  "address": "서울특별시 중구 세종대로 110",
+  "address_type": "road",
+  "zipcode": "04524",
+  "source": "vworld"
+}
+```
+
 ## Preview media and performance
 
 `GET /api/datasets/{id}/panoramas/{frame_id}?width={width}` returns an image body, or JSON
@@ -153,9 +178,16 @@ using a viewport-derived fast preview up to 2048px, a cache-stable 4096px high-q
 an explicitly selected 8192px preview. The original panorama is never requested by the operator
 workspace.
 
-`GET /api/datasets/{id}/points/{frame_id}?budget=120000&radius=40` returns
+`GET /api/datasets/{id}/points/{frame_id}?budget=250000` returns
 `application/vnd.mmsp` (or `application/octet-stream`). The browser never requests raw LAS.
-`budget` is operator-selectable (60k/120k/250k) and `radius` is 20/40/70 m.
+`budget` defaults to 250k and is operator-selectable (250k/500k/1m); values below 250k or above 1m are
+rejected. At the maximum, the compact MMSP body is bounded to 15,000,040 bytes. Per-dataset MMSP
+derivatives are capped at 1 GiB and evict the oldest files first. The point preview has a server-owned spatial
+contract: only samples within 25 m of the acquisition origin are eligible; by default 75% of the
+available budget goes to the dense 0–15 m band and 25% to the lower-density 15–25 m band. Unused
+capacity in either band is deterministically reassigned to the other, while per-block quotas retain
+nearby block coverage. There is no client radius override. MMSP cache fingerprint `mmsp-v3`
+includes both band limits and the allocation ratio so older wide-radius derivatives are not reused.
 
 MMSP v1 is little-endian:
 
@@ -204,9 +236,9 @@ panorama `(u, v)` in the browser; pointer movement never triggers per-point HTTP
 `GET /api/datasets/{id}/overlays` lists registered SHP layers. Feature collections are paged by
 `GET /api/datasets/{id}/overlays/{layer_id}/features?coordinate_space=dataset|wgs84&offset=...&limit=...`.
 The client keeps layer selection, visibility, loaded pages, and feature selection in one shared
-context so the advanced editor, map, panorama, and point viewer stay in sync. The main dataset panel
-only exposes a searchable layer list and visibility toggles; feature loading and the full attribute
-table stay in the advanced SHP management panel.
+context so the attribute editor, map, panorama, and point viewer stay in sync. The main dataset panel
+only exposes a searchable layer list and visibility toggles. Layer upload/name/color controls remain
+in `SHP management`, while the full attribute table is rendered only in its independent popup.
 
 `PATCH /api/datasets/{id}/overlays/{layer_id}` changes the user-facing `name` and/or shared
 `color` (`#RRGGBB`). It requires `expected_metadata_revision`; a stale value returns `409`, while an
@@ -230,6 +262,12 @@ properties, and `DELETE` marks a feature deleted from the editable copy. The ori
 bundle is preserved. Revision conflicts return `409`; invalid geometry, field values, or coordinate
 space return `422`.
 
+`DELETE /api/datasets/{id}/overlays/{layer_id}/fields/{field_name}?expected_revision=...` removes a
+DBF column from every feature in the editable store, advances the feature revision once, records a
+`delete_field` audit entry, and removes the field from subsequent edited SHP exports. It never mutates
+the uploaded source bundle. Exact case-insensitive `ID`, required/internal fields, and the final
+remaining DBF field are protected; stale revisions return `409`.
+
 `GET /api/datasets/{id}/overlays/{layer_id}/project/{frame_id}` returns nearby Point features as
 normalized panorama coordinates and includes their complete properties. The optional
 `max_distance` bounds the query.
@@ -243,6 +281,22 @@ files, mismatched payload identities, and unknown bbox spaces. A request parses 
 model manifests plus result JSON across the completed-run lookup, at most 64 models, and returns at
 most 2,000 boxes. Reaching any of those limits stops scanning immediately and sets `truncated: true`.
 Each observation has an opaque per-run/model `source_id` for deterministic deduplication.
+The response also includes `models: [{model_id, source_id, source_name, count}]` for every parsed model,
+including models with zero observations in the selected frame, so the panorama can keep independent
+visibility controls stable while the operator moves between frames. New clients derive the list
+from observations when an older server omits this field; older clients may safely ignore it.
+`model_id` is an opaque stable identity derived from the server-owned model key, so two models with
+the same display filename remain independently controllable. Observations carry the same optional
+`model_id`; legacy responses fall back to their per-run/model `source_id`.
+An observation also has `dataset_position: [x, y, z]` only when the pipeline accepted a finite
+point-cloud representative for SHP output. Candidate/rejected coordinates are never exposed as a
+3-D detection. The point viewer converts accepted dataset coordinates to the frame-local MMSP
+space, limits them to the same 25 m preview, and renders an identity wireframe plus center marker;
+the wireframe is not presented as an inferred physical object extent. Matching visible SHP
+representatives preserve layer/feature Details only when detection ID and compatible model, image,
+and class metadata agree, while the marker itself does not depend on SHP import or visibility. All
+bounded observations returned by the endpoint are considered before the 25 m / accepted-position
+filter; there is no earlier client-side 512-item cutoff.
 
 Pipeline result schema 18 explicitly stores each `bbox_xyxy` as
 `panorama_equirectangular_pixels` after the full, tiled, or forward perspective detector has been
@@ -256,6 +310,14 @@ SSE completion exposes newly written boxes without requiring navigation or reloa
 matches a representative feature in a visible result SHP by detection identity, compatible model /
 image / class metadata, and panorama bbox, the client draws only the raw box but retains the SHP
 `layerId` / `featureId` for selection and Details; unrelated raw observations remain unlinked.
+Panorama boxes use a repeat-wrapped 4096x2048 overlay texture for seam-safe rendering, a thin
+1.5 px line (3 px when selected), with no always-visible text tag. Hovering a box opens the compact
+overlay tooltip with the class as its title and `conf` among the prioritized values. A linked SHP
+representative shows its user-defined layer name/color in the header; an unlinked raw observation
+shows its model name/stable model color. Clicking pins the same tooltip. This prevents neighboring
+objects from producing overlapping labels. Per-model panorama switches filter rendered boxes,
+hit-testing, and the visible YOLO count together; the stable-model-ID choice persists across frame
+changes.
 
 ## Optimization and runs
 
@@ -294,6 +356,18 @@ match the server configuration rather than inventing dataset-independent values.
 `GET /api/runs` returns `{ "items": RunRecord[] }`. `POST /api/runs/{id}/cancel` returns the updated
 record. Progress is 0–100 and status is one of `queued`, `preparing`, `running`, `completed`,
 `failed`, `cancelled`, or `cancelling`.
+
+`GET /api/datasets/{dataset_id}/runs/latest-completed` returns
+`{ "run": RunRecord | null }`. It queries the durable run registry for that dataset rather than
+the bounded recent queue, and therefore includes a completed run dismissed from queue/bootstrap
+visibility. "Latest" is ordered by actual `finished_at`, with `updated_at` then `created_at` as
+legacy fallbacks; `created_at` and run ID provide deterministic tie-breaks. The endpoint returns
+`404` for an unknown or unregistered dataset. The main
+검출결과 action uses this endpoint; `null` means that the selected dataset has no completed run.
+During rolling upgrades, a web client receiving `404` for this endpoint falls back to
+`GET /api/runs?limit=200` and selects the newest completed run for the active dataset. That legacy
+fallback cannot recover a run already dismissed by an older server, so durable dismissed-result
+lookup becomes complete as soon as the new endpoint is deployed or the API process is restarted.
 
 `DELETE /api/runs/{id}` dismisses a completed or failed run from collection/bootstrap responses.
 This is a visibility operation, not artifact deletion: the response contains

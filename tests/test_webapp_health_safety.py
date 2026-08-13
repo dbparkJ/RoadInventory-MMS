@@ -37,6 +37,10 @@ class WebAppHealthSafetyTests(unittest.TestCase):
                 bootstrap_payload = bootstrap.json()
                 self.assertTrue(bootstrap_payload["capabilities"]["resumable_uploads"])
                 self.assertEqual(
+                    bootstrap_payload["capabilities"]["max_point_budget"],
+                    1_000_000,
+                )
+                self.assertEqual(
                     bootstrap_payload["map"],
                     {
                         "provider": "vworld",

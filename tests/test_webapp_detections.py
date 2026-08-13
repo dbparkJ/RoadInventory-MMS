@@ -137,6 +137,10 @@ class WebAppDetectionTests(unittest.TestCase):
                                 "class_id": 1,
                                 "class_name": "signal",
                                 "bbox_xyxy": [1900, 900, 2000, 1000],
+                                "accepted_for_shp": True,
+                                "x": 300_010.5,
+                                "y": 4_100_012.25,
+                                "z": 14.0,
                             }
                         ],
                     ),
@@ -149,6 +153,10 @@ class WebAppDetectionTests(unittest.TestCase):
                                 "class_name": "sign",
                                 # An unwrapped seam box is a valid panorama box.
                                 "bbox_xyxy": [3980, 800, 4020, 900],
+                                "accepted_for_shp": False,
+                                "candidate_x": 300_020.0,
+                                "candidate_y": 4_100_020.0,
+                                "candidate_z": 15.0,
                             }
                         ],
                     ),
@@ -163,6 +171,23 @@ class WebAppDetectionTests(unittest.TestCase):
             body = response.json()
             self.assertEqual(body["coordinate_space"], "panorama_equirectangular_pixels")
             self.assertEqual(body["model_count"], 2)
+            self.assertEqual(
+                body["models"],
+                [
+                    {
+                        "model_id": body["items"][0]["model_id"],
+                        "source_id": body["items"][0]["source_id"],
+                        "source_name": "traffic-light.pt",
+                        "count": 1,
+                    },
+                    {
+                        "model_id": body["items"][1]["model_id"],
+                        "source_id": body["items"][1]["source_id"],
+                        "source_name": "traffic-sign.pt",
+                        "count": 1,
+                    },
+                ],
+            )
             self.assertEqual(body["count"], 2)
             self.assertEqual(
                 [item["source_name"] for item in body["items"]],
@@ -171,6 +196,14 @@ class WebAppDetectionTests(unittest.TestCase):
             self.assertNotEqual(
                 body["items"][0]["source_id"], body["items"][1]["source_id"]
             )
+            self.assertNotEqual(
+                body["items"][0]["model_id"], body["items"][1]["model_id"]
+            )
+            self.assertEqual(
+                body["items"][0]["dataset_position"],
+                [300_010.5, 4_100_012.25, 14.0],
+            )
+            self.assertNotIn("dataset_position", body["items"][1])
             self.assertEqual(body["items"][1]["properties"]["bbox_r"], 4020.0)
             self.assertFalse((state / "overlays").exists())
 
@@ -272,6 +305,8 @@ class WebAppDetectionTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["model_count"], 1)
             self.assertEqual(response.json()["items"], [])
+            self.assertEqual(response.json()["models"][0]["source_name"], "new.pt")
+            self.assertEqual(response.json()["models"][0]["count"], 0)
 
     def test_request_wide_json_budget_stops_model_parsing_and_marks_response(self) -> None:
         with (

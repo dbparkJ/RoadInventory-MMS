@@ -1,6 +1,8 @@
 import {
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   CircleGauge,
   CloudOff,
   Eye,
@@ -9,6 +11,7 @@ import {
   Keyboard,
   Layers3,
   Map,
+  Route,
   Shapes,
   Table2,
   X,
@@ -18,6 +21,7 @@ import { frameNavigationDirection } from '../lib/frameNavigation'
 import type { PanoramaHoverProjection } from '../lib/panoramaProjection'
 import { DEFAULT_USER_SETTINGS, type UserSettings, type UserSettingsPatch } from '../lib/userSettings'
 import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
+import type { MapMode } from '../views/MapView'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
 
@@ -39,6 +43,8 @@ interface WorkspaceProps {
   detectionRevisionKey?: string
   panoramaOpen: boolean
   pointCloudOpen: boolean
+  maxPointBudget?: number
+  attributeTableOpen?: boolean
   hasMoreFrames: boolean
   /** @deprecated 작업 설정은 통합 설정 패널로 이동했습니다. */
   inspectorOpen?: boolean
@@ -47,12 +53,12 @@ interface WorkspaceProps {
   externalAction?: ReactNode
   onTogglePanorama: () => void
   onTogglePointCloud: () => void
+  onToggleAttributeTable?: () => void
   onFrameChange: (frame: Frame) => void
   onMoveFrame: (direction: -1 | 1) => void
   /** @deprecated 작업 설정은 통합 설정 패널로 이동했습니다. */
   onToggleInspector?: () => void
   onOpenSource: () => void
-  onOpenOverlay?: () => void
   onUseDemo: () => void
   onSettingsChange?: (patch: UserSettingsPatch) => void
 }
@@ -69,29 +75,34 @@ export function Workspace({
   detectionRevisionKey = '',
   panoramaOpen,
   pointCloudOpen,
+  maxPointBudget = 1_000_000,
+  attributeTableOpen = false,
   hasMoreFrames,
   detached = false,
   settings = DEFAULT_USER_SETTINGS,
   externalAction,
   onTogglePanorama,
   onTogglePointCloud,
+  onToggleAttributeTable,
   onFrameChange,
   onMoveFrame,
   onOpenSource,
-  onOpenOverlay,
   onUseDemo,
   onSettingsChange,
 }: WorkspaceProps) {
   const overlay = useOptionalOverlayWorkspace()
   const panoramaPanelRef = useRef<DetachablePanelHandle>(null)
   const pointCloudPanelRef = useRef<DetachablePanelHandle>(null)
-  const [mapMode, setMapMode] = useState<'2d' | '3d'>('2d')
+  const [mapMode, setMapMode] = useState<MapMode>('2d')
+  const [trackLayerVisible, setTrackLayerVisible] = useState(true)
+  const [layerCardCollapsed, setLayerCardCollapsed] = useState(false)
   const [hoveredPanoramaPoint, setHoveredPanoramaPoint] = useState<PanoramaHoverProjection | null>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
   const canMovePrevious = currentIndex > 0
   const canMoveNext = currentIndex >= 0 && (currentIndex < frames.length - 1 || hasMoreFrames)
 
   useEffect(() => setHoveredPanoramaPoint(null), [frame?.id])
+  useEffect(() => setTrackLayerVisible(true), [dataset?.id])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -155,6 +166,17 @@ export function Workspace({
             <Layers3 size={15} />
             3D 포인트
           </button>
+          <button
+            type="button"
+            className={attributeTableOpen ? 'active' : ''}
+            aria-pressed={attributeTableOpen}
+            disabled={!dataset}
+            onClick={onToggleAttributeTable}
+            title={attributeTableOpen ? 'SHP 속성표 팝업 닫기' : 'SHP 속성표 팝업 열기'}
+          >
+            <Table2 size={15} />
+            속성표
+          </button>
           <span className="lazy-layer-note">
             <Eye size={12} /> 필요한 데이터만 로드
           </span>
@@ -206,6 +228,7 @@ export function Workspace({
                 selectedFrame={frame}
                 activeTrackId={selectedTrack}
                 showAllTracks={settings.showAllMapTracks}
+                trackLayerVisible={trackLayerVisible}
                 frameRange={frameRange}
                 loading={routeLoading}
                 mapMode={mapMode}
@@ -214,15 +237,47 @@ export function Workspace({
               />
             </Suspense>
 
-            {Boolean(overlay?.layers.length) && (
-              <section className="overlay-quick-controls" aria-label="메인 SHP 레이어 표시 설정">
-                <header>
-                  <span><Shapes size={14} /> 검출 레이어</span>
-                  <button type="button" onClick={onOpenOverlay} title="SHP 속성표 열기">
-                    <Table2 size={13} /> 속성표
+            <section
+              className={`overlay-quick-controls ${layerCardCollapsed ? 'collapsed' : ''}`}
+              aria-label="지도 레이어 표시 설정"
+            >
+              <header>
+                <span>
+                  <Shapes size={14} /> 검출·트랙 레이어
+                  <small>
+                    {(trackLayerVisible ? 1 : 0) + (overlay?.visibleLayerIds.size ?? 0)} /{' '}
+                    {1 + (overlay?.layers.length ?? 0)}
+                  </small>
+                </span>
+                <button
+                  type="button"
+                  aria-expanded={!layerCardCollapsed}
+                  aria-controls="map-layer-quick-list"
+                  aria-label={
+                    layerCardCollapsed ? '지도 레이어 카드 펼치기' : '지도 레이어 카드 최소화'
+                  }
+                  title={layerCardCollapsed ? '레이어 목록 펼치기' : '한 줄로 최소화'}
+                  onClick={() => setLayerCardCollapsed((value) => !value)}
+                >
+                  {layerCardCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                </button>
+              </header>
+              {!layerCardCollapsed && (
+                <div id="map-layer-quick-list" className="map-layer-quick-list">
+                  <button
+                    type="button"
+                    className={trackLayerVisible ? 'active' : ''}
+                    aria-pressed={trackLayerVisible}
+                    onClick={() => setTrackLayerVisible((visible) => !visible)}
+                    title={`MMS 트랙 ${trackLayerVisible ? '숨기기' : '표시'}`}
+                  >
+                    <i className="map-layer-track-swatch">
+                      <Route size={11} />
+                    </i>
+                    <span>MMS 트랙</span>
+                    <small>경로 · 프레임</small>
+                    {trackLayerVisible ? <Eye size={13} /> : <EyeOff size={13} />}
                   </button>
-                </header>
-                <div>
                   {overlay?.layers.map((layer) => {
                     const visible = overlay.visibleLayerIds.has(layer.id)
                     return (
@@ -236,13 +291,14 @@ export function Workspace({
                       >
                         <i style={{ background: overlay.layerColor(layer.id) }} />
                         <span>{layer.name}</span>
+                        <small>{mapGeometryLabel(layer.geometry_type)}</small>
                         {visible ? <Eye size={13} /> : <EyeOff size={13} />}
                       </button>
                     )
                   })}
                 </div>
-              </section>
-            )}
+              )}
+            </section>
 
             <DetachablePanel
               ref={panoramaPanelRef}
@@ -275,6 +331,8 @@ export function Workspace({
                         <PanoramaView
                           datasetId={dataset.id}
                           frame={frame}
+                          frames={frames}
+                          onFrameChange={onFrameChange}
                           demoMode={demoMode}
                           detectionRevisionKey={detectionRevisionKey}
                           forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
@@ -335,6 +393,8 @@ export function Workspace({
                           datasetId={dataset.id}
                           frame={frame}
                           demoMode={demoMode}
+                          maxPointBudget={maxPointBudget}
+                          detectionRevisionKey={detectionRevisionKey}
                           onHoverPanoramaPoint={setHoveredPanoramaPoint}
                         />
                       </Suspense>
@@ -385,4 +445,12 @@ function ViewerLoading({ label }: { label: string }) {
       <small>필요한 모듈만 불러오고 있습니다.</small>
     </div>
   )
+}
+
+function mapGeometryLabel(geometryType: string): string {
+  const normalized = geometryType.replace(/^Multi/, '')
+  if (normalized === 'Point') return '점'
+  if (normalized === 'LineString') return '선'
+  if (normalized === 'Polygon') return '면'
+  return geometryType || '피처'
 }

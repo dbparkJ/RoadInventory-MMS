@@ -16,13 +16,30 @@ import {
   projectFrameLocalPointToPanorama,
   type PanoramaHoverProjection,
 } from '../lib/panoramaProjection'
-import type { Frame, OverlayFeature, PanoramaProjectionMetadata, PointCloudPayload } from '../types'
+import type {
+  Frame,
+  OverlayFeature,
+  PanoramaDetectionBoxObservation,
+  PanoramaProjectionMetadata,
+  PointCloudPayload,
+} from '../types'
 
-const BUDGETS = [
-  { value: 60_000, label: '빠름 · 6만' },
-  { value: 120_000, label: '균형 · 12만' },
-  { value: 250_000, label: '정밀 · 25만' },
+export const POINT_CLOUD_BUDGETS = [
+  { value: 250_000, label: '기본 · 25만' },
+  { value: 500_000, label: '정밀 · 50만' },
+  { value: 1_000_000, label: '최대 · 100만' },
 ]
+export const DEFAULT_POINT_CLOUD_BUDGET = 250_000
+export function pointCloudBudgetsForMaximum(maximum: number) {
+  const finiteMaximum = Number.isFinite(maximum) ? maximum : DEFAULT_POINT_CLOUD_BUDGET
+  const safeMaximum = Math.max(
+    DEFAULT_POINT_CLOUD_BUDGET,
+    Math.min(1_000_000, Math.floor(finiteMaximum)),
+  )
+  return POINT_CLOUD_BUDGETS.filter((entry) => entry.value <= safeMaximum)
+}
+const POINT_PREVIEW_DENSE_RADIUS_M = 15
+const POINT_PREVIEW_MAX_RADIUS_M = 25
 
 export interface PointCloudViewState {
   position: [number, number, number]
@@ -52,7 +69,7 @@ export function restorePointCloudViewState(
   target.fromArray(state.target)
 }
 
-interface RenderOverlayPoint {
+export interface RenderOverlayPoint {
   layerId: string
   layerName: string
   featureId: string | number
@@ -60,6 +77,36 @@ interface RenderOverlayPoint {
   position: [number, number, number]
   selected: boolean
   properties: Record<string, unknown>
+}
+
+export interface RenderPointCloudDetection {
+  sourceId: string
+  observationId: string
+  layerId?: string
+  layerName: string
+  featureId?: string | number
+  color: string
+  tooltipColor?: string
+  position: [number, number, number]
+  selected: boolean
+  properties: Record<string, unknown>
+}
+
+type PointCloudHoverEntry = RenderOverlayPoint | RenderPointCloudDetection
+
+export function pointCloudHoverState(
+  entry: PointCloudHoverEntry,
+  viewport: Pick<OverlayHoverState, 'x' | 'y' | 'viewportWidth' | 'viewportHeight'>,
+): OverlayHoverState {
+  const observationId = 'observationId' in entry ? entry.observationId : ''
+  return {
+    layerId: entry.layerId,
+    layerName: entry.layerName,
+    featureId: entry.featureId ?? observationId,
+    properties: entry.properties,
+    layerColor: 'tooltipColor' in entry ? entry.tooltipColor ?? entry.color : entry.color,
+    ...viewport,
+  }
 }
 
 interface NearbyOverlayFeature {
@@ -71,6 +118,129 @@ interface NearbyOverlayFeature {
 
 export function pointCloudDetectionPointSize(selected: boolean): number {
   return selected ? 1 : 0.62
+}
+
+const DETECTION_COLORS = ['#ffb84d', '#4dd9ff', '#ff6f91', '#7ee787', '#c59cff']
+const DETECTION_BOX_EDGE_INDICES = [
+  0, 1, 1, 3, 3, 2, 2, 0,
+  4, 5, 5, 7, 7, 6, 6, 4,
+  0, 4, 1, 5, 2, 6, 3, 7,
+] as const
+const DETECTION_BOX_CORNERS = [
+  [-1, -1, -1], [1, -1, -1], [-1, 1, -1], [1, 1, -1],
+  [-1, -1, 1], [1, -1, 1], [-1, 1, 1], [1, 1, 1],
+] as const
+
+function pointCloudDetectionColor(sourceId: string): string {
+  let hash = 0
+  for (let index = 0; index < sourceId.length; index += 1) {
+    hash = ((hash * 31) + sourceId.charCodeAt(index)) >>> 0
+  }
+  return DETECTION_COLORS[hash % DETECTION_COLORS.length]
+}
+
+export function pointCloudDetectionWireframePositions(
+  detections: RenderPointCloudDetection[],
+): Float32Array {
+  const positions = new Float32Array(detections.length * DETECTION_BOX_EDGE_INDICES.length * 3)
+  let offset = 0
+  detections.forEach((entry) => {
+    // The cube is an identity marker around the pipeline's accepted 3-D
+    // representative point, not an inferred physical object extent.
+    const halfSize = entry.selected ? 0.45 : 0.35
+    DETECTION_BOX_EDGE_INDICES.forEach((cornerIndex) => {
+      const corner = DETECTION_BOX_CORNERS[cornerIndex]
+      positions[offset] = entry.position[0] + corner[0] * halfSize
+      positions[offset + 1] = entry.position[1] + corner[1] * halfSize
+      positions[offset + 2] = entry.position[2] + corner[2] * halfSize
+      offset += 3
+    })
+  })
+  return positions
+}
+
+function normalizedDetectionProperty(
+  properties: Record<string, unknown>,
+  ...aliases: string[]
+): string {
+  const normalizedAliases = new Set(
+    aliases.map((alias) => alias.toLocaleLowerCase('en-US')),
+  )
+  const match = Object.entries(properties).find(([key, value]) => (
+    normalizedAliases.has(key.toLocaleLowerCase('en-US'))
+    && String(value ?? '').trim().length > 0
+  ))
+  return String(match?.[1] ?? '').trim().normalize('NFC').toLocaleLowerCase('en-US')
+}
+
+function compatibleDetectionProperty(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+  ...aliases: string[]
+): boolean {
+  const leftValue = normalizedDetectionProperty(left, ...aliases)
+  const rightValue = normalizedDetectionProperty(right, ...aliases)
+  return !leftValue || !rightValue || leftValue === rightValue
+}
+
+export function pointCloudDetectionsFromObservations(
+  observations: PanoramaDetectionBoxObservation[],
+  frameOrigin: [number, number, number] | undefined,
+  overlayPoints: RenderOverlayPoint[],
+  maximumRadius = POINT_PREVIEW_MAX_RADIUS_M,
+): RenderPointCloudDetection[] {
+  if (!frameOrigin) return []
+  const maximumDistanceSquared = maximumRadius ** 2
+  return observations.flatMap((observation) => {
+    const position = datasetPointToFrameLocal(observation.dataset_position, frameOrigin)
+    if (
+      !position
+      || position[0] ** 2 + position[1] ** 2 + position[2] ** 2 > maximumDistanceSquared
+    ) return []
+    const detectionId = normalizedDetectionProperty(
+      observation.properties,
+      'det_id',
+      'detection_id',
+    )
+    const representative = overlayPoints.find((point) => {
+      const pointDetectionId = normalizedDetectionProperty(
+        point.properties,
+        'det_id',
+        'detection_id',
+      )
+      if (!detectionId || !pointDetectionId || detectionId !== pointDetectionId) return false
+      if (!compatibleDetectionProperty(observation.properties, point.properties, 'model_nm', 'model_name')) {
+        return false
+      }
+      if (!compatibleDetectionProperty(observation.properties, point.properties, 'img_name', 'image_name')) {
+        return false
+      }
+      if (!compatibleDetectionProperty(observation.properties, point.properties, 'class_nm', 'class_name')) {
+        return false
+      }
+      const deltaSquared = point.position.reduce(
+        (sum, coordinate, index) => sum + (coordinate - position[index]) ** 2,
+        0,
+      )
+      return deltaSquared <= 0.5 ** 2
+    })
+    return [{
+      sourceId: observation.source_id,
+      observationId: observation.observation_id,
+      layerId: representative?.layerId,
+      layerName: representative?.layerName
+        ?? (observation.source_name ? `YOLO · ${observation.source_name}` : 'YOLO 검출'),
+      featureId: representative?.featureId,
+      color: pointCloudDetectionColor(observation.model_id ?? observation.source_id),
+      tooltipColor: representative?.color,
+      position,
+      selected: representative?.selected ?? false,
+      properties: {
+        ...observation.properties,
+        ...(representative?.properties ?? {}),
+      },
+    }]
+  })
 }
 
 export function demoPanoramaProjectionMetadata(frame: Frame): PanoramaProjectionMetadata {
@@ -108,7 +278,7 @@ export function datasetPointToFrameLocal(
   ]
 }
 
-export function captureHeadingDirection(heading: number | undefined): [number, number, number] {
+export function captureHeadingDirection(heading: number | null | undefined): [number, number, number] {
   const radians = ((Number.isFinite(heading) ? Number(heading) : 0) * Math.PI) / 180
   return [Math.sin(radians), Math.cos(radians), 0]
 }
@@ -200,11 +370,15 @@ export default function PointCloudView({
   datasetId,
   frame,
   demoMode,
+  maxPointBudget = 1_000_000,
+  detectionRevisionKey = '',
   onHoverPanoramaPoint,
 }: {
   datasetId: string
   frame: Frame | null
   demoMode: boolean
+  maxPointBudget?: number
+  detectionRevisionKey?: string
   onHoverPanoramaPoint?: (point: PanoramaHoverProjection | null) => void
 }) {
   const overlay = useOptionalOverlayWorkspace()
@@ -215,20 +389,33 @@ export default function PointCloudView({
   const pointSizeRef = useRef(1.4)
   const projectionMetadataRef = useRef<PanoramaProjectionMetadata | null>(null)
   const onHoverPanoramaPointRef = useRef(onHoverPanoramaPoint)
+  const availableBudgets = useMemo(
+    () => pointCloudBudgetsForMaximum(maxPointBudget),
+    [maxPointBudget],
+  )
+  const maximumAvailableBudget = availableBudgets.at(-1)?.value ?? DEFAULT_POINT_CLOUD_BUDGET
   const [payload, setPayload] = useState<PointCloudPayload | null>(null)
-  const [budget, setBudget] = useState(120_000)
-  const [radius, setRadius] = useState(40)
+  const [budget, setBudget] = useState(() =>
+    Math.min(DEFAULT_POINT_CLOUD_BUDGET, maximumAvailableBudget),
+  )
   const [pointSize, setPointSize] = useState(1.4)
   const [loading, setLoading] = useState(false)
   const [indexing, setIndexing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
   const [nearbyOverlayFeatures, setNearbyOverlayFeatures] = useState<NearbyOverlayFeature[]>([])
+  const [detectionObservations, setDetectionObservations] = useState<PanoramaDetectionBoxObservation[]>([])
+  const [detectionLoading, setDetectionLoading] = useState(false)
+  const [detectionError, setDetectionError] = useState<string | null>(null)
   const [nearbyOverlayTotal, setNearbyOverlayTotal] = useState(0)
   const [overlayLoading, setOverlayLoading] = useState(false)
   const [overlayError, setOverlayError] = useState<string | null>(null)
   const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
   const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
+
+  useEffect(() => {
+    setBudget((current) => Math.min(current, maximumAvailableBudget))
+  }, [maximumAvailableBudget])
   const overlayHoverRef = useRef<OverlayHoverState | null>(null)
   const selectedOverlay = overlay?.selected
   const visibleOverlayLayers = useMemo(
@@ -324,7 +511,7 @@ export default function PointCloudView({
               datasetId,
               layer.id,
               [origin[0], origin[1]],
-              radius * 1.5,
+              POINT_PREVIEW_MAX_RADIUS_M,
               5_000,
               controller.signal,
             )
@@ -369,7 +556,6 @@ export default function PointCloudView({
     frame?.dataset_position,
     frame?.id,
     overlayLayerColor,
-    radius,
     visibleOverlayLayerKey,
     visibleOverlayLayers,
   ])
@@ -377,7 +563,7 @@ export default function PointCloudView({
   const overlayPoints = useMemo<RenderOverlayPoint[]>(() => {
     const origin = frame?.dataset_position
     if (!origin) return []
-    const maximumDistanceSquared = (radius * 1.5) ** 2
+    const maximumDistanceSquared = POINT_PREVIEW_MAX_RADIUS_M ** 2
     return nearbyOverlayFeatures.flatMap(({ layerId, layerName, color, feature }) => {
       if (feature.geometry?.type !== 'Point') return []
       const position = datasetPointToFrameLocal(feature.geometry.coordinates, origin)
@@ -394,7 +580,44 @@ export default function PointCloudView({
           String(selectedOverlay.featureId) === String(feature.id),
       }]
     })
-  }, [frame?.dataset_position, nearbyOverlayFeatures, radius, selectedOverlay])
+  }, [frame?.dataset_position, nearbyOverlayFeatures, selectedOverlay])
+
+  useEffect(() => {
+    if (!frame || demoMode) {
+      setDetectionObservations([])
+      setDetectionLoading(false)
+      setDetectionError(null)
+      return
+    }
+    const controller = new AbortController()
+    setDetectionObservations([])
+    setDetectionLoading(true)
+    setDetectionError(null)
+    void api.frameDetections(datasetId, frame.id, controller.signal)
+      .then((response) => {
+        if (!controller.signal.aborted) setDetectionObservations(response.items)
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setDetectionError(
+            reason instanceof Error ? reason.message : 'YOLO 3D 위치를 불러오지 못했습니다.',
+          )
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetectionLoading(false)
+      })
+    return () => controller.abort()
+  }, [datasetId, demoMode, detectionRevisionKey, frame])
+
+  const detectionPoints = useMemo(
+    () => pointCloudDetectionsFromObservations(
+      detectionObservations,
+      frame?.dataset_position,
+      overlayPoints,
+    ),
+    [detectionObservations, frame?.dataset_position, overlayPoints],
+  )
 
   useEffect(() => {
     if (!frame) {
@@ -413,7 +636,7 @@ export default function PointCloudView({
       try {
         const data = demoMode
           ? createDemoPointCloud(budget)
-          : parseMmsp(await api.points(datasetId, frame.id, budget, radius, controller.signal))
+          : parseMmsp(await api.points(datasetId, frame.id, budget, controller.signal))
         if (!controller.signal.aborted) {
           setPayload(data)
           setLoading(false)
@@ -436,7 +659,7 @@ export default function PointCloudView({
       controller.abort()
       if (retryTimer) window.clearTimeout(retryTimer)
     }
-  }, [budget, datasetId, demoMode, frame, radius, reloadKey])
+  }, [budget, datasetId, demoMode, frame, reloadKey])
 
   useEffect(() => {
     const host = hostRef.current
@@ -559,6 +782,12 @@ export default function PointCloudView({
     let overlayObject: THREE.Points | null = null
     let selectedGeometry: THREE.BufferGeometry | null = null
     let selectedMaterial: THREE.PointsMaterial | null = null
+    let detectionGeometry: THREE.BufferGeometry | null = null
+    let detectionMaterial: THREE.PointsMaterial | null = null
+    let detectionObject: THREE.Points | null = null
+    let detectionBoxGeometry: THREE.BufferGeometry | null = null
+    let detectionBoxMaterial: THREE.LineBasicMaterial | null = null
+    let detectionBoxObject: THREE.LineSegments | null = null
     if (overlayPoints.length) {
       const positions = new Float32Array(overlayPoints.length * 3)
       const colors = new Float32Array(overlayPoints.length * 3)
@@ -599,6 +828,52 @@ export default function PointCloudView({
       }
     }
 
+    if (detectionPoints.length) {
+      const positions = new Float32Array(detectionPoints.length * 3)
+      const colors = new Float32Array(detectionPoints.length * 3)
+      const boxColors = new Float32Array(
+        detectionPoints.length * DETECTION_BOX_EDGE_INDICES.length * 3,
+      )
+      detectionPoints.forEach((entry, index) => {
+        positions.set(entry.position, index * 3)
+        const color = new THREE.Color(entry.selected ? '#ffffff' : entry.color)
+        colors.set([color.r, color.g, color.b], index * 3)
+        for (let vertex = 0; vertex < DETECTION_BOX_EDGE_INDICES.length; vertex += 1) {
+          boxColors.set(
+            [color.r, color.g, color.b],
+            (index * DETECTION_BOX_EDGE_INDICES.length + vertex) * 3,
+          )
+        }
+      })
+      detectionBoxGeometry = new THREE.BufferGeometry()
+      detectionBoxGeometry.setAttribute(
+        'position',
+        new THREE.BufferAttribute(pointCloudDetectionWireframePositions(detectionPoints), 3),
+      )
+      detectionBoxGeometry.setAttribute('color', new THREE.BufferAttribute(boxColors, 3))
+      detectionBoxMaterial = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+      detectionBoxObject = new THREE.LineSegments(detectionBoxGeometry, detectionBoxMaterial)
+      detectionBoxObject.renderOrder = 8
+      detectionGeometry = new THREE.BufferGeometry()
+      detectionGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+      detectionGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+      detectionMaterial = new THREE.PointsMaterial({
+        size: 0.82,
+        sizeAttenuation: true,
+        vertexColors: true,
+        depthTest: false,
+      })
+      detectionObject = new THREE.Points(detectionGeometry, detectionMaterial)
+      detectionObject.renderOrder = 9
+      scene.add(detectionBoxObject)
+      scene.add(detectionObject)
+    }
+
     const grid = new THREE.GridHelper(Math.ceil(span * 1.4), 24, 0x2bcfa8, 0x213548)
     grid.rotation.x = Math.PI / 2
     grid.position.z = payload.bounds.min[2] - 0.1
@@ -633,6 +908,8 @@ export default function PointCloudView({
     pointRaycaster.params.Points = { threshold: 0.18 }
     const overlayRaycaster = new THREE.Raycaster()
     overlayRaycaster.params.Points = { threshold: 0.48 }
+    const detectionRaycaster = new THREE.Raycaster()
+    detectionRaycaster.params.Points = { threshold: 0.52 }
     const pointer = new THREE.Vector2()
     const ownerWindow = host.ownerDocument.defaultView ?? window
     let pointerStart: { x: number; y: number } | null = null
@@ -659,6 +936,7 @@ export default function PointCloudView({
       )
       pointRaycaster.setFromCamera(pointer, camera)
       overlayRaycaster.setFromCamera(pointer, camera)
+      detectionRaycaster.setFromCamera(pointer, camera)
       return bounds
     }
 
@@ -675,7 +953,20 @@ export default function PointCloudView({
       const bounds = setPointerFromClient(pending.x, pending.y)
       if (!bounds) return
 
-      const overlayIndex = overlayObject
+      const detectionIndex = detectionObject
+        ? closestPointHitIndex(
+            detectionRaycaster.intersectObject(detectionObject, false),
+            pointer,
+            camera,
+            bounds.width,
+            bounds.height,
+            14,
+          )
+        : null
+      const detectionEntry = detectionIndex === null
+        ? undefined
+        : detectionPoints[detectionIndex]
+      const overlayIndex = !detectionEntry && overlayObject
         ? closestPointHitIndex(
             overlayRaycaster.intersectObject(overlayObject, false),
             pointer,
@@ -688,16 +979,13 @@ export default function PointCloudView({
       const overlayEntry = overlayIndex === null
         ? undefined
         : overlayPoints[overlayIndex]
-      setOverlayHover(overlayEntry ? {
-        layerId: overlayEntry.layerId,
-        layerName: overlayEntry.layerName,
-        featureId: overlayEntry.featureId,
-        properties: overlayEntry.properties,
+      const hoverEntry = detectionEntry ?? overlayEntry
+      setOverlayHover(hoverEntry ? pointCloudHoverState(hoverEntry, {
         x: pending.x - bounds.left,
         y: pending.y - bounds.top,
         viewportWidth: bounds.width,
         viewportHeight: bounds.height,
-      } : null)
+      }) : null)
 
       const pointIndex = closestPointHitIndex(
         pointRaycaster.intersectObject(points, false),
@@ -777,6 +1065,33 @@ export default function PointCloudView({
         }
         return
       }
+      if (detectionObject) {
+        const detectionIndex = closestPointHitIndex(
+          detectionRaycaster.intersectObject(detectionObject, false),
+          pointer,
+          camera,
+          bounds.width,
+          bounds.height,
+          14,
+        )
+        const entry = detectionIndex === null ? undefined : detectionPoints[detectionIndex]
+        if (entry) {
+          const transient = overlayHoverRef.current
+          setPinnedOverlayHover(
+            transient
+              && transient.layerId === entry.layerId
+              && String(transient.featureId) === String(entry.featureId ?? entry.observationId)
+              ? transient
+              : pointCloudHoverState(entry, {
+                  x: event.clientX - bounds.left,
+                  y: event.clientY - bounds.top,
+                  viewportWidth: bounds.width,
+                  viewportHeight: bounds.height,
+                }),
+          )
+          return
+        }
+      }
       if (overlayObject) {
         const overlayIndex = closestPointHitIndex(
           overlayRaycaster.intersectObject(overlayObject, false),
@@ -793,16 +1108,12 @@ export default function PointCloudView({
             transient?.layerId === entry.layerId &&
               String(transient.featureId) === String(entry.featureId)
               ? transient
-              : {
-                  layerId: entry.layerId,
-                  layerName: entry.layerName,
-                  featureId: entry.featureId,
-                  properties: entry.properties,
+              : pointCloudHoverState(entry, {
                   x: event.clientX - bounds.left,
                   y: event.clientY - bounds.top,
                   viewportWidth: bounds.width,
                   viewportHeight: bounds.height,
-                },
+                }),
           )
         }
       }
@@ -831,6 +1142,10 @@ export default function PointCloudView({
       overlayMaterial?.dispose()
       selectedGeometry?.dispose()
       selectedMaterial?.dispose()
+      detectionGeometry?.dispose()
+      detectionMaterial?.dispose()
+      detectionBoxGeometry?.dispose()
+      detectionBoxMaterial?.dispose()
       capturePose.traverse((object) => {
         const renderable = object as THREE.Object3D & {
           geometry?: THREE.BufferGeometry
@@ -847,7 +1162,7 @@ export default function PointCloudView({
       renderer.dispose()
       renderer.domElement.remove()
     }
-  }, [frame?.dataset_position, frame?.heading, overlayPoints, payload])
+  }, [detectionPoints, frame?.dataset_position, frame?.heading, overlayPoints, payload])
 
   useEffect(() => {
     const material = pointMaterialRef.current
@@ -859,6 +1174,7 @@ export default function PointCloudView({
     <div
       className={`pointcloud-view ${overlay?.pickMode ? 'coordinate-pick-active' : ''}`}
       data-shp-point-count={overlayPoints.length}
+      data-yolo-point-count={detectionPoints.length}
     >
       <div ref={hostRef} className="pointcloud-canvas" />
       <OverlayHoverTooltip
@@ -915,27 +1231,29 @@ export default function PointCloudView({
         <label>
           <CircleGauge size={14} />
           <select value={budget} onChange={(event) => setBudget(Number(event.target.value))}>
-            {BUDGETS.map((entry) => (
+            {availableBudgets.map((entry) => (
               <option value={entry.value} key={entry.value}>
                 {entry.label}
               </option>
             ))}
           </select>
         </label>
-        <label>
-          반경
-          <select value={radius} onChange={(event) => setRadius(Number(event.target.value))}>
-            <option value={20}>20 m</option>
-            <option value={40}>40 m</option>
-            <option value={70}>70 m</option>
-          </select>
-        </label>
+        <span title="촬영 위치 기준 15m 안쪽은 고밀도, 15~25m는 저밀도로 샘플링합니다.">
+          범위 · 15m 고밀도 · 최대 25m
+        </span>
         {overlayPoints.length > 0 && (
           <span title="현재 프레임 주변에 표시된 SHP 포인트">
             <MapPin size={14} /> SHP {overlayPoints.length.toLocaleString('ko-KR')}
             {nearbyOverlayTotal > overlayPoints.length ? '+' : ''}
           </span>
         )}
+        {detectionPoints.length > 0 && (
+          <span title="YOLO 검출과 포인트클라우드가 실제로 연결된 3D 대표 위치">
+            <Crosshair size={14} /> YOLO 3D {detectionPoints.length.toLocaleString('ko-KR')}
+          </span>
+        )}
+        {detectionLoading && <LoaderCircle size={14} className="spin" aria-label="YOLO 3D 위치 불러오는 중" />}
+        {detectionError && <span className="viewer-overlay-error" title={detectionError}>YOLO 3D 일부 오류</span>}
         {overlayLoading && <LoaderCircle size={14} className="spin" aria-label="SHP 포인트 불러오는 중" />}
         {overlayError && <span className="viewer-overlay-error" title={overlayError}>SHP 일부 오류</span>}
         {overlay?.pickMode && (

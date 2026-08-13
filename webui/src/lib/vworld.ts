@@ -7,6 +7,10 @@ import type {
   Point,
   Position,
 } from 'geojson'
+import {
+  MAP_SELECTED_FEATURE_COLOR,
+  MAP_SELECTED_FRAME_COLOR,
+} from './mapSelectionColors'
 
 export const VWORLD_IFRAME_URL = '/vworld-map.html'
 export const VWORLD_CONTAINER_ID = 'vmap'
@@ -467,7 +471,7 @@ function appendFrames(
       const haloId = `${entityId}:selected-halo`
       if (
         addPoint(runtime, entities, feature.geometry.coordinates, haloId, {
-          color: '#ffd166',
+          color: MAP_SELECTED_FRAME_COLOR,
           size: 15,
           outlineColor: '#ffffff',
           outlineWidth: 2,
@@ -480,7 +484,7 @@ function appendFrames(
     const added = addPoint(runtime, entities, feature.geometry.coordinates, entityId, {
       color: selected ? '#07111f' : trackColor,
       size: selected ? 8 : 7,
-      outlineColor: selected ? '#ffd166' : inRange ? '#ffffff' : '#09261f',
+      outlineColor: selected ? MAP_SELECTED_FRAME_COLOR : inRange ? '#ffffff' : '#09261f',
       outlineWidth: selected ? 2 : inRange ? 3 : 1,
       distanceScale: selected ? selectedFrameDistanceScale() : undefined,
     })
@@ -554,14 +558,15 @@ function addOverlayGeometry(
   style: { color: string; selected: boolean },
   onEntity: (entityId: string) => void,
 ): void {
+  const selectedColor = style.selected ? MAP_SELECTED_FEATURE_COLOR : style.color
   switch (geometry.type) {
     case 'Point': {
       const entityId = idPrefix
       if (
         addPoint(runtime, entities, geometry.coordinates, entityId, {
-          color: style.color,
+          color: selectedColor,
           size: style.selected ? 15 : 10,
-          outlineColor: '#ffffff',
+          outlineColor: style.selected ? '#fff2ec' : '#ffffff',
           outlineWidth: style.selected ? 3 : 1,
         })
       ) {
@@ -585,7 +590,7 @@ function addOverlayGeometry(
       const entityId = idPrefix
       if (
         addPolyline(runtime, entities, geometry.coordinates, entityId, {
-          color: style.color,
+          color: selectedColor,
           alpha: 0.96,
           width: style.selected ? 6 : 3,
           zIndex: style.selected ? 12 : 10,
@@ -700,6 +705,7 @@ function addPolygon(
   style: { color: string; selected: boolean },
   onEntity: (entityId: string) => void,
 ): void {
+  const selectedColor = style.selected ? MAP_SELECTED_FEATURE_COLOR : style.color
   const [outer, ...holes] = rings
   if (!outer) return
   const outerPositions = outer.map((coordinate) => toCartesian(runtime, coordinate)).filter(isValue)
@@ -712,7 +718,7 @@ function addPolygon(
     id,
     polygon: {
       hierarchy: new runtime.Cesium.PolygonHierarchy(outerPositions, holeHierarchies),
-      material: cssColor(runtime, style.color, style.selected ? 0.46 : 0.24),
+      material: cssColor(runtime, selectedColor, style.selected ? 0.52 : 0.24),
       classificationType: runtime.Cesium.ClassificationType?.BOTH,
     },
   })
@@ -722,7 +728,7 @@ function addPolygon(
     const outlineId = `${id}:outline:${index}`
     if (
       addPolyline(runtime, entities, ring, outlineId, {
-        color: style.selected ? '#ffffff' : style.color,
+        color: style.selected ? MAP_SELECTED_FEATURE_COLOR : style.color,
         alpha: 0.98,
         width: style.selected ? 4 : 2,
         zIndex: style.selected ? 12 : 10,

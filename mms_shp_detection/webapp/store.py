@@ -381,6 +381,7 @@ class WebStore:
             ).fetchone()
         return self.frame_from_row(row)
 
+
     def locate_frame(
         self,
         dataset_id: str,
@@ -706,14 +707,17 @@ class WebStore:
         *,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Return newest durable results, including runs hidden from the queue."""
+        """Return most recently finished durable results, including hidden runs."""
 
         with self.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM runs
                 WHERE dataset_id=? AND status='completed'
-                ORDER BY created_at DESC, id DESC
+                ORDER BY
+                    COALESCE(finished_at, updated_at, created_at) DESC,
+                    created_at DESC,
+                    id DESC
                 LIMIT ?
                 """,
                 (dataset_id, int(limit)),

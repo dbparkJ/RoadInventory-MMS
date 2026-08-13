@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  MAP_SELECTED_FEATURE_COLOR,
+  MAP_SELECTED_FRAME_COLOR,
+} from './mapSelectionColors'
+import {
   assertVWorldSdk,
   cameraTargetForSceneMode,
   cameraTargetForCoordinates,
@@ -300,8 +304,18 @@ describe('VWorld WebGL 3.0 adapter', () => {
     expect(onOverlay).toHaveBeenCalledWith('layer-a', 'feature-7')
     const selectedFrame = collection.values.find((entity) => entity.id === 'frame:0')
     const selectedHalo = collection.values.find((entity) => entity.id === 'frame:0:selected-halo')
+    const selectedPolygon = collection.values.find((entity) => entity.id === 'overlay:0')
     expect((selectedFrame?.point as { pixelSize?: number }).pixelSize).toBe(8)
     expect((selectedHalo?.point as { pixelSize?: number }).pixelSize).toBe(15)
+    expect(
+      (selectedFrame?.point as { outlineColor?: { value?: string } }).outlineColor?.value,
+    ).toBe(MAP_SELECTED_FRAME_COLOR)
+    expect((selectedHalo?.point as { color?: { value?: string } }).color?.value).toBe(
+      MAP_SELECTED_FRAME_COLOR,
+    )
+    expect(
+      (selectedPolygon?.polygon as { material?: { value?: string } }).material?.value,
+    ).toBe(MAP_SELECTED_FEATURE_COLOR)
     expect((selectedFrame?.point as { scaleByDistance?: unknown }).scaleByDistance).toMatchObject(
       selectedFrameDistanceScale(),
     )

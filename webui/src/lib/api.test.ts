@@ -107,7 +107,75 @@ describe('overlay layer metadata', () => {
   })
 })
 
+describe('overlay attribute schema', () => {
+  it('deletes an encoded field name with the optimistic layer revision', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          deleted_field: '상태 값',
+          revision: 5,
+          fields: [{ name: 'NAME', type: 'C' }],
+          layer: {
+            id: 'layer 1',
+            dataset_id: 'dataset/a',
+            name: 'layer',
+            geometry_type: 'Point',
+            feature_count: 1,
+            revision: 5,
+          },
+          source_preserved: true,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.deleteOverlayField('dataset/a', 'layer 1', '상태 값', 4)
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/overlays/layer%201/fields/%EC%83%81%ED%83%9C%20%EA%B0%92?expected_revision=4',
+      )
+      expect(fetchMock.mock.calls[0][1]?.method).toBe('DELETE')
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
 describe('run API', () => {
+  it('requests a bounded legacy run page for compatibility lookup', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    try {
+      await api.runs(undefined, 200)
+      expect(fetchMock.mock.calls[0][0]).toBe('/api/runs?limit=200')
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('requests the durable latest completed run for one encoded dataset', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ run: null }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    try {
+      await expect(api.latestCompletedRun('dataset/a ?')).resolves.toEqual({ run: null })
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa%20%3F/runs/latest-completed',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
   it('encodes the run id and dismisses it with DELETE', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
@@ -158,6 +226,26 @@ describe('frame detections API', () => {
       await api.frameDetections('dataset/a', 'frame 1')
       expect(fetchMock.mock.calls[0][0]).toBe(
         '/api/datasets/dataset%2Fa/frames/frame%201/detections',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('point preview API', () => {
+  it('requests only a budget because the server owns the 15m/25m distance bands', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(new ArrayBuffer(40), {
+        status: 200,
+        headers: { 'Content-Type': 'application/vnd.mmsp' },
+      }),
+    )
+
+    try {
+      await api.points('dataset/a', 'frame 1', 120_000)
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/points/frame%201?budget=120000',
       )
     } finally {
       fetchMock.mockRestore()

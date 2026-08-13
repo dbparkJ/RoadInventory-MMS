@@ -150,6 +150,146 @@ class WebAppOverlayTests(unittest.TestCase):
                 },
             )
 
+    def test_delete_attribute_field_updates_edit_store_export_and_audit(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as bundle_text,
+            tempfile.TemporaryDirectory() as id_bundle_text,
+        ):
+            state = Path(state_text)
+            source_bundle = _write_bundle(Path(bundle_text))
+            source_hashes = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in source_bundle
+            }
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=state,
+                start_runner=False,
+            )
+            _seed_dataset(app)
+
+            with TestClient(app) as client:
+                uploaded = client.post(
+                    "/api/datasets/dataset-a/overlays",
+                    files=_multipart(source_bundle),
+                )
+                self.assertEqual(uploaded.status_code, 201, uploaded.text)
+                layer_id = uploaded.json()["layer"]["id"]
+                field_url = (
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/fields/NAME"
+                )
+
+                from mms_shp_detection.webapp import overlays as overlays_module
+
+                with patch.object(
+                    overlays_module,
+                    "atomic_replace_bytes",
+                    side_effect=OSError("simulated manifest failure"),
+                ):
+                    deleted = client.delete(
+                        field_url, params={"expected_revision": 1}
+                    )
+                self.assertEqual(deleted.status_code, 200, deleted.text)
+                payload = deleted.json()
+                self.assertEqual(payload["deleted_field"], "NAME")
+                self.assertEqual(payload["revision"], 2)
+                self.assertTrue(payload["source_preserved"])
+                self.assertEqual(
+                    [field["name"] for field in payload["fields"]], ["VALUE"]
+                )
+                recovered = client.get(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features",
+                    params={"coordinate_space": "dataset"},
+                ).json()
+                self.assertEqual(recovered["revision"], 2)
+                self.assertEqual(
+                    [field["name"] for field in recovered["fields"]], ["VALUE"]
+                )
+                self.assertEqual(
+                    recovered["features"][0]["properties"], {"VALUE": 1}
+                )
+
+                features = client.get(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features",
+                    params={"coordinate_space": "dataset"},
+                ).json()
+                self.assertEqual(features["revision"], 2)
+                self.assertEqual(features["features"][0]["properties"], {"VALUE": 1})
+                stale = client.delete(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/fields/VALUE",
+                    params={"expected_revision": 1},
+                )
+                self.assertEqual(stale.status_code, 409, stale.text)
+                final_field = client.delete(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/fields/VALUE",
+                    params={"expected_revision": 2},
+                )
+                self.assertEqual(final_field.status_code, 422, final_field.text)
+
+                exported = client.get(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/download"
+                )
+                self.assertEqual(exported.status_code, 200, exported.text)
+                with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                    shp_name = next(
+                        name for name in archive.namelist() if name.endswith(".shp")
+                    )
+                    stem = Path(shp_name).stem
+                    reader = shapefile.Reader(
+                        shp=io.BytesIO(archive.read(f"{stem}.shp")),
+                        shx=io.BytesIO(archive.read(f"{stem}.shx")),
+                        dbf=io.BytesIO(archive.read(f"{stem}.dbf")),
+                        encoding="utf-8",
+                    )
+                    try:
+                        self.assertEqual(
+                            [field[0] for field in reader.fields[1:]], ["VALUE"]
+                        )
+                        self.assertEqual(list(reader.record(0)), [1])
+                    finally:
+                        reader.close()
+
+                id_uploaded = client.post(
+                    "/api/datasets/dataset-a/overlays",
+                    files=_multipart(_write_id_bundle(Path(id_bundle_text))),
+                )
+                self.assertEqual(id_uploaded.status_code, 201, id_uploaded.text)
+                id_layer = id_uploaded.json()["layer"]
+                protected = client.delete(
+                    f"/api/datasets/dataset-a/overlays/{id_layer['id']}/fields/id",
+                    params={"expected_revision": id_layer["revision"]},
+                )
+                self.assertEqual(protected.status_code, 422, protected.text)
+
+            overlay_root = next((state / "overlays").iterdir())
+            layer_dir = overlay_root / layer_id
+            connection = sqlite3.connect(layer_dir / "features.sqlite3")
+            try:
+                audit = connection.execute(
+                    "SELECT revision,action,feature_id,before_json,after_json "
+                    "FROM audit ORDER BY revision"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(
+                [(row[0], row[1], row[2]) for row in audit],
+                [(2, "delete_field", "field:NAME")],
+            )
+            self.assertEqual(json.loads(audit[0][3])["field"]["name"], "NAME")
+            self.assertEqual(
+                [field["name"] for field in json.loads(audit[0][4])["fields"]],
+                ["VALUE"],
+            )
+            self.assertEqual(
+                source_hashes,
+                {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in source_bundle
+                },
+            )
+
     def test_layer_name_and_color_update_persist_with_metadata_revision(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

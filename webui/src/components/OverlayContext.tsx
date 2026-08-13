@@ -33,6 +33,14 @@ interface LayerFeatures {
   errorDataset?: string
 }
 
+interface SelectedFeatureDetailCache {
+  datasetId: string
+  layerId: string
+  featureId: string | number
+  revision: number
+  feature: OverlayFeature
+}
+
 export interface OverlaySelection {
   layerId: string
   featureId: string | number
@@ -93,6 +101,7 @@ export interface OverlayContextValue {
   ) => Promise<void>
   copySelectedLocation: () => Promise<void>
   deleteSelected: () => Promise<void>
+  deleteField: (layerId: string, fieldName: string) => Promise<void>
   layerColor: (layerId: string) => string
 }
 
@@ -100,6 +109,26 @@ const OverlayContext = createContext<OverlayContextValue | null>(null)
 
 function featureId(feature: OverlayFeature): string {
   return String(feature.id)
+}
+
+function detailFeatureForSelection(
+  detail: SelectedFeatureDetailCache | null,
+  datasetId: string,
+  selection: OverlaySelection | null,
+  layerRevision: number | undefined,
+): OverlayFeature | null {
+  if (
+    !detail ||
+    !selection ||
+    layerRevision === undefined ||
+    detail.datasetId !== datasetId ||
+    detail.layerId !== selection.layerId ||
+    String(detail.featureId) !== String(selection.featureId) ||
+    detail.revision < layerRevision
+  ) {
+    return null
+  }
+  return detail.feature
 }
 
 function emptyCollection(revision = 0): OverlayFeatureCollection {
@@ -130,11 +159,10 @@ export function OverlayProvider({
   const [visibleLayerIds, setVisibleLayerIds] = useState<Set<string>>(new Set())
   const [activeLayerId, setActiveLayerId] = useState('')
   const [selected, setSelected] = useState<OverlaySelection | null>(null)
-  const [selectedDatasetDetail, setSelectedDatasetDetail] = useState<{
-    layerId: string
-    featureId: string | number
-    feature: OverlayFeature
-  } | null>(null)
+  const [selectedDatasetDetail, setSelectedDatasetDetail] =
+    useState<SelectedFeatureDetailCache | null>(null)
+  const [selectedWgs84Detail, setSelectedWgs84Detail] =
+    useState<SelectedFeatureDetailCache | null>(null)
   const [loading, setLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [creatingFeature, setCreatingFeature] = useState(false)
@@ -146,8 +174,17 @@ export function OverlayProvider({
   const knownLayerIdsRef = useRef<Set<string>>(new Set())
   const coordinateLoadsRef = useRef<Set<string>>(new Set())
   const selectionRequestRef = useRef(0)
+  const selectionControllerRef = useRef<AbortController | null>(null)
   const visibleLayerIdsRef = useRef(visibleLayerIds)
   visibleLayerIdsRef.current = visibleLayerIds
+
+  const clearSelectedDetails = useCallback(() => {
+    selectionRequestRef.current += 1
+    selectionControllerRef.current?.abort()
+    selectionControllerRef.current = null
+    setSelectedDatasetDetail(null)
+    setSelectedWgs84Detail(null)
+  }, [])
 
   const layerColor = useCallback(
     (layerId: string) => {
@@ -317,12 +354,12 @@ export function OverlayProvider({
     if (!datasetId || demoMode) {
       loadedDatasetRef.current = datasetId
       knownLayerIdsRef.current = new Set()
+      clearSelectedDetails()
       setLayers([])
       setFeatures({})
       setVisibleLayerIds(new Set())
       setActiveLayerId('')
       setSelected(null)
-      setSelectedDatasetDetail(null)
       setPickTarget(null)
       return
     }
@@ -331,12 +368,12 @@ export function OverlayProvider({
     if (loadedDatasetRef.current !== datasetId) {
       loadedDatasetRef.current = datasetId
       knownLayerIdsRef.current = new Set()
+      clearSelectedDetails()
       setLayers([])
       setFeatures({})
       setVisibleLayerIds(new Set())
       setActiveLayerId('')
       setSelected(null)
-      setSelectedDatasetDetail(null)
       setPickTarget(null)
     }
     setLoading(true)
@@ -375,6 +412,13 @@ export function OverlayProvider({
       setSelected((current) =>
         current && nextLayers.some((layer) => layer.id === current.layerId) ? current : null,
       )
+      const keepCurrentDetail = (detail: SelectedFeatureDetailCache | null) => {
+        if (!detail || detail.datasetId !== datasetId) return null
+        const layer = nextLayers.find((candidate) => candidate.id === detail.layerId)
+        return layer && detail.revision >= layer.revision ? detail : null
+      }
+      setSelectedDatasetDetail(keepCurrentDetail)
+      setSelectedWgs84Detail(keepCurrentDetail)
       setPickTarget((current) =>
         current && nextLayerIds.has(current.layerId) ? current : null,
       )
@@ -402,7 +446,7 @@ export function OverlayProvider({
       if (requestGeneration.current === generation) setLoading(false)
       if (refreshControllerRef.current === controller) refreshControllerRef.current = null
     }
-  }, [datasetId, demoMode, loadFeaturePage, notify])
+  }, [clearSelectedDetails, datasetId, demoMode, loadFeaturePage, notify])
 
   useEffect(() => {
     void refresh()
@@ -459,6 +503,23 @@ export function OverlayProvider({
     [features, layers, loadFeaturePage],
   )
 
+  const shortcutStateRef = useRef({
+    activeLayerId,
+    beginCreatePoint,
+    pickMode,
+    pickTarget,
+    selected,
+    setPickMode,
+  })
+  shortcutStateRef.current = {
+    activeLayerId,
+    beginCreatePoint,
+    pickMode,
+    pickTarget,
+    selected,
+    setPickMode,
+  }
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
@@ -471,17 +532,29 @@ export function OverlayProvider({
       ) {
         return
       }
-      if (event.key === 'Escape' && pickMode) {
+      const shortcut = shortcutStateRef.current
+      if (event.key === 'Escape' && shortcut.pickMode) {
         event.preventDefault()
-        setPickMode(false)
-      } else if (event.code === 'KeyP' && selected) {
+        shortcut.setPickMode(false)
+      } else if (event.code === 'KeyN') {
         event.preventDefault()
-        setPickMode(!pickMode)
+        if (event.repeat) return
+        if (
+          shortcut.pickTarget?.kind === 'create' &&
+          shortcut.pickTarget.layerId === shortcut.activeLayerId
+        ) {
+          shortcut.setPickMode(false)
+        } else {
+          shortcut.beginCreatePoint(shortcut.activeLayerId)
+        }
+      } else if (event.code === 'KeyP' && shortcut.selected) {
+        event.preventDefault()
+        shortcut.setPickMode(!shortcut.pickMode)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [pickMode, selected, setPickMode])
+  }, [])
 
   const upload = useCallback(
     async (files: File[], name?: string, crs?: string, encoding: OverlayEncoding = 'auto') => {
@@ -500,6 +573,7 @@ export function OverlayProvider({
         })
         await refresh()
         setActiveLayerId(response.layer.id)
+        clearSelectedDetails()
         setSelected(null)
       } catch (reason) {
         notify?.({
@@ -512,20 +586,23 @@ export function OverlayProvider({
         setUploading(false)
       }
     },
-    [datasetId, demoMode, notify, refresh],
+    [clearSelectedDetails, datasetId, demoMode, notify, refresh],
   )
 
   const removeLayer = useCallback(
     async (layerId: string) => {
       if (!datasetId || demoMode) return
       await api.deleteOverlay(datasetId, layerId)
-      if (selected?.layerId === layerId) setSelected(null)
+      if (selected?.layerId === layerId) {
+        clearSelectedDetails()
+        setSelected(null)
+      }
       if (activeLayerId === layerId) setActiveLayerId('')
       setPickTarget((current) => (current?.layerId === layerId ? null : current))
       notify?.({ tone: 'info', title: 'SHP 레이어 등록을 제거했습니다', message: '업로드 원본은 보존됩니다.' })
       await refresh()
     },
-    [activeLayerId, datasetId, demoMode, notify, refresh, selected?.layerId],
+    [activeLayerId, clearSelectedDetails, datasetId, demoMode, notify, refresh, selected?.layerId],
   )
 
   const updateLayerMetadata = useCallback(
@@ -577,68 +654,31 @@ export function OverlayProvider({
 
   const selectFeature = useCallback(
     (selection: OverlaySelection | null, options?: OverlaySelectionOptions) => {
+      clearSelectedDetails()
       setSelected(selection)
-      if (!selection) {
-        selectionRequestRef.current += 1
-        setSelectedDatasetDetail(null)
-        return
-      }
+      if (!selection) return
       setActiveLayerId(selection.layerId)
-      setSelectedDatasetDetail(null)
-      if (selection) {
-        if (!visibleLayerIdsRef.current.has(selection.layerId)) {
-          setVisibleLayerIds((current) => new Set(current).add(selection.layerId))
-          const layer = layers.find((candidate) => candidate.id === selection.layerId)
-          if (layer && !features[selection.layerId]?.wgs84 && !features[selection.layerId]?.loadingWgs84) {
-            void loadFeaturePage(layer, 'wgs84', requestGeneration.current)
-          }
+      if (!visibleLayerIdsRef.current.has(selection.layerId)) {
+        setVisibleLayerIds((current) => new Set(current).add(selection.layerId))
+        const layer = layers.find((candidate) => candidate.id === selection.layerId)
+        if (layer && !features[selection.layerId]?.wgs84 && !features[selection.layerId]?.loadingWgs84) {
+          void loadFeaturePage(layer, 'wgs84', requestGeneration.current)
         }
-        if (options?.navigate !== false) {
-          window.dispatchEvent(
-            new CustomEvent('mms-overlay-selected', { detail: { datasetId, selection } }),
-          )
-        }
+      }
+      if (options?.navigate !== false) {
+        window.dispatchEvent(
+          new CustomEvent('mms-overlay-selected', { detail: { datasetId, selection } }),
+        )
       }
     },
-    [datasetId, features, layers, loadFeaturePage],
+    [clearSelectedDetails, datasetId, features, layers, loadFeaturePage],
   )
 
   const selectedLayer = useMemo(
     () => layers.find((layer) => layer.id === selected?.layerId) ?? null,
     [layers, selected?.layerId],
   )
-
-  useEffect(() => {
-    if (!selected || !selectedLayer || !datasetId || demoMode) return
-    const cached = features[selected.layerId]?.dataset?.features.find(
-      (feature) => String(feature.id) === String(selected.featureId),
-    )
-    if (cached) {
-      setSelectedDatasetDetail({ ...selected, feature: cached })
-      return
-    }
-    const requestId = selectionRequestRef.current + 1
-    selectionRequestRef.current = requestId
-    const controller = new AbortController()
-    void api
-      .overlayFeature(datasetId, selected.layerId, selected.featureId, 'dataset', controller.signal)
-      .then((response) => {
-        if (selectionRequestRef.current !== requestId || controller.signal.aborted) return
-        setSelectedDatasetDetail({ ...selected, feature: response.feature })
-      })
-      .catch((reason: unknown) => {
-        if (selectionRequestRef.current !== requestId || controller.signal.aborted) return
-        notify?.({
-          tone: 'error',
-          title: '선택한 SHP 피처를 불러오지 못했습니다',
-          message: reason instanceof Error ? reason.message : undefined,
-        })
-      })
-    return () => controller.abort()
-    // The selected layer revision is the server-side invalidation token.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [datasetId, demoMode, selected, selectedLayer?.revision])
-  const selectedFeature = useMemo(
+  const selectedWgs84PageFeature = useMemo(
     () =>
       selected
         ? features[selected.layerId]?.wgs84?.features.find(
@@ -647,18 +687,127 @@ export function OverlayProvider({
         : null,
     [features, selected],
   )
-  const selectedDatasetFeature = useMemo(
+  const selectedDatasetPageFeature = useMemo(
     () =>
       selected
         ? features[selected.layerId]?.dataset?.features.find(
             (feature) => featureId(feature) === String(selected.featureId),
-          ) ??
-          (selectedDatasetDetail?.layerId === selected.layerId &&
-          String(selectedDatasetDetail.featureId) === String(selected.featureId)
-            ? selectedDatasetDetail.feature
-            : null)
+          ) ?? null
         : null,
-    [features, selected, selectedDatasetDetail],
+    [features, selected],
+  )
+  const selectedWgs84DetailFeature = useMemo(
+    () =>
+      detailFeatureForSelection(
+        selectedWgs84Detail,
+        datasetId,
+        selected,
+        selectedLayer?.revision,
+      ),
+    [datasetId, selected, selectedLayer?.revision, selectedWgs84Detail],
+  )
+  const selectedDatasetDetailFeature = useMemo(
+    () =>
+      detailFeatureForSelection(
+        selectedDatasetDetail,
+        datasetId,
+        selected,
+        selectedLayer?.revision,
+      ),
+    [datasetId, selected, selectedDatasetDetail, selectedLayer?.revision],
+  )
+
+  useEffect(() => {
+    if (!selected || !selectedLayer || !datasetId || demoMode) {
+      selectionControllerRef.current?.abort()
+      selectionControllerRef.current = null
+      return
+    }
+    const coordinateSpaces: OverlayCoordinateSpace[] = []
+    if (!selectedDatasetPageFeature && !selectedDatasetDetailFeature) {
+      coordinateSpaces.push('dataset')
+    }
+    if (!selectedWgs84PageFeature && !selectedWgs84DetailFeature) {
+      coordinateSpaces.push('wgs84')
+    }
+    if (coordinateSpaces.length === 0) return
+
+    const requestId = selectionRequestRef.current + 1
+    selectionRequestRef.current = requestId
+    selectionControllerRef.current?.abort()
+    const controller = new AbortController()
+    selectionControllerRef.current = controller
+    void Promise.allSettled(
+      coordinateSpaces.map(async (coordinateSpace) => ({
+        coordinateSpace,
+        response: await api.overlayFeature(
+          datasetId,
+          selected.layerId,
+          selected.featureId,
+          coordinateSpace,
+          controller.signal,
+        ),
+      })),
+    ).then((results) => {
+      if (selectionRequestRef.current !== requestId || controller.signal.aborted) return
+      const failures: unknown[] = []
+      results.forEach((result) => {
+        if (result.status === 'rejected') {
+          failures.push(result.reason)
+          return
+        }
+        const { coordinateSpace, response } = result.value
+        if (response.revision < selectedLayer.revision) return
+        const detail: SelectedFeatureDetailCache = {
+          datasetId,
+          layerId: selected.layerId,
+          featureId: selected.featureId,
+          revision: response.revision,
+          feature: response.feature,
+        }
+        if (coordinateSpace === 'wgs84') setSelectedWgs84Detail(detail)
+        else setSelectedDatasetDetail(detail)
+      })
+      if (failures.length > 0) {
+        const reason = failures[0]
+        notify?.({
+          tone: 'error',
+          title:
+            failures.length === coordinateSpaces.length
+              ? '선택한 SHP 피처를 불러오지 못했습니다'
+              : '선택한 SHP 피처의 일부 좌표를 불러오지 못했습니다',
+          message: reason instanceof Error ? reason.message : undefined,
+        })
+      }
+    })
+    return () => {
+      controller.abort()
+      if (selectionControllerRef.current === controller) selectionControllerRef.current = null
+    }
+  }, [
+    datasetId,
+    demoMode,
+    notify,
+    selected,
+    selectedDatasetDetailFeature,
+    selectedDatasetPageFeature,
+    selectedLayer,
+    selectedWgs84DetailFeature,
+    selectedWgs84PageFeature,
+  ])
+  const selectedFeature = useMemo(
+    () =>
+      selected
+        ? selectedWgs84PageFeature ?? selectedWgs84DetailFeature
+        : null,
+    [selected, selectedWgs84DetailFeature, selectedWgs84PageFeature],
+  )
+  const selectedDatasetFeature = useMemo(
+    () =>
+      selected
+        ? selectedDatasetPageFeature ?? selectedDatasetDetailFeature
+        : null,
+    [selected, selectedDatasetDetailFeature, selectedDatasetPageFeature],
   )
 
   const createFeature = useCallback(
@@ -677,9 +826,14 @@ export function OverlayProvider({
         })
         const nextSelection = { layerId, featureId: response.feature.id }
         selectFeature(nextSelection)
-        if (response.coordinate_space === 'dataset') {
-          setSelectedDatasetDetail({ ...nextSelection, feature: response.feature })
+        const detail: SelectedFeatureDetailCache = {
+          datasetId,
+          ...nextSelection,
+          revision: response.revision,
+          feature: response.feature,
         }
+        if (response.coordinate_space === 'dataset') setSelectedDatasetDetail(detail)
+        else setSelectedWgs84Detail(detail)
         const generation = requestGeneration.current
         const reloadDataset = Boolean(features[layerId]?.dataset)
         await Promise.all([
@@ -715,9 +869,15 @@ export function OverlayProvider({
           ...patch,
           expected_revision: currentRevision,
         })
-        if (response.coordinate_space === 'dataset') {
-          setSelectedDatasetDetail({ ...selected, feature: response.feature })
+        const detail: SelectedFeatureDetailCache = {
+          datasetId,
+          ...selected,
+          revision: response.revision,
+          feature: response.feature,
         }
+        clearSelectedDetails()
+        if (response.coordinate_space === 'dataset') setSelectedDatasetDetail(detail)
+        else setSelectedWgs84Detail(detail)
         const generation = requestGeneration.current
         const reloadDataset = Boolean(features[selected.layerId]?.dataset)
         await Promise.all([
@@ -734,7 +894,7 @@ export function OverlayProvider({
         throw reason
       }
     },
-    [datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer],
+    [clearSelectedDetails, datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer],
   )
 
   const applyPickedCoordinate = useCallback(
@@ -793,8 +953,8 @@ export function OverlayProvider({
     if (!datasetId || !selected || !selectedLayer || demoMode) return
     const currentRevision = features[selected.layerId]?.dataset?.revision ?? selectedLayer.revision
     await api.deleteOverlayFeature(datasetId, selected.layerId, selected.featureId, currentRevision)
+    clearSelectedDetails()
     setSelected(null)
-    setSelectedDatasetDetail(null)
     setPickTarget(null)
     notify?.({ tone: 'info', title: '선택한 SHP 피처를 삭제했습니다' })
     const generation = requestGeneration.current
@@ -803,14 +963,53 @@ export function OverlayProvider({
       loadFeaturePage(selectedLayer, 'wgs84', generation),
       ...(reloadDataset ? [loadFeaturePage(selectedLayer, 'dataset', generation)] : []),
     ])
-  }, [datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer])
+  }, [clearSelectedDetails, datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer])
+
+  const deleteField = useCallback(
+    async (layerId: string, fieldName: string) => {
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!datasetId || !layer || demoMode) return
+      const currentRevision =
+        features[layerId]?.dataset?.revision ??
+        features[layerId]?.wgs84?.revision ??
+        layer.revision
+      try {
+        await api.deleteOverlayField(datasetId, layerId, fieldName, currentRevision)
+        if (selected?.layerId === layerId) clearSelectedDetails()
+        notify?.({
+          tone: 'info',
+          title: `SHP 속성 열 '${fieldName}'을 삭제했습니다`,
+          message: '업로드 원본은 보존됩니다.',
+        })
+        await refresh()
+      } catch (reason) {
+        await refresh()
+        notify?.({
+          tone: 'error',
+          title: 'SHP 속성 열을 삭제하지 못했습니다',
+          message: reason instanceof Error ? reason.message : undefined,
+        })
+        throw reason
+      }
+    },
+    [clearSelectedDetails, datasetId, demoMode, features, layers, notify, refresh, selected?.layerId],
+  )
 
   const mapFeatures = useMemo(
     () =>
       layers.flatMap((layer) => {
         if (!visibleLayerIds.has(layer.id)) return []
         const color = layerColor(layer.id)
-        return (features[layer.id]?.wgs84?.features ?? []).map((feature) => ({
+        const pageFeatures = features[layer.id]?.wgs84?.features ?? []
+        const selectedForLayer = selected?.layerId === layer.id ? selectedFeature : null
+        const layerFeatures =
+          selectedForLayer &&
+          !pageFeatures.some(
+            (feature) => featureId(feature) === String(selectedForLayer.id),
+          )
+            ? [...pageFeatures, selectedForLayer]
+            : pageFeatures
+        return layerFeatures.map((feature) => ({
           ...feature,
           properties: {
             ...feature.properties,
@@ -824,7 +1023,7 @@ export function OverlayProvider({
           },
         }))
       }),
-    [features, layerColor, layers, selected, visibleLayerIds],
+    [features, layerColor, layers, selected, selectedFeature, visibleLayerIds],
   )
 
   const datasetFeatures = useMemo(
@@ -874,6 +1073,7 @@ export function OverlayProvider({
       applyPickedCoordinate,
       copySelectedLocation,
       deleteSelected,
+      deleteField,
       layerColor,
     }),
     [
@@ -885,6 +1085,7 @@ export function OverlayProvider({
       datasetFeatures,
       datasetId,
       deleteSelected,
+      deleteField,
       features,
       ensureDatasetFeatures,
       layerColor,

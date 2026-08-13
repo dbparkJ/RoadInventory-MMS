@@ -103,7 +103,7 @@ export interface Frame {
   image_name?: string
   timestamp: string
   coordinate: Coordinate | null
-  heading?: number
+  heading?: number | null
   speed_kph?: number
   has_panorama: boolean
   has_points: boolean
@@ -115,7 +115,7 @@ export interface RoutePoint extends Coordinate {
   frame_id?: string
   track_id?: string
   index?: number
-  heading?: number
+  heading?: number | null
 }
 
 export interface RouteResponse {
@@ -175,6 +175,7 @@ export interface BootstrapResponse {
     shp_overlays?: boolean
     shp_feature_editing?: boolean
     shp_result_download?: boolean
+    max_point_budget?: number
     max_overlay_upload_bytes?: number
     max_overlay_features?: number
   }
@@ -227,10 +228,11 @@ export interface RunRecord {
   error_info?: RunErrorInfo | null
   versions?: RunVersions
   counts?: RunCounts
-  stage_results?: RunStageResult[]
-  created_at: string
-  started_at?: string
-  finished_at?: string
+    stage_results?: RunStageResult[]
+    created_at: string
+    updated_at?: string
+    started_at?: string
+    finished_at?: string
   eta_seconds?: number
   result_url?: string
 }
@@ -312,6 +314,16 @@ export interface OverlayField {
   type?: string
   size?: number
   decimal?: number
+  required?: boolean
+  internal?: boolean
+}
+
+export interface OverlayFieldDeleteResponse {
+  deleted_field: string
+  revision: number
+  fields: OverlayField[]
+  layer: OverlayLayer
+  source_preserved: boolean
 }
 
 export interface OverlayGeometry {
@@ -371,10 +383,19 @@ export interface PanoramaOverlayFeature {
 
 export interface PanoramaDetectionBoxObservation {
   source_id: string
+  model_id?: string
   source_name?: string
   observation_id: string
   feature_id?: string | number
+  dataset_position?: [number, number, number]
   properties: Record<string, unknown>
+}
+
+export interface PanoramaDetectionModel {
+  source_id: string
+  model_id?: string
+  source_name?: string
+  count: number
 }
 
 export interface FrameDetectionResponse {
@@ -383,6 +404,8 @@ export interface FrameDetectionResponse {
   coordinate_space: 'panorama_equirectangular_pixels'
   projection: 'equirectangular'
   items: PanoramaDetectionBoxObservation[]
+  /** Present on current servers; clients also derive this from items for compatibility. */
+  models?: PanoramaDetectionModel[]
   count: number
   model_count: number
   truncated: boolean
@@ -398,6 +421,16 @@ export interface PanoramaProjectionMetadata {
   up: [number, number, number]
   yaw_offset_deg: number
   pitch_offset_deg: number
+}
+
+export interface FrameAddressResponse {
+  dataset_id: string
+  frame_id: string
+  coordinate: Coordinate
+  address: string | null
+  address_type: string | null
+  zipcode: string | null
+  source: 'delivery_metadata' | 'vworld' | 'coordinate_fallback'
 }
 
 export interface FrameLocateResponse {

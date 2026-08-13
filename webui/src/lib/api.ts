@@ -2,6 +2,7 @@ import type {
   BootstrapResponse,
   DatasetDetail,
   FrameDetectionResponse,
+  FrameAddressResponse,
   FrameLocateResponse,
   FramePage,
   OverlayCoordinateSpace,
@@ -10,6 +11,7 @@ import type {
   OverlayFeatureCollection,
   OverlayFeatureCreateRequest,
   OverlayFeatureDetail,
+  OverlayFieldDeleteResponse,
   OverlayLayer,
   PanoramaOverlayFeature,
   PanoramaDetectionBoxObservation,
@@ -388,6 +390,21 @@ export const api = {
     )
   },
 
+  deleteOverlayField(
+    datasetId: string,
+    layerId: string,
+    fieldName: string,
+    expectedRevision: number,
+  ) {
+    return json<OverlayFieldDeleteResponse>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/fields/${encodeURIComponent(fieldName)}`,
+        { expected_revision: expectedRevision },
+      ),
+      { method: 'DELETE', timeout: 30_000 },
+    )
+  },
+
   patchOverlay(
     datasetId: string,
     layerId: string,
@@ -457,6 +474,13 @@ export const api = {
     )
   },
 
+  frameAddress(datasetId: string, frameId: string, signal?: AbortSignal) {
+    return json<FrameAddressResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/address`,
+      { signal, timeout: 8_000, retries: 0 },
+    )
+  },
+
   panoramaPick(
     datasetId: string,
     frameId: string,
@@ -491,17 +515,18 @@ export const api = {
     id: string,
     frameId: string,
     budget: number,
-    radius: number,
     signal?: AbortSignal,
   ) {
     const response = await request(
       buildApiUrl(`/api/datasets/${encodeURIComponent(id)}/points/${encodeURIComponent(frameId)}`, {
         budget,
-        radius,
       }),
       {
         signal,
-        timeout: 45_000,
+        // A cold 1M-point derivative may need to read multiple source blocks
+        // before the compact MMSP response is cached. Frame changes still
+        // abort immediately through the caller-provided signal.
+        timeout: 120_000,
         headers: { Accept: 'application/vnd.mmsp, application/octet-stream' },
       },
     )
@@ -560,8 +585,15 @@ export const api = {
     })
   },
 
-  runs(signal?: AbortSignal) {
-    return json<{ items: RunRecord[] }>('/api/runs', { signal })
+  runs(signal?: AbortSignal, limit?: number) {
+    return json<{ items: RunRecord[] }>(buildApiUrl('/api/runs', { limit }), { signal })
+  },
+
+  latestCompletedRun(datasetId: string, signal?: AbortSignal) {
+    return json<{ run: RunRecord | null }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/runs/latest-completed`,
+      { signal },
+    )
   },
 
   runResults(runId: string, signal?: AbortSignal) {

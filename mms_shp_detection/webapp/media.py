@@ -6,10 +6,14 @@ import json
 import math
 import os
 import struct
+import time
 import uuid
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -28,7 +32,132 @@ MMSO_RECORD_BYTES = 15
 MMSO_VERSION = 1
 MAX_PREVIEW_BLOCKS = 256
 PANORAMA_POINT_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
+POINT_PREVIEW_CACHE_LIMIT_BYTES = 1024 * 1024 * 1024
+POINT_PREVIEW_DEFAULT_BUDGET = 250_000
+POINT_PREVIEW_MIN_BUDGET = 250_000
+POINT_PREVIEW_MAX_BUDGET = 1_000_000
+POINT_PREVIEW_MAX_PAYLOAD_BYTES = (
+    MMSP_HEADER.size + POINT_PREVIEW_MAX_BUDGET * MMSP_RECORD_BYTES
+)
+POINT_PREVIEW_DENSE_RADIUS_M = 15.0
+POINT_PREVIEW_MAX_RADIUS_M = 25.0
+POINT_PREVIEW_DENSE_BUDGET_FRACTION = 0.75
+VWORLD_ADDRESS_ENDPOINT = "https://api.vworld.kr/req/address"
+VWORLD_DEVELOPMENT_KEY = "EE4D1CA9-BEA1-3AFF-AE81-DE0B92A0E352"
+VWORLD_ADDRESS_RESPONSE_LIMIT_BYTES = 256 * 1024
+VWORLD_ADDRESS_FAILURE_TTL_SECONDS = 30.0
+VWORLD_ADDRESS_FAILURE_CACHE_MAX_ENTRIES = 2048
+VWORLD_ADDRESS_MAX_INFLIGHT = 32
 T = TypeVar("T")
+
+
+def _metadata_frame_address(task: dict[str, Any]) -> str | None:
+    """Return a delivery-supplied address without contacting an external API."""
+
+    for key in (
+        "road_address",
+        "road_addr",
+        "address",
+        "parcel_address",
+        "parcel_addr",
+    ):
+        value = task.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:500]
+    metadata = task.get("metadata")
+    if isinstance(metadata, dict):
+        return _metadata_frame_address(metadata)
+    return None
+
+
+def _vworld_reverse_geocode(
+    longitude: float,
+    latitude: float,
+    api_key: str,
+    *,
+    timeout_seconds: float = 4.0,
+) -> dict[str, str | None] | None:
+    """Resolve one WGS84 point with V-World Geocoder API 2.0.
+
+    The request URL is fixed, the response body is bounded, and the API key is
+    never included in an exception returned to a browser or written to logs.
+    """
+
+    for address_type in ("ROAD", "PARCEL"):
+        query = urlencode(
+            {
+                "service": "address",
+                "request": "getaddress",
+                "version": "2.0",
+                "crs": "EPSG:4326",
+                "type": address_type,
+                "point": f"{longitude:.8f},{latitude:.8f}",
+                "format": "json",
+                "errorformat": "json",
+                "simple": "false",
+                "key": api_key,
+            }
+        )
+        outgoing = UrlRequest(
+            f"{VWORLD_ADDRESS_ENDPOINT}?{query}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "MMS-Web-Workspace/0.1",
+            },
+            method="GET",
+        )
+        with urlopen(outgoing, timeout=timeout_seconds) as response:
+            payload = response.read(VWORLD_ADDRESS_RESPONSE_LIMIT_BYTES + 1)
+        if len(payload) > VWORLD_ADDRESS_RESPONSE_LIMIT_BYTES:
+            raise ValueError("V-World address response exceeded the size limit.")
+        document = json.loads(payload.decode("utf-8"))
+        response_payload = document.get("response") if isinstance(document, dict) else None
+        if not isinstance(response_payload, dict):
+            continue
+        if response_payload.get("status") == "NOT_FOUND":
+            continue
+        if response_payload.get("status") != "OK":
+            return None
+        result = response_payload.get("result")
+        candidates = result if isinstance(result, list) else [result]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            address = str(item.get("text") or "").strip()
+            if not address:
+                continue
+            return {
+                "address": address[:500],
+                "address_type": str(item.get("type") or address_type).strip()[:32] or None,
+                "zipcode": str(item.get("zipcode") or "").strip()[:16] or None,
+            }
+    return None
+
+
+def _prune_address_failure_cache(
+    failures: dict[str, float], now: float
+) -> None:
+    expired = [key for key, deadline in failures.items() if deadline <= now]
+    for key in expired:
+        failures.pop(key, None)
+    overflow = len(failures) - VWORLD_ADDRESS_FAILURE_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        for key, _deadline in sorted(failures.items(), key=lambda item: item[1])[:overflow]:
+            failures.pop(key, None)
+
+
+def _remember_address_failure(failures: dict[str, float], key: str, now: float) -> None:
+    failures[key] = now + VWORLD_ADDRESS_FAILURE_TTL_SECONDS
+    _prune_address_failure_cache(failures, now)
+
+
+def _address_inflight_is_full(
+    inflight: dict[str, asyncio.Task[dict[str, str | None] | None]],
+) -> bool:
+    for pending_key, pending_task in list(inflight.items()):
+        if pending_task.done():
+            inflight.pop(pending_key, None)
+    return len(inflight) >= VWORLD_ADDRESS_MAX_INFLIGHT
 
 
 async def _finish_preview_after_request_cancel(
@@ -316,6 +445,8 @@ def _sample_nearby_points(
     *,
     budget: int,
     radius: float,
+    dense_radius: float | None = None,
+    dense_budget_fraction: float = POINT_PREVIEW_DENSE_BUDGET_FRACTION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from mms_shp_detection.pointcloud import (
         match_nearest_pointcloud_files,
@@ -341,11 +472,23 @@ def _sample_nearby_points(
         )
     )
 
-    xyz_parts: list[np.ndarray] = []
-    rgb_parts: list[np.ndarray] = []
     # A quota per nearby block keeps a dense scanner strip from consuming the
     # complete response before adjacent blocks contribute any context.
     bounded_candidates = candidates[: min(MAX_PREVIEW_BLOCKS, 32)]
+    if dense_radius is not None:
+        return _sample_distance_bands(
+            bounded_candidates,
+            catalog,
+            reader,
+            origin=origin,
+            budget=budget,
+            dense_radius=dense_radius,
+            maximum_radius=radius,
+            dense_budget_fraction=dense_budget_fraction,
+        )
+
+    xyz_parts: list[np.ndarray] = []
+    rgb_parts: list[np.ndarray] = []
     per_block_quota = max(1, math.ceil(budget / max(1, len(bounded_candidates))))
     remaining = budget
     for _distance, point_file, block in bounded_candidates:
@@ -392,20 +535,194 @@ def _sample_nearby_points(
     return xyz, rgb, origin
 
 
+def _distance_band_quotas(
+    dense_count: int,
+    sparse_count: int,
+    budget: int,
+    *,
+    dense_budget_fraction: float = POINT_PREVIEW_DENSE_BUDGET_FRACTION,
+) -> tuple[int, int]:
+    """Allocate a denser inner band and redistribute unused capacity."""
+
+    available = max(0, dense_count) + max(0, sparse_count)
+    target = min(max(0, budget), available)
+    if target <= 0:
+        return 0, 0
+    fraction = min(1.0, max(0.0, float(dense_budget_fraction)))
+    preferred_dense = round(target * fraction)
+    dense_quota = min(max(0, dense_count), preferred_dense)
+    sparse_quota = min(max(0, sparse_count), target - preferred_dense)
+    remaining = target - dense_quota - sparse_quota
+    dense_extra = min(max(0, dense_count) - dense_quota, remaining)
+    dense_quota += dense_extra
+    remaining -= dense_extra
+    sparse_quota += min(max(0, sparse_count) - sparse_quota, remaining)
+    return dense_quota, sparse_quota
+
+
+def _per_block_sample_quotas(counts: list[int], target: int) -> list[int]:
+    """Distribute a band quota deterministically while retaining block coverage."""
+
+    quotas = [0] * len(counts)
+    active = [index for index, count in enumerate(counts) if count > 0]
+    remaining = min(max(0, target), sum(max(0, count) for count in counts))
+    if remaining <= 0:
+        return quotas
+    if remaining >= len(active):
+        for index in active:
+            quotas[index] = 1
+        remaining -= len(active)
+    capacities = [max(0, counts[index] - quotas[index]) for index in range(len(counts))]
+    if remaining <= 0 or not sum(capacities):
+        return quotas
+    total_capacity = sum(capacities)
+    exact = [remaining * capacity / total_capacity for capacity in capacities]
+    additions = [min(capacity, math.floor(value)) for capacity, value in zip(capacities, exact)]
+    for index, addition in enumerate(additions):
+        quotas[index] += addition
+    remainder = remaining - sum(additions)
+    order = sorted(
+        range(len(counts)),
+        key=lambda index: (
+            -(exact[index] - math.floor(exact[index])),
+            -capacities[index],
+            index,
+        ),
+    )
+    for index in order:
+        if remainder <= 0:
+            break
+        if quotas[index] >= counts[index]:
+            continue
+        quotas[index] += 1
+        remainder -= 1
+    return quotas
+
+
+def _safe_preview_point_file(
+    point_file: dict[str, Any], catalog: dict[str, Any]
+) -> dict[str, Any]:
+    if not catalog.get("data_root"):
+        return point_file
+    from mms_shp_detection.pointcloud import resolve_safe_pointcloud_source
+
+    return {
+        **point_file,
+        "path": str(
+            resolve_safe_pointcloud_source(
+                str(point_file.get("path", "")), str(catalog["data_root"])
+            )
+        ),
+    }
+
+
+def _sample_distance_bands(
+    candidates: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    catalog: dict[str, Any],
+    reader: Any,
+    *,
+    origin: np.ndarray,
+    budget: int,
+    dense_radius: float,
+    maximum_radius: float,
+    dense_budget_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample 0..dense_radius more heavily than the outer preview band."""
+
+    safe_candidates = [
+        (_safe_preview_point_file(point_file, catalog), block)
+        for _distance, point_file, block in candidates
+    ]
+    dense_squared = dense_radius * dense_radius
+    maximum_squared = maximum_radius * maximum_radius
+    band_counts: list[tuple[int, int]] = []
+    for point_file, block in safe_candidates:
+        xyz, _rgb, _intensity = reader.read_block_points(point_file, block)
+        if xyz.size == 0:
+            band_counts.append((0, 0))
+            continue
+        squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
+        dense_count = int(np.count_nonzero(squared <= dense_squared))
+        sparse_count = int(
+            np.count_nonzero((squared > dense_squared) & (squared <= maximum_squared))
+        )
+        band_counts.append((dense_count, sparse_count))
+
+    dense_quota, sparse_quota = _distance_band_quotas(
+        sum(count[0] for count in band_counts),
+        sum(count[1] for count in band_counts),
+        budget,
+        dense_budget_fraction=dense_budget_fraction,
+    )
+    dense_by_block = _per_block_sample_quotas(
+        [count[0] for count in band_counts], dense_quota
+    )
+    sparse_by_block = _per_block_sample_quotas(
+        [count[1] for count in band_counts], sparse_quota
+    )
+
+    xyz_parts: list[np.ndarray] = []
+    rgb_parts: list[np.ndarray] = []
+    for index, (point_file, block) in enumerate(safe_candidates):
+        if dense_by_block[index] <= 0 and sparse_by_block[index] <= 0:
+            continue
+        xyz, rgb, _intensity = reader.read_block_points(point_file, block)
+        if xyz.size == 0:
+            continue
+        squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
+        selected_parts: list[np.ndarray] = []
+        for mask, quota in (
+            (squared <= dense_squared, dense_by_block[index]),
+            (
+                (squared > dense_squared) & (squared <= maximum_squared),
+                sparse_by_block[index],
+            ),
+        ):
+            selected = np.flatnonzero(mask)
+            if selected.size > quota:
+                sample_positions = np.linspace(
+                    0, selected.size - 1, quota, dtype=np.int64
+                )
+                selected = selected[sample_positions]
+            if selected.size:
+                selected_parts.append(selected)
+        if not selected_parts:
+            continue
+        selected = np.concatenate(selected_parts)
+        selected_xyz = np.asarray(xyz[selected], dtype=np.float64)
+        selected_rgb = np.asarray(rgb[selected], dtype=np.uint8)
+        if selected_rgb.shape != (selected_xyz.shape[0], 3):
+            selected_rgb = np.full((selected_xyz.shape[0], 3), 210, dtype=np.uint8)
+        xyz_parts.append(selected_xyz)
+        rgb_parts.append(selected_rgb)
+
+    if not xyz_parts:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint8),
+            origin,
+        )
+    return np.concatenate(xyz_parts), np.concatenate(rgb_parts), origin
+
+
 def _build_mmsp(
     task: dict[str, Any],
     catalog: dict[str, Any],
     reader: Any,
     *,
     budget: int,
-    radius: float,
 ) -> bytes:
+    if budget < 1 or budget > POINT_PREVIEW_MAX_BUDGET:
+        raise ValueError(
+            f"Point preview budget must be between 1 and {POINT_PREVIEW_MAX_BUDGET}."
+        )
     xyz, rgb, origin = _sample_nearby_points(
         task,
         catalog,
         reader,
         budget=budget,
-        radius=radius,
+        radius=POINT_PREVIEW_MAX_RADIUS_M,
+        dense_radius=POINT_PREVIEW_DENSE_RADIUS_M,
     )
     if xyz.size:
         relative = np.asarray(xyz - origin[None, :], dtype="<f4")
@@ -517,6 +834,142 @@ def panorama_projection_metadata(
         "yaw_offset_deg": resolved_yaw,
         "pitch_offset_deg": resolved_pitch,
     }
+
+
+def _frame_address_payload(
+    dataset_id: str,
+    frame_id: str,
+    longitude: float,
+    latitude: float,
+    record: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "dataset_id": dataset_id,
+        "frame_id": frame_id,
+        "coordinate": {"lon": longitude, "lat": latitude},
+        "address": record.get("address") if record else None,
+        "address_type": record.get("address_type") if record else None,
+        "zipcode": record.get("zipcode") if record else None,
+        "source": record.get("source") if record else "coordinate_fallback",
+    }
+
+
+@router.get("/datasets/{dataset_id}/frames/{frame_id}/address")
+async def frame_address(
+    dataset_id: str,
+    frame_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Return a delivery/V-World address without persistently storing it."""
+
+    require_ready_dataset(request, dataset_id)
+    store = request.app.state.store
+    frame = store.get_frame(dataset_id, frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    try:
+        longitude = float(frame["longitude"])
+        latitude = float(frame["latitude"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Frame has no WGS84 coordinate.") from exc
+    if not (
+        math.isfinite(longitude)
+        and math.isfinite(latitude)
+        and -180.0 <= longitude <= 180.0
+        and -90.0 <= latitude <= 90.0
+    ):
+        raise HTTPException(status_code=422, detail="Frame has no valid WGS84 coordinate.")
+
+    metadata_address = _metadata_frame_address(frame.get("task") or {})
+    if metadata_address:
+        metadata_record = {
+            "address": metadata_address,
+            "address_type": "delivery",
+            "zipcode": None,
+            "source": "delivery_metadata",
+        }
+        return _frame_address_payload(
+            dataset_id, frame_id, longitude, latitude, metadata_record
+        )
+
+    # Five decimal places are about one metre in Korea. Nearby duplicate
+    # requests share a lock/failure TTL without degrading the displayed pose.
+    coordinate_key = f"{longitude:.5f}:{latitude:.5f}"
+    failures: dict[str, float] = request.app.state.address_failure_cache
+    now = time.monotonic()
+    _prune_address_failure_cache(failures, now)
+    if failures.get(coordinate_key, 0.0) > now:
+        return _frame_address_payload(
+            dataset_id, frame_id, longitude, latitude, None
+        )
+
+    api_key = str(request.app.state.vworld_api_key or "").strip()
+    if not api_key:
+        _remember_address_failure(failures, coordinate_key, time.monotonic())
+        return _frame_address_payload(
+            dataset_id, frame_id, longitude, latitude, None
+        )
+
+    async def resolve() -> dict[str, str | None] | None:
+        try:
+            async with request.app.state.address_semaphore:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _vworld_reverse_geocode,
+                        longitude,
+                        latitude,
+                        api_key,
+                    ),
+                    timeout=5.0,
+                )
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            request.app.state.logger.warning(
+                "V-World reverse geocoding unavailable for frame %s (%s).",
+                frame_id,
+                type(exc).__name__,
+            )
+            return None
+
+    # V-World's terms prohibit saving real-time geocoder results to a separate
+    # database. Share only requests that are concurrently in flight, then
+    # discard the task immediately after it completes.
+    inflight: dict[str, asyncio.Task[dict[str, str | None] | None]] = (
+        request.app.state.address_inflight
+    )
+    task = inflight.get(coordinate_key)
+    if task is None or task.done():
+        # The semaphore bounds active V-World calls, while this cap also bounds
+        # callers waiting to enter it.  Without it, a burst of unique frame
+        # coordinates could retain an unbounded task backlog in memory.
+        if _address_inflight_is_full(inflight):
+            _remember_address_failure(failures, coordinate_key, time.monotonic())
+            return _frame_address_payload(
+                dataset_id, frame_id, longitude, latitude, None
+            )
+        task = asyncio.create_task(resolve())
+        inflight[coordinate_key] = task
+
+        def discard(completed: asyncio.Task[Any]) -> None:
+            if inflight.get(coordinate_key) is completed:
+                inflight.pop(coordinate_key, None)
+            # Every original HTTP waiter may have been aborted. Consume an
+            # unexpected error so an orphaned coalesced task cannot emit an
+            # unhandled-task warning; active waiters still receive the error.
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(discard)
+    resolved = await asyncio.shield(task)
+    if resolved is None:
+        _remember_address_failure(failures, coordinate_key, time.monotonic())
+        return _frame_address_payload(
+            dataset_id, frame_id, longitude, latitude, None
+        )
+    failures.pop(coordinate_key, None)
+    record = {**resolved, "source": "vworld"}
+    return _frame_address_payload(
+        dataset_id, frame_id, longitude, latitude, record
+    )
 
 
 def _nearest_per_panorama_cell(
@@ -707,8 +1160,11 @@ async def points(
     dataset_id: str,
     frame_id: str,
     request: Request,
-    budget: int = Query(100_000, ge=1_000, le=250_000),
-    radius: float = Query(30.0, ge=1.0, le=100.0),
+    budget: int = Query(
+        POINT_PREVIEW_DEFAULT_BUDGET,
+        ge=POINT_PREVIEW_MIN_BUDGET,
+        le=POINT_PREVIEW_MAX_BUDGET,
+    ),
 ) -> Response:
     dataset = require_ready_dataset(request, dataset_id)
     frame = request.app.state.store.get_frame(dataset_id, frame_id)
@@ -744,7 +1200,9 @@ async def points(
         )
 
     fingerprint_payload = (
-        f"mmsp-v2\0{dataset_id}\0{frame_id}\0{budget}\0{radius:.4f}\0"
+        f"mmsp-v3\0{dataset_id}\0{frame_id}\0{budget}\0"
+        f"{POINT_PREVIEW_DENSE_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
+        f"{POINT_PREVIEW_DENSE_BUDGET_FRACTION:.4f}\0"
         f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
     )
     fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
@@ -777,9 +1235,15 @@ async def points(
                             catalog,
                             request.app.state.point_reader,
                             budget=budget,
-                            radius=radius,
                         )
                         await asyncio.to_thread(_write_once, output_path, payload)
+                        await asyncio.to_thread(
+                            _enforce_file_cache_quota,
+                            output_path.parent,
+                            suffix=".mmsp",
+                            maximum_bytes=POINT_PREVIEW_CACHE_LIMIT_BYTES,
+                            keep=output_path,
+                        )
 
                     await _finish_preview_after_request_cancel(
                         build_and_write(),

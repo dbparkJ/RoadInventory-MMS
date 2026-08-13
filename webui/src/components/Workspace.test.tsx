@@ -4,11 +4,27 @@ import { useState, type ComponentProps } from 'react'
 import type { DatasetSummary, Frame } from '../types'
 import { Workspace } from './Workspace'
 
+type MockMapMode = '2d' | 'satellite' | '3d'
+
 vi.mock('../views/MapView', () => ({
-  MapView: ({ mapMode, onMapModeChange }: { mapMode: '2d' | '3d'; onMapModeChange: (mode: '2d' | '3d') => void }) => {
+  MapView: ({
+    mapMode,
+    onMapModeChange,
+    trackLayerVisible,
+  }: {
+    mapMode: MockMapMode
+    onMapModeChange: (mode: MockMapMode) => void
+    trackLayerVisible?: boolean
+  }) => {
     const instance = useState(() => crypto.randomUUID())[0]
     return (
-      <div data-testid="map-view" data-instance={instance} data-mode={mapMode}>
+      <div
+        data-testid="map-view"
+        data-instance={instance}
+        data-mode={mapMode}
+        data-track-layer-visible={String(trackLayerVisible ?? true)}
+      >
+        <button type="button" onClick={() => onMapModeChange('satellite')}>mock satellite</button>
         <button type="button" onClick={() => onMapModeChange('3d')}>mock 3D</button>
       </div>
     )
@@ -122,6 +138,38 @@ function ControlledWorkspace({ onMoveFrame = vi.fn() }: { onMoveFrame?: (directi
 }
 
 describe('Workspace popup viewers', () => {
+  it('toggles the independent track layer and collapses the layer card to one line', async () => {
+    renderWorkspace()
+    const map = await screen.findByTestId('map-view')
+    const panel = screen.getByRole('region', { name: '지도 레이어 표시 설정' })
+
+    expect(map).toHaveAttribute('data-track-layer-visible', 'true')
+    expect(panel.querySelector('#map-layer-quick-list')).not.toBeNull()
+
+    fireEvent.click(screen.getByTitle('MMS 트랙 숨기기'))
+    expect(map).toHaveAttribute('data-track-layer-visible', 'false')
+    expect(screen.getByTitle('MMS 트랙 표시')).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(screen.getByRole('button', { name: '지도 레이어 카드 최소화' }))
+    expect(panel).toHaveClass('collapsed')
+    expect(panel.querySelector('#map-layer-quick-list')).toBeNull()
+    expect(screen.getByRole('button', { name: '지도 레이어 카드 펼치기' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+  })
+
+  it('exposes the attribute table next to 3D points and delegates popup lifecycle', async () => {
+    const onToggleAttributeTable = vi.fn()
+    renderWorkspace({ onToggleAttributeTable })
+    await screen.findByTestId('map-view')
+
+    const button = screen.getByRole('button', { name: '속성표' })
+    expect(button).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(button)
+    expect(onToggleAttributeTable).toHaveBeenCalledOnce()
+  })
+
   it('remounts the map when the workspace crosses a document boundary', async () => {
     const props: ComponentProps<typeof Workspace> = {
       dataset: DATASET,
@@ -144,19 +192,22 @@ describe('Workspace popup viewers', () => {
     }
     const view = render(<Workspace {...props} />)
     const mainInstance = (await screen.findByTestId('map-view')).dataset.instance
-    fireEvent.click(screen.getByRole('button', { name: 'mock 3D' }))
-    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+    fireEvent.click(screen.getByRole('button', { name: 'mock satellite' }))
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', 'satellite')
 
     view.rerender(<Workspace {...props} detached />)
     const popupInstance = screen.getByTestId('map-view').dataset.instance
-    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', 'satellite')
 
     view.rerender(<Workspace {...props} detached={false} />)
     const returnedInstance = screen.getByTestId('map-view').dataset.instance
-    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', 'satellite')
 
     expect(popupInstance).not.toBe(mainInstance)
     expect(returnedInstance).not.toBe(popupInstance)
+
+    fireEvent.click(screen.getByRole('button', { name: 'mock 3D' }))
+    expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
   })
 
   it('opens panorama and 3D points only in independent windows', async () => {

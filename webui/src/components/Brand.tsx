@@ -1,17 +1,19 @@
-import { ScanLine } from 'lucide-react'
-
 export function Brand({ compact = false }: { compact?: boolean }) {
   return (
-    <div className="brand" aria-label="MMS Studio">
-      <span className="brand-mark">
-        <ScanLine size={20} strokeWidth={2.25} />
+    <div className={`brand ${compact ? 'compact' : ''}`} aria-label="MMS 도로대장 자동화">
+      <span className="brand-accent" aria-hidden="true" />
+      <span className="brand-copy">
+        <strong>MMS 도로대장 자동화</strong>
+        {!compact && <small>ROAD INVENTORY WORKSPACE</small>}
       </span>
-      {!compact && (
-        <span className="brand-copy">
-          <strong>MMS Studio</strong>
-          <small>Spatial Operations</small>
-        </span>
-      )}
+    </div>
+  )
+}
+
+export function BrandLogo() {
+  return (
+    <div className="brand-signature" aria-label="GEO&">
+      <img className="brand-logo" src="/logo.png" alt="GEO&" />
     </div>
   )
 }

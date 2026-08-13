@@ -75,15 +75,65 @@ export function coerceOverlayFieldValue(
   return value
 }
 
-export function OverlayPanel({
-  focusLayerId,
-  externalAction,
-  onClose,
-}: {
+/** ``support_id`` is the pipeline's explicit sign-to-pole join key. */
+export function overlaySupportId(properties: Record<string, unknown>): string | null {
+  const entry = Object.entries(properties).find(
+    ([key]) => key.trim().toLocaleLowerCase('en-US') === 'support_id',
+  )
+  if (!entry) return null
+  const value = String(entry[1] ?? '').trim()
+  return value || null
+}
+
+export function sharesOverlaySupport(
+  selectedProperties: Record<string, unknown> | null | undefined,
+  candidateProperties: Record<string, unknown>,
+): boolean {
+  if (!selectedProperties) return false
+  const selectedSupportId = overlaySupportId(selectedProperties)
+  const candidateSupportId = overlaySupportId(candidateProperties)
+  return Boolean(
+    selectedSupportId &&
+    candidateSupportId &&
+    selectedSupportId === candidateSupportId,
+  )
+}
+
+export function sharesOverlayLocationOrSupport(
+  selectedFeature: OverlayFeature | null | undefined,
+  candidateFeature: OverlayFeature,
+): boolean {
+  if (!selectedFeature) return false
+  if (sharesOverlaySupport(selectedFeature.properties, candidateFeature.properties)) return true
+  const selectedPoint = pointCoordinates(selectedFeature)
+  const candidatePoint = pointCoordinates(candidateFeature)
+  if (!selectedPoint || !candidatePoint) return false
+  // Geometry-only copies preserve XY exactly. A tiny epsilon also tolerates a
+  // harmless serialization round trip without grouping visibly distinct data.
+  return Math.abs(selectedPoint[0] - candidatePoint[0]) <= 1e-6
+    && Math.abs(selectedPoint[1] - candidatePoint[1]) <= 1e-6
+}
+
+interface OverlayPanelProps {
   focusLayerId?: string
   externalAction?: ReactNode
   onClose: () => void
-}) {
+}
+
+export function OverlayPanel(props: OverlayPanelProps) {
+  return <OverlayWorkspacePanel {...props} mode="manager" />
+}
+
+export function OverlayAttributePanel(props: OverlayPanelProps) {
+  return <OverlayWorkspacePanel {...props} mode="attributes" />
+}
+
+function OverlayWorkspacePanel({
+  focusLayerId,
+  externalAction,
+  onClose,
+  mode,
+}: OverlayPanelProps & { mode: 'manager' | 'attributes' }) {
   const overlay = useOverlayWorkspace()
   const [files, setFiles] = useState<File[]>([])
   const [name, setName] = useState('')
@@ -99,6 +149,7 @@ export function OverlayPanel({
   const [validationError, setValidationError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [uploadOpen, setUploadOpen] = useState(overlay.layers.length === 0)
+  const [selectedFieldName, setSelectedFieldName] = useState<string | null>(null)
   const previousLayerCountRef = useRef(overlay.layers.length)
   const appliedFocusLayerRef = useRef<string | undefined>(undefined)
 
@@ -143,6 +194,16 @@ export function OverlayPanel({
   const fieldsByName = new Map(
     fieldDefinitions.map((field) => [fieldName(field), typeof field === 'string' ? undefined : field]),
   )
+  const selectedField = fieldDefinitions.find(
+    (field) => fieldName(field) === selectedFieldName,
+  )
+  const selectedFieldProtected = Boolean(
+    selectedField &&
+      (fieldName(selectedField).toLocaleLowerCase('en-US') === 'id' ||
+        fieldName(selectedField).startsWith('__') ||
+        (typeof selectedField !== 'string' && (selectedField.required || selectedField.internal)) ||
+        fieldDefinitions.length <= 1),
+  )
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase('ko-KR')
     if (!normalized) return collection
@@ -164,8 +225,10 @@ export function OverlayPanel({
   }, [activeLayer?.color, activeLayer?.id, activeLayer?.name, overlay.layerColor])
 
   useEffect(() => {
-    if (activeLayerId) void overlay.ensureDatasetFeatures(activeLayerId)
-  }, [activeLayerId, overlay.ensureDatasetFeatures])
+    if (mode === 'attributes' && activeLayerId) void overlay.ensureDatasetFeatures(activeLayerId)
+  }, [activeLayerId, mode, overlay.ensureDatasetFeatures])
+
+  useEffect(() => setSelectedFieldName(null), [activeLayerId])
 
   useEffect(() => {
     if (selected && !selectedIsPoint && movingSelected) overlay.setPickMode(false)
@@ -294,14 +357,17 @@ export function OverlayPanel({
   }
 
   return (
-    <section className="overlay-panel" aria-label="SHP 레이어 및 속성표">
+    <section
+      className={`overlay-panel overlay-panel-${mode}`}
+      aria-label={mode === 'manager' ? 'SHP 레이어 관리' : 'SHP 속성표'}
+    >
       <header className="overlay-panel-header">
         <div>
           <span className="eyebrow">VECTOR WORKSPACE</span>
-          <h2>SHP 레이어 · 속성표</h2>
+          <h2>{mode === 'manager' ? 'SHP 레이어 관리' : 'SHP 속성표'}</h2>
         </div>
         <div className="overlay-panel-actions">
-          {overlay.layers.length > 0 && (
+          {mode === 'manager' && overlay.layers.length > 0 && (
             <button
               type="button"
               className={`button ${uploadOpen ? 'secondary' : 'primary'} compact overlay-add-layer`}
@@ -319,7 +385,7 @@ export function OverlayPanel({
         </div>
       </header>
 
-      {uploadOpen && <form id="overlay-upload-form" className="overlay-upload" onSubmit={(event) => void submitUpload(event)}>
+      {mode === 'manager' && uploadOpen && <form id="overlay-upload-form" className="overlay-upload" onSubmit={(event) => void submitUpload(event)}>
         <label className="overlay-file-drop">
           <Upload size={18} />
           <span>
@@ -360,19 +426,19 @@ export function OverlayPanel({
           {actionError}
         </small>
       )}
-      {overlay.pickTarget?.kind === 'create' && (
+      {mode === 'attributes' && overlay.pickTarget?.kind === 'create' && (
         <small className="pick-instruction overlay-create-instruction" role="status">
-          지도·파노라마·3D 포인트 뷰에서 신규 피처 위치를 클릭하세요. Esc로 취소할 수 있습니다.
+          지도·파노라마·3D 포인트 뷰에서 신규 피처 위치를 클릭하세요. N 또는 Esc로 취소할 수 있습니다.
         </small>
       )}
 
-      <div className="overlay-workspace-grid">
+      <div className={`overlay-workspace-grid overlay-workspace-${mode}`}>
         <aside className="overlay-layer-list">
           <header>
             <span><Layers3 size={14} /> 레이어</span>
             <small>{overlay.layers.length}</small>
           </header>
-          {activeLayer && (
+          {mode === 'manager' && activeLayer && (
             <form className="overlay-layer-settings" onSubmit={(event) => void saveLayerMetadata(event)}>
               <label>
                 <span>레이어 이름</span>
@@ -435,7 +501,7 @@ export function OverlayPanel({
                     )}
                   </span>
                 </button>
-                <div>
+                {mode === 'manager' && <div>
                   <button
                     type="button"
                     className={`layer-visibility-toggle ${visible ? 'active' : ''}`}
@@ -462,15 +528,15 @@ export function OverlayPanel({
                     type="button"
                     className="danger-action"
                     title="레이어 등록 제거"
-                    onClick={() => {
-                      if (window.confirm(`${layer.name} 레이어를 목록에서 제거할까요?\n업로드 원본은 보존됩니다.`)) {
+                    onClick={(event) => {
+                      if (event.currentTarget.ownerDocument.defaultView?.confirm(`${layer.name} 레이어를 목록에서 제거할까요?\n업로드 원본은 보존됩니다.`)) {
                         void performAction(() => overlay.removeLayer(layer.id))
                       }
                     }}
                   >
                     <Trash2 size={14} />
                   </button>
-                </div>
+                </div>}
               </article>
             )
           })}
@@ -479,7 +545,7 @@ export function OverlayPanel({
           )}
         </aside>
 
-        <div className="overlay-table-area">
+        {mode === 'attributes' && <div className="overlay-table-area">
           <div className="overlay-table-toolbar">
             <span><Table2 size={14} /> 속성표</span>
             <button
@@ -494,6 +560,30 @@ export function OverlayPanel({
               }}
             >
               <Plus size={13} /> 신규 포인트
+            </button>
+            <button
+              type="button"
+              className="button compact danger"
+              disabled={!selectedField || selectedFieldProtected}
+              title={
+                !selectedField
+                  ? '삭제할 속성 열 머리글을 먼저 선택하세요.'
+                  : selectedFieldProtected
+                    ? 'ID·필수·내부 열 또는 마지막 남은 열은 삭제할 수 없습니다.'
+                    : `${fieldName(selectedField)} 열 삭제`
+              }
+              onClick={(event) => {
+                if (!activeLayer || !selectedField || selectedFieldProtected) return
+                const nameToDelete = fieldName(selectedField)
+                const confirmed = event.currentTarget.ownerDocument.defaultView?.confirm(
+                  `'${nameToDelete}' 속성 열을 편집본에서 삭제할까요?\n모든 피처의 해당 값이 제거되며 되돌릴 수 없습니다. 업로드 원본은 보존됩니다.`,
+                )
+                if (!confirmed) return
+                setSelectedFieldName(null)
+                void performAction(() => overlay.deleteField(activeLayer.id, nameToDelete))
+              }}
+            >
+              <Trash2 size={13} /> 선택 열 삭제
             </button>
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="피처 검색" />
             <small>
@@ -512,7 +602,18 @@ export function OverlayPanel({
                   <th>X</th>
                   <th>Y</th>
                   <th>Z</th>
-                  {fields.map((field) => <th key={field}>{field}</th>)}
+                  {fields.map((field) => (
+                    <th key={field} className={selectedFieldName === field ? 'selected-column' : ''}>
+                      <button
+                        type="button"
+                        className="overlay-column-select"
+                        aria-pressed={selectedFieldName === field}
+                        onClick={() => setSelectedFieldName((current) => current === field ? null : field)}
+                      >
+                        {field}
+                      </button>
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
@@ -521,10 +622,15 @@ export function OverlayPanel({
                   const isSelected =
                     overlay.selected?.layerId === activeLayerId &&
                     String(overlay.selected.featureId) === String(feature.id)
+                  const sharesSelectedSupport = sharesOverlayLocationOrSupport(selected, feature)
                   return (
                     <tr
                       key={String(feature.id)}
-                      className={isSelected ? 'selected' : ''}
+                      className={[
+                        isSelected ? 'selected' : '',
+                        sharesSelectedSupport ? 'related-support' : '',
+                      ].filter(Boolean).join(' ')}
+                      data-related-support={sharesSelectedSupport ? 'true' : undefined}
                       title="한 번 클릭해 선택 · 두 번 클릭해 지도와 파노라마로 이동"
                       onClick={() => overlay.selectFeature({ layerId: activeLayerId, featureId: feature.id })}
                       onDoubleClick={onClose}
@@ -558,9 +664,9 @@ export function OverlayPanel({
               </button>
             )}
           </div>
-        </div>
+        </div>}
 
-        <aside className="overlay-feature-editor">
+        {mode === 'attributes' && <aside className="overlay-feature-editor">
           <header>
             <span><Crosshair size={14} /> 선택 피처 편집</span>
             {selected && <code>{String(selected.id)}</code>}
@@ -648,10 +754,10 @@ export function OverlayPanel({
                 <button
                   type="button"
                   className="button danger"
-                  onClick={() => {
-                    if (window.confirm('선택한 피처를 편집본에서 삭제할까요?')) {
-                      void performAction(overlay.deleteSelected)
-                    }
+                    onClick={(event) => {
+                      if (event.currentTarget.ownerDocument.defaultView?.confirm('선택한 피처를 편집본에서 삭제할까요?')) {
+                        void performAction(overlay.deleteSelected)
+                      }
                   }}
                 >
                   <Trash2 size={14} /> 삭제
@@ -659,7 +765,7 @@ export function OverlayPanel({
               </footer>
             </>
           )}
-        </aside>
+        </aside>}
       </div>
     </section>
   )

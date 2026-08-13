@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  MAP_SELECTED_FEATURE_COLOR,
+  MAP_SELECTED_FRAME_COLOR,
+} from './mapSelectionColors'
+import {
   assertVWorld2DSdk,
   createVWorld2DDataSource,
   fitVWorld2DMap,
   handleVWorld2DClick,
   renderVWorld2DScene,
   selectedFrameRadiusForResolution,
+  setVWorld2DBaseMap,
   startVWorld2DMap,
   VWORLD_2D_BASE_WMTS_URL,
+  VWORLD_2D_SATELLITE_WMTS_URL,
   vworld2DOverlayHoverTarget,
 } from './vworld2d'
 
@@ -35,6 +41,7 @@ class FakeFeature {
 function fakeSdk() {
   const options: Record<string, unknown>[] = []
   const tileSourceOptions: Record<string, unknown>[] = []
+  const tileLayers: FakeTileLayer[] = []
   const source = {
     features: [] as FakeFeature[],
     addFeatures(features: FakeFeature[]) {
@@ -49,6 +56,8 @@ function fakeSdk() {
     setCenter: vi.fn(),
     setZoom: vi.fn(),
   }
+  const interactions = { kind: 'default-map-interactions' }
+  const interactionDefaults = vi.fn(() => interactions)
   const map = {
     picked: null as FakeFeature | null,
     addLayer: vi.fn(),
@@ -82,7 +91,11 @@ function fakeSdk() {
   }
   class FakeVectorLayer {}
   class FakeTileLayer {
-    constructor(readonly value: unknown) {}
+    setSource = vi.fn()
+
+    constructor(readonly value: unknown) {
+      tileLayers.push(this)
+    }
   }
   class FakeXYZSource {
     constructor(sourceOptions: Record<string, unknown>) {
@@ -122,6 +135,7 @@ function fakeSdk() {
       toLonLat: ([x, y]: number[]) => [x / 10, y / 10],
     },
     extent: { boundingExtent: (coordinates: unknown[]) => coordinates },
+    interaction: { defaults: interactionDefaults },
   }
   const frameWindow = {
     ol,
@@ -129,7 +143,17 @@ function fakeSdk() {
     setTimeout: window.setTimeout.bind(window),
   } as unknown as Window
 
-  return { frameWindow, map, options, source, tileSourceOptions, view }
+  return {
+    frameWindow,
+    map,
+    options,
+    source,
+    tileLayers,
+    tileSourceOptions,
+    view,
+    interactions,
+    interactionDefaults,
+  }
 }
 
 describe('VWorld 2D general-map adapter', () => {
@@ -143,7 +167,14 @@ describe('VWorld 2D general-map adapter', () => {
   })
 
   it('starts OpenLayers with only the official VWorld Base WMTS layer', async () => {
-    const { frameWindow, map, options, tileSourceOptions } = fakeSdk()
+    const {
+      frameWindow,
+      map,
+      options,
+      tileSourceOptions,
+      interactions,
+      interactionDefaults,
+    } = fakeSdk()
     const runtime = await startVWorld2DMap(frameWindow, 'vmap', {
       lon: 127,
       lat: 37,
@@ -151,12 +182,19 @@ describe('VWorld 2D general-map adapter', () => {
     })
 
     expect(runtime.map).toBe(map)
+    expect(runtime.map.options).toMatchObject({ basemapType: 'graphic' })
     expect(options).toHaveLength(1)
     expect(options[0]).toMatchObject({
       target: 'vmap',
       layers: [expect.anything()],
       controls: [],
+      interactions: expect.anything(),
       logo: false,
+    })
+    expect(options[0].interactions).toBe(interactions)
+    expect(interactionDefaults).toHaveBeenCalledWith({
+      mouseWheelZoom: true,
+      onFocusOnly: false,
     })
     expect(tileSourceOptions).toEqual([{
       url: VWORLD_2D_BASE_WMTS_URL,
@@ -166,6 +204,38 @@ describe('VWorld 2D general-map adapter', () => {
     }])
     expect(JSON.stringify({ options, tileSourceOptions })).not.toContain('openstreetmap.org')
     expect(map.updateSize).toHaveBeenCalled()
+  })
+
+  it('swaps the official Base and Satellite source without replacing the map or camera', async () => {
+    const sdk = fakeSdk()
+    const runtime = await startVWorld2DMap(sdk.frameWindow, 'vmap', {
+      lon: 127,
+      lat: 37,
+      height: 1_000,
+    })
+    const originalMap = runtime.map
+    const originalLayer = runtime.baseLayer
+
+    expect(setVWorld2DBaseMap(runtime, 'satellite')).toBe(true)
+    expect(runtime.map).toBe(originalMap)
+    expect(runtime.baseLayer).toBe(originalLayer)
+    expect(runtime.baseMap).toBe('satellite')
+    expect(runtime.map.options).toMatchObject({ basemapType: 'photo' })
+    expect(sdk.tileSourceOptions.at(-1)).toEqual({
+      url: VWORLD_2D_SATELLITE_WMTS_URL,
+      crossOrigin: 'anonymous',
+      minZoom: 6,
+      maxZoom: 19,
+    })
+    expect(sdk.tileLayers[0].setSource).toHaveBeenCalledTimes(1)
+    expect(sdk.map.addLayer).not.toHaveBeenCalled()
+    expect(sdk.view.setCenter).not.toHaveBeenCalled()
+    expect(sdk.view.setZoom).not.toHaveBeenCalled()
+
+    expect(setVWorld2DBaseMap(runtime, 'satellite')).toBe(false)
+    expect(runtime.map.options).toMatchObject({ basemapType: 'photo' })
+    expect(sdk.tileLayers[0].setSource).toHaveBeenCalledTimes(1)
+    expect(sdk.tileSourceOptions).toHaveLength(2)
   })
 
   it('renders route, frame, and SHP features and dispatches map clicks', async () => {
@@ -203,6 +273,7 @@ describe('VWorld 2D general-map adapter', () => {
             __overlay_layer_id: 'layer-a',
             __overlay_feature_id: 'feature-7',
             __overlay_color: '#ffb84d',
+            __overlay_selected: 1,
             NAME: '주의 표지',
           },
           geometry: { type: 'Point' as const, coordinates: [127.2, 37.2] },
@@ -215,6 +286,18 @@ describe('VWorld 2D general-map adapter', () => {
     const dataSource = createVWorld2DDataSource(runtime)
     renderVWorld2DScene(runtime, dataSource, input)
     expect(sdk.source.features).toHaveLength(3)
+    const selectedFrameFeature = sdk.source.features.find(
+      (feature) => feature.get('frame_id') === 'frame-1',
+    )
+    const frameStyle = (selectedFrameFeature?.style as ((feature: unknown, resolution: number) => unknown))(
+      selectedFrameFeature,
+      1,
+    )
+    expect(JSON.stringify(frameStyle)).toContain(MAP_SELECTED_FRAME_COLOR)
+    const selectedOverlayFeature = sdk.source.features.find(
+      (feature) => feature.get('overlay_feature_id') === 'feature-7',
+    )
+    expect(JSON.stringify(selectedOverlayFeature?.style)).toContain(MAP_SELECTED_FEATURE_COLOR)
 
     sdk.map.picked = sdk.source.features.find((feature) => feature.get('frame_id') === 'frame-1') ?? null
     handleVWorld2DClick(runtime, { pixel: [1, 1], coordinate: [1270, 370] }, input)
