@@ -59,7 +59,7 @@ function fakeSdk() {
   const interactions = { kind: 'default-map-interactions' }
   const interactionDefaults = vi.fn(() => interactions)
   const map = {
-    picked: null as FakeFeature | null,
+    picked: null as FakeFeature | FakeFeature[] | null,
     addLayer: vi.fn(),
     removeLayer: vi.fn(),
     getView: () => view,
@@ -67,7 +67,12 @@ function fakeSdk() {
     on: vi.fn(),
     un: vi.fn(),
     forEachFeatureAtPixel(_pixel: unknown, callback: (feature: FakeFeature) => unknown) {
-      return this.picked ? callback(this.picked) : undefined
+      const picked = Array.isArray(this.picked) ? this.picked : this.picked ? [this.picked] : []
+      for (const feature of picked) {
+        const result = callback(feature)
+        if (result !== undefined && result !== null && result !== false) return result
+      }
+      return undefined
     },
     updateSize: vi.fn(),
     setTarget: vi.fn(),
@@ -317,6 +322,36 @@ describe('VWorld 2D general-map adapter', () => {
     const onCoordinate = vi.fn()
     handleVWorld2DClick(runtime, { pixel: [2, 2], coordinate: [1270, 370] }, input, onCoordinate)
     expect(onCoordinate).toHaveBeenCalledWith([127, 37, 0])
+  })
+
+  it('skips a field-survey line to reach an underlying frame or SHP feature', async () => {
+    const sdk = fakeSdk()
+    const runtime = await startVWorld2DMap(sdk.frameWindow, 'vmap', {
+      lon: 127,
+      lat: 37,
+      height: 1_000,
+    })
+    const survey = new FakeFeature({ survey_segment_id: 'survey-1' })
+    const frame = new FakeFeature({ frame_id: 'frame-under-survey' })
+    const overlay = new FakeFeature({
+      overlay_layer_id: 'layer-a',
+      overlay_feature_id: 'feature-under-survey',
+      overlay_properties: { NAME: 'under survey' },
+    })
+    const input = { onFrame: vi.fn(), onOverlay: vi.fn() }
+
+    sdk.map.picked = [survey, frame]
+    handleVWorld2DClick(runtime, { pixel: [4, 5], coordinate: [1270, 370] }, input)
+    expect(input.onFrame).toHaveBeenCalledWith('frame-under-survey')
+
+    sdk.map.picked = [survey, overlay]
+    expect(vworld2DOverlayHoverTarget(runtime, { pixel: [12, 24] })).toMatchObject({
+      layerId: 'layer-a',
+      featureId: 'feature-under-survey',
+      properties: { NAME: 'under survey' },
+    })
+    handleVWorld2DClick(runtime, { pixel: [12, 24], coordinate: [1270, 370] }, input)
+    expect(input.onOverlay).toHaveBeenCalledWith('layer-a', 'feature-under-survey')
   })
 
   it('skips invalid WGS84 geometry before projecting it', async () => {

@@ -60,10 +60,26 @@ class WebAppDatasetRouteTests(unittest.TestCase):
                         "altitude": 11.0,
                         "heading": 95.0,
                     },
+                    *[
+                        {
+                            "id": f"frame-c-{index}",
+                            "ordinal": 151 + index,
+                            "track_id": "track-02",
+                            "task": {
+                                "image_name": f"Frame-C-{index}.jpg",
+                                "origin": [300_101.0 + index, 4_100_101.0, 11.0],
+                            },
+                            "longitude": 126.752 + index * 0.00001,
+                            "latitude": 37.032,
+                            "altitude": 11.0,
+                            "heading": 95.0,
+                        }
+                        for index in range(130)
+                    ],
                 ],
                 tracks=[
                     {"id": "track-01", "name": "Track 01", "frame_count": 1},
-                    {"id": "track-02", "name": "Track 02", "frame_count": 1},
+                    {"id": "track-02", "name": "Track 02", "frame_count": 131},
                 ],
                 bbox=None,
                 warnings=[],
@@ -81,7 +97,39 @@ class WebAppDatasetRouteTests(unittest.TestCase):
                 self.assertEqual(by_image.status_code, 200, by_image.text)
                 self.assertEqual(by_image.json()["frame"]["id"], "frame-b")
                 self.assertEqual(by_image.json()["match"], "image_name")
-                self.assertEqual(by_image.json()["page_offset"], 30)
+                # The returned offset is consumed together with the located
+                # frame's track filter.  frame-b is the first frame in track-02
+                # even though its global dataset ordinal is 150.
+                self.assertEqual(by_image.json()["page_offset"], 0)
+                located_page = client.get(
+                    "/api/datasets/d_locate/frames",
+                    params={
+                        "track": by_image.json()["frame"]["track_id"],
+                        "offset": by_image.json()["page_offset"],
+                        "limit": 240,
+                    },
+                )
+                self.assertEqual(located_page.status_code, 200, located_page.text)
+                self.assertIn(
+                    by_image.json()["frame"]["id"],
+                    [item["id"] for item in located_page.json()["items"]],
+                )
+
+                late_in_track = client.post(
+                    "/api/datasets/d_locate/frames/locate",
+                    json={"image_name": "Frame-C-129.jpg"},
+                )
+                self.assertEqual(late_in_track.status_code, 200, late_in_track.text)
+                # Position 130 in track-02 is centred 120 rows into its page.
+                self.assertEqual(late_in_track.json()["page_offset"], 10)
+                late_page = client.get(
+                    "/api/datasets/d_locate/frames",
+                    params={"track": "track-02", "offset": 10, "limit": 240},
+                )
+                self.assertIn(
+                    "frame-c-129",
+                    [item["id"] for item in late_page.json()["items"]],
+                )
 
                 by_position = client.post(
                     "/api/datasets/d_locate/frames/locate",

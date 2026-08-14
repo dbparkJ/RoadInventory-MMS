@@ -776,7 +776,6 @@ function App() {
               framesLoadingMore={framesLoadingMore}
               frameTotal={frameTotal}
               hasMoreFrames={frameNextOffset !== null}
-              frameRange={frameRange}
               focusOverlayLayerId={overlayFocusLayerId}
               removingDataset={removingDatasetId === selectedDataset?.id}
               externalAction={action}
@@ -791,20 +790,6 @@ function App() {
                 setTrackId(id)
               }}
               onFrameChange={setSelectedFrame}
-              onSetFrameRangeStart={(ordinal) =>
-                setFrameRange((current) => [
-                  ordinal,
-                  current && current[1] >= ordinal ? current[1] : ordinal,
-                ])
-              }
-              onSetFrameRangeEnd={(ordinal) =>
-                setFrameRange((current) => [
-                  current && current[0] <= ordinal ? current[0] : ordinal,
-                  ordinal,
-                ])
-              }
-              onFrameRangeChange={setFrameRange}
-              onClearFrameRange={() => setFrameRange(null)}
               onLoadMoreFrames={() => void loadMoreFrames()}
               onOpenSource={() => setSourceOpen(true)}
               onRemoveDataset={(dataset) => void removeDataset(dataset)}
@@ -919,6 +904,7 @@ function App() {
                       <OptimizationPanel
                         dataset={selectedDataset}
                         selectedTrack={trackId}
+                        selectedFrame={selectedFrame}
                         frameRange={frameRange}
                         busy={submitting}
                         externalAction={
@@ -937,6 +923,20 @@ function App() {
                         }
                         onStart={startRun}
                         onOptimize={optimize}
+                        onSetFrameRangeStart={(ordinal) =>
+                          setFrameRange((current) => [
+                            ordinal,
+                            current && current[1] >= ordinal ? current[1] : ordinal,
+                          ])
+                        }
+                        onSetFrameRangeEnd={(ordinal) =>
+                          setFrameRange((current) => [
+                            current && current[0] <= ordinal ? current[0] : ordinal,
+                            ordinal,
+                          ])
+                        }
+                        onFrameRangeChange={setFrameRange}
+                        onClearFrameRange={() => setFrameRange(null)}
                       />
                     )}
                   </div>

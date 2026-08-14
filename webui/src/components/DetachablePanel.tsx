@@ -134,12 +134,14 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
         }),
       )
     }
-    popup.addEventListener('keydown', relayFrameNavigation)
+    // Relay in the capture phase so React controls and third-party viewers in
+    // a popup cannot strand global shortcuts by stopping the bubbling event.
+    popup.addEventListener('keydown', relayFrameNavigation, true)
 
     let settled = false
     let closedPoll: number | null = null
     const cleanupPopupListeners = () => {
-      popup.removeEventListener('keydown', relayFrameNavigation)
+      popup.removeEventListener('keydown', relayFrameNavigation, true)
       popup.removeEventListener('beforeunload', onClose)
       popup.removeEventListener('pagehide', onClose)
       popup.removeEventListener('unload', onClose)

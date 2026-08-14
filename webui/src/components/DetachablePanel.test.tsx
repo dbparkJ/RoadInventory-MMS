@@ -7,14 +7,16 @@ function fakePopup() {
   const events = new EventTarget()
   const popupDocument = document.implementation.createHTMLDocument('')
   let closed = false
+  const addEventListener = vi.fn(events.addEventListener.bind(events))
+  const removeEventListener = vi.fn(events.removeEventListener.bind(events))
   const popup = {
     document: popupDocument,
     get closed() {
       return closed
     },
     KeyboardEvent: window.KeyboardEvent,
-    addEventListener: events.addEventListener.bind(events),
-    removeEventListener: events.removeEventListener.bind(events),
+    addEventListener,
+    removeEventListener,
     dispatchEvent: events.dispatchEvent.bind(events),
     focus: vi.fn(),
     close: vi.fn(() => {
@@ -25,6 +27,8 @@ function fakePopup() {
   } as unknown as Window
   return {
     popup,
+    addEventListener,
+    removeEventListener,
     forceClose: () => {
       closed = true
     },
@@ -148,13 +152,14 @@ describe('DetachablePanel keyboard relay', () => {
   })
 
   it('keeps A/D relay active when deleting a feature control replaces popup content', () => {
-    const { popup } = fakePopup()
+    const { popup, addEventListener } = fakePopup()
     vi.spyOn(window, 'open').mockReturnValue(popup)
     const onKeyDown = vi.fn((event: KeyboardEvent) => event.preventDefault())
     window.addEventListener('keydown', onKeyDown)
     try {
       render(<FeatureMutationHarness />)
       fireEvent.click(screen.getByRole('button', { name: 'open mutation popup' }))
+      expect(addEventListener).toHaveBeenCalledWith('keydown', expect.any(Function), true)
       const deleteButton = Array.from(popup.document.querySelectorAll('button')).find(
         (button) => button.textContent?.trim() === 'delete feature',
       )
@@ -162,17 +167,29 @@ describe('DetachablePanel keyboard relay', () => {
       act(() => deleteButton!.click())
       expect(popup.document.body.textContent).toContain('feature deleted')
 
-      const nextFrame = new KeyboardEvent('keydown', {
-        key: 'd',
-        code: 'KeyD',
-        bubbles: true,
-        cancelable: true,
+      const shortcuts = [
+        ['a', 'KeyA'],
+        ['ArrowLeft', 'ArrowLeft'],
+        ['d', 'KeyD'],
+        ['ArrowRight', 'ArrowRight'],
+        ['n', 'KeyN'],
+        ['p', 'KeyP'],
+        ['Escape', 'Escape'],
+      ] as const
+      shortcuts.forEach(([key, code]) => {
+        const shortcut = new KeyboardEvent('keydown', {
+          key,
+          code,
+          bubbles: true,
+          cancelable: true,
+        })
+        popup.dispatchEvent(shortcut)
+        expect(shortcut.defaultPrevented).toBe(true)
       })
-      popup.dispatchEvent(nextFrame)
 
-      expect(nextFrame.defaultPrevented).toBe(true)
-      expect(onKeyDown).toHaveBeenCalledOnce()
-      expect(onKeyDown.mock.calls[0][0]).toMatchObject({ code: 'KeyD' })
+      expect(onKeyDown.mock.calls.map(([event]) => event.code)).toEqual(
+        shortcuts.map(([, code]) => code),
+      )
     } finally {
       window.removeEventListener('keydown', onKeyDown)
     }

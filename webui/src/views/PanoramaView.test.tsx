@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as THREE from 'three'
 import { api } from '../lib/api'
 import type { Frame } from '../types'
 import PanoramaView, {
@@ -13,8 +14,12 @@ import PanoramaView, {
   panoramaDetectionStrokeWidth,
   panoramaForwardYaw,
   panoramaOverlayAtUv,
+  panoramaRayYaw,
   panoramaRequestWidth,
+  panoramaSceneNavigationTarget,
   reconcilePanoramaDetectionBoxes,
+  isPanoramaSceneClick,
+  isPanoramaSceneControlTarget,
   type RenderPanoramaDetectionBox,
   type RenderPanoramaOverlayPoint,
 } from './PanoramaView'
@@ -303,6 +308,61 @@ describe('panoramaForwardYaw', () => {
   })
 })
 
+describe('panorama scene click navigation', () => {
+  const previous: Frame = {
+    ...FRAME,
+    id: 'frame-11',
+    index: 11,
+    coordinate: { lon: 126.978, lat: 37.5655 },
+  }
+  const current: Frame = { ...FRAME, heading: 0 }
+  const next: Frame = {
+    ...NEXT_FRAME,
+    coordinate: { lon: 126.978, lat: 37.5675 },
+  }
+
+  it('resolves the clicked ray to the closest loaded neighbor and paginated fallback', () => {
+    expect(panoramaSceneNavigationTarget(
+      current,
+      [previous, current, next],
+      -180,
+      -180,
+      true,
+      true,
+    )?.target?.frame.id).toBe('frame-13')
+    expect(panoramaSceneNavigationTarget(
+      current,
+      [previous, current, next],
+      0,
+      -180,
+      true,
+      true,
+    )?.target?.frame.id).toBe('frame-11')
+    expect(panoramaSceneNavigationTarget(
+      current,
+      [],
+      -180,
+      -180,
+      false,
+      true,
+    )).toEqual({ direction: 1, target: null })
+  })
+
+  it('separates a short click from a panorama drag and derives yaw from the popup ray', () => {
+    expect(isPanoramaSceneClick({ x: 10, y: 10 }, { x: 13, y: 14 })).toBe(true)
+    expect(isPanoramaSceneClick({ x: 10, y: 10 }, { x: 16, y: 10 })).toBe(false)
+    expect(panoramaRayYaw({ x: -1, z: 0 }, 25)).toBe(180)
+    expect(panoramaRayYaw({ x: 0, z: -1 }, 25)).toBe(-90)
+    expect(panoramaRayYaw({ x: 0, z: 0 }, 25)).toBe(25)
+
+    const popupDocument = document.implementation.createHTMLDocument('panorama-popup')
+    const popupButton = popupDocument.createElement('button')
+    const popupCanvas = popupDocument.createElement('canvas')
+    expect(isPanoramaSceneControlTarget(popupButton)).toBe(true)
+    expect(isPanoramaSceneControlTarget(popupCanvas)).toBe(false)
+  })
+})
+
 describe('nearestPanoramaPointIndex', () => {
   it('selects a depth sample across the equirectangular seam', () => {
     const coordinates = new Float32Array([
@@ -557,6 +617,177 @@ describe('PanoramaView frame navigation', () => {
       screen.getByRole('button', { name: '바라보는 방향의 인접 프레임으로 이동' }),
     )
     expect(onFrameChange).toHaveBeenCalledWith(forward)
+  })
+
+  it('moves on a short blank-scene click, shows its target hint, and ignores a drag', () => {
+    class PointerEventMock extends MouseEvent {
+      readonly isPrimary: boolean
+      readonly pointerId: number
+      readonly pointerType: string
+
+      constructor(type: string, init: PointerEventInit = {}) {
+        super(type, init)
+        this.isPrimary = init.isPrimary ?? true
+        this.pointerId = init.pointerId ?? 1
+        this.pointerType = init.pointerType ?? 'mouse'
+      }
+    }
+    vi.stubGlobal('PointerEvent', PointerEventMock)
+    const previous = {
+      ...FRAME,
+      id: 'frame-11',
+      index: 11,
+      coordinate: { lon: 126.978, lat: 37.5655 },
+    }
+    const forward = {
+      ...NEXT_FRAME,
+      coordinate: { lon: 126.978, lat: 37.5675 },
+    }
+    const current = { ...FRAME, heading: 0 }
+    const onFrameChange = vi.fn()
+    vi.spyOn(THREE.Raycaster.prototype, 'setFromCamera').mockImplementation(function (
+      this: THREE.Raycaster,
+    ) {
+      this.ray.direction.set(-1, 0, 0)
+    })
+    vi.spyOn(THREE.Raycaster.prototype, 'intersectObject').mockReturnValue([{
+      uv: new THREE.Vector2(0.5, 0.5),
+    }] as never)
+
+    const { container } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={current}
+        frames={[previous, current, forward]}
+        onFrameChange={onFrameChange}
+        demoMode
+      />,
+    )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
+    const canvas = container.querySelector<HTMLCanvasElement>('.panorama-canvas')
+    expect(canvas).not.toBeNull()
+    vi.spyOn(canvas!, 'getBoundingClientRect').mockReturnValue({
+      bottom: 500,
+      height: 500,
+      left: 0,
+      right: 1000,
+      top: 0,
+      width: 1000,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    })
+
+    fireEvent.pointerMove(canvas!, { clientX: 500, clientY: 250 })
+    const hoverFrame = vi.mocked(window.requestAnimationFrame).mock.calls.at(-1)?.[0]
+    act(() => hoverFrame?.(0))
+    expect(screen.getByText('클릭하여 Frame 14 이동')).toBeInTheDocument()
+    expect(container.querySelector('.panorama-scene-navigation-hint')).toHaveAttribute(
+      'data-direction',
+      'next',
+    )
+
+    fireEvent.pointerDown(canvas!, { button: 0, clientX: 500, clientY: 250 })
+    fireEvent.pointerUp(canvas!, { button: 0, clientX: 503, clientY: 254 })
+    expect(onFrameChange).toHaveBeenCalledWith(forward)
+    expect(screen.getByRole('status')).toHaveTextContent('Frame 14로 이동합니다')
+
+    onFrameChange.mockClear()
+    fireEvent.pointerDown(canvas!, { button: 0, clientX: 500, clientY: 250 })
+    fireEvent.pointerMove(canvas!, { clientX: 512, clientY: 250 })
+    expect(stage).toHaveClass('dragging')
+    fireEvent.pointerUp(canvas!, { button: 0, clientX: 503, clientY: 254 })
+    expect(onFrameChange).not.toHaveBeenCalled()
+    expect(stage).not.toHaveClass('dragging')
+  })
+
+  it('pins a YOLO hit instead of navigating the scene behind it', async () => {
+    class PointerEventMock extends MouseEvent {
+      readonly isPrimary: boolean
+      readonly pointerId: number
+      readonly pointerType: string
+
+      constructor(type: string, init: PointerEventInit = {}) {
+        super(type, init)
+        this.isPrimary = init.isPrimary ?? true
+        this.pointerId = init.pointerId ?? 1
+        this.pointerType = init.pointerType ?? 'mouse'
+      }
+    }
+    vi.stubGlobal('PointerEvent', PointerEventMock)
+    vi.mocked(api.panorama).mockResolvedValueOnce({ kind: 'url', value: '/pano.jpg' })
+    vi.mocked(api.frameDetections).mockResolvedValueOnce({
+      dataset_id: 'dataset-1',
+      frame_id: FRAME.id,
+      coordinate_space: 'panorama_equirectangular_pixels',
+      projection: 'equirectangular',
+      items: [{
+        source_id: 'model-a',
+        source_name: 'traffic-sign.pt',
+        observation_id: 'det-1',
+        properties: {
+          img_name: FRAME.image_name,
+          class_nm: 'traffic_sign',
+          conf: 0.91,
+          bbox_l: 400,
+          bbox_t: 180,
+          bbox_r: 600,
+          bbox_b: 320,
+          pano_w: 1000,
+          pano_h: 500,
+        },
+      }],
+      count: 1,
+      model_count: 1,
+      models: [{ source_id: 'model-a', source_name: 'traffic-sign.pt', count: 1 }],
+      truncated: false,
+    })
+    vi.spyOn(THREE.Raycaster.prototype, 'setFromCamera').mockImplementation(function (
+      this: THREE.Raycaster,
+    ) {
+      this.ray.direction.set(-1, 0, 0)
+    })
+    vi.spyOn(THREE.Raycaster.prototype, 'intersectObject').mockReturnValue([{
+      uv: new THREE.Vector2(0.5, 0.5),
+    }] as never)
+    const forward = {
+      ...NEXT_FRAME,
+      coordinate: { lon: 126.978, lat: 37.5675 },
+    }
+    const current = { ...FRAME, heading: 0 }
+    const onFrameChange = vi.fn()
+    const { container } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={current}
+        frames={[current, forward]}
+        onFrameChange={onFrameChange}
+        demoMode={false}
+      />,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
+      expect(threeSpies.textureLoads).toHaveBeenCalledWith('/pano.jpg')
+    })
+    const canvas = container.querySelector<HTMLCanvasElement>('.panorama-canvas')!
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      bottom: 500,
+      height: 500,
+      left: 0,
+      right: 1000,
+      top: 0,
+      width: 1000,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    })
+
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 500, clientY: 250 })
+    fireEvent.pointerUp(canvas, { button: 0, clientX: 500, clientY: 250 })
+
+    expect(onFrameChange).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog')).toHaveTextContent('traffic_sign')
+    expect(container.querySelector('.panorama-scene-navigation-hint')).not.toBeInTheDocument()
   })
 
   it('shows the reverse-geocoded address while retaining frame coordinates', async () => {

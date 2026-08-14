@@ -362,12 +362,36 @@ record. Progress is 0–100 and status is one of `queued`, `preparing`, `running
 the bounded recent queue, and therefore includes a completed run dismissed from queue/bootstrap
 visibility. "Latest" is ordered by actual `finished_at`, with `updated_at` then `created_at` as
 legacy fallbacks; `created_at` and run ID provide deterministic tie-breaks. The endpoint returns
-`404` for an unknown or unregistered dataset. The main
-검출결과 action uses this endpoint; `null` means that the selected dataset has no completed run.
-During rolling upgrades, a web client receiving `404` for this endpoint falls back to
+`404` for an unknown or unregistered dataset. It remains the compact compatibility endpoint for
+clients that need only one result; `null` means that the selected dataset has no completed run.
+During rolling upgrades, a web client receiving `404` for the completed-history endpoint falls back to
 `GET /api/runs?limit=200` and selects the newest completed run for the active dataset. That legacy
 fallback cannot recover a run already dismissed by an older server, so durable dismissed-result
 lookup becomes complete as soon as the new endpoint is deployed or the API process is restarted.
+
+`GET /api/datasets/{dataset_id}/runs/completed?limit=200&offset=0` returns every durable completed
+job as a paged history, including queue-dismissed rows. The response is
+`{ "items": RunRecord[], "offset": 0, "limit": 200, "total": 241, "next_offset": 200,
+"snapshot_at": "2026-08-14T01:02:03+00:00" }`; `next_offset` is `null` on the last page. The web
+client sends the first response's `snapshot_at` on every later page, so a run completing while the
+history is loading cannot shift OFFSET boundaries and duplicate or hide rows. It follows every
+stable page before showing the job list, and selecting a row opens that exact run's result detail
+rather than silently choosing only the latest run.
+
+`frame_range` always contains zero-based **dataset-global ordinals**, even when `track_ids` contains
+one track. The automatic-detection setup therefore validates range inputs against the full dataset
+frame count; the server intersects that global range with the requested tracks.
+
+### Field-survey sections
+
+`GET /api/datasets/{dataset_id}/survey-segments` returns
+`{ "items": SurveySegment[] }`. A segment has an opaque ID, display name, `#RRGGBB` color and a
+WGS84 `LineString` geometry. `POST` to the same path accepts
+`{ "name": "현장조사 필요구간 1", "color": "#f59e0b", "coordinates": [[127,37],[127.01,37.01]] }`
+and returns `{ "segment": SurveySegment }` with status 201. Between 2 and 5,000 finite WGS84
+vertices are accepted. `DELETE /api/datasets/{dataset_id}/survey-segments/{segment_id}` returns
+`{ "id": segment_id, "deleted": true }`. Segments are stored in the web registry, cascade with
+the dataset record, and render as a separately toggleable line layer in both VWorld 2D and 3D.
 
 `DELETE /api/runs/{id}` dismisses a completed or failed run from collection/bootstrap responses.
 This is a visibility operation, not artifact deletion: the response contains

@@ -12,6 +12,7 @@ import tempfile
 import uuid
 import zipfile
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -2027,6 +2028,53 @@ def get_latest_completed_run_for_dataset(
             if runs
             else None
         )
+    }
+
+
+@router.get("/datasets/{dataset_id}/runs/completed")
+def list_completed_runs_for_dataset(
+    dataset_id: str,
+    request: Request,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    snapshot_at: datetime | None = None,
+) -> dict[str, Any]:
+    """List durable completed jobs for result browsing, including hidden queue rows."""
+
+    if request.app.state.store.get_dataset(dataset_id) is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    if snapshot_at is not None and snapshot_at.tzinfo is None:
+        raise HTTPException(
+            status_code=422,
+            detail="snapshot_at must include a timezone.",
+        )
+    stable_snapshot = (
+        snapshot_at.astimezone(timezone.utc).isoformat()
+        if snapshot_at is not None
+        else utc_now()
+    )
+    items = [
+        public_run(request.app, run, include_log=False)
+        for run in request.app.state.store.list_completed_runs_for_dataset(
+            dataset_id,
+            limit=limit,
+            offset=offset,
+            snapshot_at=stable_snapshot,
+        )
+    ]
+    total = request.app.state.store.count_completed_runs_for_dataset(
+        dataset_id,
+        snapshot_at=stable_snapshot,
+    )
+    next_offset = offset + len(items) if offset + len(items) < total else None
+    return {
+        "items": items,
+        "runs": items,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "next_offset": next_offset,
+        "snapshot_at": stable_snapshot,
     }
 
 

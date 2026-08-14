@@ -143,6 +143,13 @@ function WorkspaceProbe() {
       </button>
       <button
         type="button"
+        aria-label="focused viewer shortcut surface"
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        focused viewer shortcut surface
+      </button>
+      <button
+        type="button"
         onClick={() => void overlay.updateLayerMetadata(LAYER.id, { name: '새 이름', color: '#112233' })}
       >
         update layer metadata
@@ -438,9 +445,18 @@ describe('OverlayProvider pick-mode shortcuts', () => {
 
     // The stable global listener must observe the post-request state. This
     // guards against a completed point-pick leaving N permanently bound to the
-    // previous create target.
-    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    // previous create target. The viewer also stops bubbling, as map SDKs do
+    // after the picked canvas has retained keyboard focus.
+    const viewer = screen.getByRole('button', { name: 'focused viewer shortcut surface' })
+    fireEvent.keyDown(viewer, { key: 'n', code: 'KeyN' })
     expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.keyDown(viewer, { key: 'Escape', code: 'Escape' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+    fireEvent.keyDown(viewer, { key: 'p', code: 'KeyP' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('move')
+    fireEvent.keyDown(viewer, { key: 'Escape', code: 'Escape' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
   })
 
   it('keeps global edit and frame shortcuts live after deleting the selected feature', async () => {
@@ -461,8 +477,12 @@ describe('OverlayProvider pick-mode shortcuts', () => {
     await waitFor(() => expect(deleteOverlayFeature).toHaveBeenCalledOnce())
     await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('none'))
 
-    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    const viewer = screen.getByRole('button', { name: 'focused viewer shortcut surface' })
+    fireEvent.keyDown(viewer, { key: 'n', code: 'KeyN' })
     expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.keyDown(viewer, { key: 'Escape', code: 'Escape' })
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
 
     const frameNavigation = vi.fn((event: KeyboardEvent) => event.preventDefault())
     window.addEventListener('keydown', frameNavigation)

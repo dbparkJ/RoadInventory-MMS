@@ -23,6 +23,7 @@ import type {
   RunResults,
   StorageRoot,
   StorageTreeResponse,
+  SurveySegment,
   UploadManifestFile,
   UploadSession,
 } from '../types'
@@ -593,6 +594,61 @@ export const api = {
     return json<{ run: RunRecord | null }>(
       `/api/datasets/${encodeURIComponent(datasetId)}/runs/latest-completed`,
       { signal },
+    )
+  },
+
+  completedRuns(
+    datasetId: string,
+    signal?: AbortSignal,
+    limit = 100,
+    offset = 0,
+    snapshotAt?: string,
+  ) {
+    return json<{
+      items: RunRecord[]
+      runs?: RunRecord[]
+      offset?: number
+      limit?: number
+      total?: number
+      next_offset?: number | null
+      snapshot_at?: string
+    }>(
+      buildApiUrl(`/api/datasets/${encodeURIComponent(datasetId)}/runs/completed`, {
+        limit,
+        offset,
+        snapshot_at: snapshotAt,
+      }),
+      { signal },
+    )
+  },
+
+  surveySegments(datasetId: string, signal?: AbortSignal) {
+    return json<{ items: SurveySegment[] }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/survey-segments`,
+      { signal },
+    )
+  },
+
+  createSurveySegment(
+    datasetId: string,
+    payload: { name: string; color?: string; coordinates: [number, number][] },
+    signal?: AbortSignal,
+  ) {
+    return json<{ segment: SurveySegment }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/survey-segments`,
+      {
+        method: 'POST',
+        ...jsonBody(payload),
+        signal,
+        timeout: 30_000,
+      },
+    )
+  },
+
+  deleteSurveySegment(datasetId: string, segmentId: string, signal?: AbortSignal) {
+    return json<{ id: string; deleted: boolean }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/survey-segments/${encodeURIComponent(segmentId)}`,
+      { method: 'DELETE', signal, timeout: 30_000 },
     )
   },
 

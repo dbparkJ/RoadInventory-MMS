@@ -77,6 +77,7 @@ interface VWorldViewer {
   scene: {
     canvas: HTMLCanvasElement
     pick(position: unknown): unknown
+    drillPick?(position: unknown, limit?: number): unknown
   }
   dataSources: VWorldDataSourceCollection
   forceResize?: () => void
@@ -548,6 +549,35 @@ export function pickedEntityId(picked: unknown): string | null {
     return typeof id === 'string' ? id : null
   }
   return null
+}
+
+/**
+ * Return pickable entity ids from front to back.  Route and survey polylines
+ * are deliberately non-interactive, so callers can continue through them to
+ * the first frame/SHP entity instead of letting a decorative line swallow the
+ * click or hover.
+ */
+export function pickedEntityIdsAtPosition(
+  scene: {
+    pick(position: unknown): unknown
+    drillPick?(position: unknown, limit?: number): unknown
+  },
+  position: unknown,
+  limit = 32,
+): string[] {
+  const drilled = scene.drillPick?.(position, limit)
+  const picked = Array.isArray(drilled)
+    ? drilled
+    : [scene.pick(position)]
+  const ids: string[] = []
+  const seen = new Set<string>()
+  picked.forEach((candidate) => {
+    const id = pickedEntityId(candidate)
+    if (!id || seen.has(id)) return
+    seen.add(id)
+    ids.push(id)
+  })
+  return ids
 }
 
 function addOverlayGeometry(

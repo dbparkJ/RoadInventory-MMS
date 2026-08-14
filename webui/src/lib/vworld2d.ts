@@ -365,23 +365,28 @@ export function handleVWorld2DClick(
   input: Pick<VWorld2DSceneInput, 'onFrame' | 'onOverlay'>,
   onCoordinate?: (coordinate: [number, number, number]) => void,
 ): void {
-  const picked = event.pixel === undefined
-    ? null
-    : runtime.map.forEachFeatureAtPixel(event.pixel, (feature) => feature)
-  if (picked && typeof picked === 'object' && 'get' in picked) {
-    const feature = picked as VWorld2DFeature
-    const frameId = feature.get('frame_id')
-    if (typeof frameId === 'string' && frameId) {
-      input.onFrame(frameId)
-      return
-    }
-    const layerId = feature.get('overlay_layer_id')
-    const featureId = feature.get('overlay_feature_id')
-    if (typeof layerId === 'string' && typeof featureId === 'string' && layerId && featureId) {
-      input.onOverlay(layerId, featureId)
-      return
-    }
+  let handled = false
+  if (event.pixel !== undefined) {
+    runtime.map.forEachFeatureAtPixel(event.pixel, (feature) => {
+      const frameId = feature.get('frame_id')
+      if (typeof frameId === 'string' && frameId) {
+        input.onFrame(frameId)
+        handled = true
+        return feature
+      }
+      const layerId = feature.get('overlay_layer_id')
+      const featureId = feature.get('overlay_feature_id')
+      if (typeof layerId === 'string' && typeof featureId === 'string' && layerId && featureId) {
+        input.onOverlay(layerId, featureId)
+        handled = true
+        return feature
+      }
+      // Returning undefined keeps OpenLayers walking lower layers.  Saved
+      // field-survey and route lines are visual guides, not hit targets.
+      return undefined
+    })
   }
+  if (handled) return
   if (event.coordinate !== undefined && onCoordinate) {
     const [lon, lat] = runtime.ol.proj.toLonLat(event.coordinate)
     if (Number.isFinite(lon) && Number.isFinite(lat)) onCoordinate([lon, lat, 0])
@@ -396,7 +401,20 @@ export function vworld2DOverlayHoverTarget(
   const pixelX = Number(event.pixel[0])
   const pixelY = Number(event.pixel[1])
   if (!Number.isFinite(pixelX) || !Number.isFinite(pixelY)) return null
-  const picked = runtime.map.forEachFeatureAtPixel(event.pixel, (feature) => feature)
+  const picked = runtime.map.forEachFeatureAtPixel(event.pixel, (feature) => {
+    const layerId = feature.get('overlay_layer_id')
+    const featureId = feature.get('overlay_feature_id')
+    const properties = feature.get('overlay_properties')
+    return typeof layerId === 'string' &&
+      typeof featureId === 'string' &&
+      layerId &&
+      featureId &&
+      properties &&
+      typeof properties === 'object' &&
+      !Array.isArray(properties)
+      ? feature
+      : undefined
+  })
   if (!picked || typeof picked !== 'object' || !('get' in picked)) return null
   const feature = picked as VWorld2DFeature
   const layerId = feature.get('overlay_layer_id')

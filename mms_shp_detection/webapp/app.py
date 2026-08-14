@@ -30,6 +30,7 @@ from .runs import RunManager, public_run
 from .runs import router as runs_router
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
 from .store import WebStore
+from .surveys import router as surveys_router
 from .uploads import router as uploads_router
 
 API_VERSION = "1"
@@ -523,6 +524,7 @@ def create_app(
     app.include_router(optimizer_router)
     app.include_router(uploads_router)
     app.include_router(runs_router)
+    app.include_router(surveys_router)
 
     @app.get("/api/health", tags=["system"])
     async def health() -> dict[str, Any]:

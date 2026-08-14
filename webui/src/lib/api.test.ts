@@ -176,6 +176,24 @@ describe('run API', () => {
     }
   })
 
+  it('requests a deterministic completed-run history page for one dataset', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0, next_offset: null }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    try {
+      await api.completedRuns('dataset/a', undefined, 200, 400, '2026-08-14T01:02:03+00:00')
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/runs/completed?limit=200&offset=400&snapshot_at=2026-08-14T01%3A02%3A03%2B00%3A00',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
   it('encodes the run id and dismisses it with DELETE', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
@@ -198,6 +216,46 @@ describe('run API', () => {
         '/api/runs/run%2Fa%20%3F',
         expect.objectContaining({ method: 'DELETE' }),
       )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('field survey API', () => {
+  it('creates and deletes an encoded persistent survey segment', async () => {
+    const segment = {
+      id: 'survey/a',
+      dataset_id: 'dataset/a',
+      name: '현장조사 필요구간 1',
+      color: '#f59e0b',
+      geometry: { type: 'LineString', coordinates: [[127, 37], [127.1, 37.1]] },
+      created_at: '2026-08-14T00:00:00Z',
+      updated_at: '2026-08-14T00:00:00Z',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ segment }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: segment.id, deleted: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+
+    try {
+      await api.createSurveySegment('dataset/a', {
+        name: segment.name,
+        color: segment.color,
+        coordinates: [[127, 37], [127.1, 37.1]],
+      })
+      await api.deleteSurveySegment('dataset/a', 'survey/a')
+      expect(fetchMock.mock.calls[0][0]).toBe('/api/datasets/dataset%2Fa/survey-segments')
+      expect(fetchMock.mock.calls[0][1]?.method).toBe('POST')
+      expect(fetchMock.mock.calls[1][0]).toBe(
+        '/api/datasets/dataset%2Fa/survey-segments/survey%2Fa',
+      )
+      expect(fetchMock.mock.calls[1][1]?.method).toBe('DELETE')
     } finally {
       fetchMock.mockRestore()
     }

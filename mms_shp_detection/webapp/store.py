@@ -136,6 +136,19 @@ class WebStore:
                 );
                 CREATE INDEX IF NOT EXISTS runs_status_created
                     ON runs(status, created_at);
+                CREATE INDEX IF NOT EXISTS runs_dataset_status_finished
+                    ON runs(dataset_id, status, finished_at, updated_at, created_at, id);
+                CREATE TABLE IF NOT EXISTS survey_segments (
+                    id TEXT PRIMARY KEY,
+                    dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    coordinates_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS survey_segments_dataset_created
+                    ON survey_segments(dataset_id, created_at, id);
                 """
             )
             # ``CREATE TABLE IF NOT EXISTS`` does not migrate an existing
@@ -425,6 +438,26 @@ class WebStore:
                 ).fetchone()
         return self.frame_from_row(row)
 
+    def frame_offset_in_track(
+        self,
+        dataset_id: str,
+        *,
+        track_id: str,
+        ordinal: int,
+    ) -> int:
+        """Return the zero-based position used by a track-filtered frame page."""
+
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM frames
+                WHERE dataset_id=? AND track_id=? AND ordinal<?
+                """,
+                (dataset_id, track_id, int(ordinal)),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def list_frames(
         self,
         dataset_id: str,
@@ -706,6 +739,8 @@ class WebStore:
         dataset_id: str,
         *,
         limit: int = 20,
+        offset: int = 0,
+        snapshot_at: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return most recently finished durable results, including hidden runs."""
 
@@ -714,15 +749,100 @@ class WebStore:
                 """
                 SELECT * FROM runs
                 WHERE dataset_id=? AND status='completed'
+                  AND (? IS NULL OR julianday(COALESCE(finished_at, updated_at, created_at))
+                      <= julianday(?))
                 ORDER BY
                     COALESCE(finished_at, updated_at, created_at) DESC,
                     created_at DESC,
                     id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (dataset_id, int(limit)),
+                (
+                    dataset_id,
+                    snapshot_at,
+                    snapshot_at,
+                    int(limit),
+                    int(offset),
+                ),
             ).fetchall()
         return [self.run_from_row(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def count_completed_runs_for_dataset(
+        self,
+        dataset_id: str,
+        *,
+        snapshot_at: str | None = None,
+    ) -> int:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM runs
+                WHERE dataset_id=? AND status='completed'
+                  AND (? IS NULL OR julianday(COALESCE(finished_at, updated_at, created_at))
+                      <= julianday(?))
+                """,
+                (dataset_id, snapshot_at, snapshot_at),
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    @staticmethod
+    def survey_segment_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["coordinates"] = _loads(item.pop("coordinates_json", None), [])
+        return item
+
+    def list_survey_segments(self, dataset_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM survey_segments
+                WHERE dataset_id=?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (dataset_id,),
+            ).fetchall()
+        return [
+            self.survey_segment_from_row(row)
+            for row in rows
+            if row is not None
+        ]  # type: ignore[misc]
+
+    def create_survey_segment(self, segment: dict[str, Any]) -> dict[str, Any]:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO survey_segments(
+                    id,dataset_id,name,color,coordinates_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    segment["id"],
+                    segment["dataset_id"],
+                    segment["name"],
+                    segment["color"],
+                    _json(segment["coordinates"]),
+                    segment["created_at"],
+                    segment["updated_at"],
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM survey_segments WHERE id=? AND dataset_id=?",
+                (segment["id"], segment["dataset_id"]),
+            ).fetchone()
+        result = self.survey_segment_from_row(row)
+        if result is None:  # pragma: no cover - SQLite INSERT guarantees the row
+            raise RuntimeError("Survey segment was not persisted.")
+        return result
+
+    def delete_survey_segment(self, dataset_id: str, segment_id: str) -> bool:
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                "DELETE FROM survey_segments WHERE dataset_id=? AND id=?",
+                (dataset_id, segment_id),
+            )
+        return bool(cursor.rowcount)
 
     def dismiss_terminal_run(
         self,

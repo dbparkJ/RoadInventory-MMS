@@ -8,6 +8,7 @@ import {
   cameraTargetForSceneMode,
   cameraTargetForCoordinates,
   pickedEntityId,
+  pickedEntityIdsAtPosition,
   renderVWorldOverlay,
   renderVWorldScene,
   selectedFrameDistanceScale,
@@ -357,5 +358,25 @@ describe('VWorld WebGL 3.0 adapter', () => {
     expect(pickedEntityId({ id: { id: 'frame:9' } })).toBe('frame:9')
     expect(pickedEntityId({ id: 'overlay:3' })).toBe('overlay:3')
     expect(pickedEntityId(undefined)).toBeNull()
+  })
+
+  it('drill-picks through route and survey lines in front-to-back order', () => {
+    const scene = {
+      pick: vi.fn(),
+      drillPick: vi.fn(() => [
+        { id: { id: 'route:0' } },
+        { id: 'route:0:halo' },
+        { id: { id: 'overlay:3' } },
+        { id: { id: 'overlay:3' } },
+      ]),
+    }
+
+    expect(pickedEntityIdsAtPosition(scene, { x: 10, y: 20 })).toEqual([
+      'route:0',
+      'route:0:halo',
+      'overlay:3',
+    ])
+    expect(scene.drillPick).toHaveBeenCalledWith({ x: 10, y: 20 }, 32)
+    expect(scene.pick).not.toHaveBeenCalled()
   })
 })

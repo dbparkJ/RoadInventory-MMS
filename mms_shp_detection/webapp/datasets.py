@@ -845,9 +845,18 @@ def locate_frame(
         match = "nearest_position"
     if frame is None:
         raise HTTPException(status_code=404, detail="A matching MMS frame was not found.")
+    # The web client reloads the located frame with the returned track filter.
+    # Therefore this offset must be relative to that track, not to the global
+    # dataset ordinal.  A global offset can leave the selected frame outside
+    # the reloaded page and disable previous/next-frame shortcuts indefinitely.
+    track_offset = request.app.state.store.frame_offset_in_track(
+        dataset_id,
+        track_id=str(frame["track_id"]),
+        ordinal=int(frame["ordinal"]),
+    )
     return {
         "frame": public_frame(frame),
-        "page_offset": max(0, int(frame["ordinal"]) - 120),
+        "page_offset": max(0, track_offset - 120),
         "match": match,
     }
 

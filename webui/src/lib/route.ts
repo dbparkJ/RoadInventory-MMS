@@ -36,9 +36,19 @@ function groupRouteByTrack(route: RoutePoint[]): Map<string, RoutePoint[]> {
   return tracks
 }
 
-export function buildTrackColorMap(route: RoutePoint[]): Map<string, string> {
+export function buildTrackColorMap(
+  route: RoutePoint[],
+  preferredTrackIds: readonly string[] = [],
+): Map<string, string> {
+  const routeTrackIds = [...groupRouteByTrack(route).keys()]
+  const knownTrackIds = new Set<string>()
+  const orderedTrackIds = [...preferredTrackIds, ...routeTrackIds].filter((trackId) => {
+    if (knownTrackIds.has(trackId)) return false
+    knownTrackIds.add(trackId)
+    return true
+  })
   return new Map(
-    [...groupRouteByTrack(route).keys()].map((trackId, index) => [
+    orderedTrackIds.map((trackId, index) => [
       trackId,
       TRACK_COLORS[index % TRACK_COLORS.length],
     ]),
@@ -47,6 +57,7 @@ export function buildTrackColorMap(route: RoutePoint[]): Map<string, string> {
 
 export function buildRouteFeatureCollection(
   route: RoutePoint[],
+  trackColors?: ReadonlyMap<string, string>,
 ): FeatureCollection<LineString, RouteFeatureProperties> {
   const tracks = groupRouteByTrack(route)
 
@@ -60,7 +71,8 @@ export function buildRouteFeatureCollection(
               properties: {
                 track_id: trackId,
                 track_index: trackIndex,
-                track_color: TRACK_COLORS[trackIndex % TRACK_COLORS.length],
+                track_color:
+                  trackColors?.get(trackId) ?? TRACK_COLORS[trackIndex % TRACK_COLORS.length],
               },
               geometry: {
                 type: 'LineString' as const,
@@ -82,6 +94,7 @@ export function buildRouteRangeFeatureCollection(
   route: RoutePoint[],
   frameIndexes: ReadonlyMap<string, number>,
   frameRange: readonly [number, number] | null | undefined,
+  trackColors?: ReadonlyMap<string, string>,
 ): FeatureCollection<LineString, RouteFeatureProperties> {
   if (!frameRange) return { type: 'FeatureCollection', features: [] }
 
@@ -98,7 +111,8 @@ export function buildRouteRangeFeatureCollection(
           properties: {
             track_id: trackId,
             track_index: trackIndex,
-            track_color: TRACK_COLORS[trackIndex % TRACK_COLORS.length],
+            track_color:
+              trackColors?.get(trackId) ?? TRACK_COLORS[trackIndex % TRACK_COLORS.length],
           },
           geometry: {
             type: 'LineString',

@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Frame } from '../types'
 import {
   collectionForMapLayer,
+  buildSurveyFeatureCollection,
+  filterMapTracks,
+  firstTargetEntityId,
   frameNavigationTarget,
   isVWorld2DMapMode,
   mapProviderForMode,
@@ -44,6 +47,44 @@ describe('MapView frame navigation policy', () => {
 })
 
 describe('MapView map modes', () => {
+  it('builds independent saved and draft field-survey lines', () => {
+    const collection = buildSurveyFeatureCollection(
+      [{
+        id: 'survey-1',
+        dataset_id: 'dataset-1',
+        name: '현장조사 필요구간 1',
+        color: '#f59e0b',
+        geometry: { type: 'LineString', coordinates: [[127, 37], [127.1, 37.1]] },
+        created_at: '2026-08-14T00:00:00Z',
+        updated_at: '2026-08-14T00:00:00Z',
+      }],
+      [[128, 38], [128.1, 38.1]],
+      '#22d3ee',
+    )
+
+    expect(collection.features).toHaveLength(2)
+    expect(collection.features.map((feature) => feature.properties?.track_color)).toEqual([
+      '#f59e0b',
+      '#22d3ee',
+    ])
+    expect(collection.features[1].properties?.survey_draft).toBe(1)
+  })
+
+  it('filters route points and frames to independently visible tracks', () => {
+    const visible = new Set(['track-a', 'track-c'])
+    const items = [
+      { track_id: 'track-a' },
+      { track_id: 'track-b' },
+      { track_id: 'track-c' },
+    ]
+
+    expect(filterMapTracks(items, visible).map((item) => item.track_id)).toEqual([
+      'track-a',
+      'track-c',
+    ])
+    expect(filterMapTracks(items, new Set())).toEqual([])
+  })
+
   it('returns an empty collection when an independent map layer is hidden', () => {
     const collection = {
       type: 'FeatureCollection' as const,
@@ -73,6 +114,17 @@ describe('MapView map modes', () => {
     expect(mapProviderForMode('2d')).toBe('vworld-wmts-base-1.0.0')
     expect(mapProviderForMode('satellite')).toBe('vworld-wmts-satellite-1.0.0')
     expect(mapProviderForMode('3d')).toBe('vworld-webgl-3.0')
+  })
+
+  it('walks past non-interactive survey picks to the first mapped 3D entity', () => {
+    const frameTargets = new Map([['frame:4', vi.fn()]])
+    const overlayTargets = new Map([['overlay:2', vi.fn()]])
+
+    expect(firstTargetEntityId(
+      ['route:0', 'route:0:halo', 'frame:4', 'overlay:2'],
+      [frameTargets, overlayTargets],
+    )).toBe('frame:4')
+    expect(firstTargetEntityId(['route:0', 'route:0:halo'], [frameTargets])).toBeNull()
   })
 })
 
@@ -129,6 +181,23 @@ describe('MapView iframe shortcut relay', () => {
     expect(event.defaultPrevented).toBe(true)
     expect(dispatchEvent).toHaveBeenCalledOnce()
     expect(dispatchEvent.mock.calls[0][0]).toMatchObject({ code: 'KeyN', repeat: true })
+  })
+
+  it('relays P from the iframe after a feature mutation leaves map focus active', () => {
+    const dispatchEvent = vi.fn((relayedEvent: Event) => {
+      relayedEvent.preventDefault()
+      return false
+    })
+    const ownerWindow = { document, dispatchEvent } as unknown as Window
+    const event = new KeyboardEvent('keydown', {
+      key: 'p',
+      code: 'KeyP',
+      cancelable: true,
+    })
+
+    expect(relayMapOverlayShortcut(event, ownerWindow)).toBe(true)
+    expect(event.defaultPrevented).toBe(true)
+    expect(dispatchEvent.mock.calls[0][0]).toMatchObject({ code: 'KeyP' })
   })
 
   it('does not relay modified or editable-target N keys', () => {

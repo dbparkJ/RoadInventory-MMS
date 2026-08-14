@@ -15,11 +15,13 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type {
   AutoPreset,
   DatasetSummary,
+  Frame,
   FrameRange,
   ManualParameters,
   ParameterMode,
   RunRequest,
 } from '../types'
+import { FrameRangePicker } from './FrameRangePicker'
 
 const DEFAULT_PARAMETERS: ManualParameters = {
   voxel_size: 0.1,
@@ -110,19 +112,29 @@ const PRESETS: Array<{
 export function OptimizationPanel({
   dataset,
   selectedTrack,
+  selectedFrame,
   frameRange,
   busy,
   externalAction,
   onStart,
   onOptimize,
+  onSetFrameRangeStart,
+  onSetFrameRangeEnd,
+  onFrameRangeChange,
+  onClearFrameRange,
 }: {
   dataset: DatasetSummary | null
   selectedTrack: string
+  selectedFrame: Frame | null
   frameRange: FrameRange | null
   busy: boolean
   externalAction?: ReactNode
   onStart: (request: RunRequest) => Promise<void>
   onOptimize: (request: RunRequest) => Promise<ManualParameters | undefined>
+  onSetFrameRangeStart: (ordinal: number) => void
+  onSetFrameRangeEnd: (ordinal: number) => void
+  onFrameRangeChange: (range: FrameRange) => void
+  onClearFrameRange: () => void
 }) {
   const [mode, setMode] = useState<ParameterMode>('automatic')
   const [parameters, setParameters] = useState(DEFAULT_PARAMETERS)
@@ -135,7 +147,7 @@ export function OptimizationPanel({
   }, [dataset?.id])
 
   const datasetReady = dataset?.status === 'ready'
-  const selectedTrackFrameCount = selectedTrack
+  const selectedScopeFrameCount = selectedTrack
     ? dataset?.tracks.find((track) => track.id === selectedTrack)?.frame_count
     : dataset?.frame_count
   const request: RunRequest | null = dataset && datasetReady
@@ -180,6 +192,16 @@ export function OptimizationPanel({
       </div>
 
       <div className="inspector-scroll">
+        <FrameRangePicker
+          frameLimit={Math.max(1, dataset?.frame_count ?? 1)}
+          selectedFrame={selectedFrame}
+          frameRange={frameRange}
+          onSetStart={onSetFrameRangeStart}
+          onSetEnd={onSetFrameRangeEnd}
+          onChange={onFrameRangeChange}
+          onClear={onClearFrameRange}
+        />
+
         <section className="setup-section">
           <div className="section-label">
             <span>파라미터 모드</span>
@@ -334,8 +356,8 @@ export function OptimizationPanel({
                     : '전체 구간'}
           </span>
           <small>
-            {dataset && selectedTrackFrameCount !== undefined
-              ? `${selectedTrackFrameCount.toLocaleString('ko-KR')} frames`
+            {dataset && selectedScopeFrameCount !== undefined
+              ? `${selectedScopeFrameCount.toLocaleString('ko-KR')} frames`
               : '—'}
           </small>
         </div>

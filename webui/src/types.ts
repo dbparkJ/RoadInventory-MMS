@@ -235,6 +235,21 @@ export interface RunRecord {
     finished_at?: string
   eta_seconds?: number
   result_url?: string
+  request?: RunRequest
+  resolved?: Record<string, unknown>
+}
+
+export interface SurveySegment {
+  id: string
+  dataset_id: string
+  name: string
+  color: string
+  geometry: {
+    type: 'LineString'
+    coordinates: [number, number][]
+  }
+  created_at: string
+  updated_at: string
 }
 
 export interface RunResultFile {

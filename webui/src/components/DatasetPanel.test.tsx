@@ -60,14 +60,9 @@ function renderPanel(overrides: Partial<ComponentProps<typeof DatasetPanel>> = {
     framesLoadingMore: false,
     frameTotal: FRAMES.length,
     hasMoreFrames: false,
-    frameRange: null,
     onDatasetChange: vi.fn(),
     onTrackChange: vi.fn(),
     onFrameChange: vi.fn(),
-    onSetFrameRangeStart: vi.fn(),
-    onSetFrameRangeEnd: vi.fn(),
-    onFrameRangeChange: vi.fn(),
-    onClearFrameRange: vi.fn(),
     onLoadMoreFrames: vi.fn(),
     onOpenSource: vi.fn(),
     ...overrides,
@@ -78,39 +73,12 @@ function renderPanel(overrides: Partial<ComponentProps<typeof DatasetPanel>> = {
 
 afterEach(cleanup)
 
-describe('DatasetPanel frame range selection', () => {
-  it('applies a one-based numeric range as an ordered zero-based ordinal range', () => {
-    const onFrameRangeChange = vi.fn()
-    renderPanel({ onFrameRangeChange })
-
-    fireEvent.change(screen.getByRole('spinbutton', { name: '실행 시작 프레임 번호' }), {
-      target: { value: '12' },
-    })
-    fireEvent.change(screen.getByRole('spinbutton', { name: '실행 끝 프레임 번호' }), {
-      target: { value: '5' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: '적용' }))
-
-    expect(onFrameRangeChange).toHaveBeenCalledOnce()
-    expect(onFrameRangeChange).toHaveBeenCalledWith([4, 11])
-  })
-
-  it('uses the map-selected frame as either execution range boundary', () => {
-    const onSetFrameRangeStart = vi.fn()
-    const onSetFrameRangeEnd = vi.fn()
-    renderPanel({ onSetFrameRangeStart, onSetFrameRangeEnd, selectedFrame: FRAMES[1] })
-
-    fireEvent.click(screen.getByRole('button', { name: '현재 프레임 21을 실행 범위 시작으로 지정' }))
-    fireEvent.click(screen.getByRole('button', { name: '현재 프레임 21을 실행 범위 끝으로 지정' }))
-
-    expect(onSetFrameRangeStart).toHaveBeenCalledWith(20)
-    expect(onSetFrameRangeEnd).toHaveBeenCalledWith(20)
-  })
-
-  it('removes the frame list while retaining compact execution range controls', () => {
+describe('DatasetPanel data explorer', () => {
+  it('does not render execution range controls or the retired frame list', () => {
     renderPanel()
 
-    expect(screen.getByRole('spinbutton', { name: '실행 시작 프레임 번호' })).toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: '실행 시작 프레임 번호' })).not.toBeInTheDocument()
+    expect(screen.queryByText('실행 프레임 범위')).not.toBeInTheDocument()
     expect(screen.queryByText('frame-11')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /프레임 컴포넌트/ })).not.toBeInTheDocument()
   })
@@ -177,5 +145,23 @@ describe('DatasetPanel frame range selection', () => {
       'aria-expanded',
       'false',
     )
+  })
+
+  it('naturally sorts track rows by their displayed names', () => {
+    renderPanel({
+      selectedDataset: {
+        ...DATASET,
+        tracks: [
+          { id: 'sec-10', name: 'SEC_10', frame_count: 1 },
+          { id: 'sec-2', name: 'SEC_02', frame_count: 1 },
+          { id: 'sec-5', name: 'SEC_05', frame_count: 1 },
+          { id: 'sec-1', name: 'SEC_01', frame_count: 1 },
+        ],
+      },
+    })
+
+    expect(
+      Array.from(document.querySelectorAll('.track-row strong')).map((node) => node.textContent),
+    ).toEqual(['전체 구간', 'SEC_01', 'SEC_02', 'SEC_05', 'SEC_10'])
   })
 })

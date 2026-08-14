@@ -513,6 +513,113 @@ class WebAppRunSafetyTests(unittest.TestCase):
                     404,
                 )
 
+    def test_completed_dataset_runs_lists_every_durable_job_in_finish_order(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            seed_dataset(app.state.store)
+            for run_id, created_at, finished_at in (
+                (
+                    "run-finished-later",
+                    "2026-08-01T00:00:00+00:00",
+                    "2026-08-01T03:00:00+00:00",
+                ),
+                (
+                    "run-finished-earlier",
+                    "2026-08-01T01:00:00+00:00",
+                    "2026-08-01T02:00:00+00:00",
+                ),
+            ):
+                app.state.store.create_run(
+                    {
+                        "id": run_id,
+                        "dataset_id": "dataset-a",
+                        "request": {
+                            "dataset_id": "dataset-a",
+                            "track_ids": ["track-a"],
+                            "frame_range": [1, 7],
+                        },
+                        "resolved": {},
+                        "work_relative": run_id,
+                        "created_at": created_at,
+                        "updated_at": created_at,
+                    }
+                )
+                app.state.store.update_run(
+                    run_id,
+                    finished_at,
+                    status="completed",
+                    return_code=0,
+                    finished_at=finished_at,
+                )
+                app.state.store.dismiss_terminal_run(run_id, finished_at)
+
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/datasets/dataset-a/runs/completed?limit=100"
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(
+                [item["id"] for item in response.json()["items"]],
+                ["run-finished-later", "run-finished-earlier"],
+            )
+            self.assertEqual(
+                response.json()["items"][0]["request"]["frame_range"],
+                [1, 7],
+            )
+            paged = client.get(
+                "/api/datasets/dataset-a/runs/completed?limit=1&offset=0"
+            )
+            self.assertEqual(paged.status_code, 200, paged.text)
+            self.assertEqual(paged.json()["total"], 2)
+            self.assertEqual(paged.json()["next_offset"], 1)
+            snapshot_at = paged.json()["snapshot_at"]
+            self.assertIsInstance(snapshot_at, str)
+            self.assertEqual(
+                [item["id"] for item in paged.json()["items"]],
+                ["run-finished-later"],
+            )
+            app.state.store.create_run(
+                {
+                    "id": "run-completed-after-snapshot",
+                    "dataset_id": "dataset-a",
+                    "request": {
+                        "dataset_id": "dataset-a",
+                        "track_ids": ["track-a"],
+                        "frame_range": None,
+                    },
+                    "resolved": {},
+                    "work_relative": "run-completed-after-snapshot",
+                    "created_at": "2999-01-01T00:00:00+00:00",
+                    "updated_at": "2999-01-01T00:00:00+00:00",
+                }
+            )
+            app.state.store.update_run(
+                "run-completed-after-snapshot",
+                "2999-01-01T00:01:00+00:00",
+                status="completed",
+                return_code=0,
+                finished_at="2999-01-01T00:01:00+00:00",
+            )
+            last_page = client.get(
+                "/api/datasets/dataset-a/runs/completed",
+                params={"limit": 1, "offset": 1, "snapshot_at": snapshot_at},
+            )
+            self.assertEqual(last_page.status_code, 200, last_page.text)
+            self.assertEqual(last_page.json()["total"], 2)
+            self.assertIsNone(last_page.json()["next_offset"])
+            self.assertEqual(
+                [item["id"] for item in last_page.json()["items"]],
+                ["run-finished-earlier"],
+            )
+
     def test_run_archives_are_complete_filtered_and_path_redacted(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

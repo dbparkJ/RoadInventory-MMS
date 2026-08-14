@@ -12,15 +12,21 @@ import {
   Layers3,
   Map,
   Route,
+  Save,
   Shapes,
   Table2,
+  Trash2,
+  Undo2,
   X,
 } from 'lucide-react'
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { api } from '../lib/api'
 import { frameNavigationDirection } from '../lib/frameNavigation'
 import type { PanoramaHoverProjection } from '../lib/panoramaProjection'
+import { TRACK_COLORS } from '../lib/route'
+import { naturalSortTracks } from '../lib/tracks'
 import { DEFAULT_USER_SETTINGS, type UserSettings, type UserSettingsPatch } from '../lib/userSettings'
-import type { DatasetSummary, Frame, FrameRange, RoutePoint } from '../types'
+import type { DatasetSummary, Frame, FrameRange, RoutePoint, SurveySegment } from '../types'
 import type { MapMode } from '../views/MapView'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
@@ -94,15 +100,206 @@ export function Workspace({
   const panoramaPanelRef = useRef<DetachablePanelHandle>(null)
   const pointCloudPanelRef = useRef<DetachablePanelHandle>(null)
   const [mapMode, setMapMode] = useState<MapMode>('2d')
-  const [trackLayerVisible, setTrackLayerVisible] = useState(true)
+  const sortedTracks = useMemo(() => naturalSortTracks(dataset?.tracks ?? []), [dataset?.tracks])
+  const trackCatalogueKey = `${dataset?.id ?? ''}:${sortedTracks.map((track) => track.id).join('\u0000')}`
+  const [trackVisibility, setTrackVisibility] = useState<{
+    catalogueKey: string
+    hiddenTrackIds: ReadonlySet<string>
+  }>(() => ({ catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set() }))
+  const hiddenTrackIds =
+    trackVisibility.catalogueKey === trackCatalogueKey
+      ? trackVisibility.hiddenTrackIds
+      : new Set<string>()
+  const visibleTrackIds = useMemo(
+    () => new Set(sortedTracks.filter((track) => !hiddenTrackIds.has(track.id)).map((track) => track.id)),
+    [hiddenTrackIds, sortedTracks],
+  )
+  const trackOrder = useMemo(() => sortedTracks.map((track) => track.id), [sortedTracks])
   const [layerCardCollapsed, setLayerCardCollapsed] = useState(false)
+  const [surveySegments, setSurveySegments] = useState<SurveySegment[]>([])
+  const [hiddenSurveySegmentIds, setHiddenSurveySegmentIds] = useState<ReadonlySet<string>>(new Set())
+  const [surveyDrawing, setSurveyDrawing] = useState(false)
+  const [surveyDraft, setSurveyDraft] = useState<[number, number][]>([])
+  const [surveyDraftName, setSurveyDraftName] = useState('현장조사 필요구간 1')
+  const [surveyDraftColor, setSurveyDraftColor] = useState('#f59e0b')
+  const [surveyBusy, setSurveyBusy] = useState(false)
+  const [surveyError, setSurveyError] = useState<string | null>(null)
+  const surveyLoadControllerRef = useRef<AbortController | null>(null)
+  const surveyMutationControllerRef = useRef<AbortController | null>(null)
+  const surveyGenerationRef = useRef(0)
+  const surveyDatasetIdRef = useRef(dataset?.id ?? '')
+  surveyDatasetIdRef.current = dataset?.id ?? ''
   const [hoveredPanoramaPoint, setHoveredPanoramaPoint] = useState<PanoramaHoverProjection | null>(null)
   const currentIndex = frame ? frames.findIndex((candidate) => candidate.id === frame.id) : -1
   const canMovePrevious = currentIndex > 0
   const canMoveNext = currentIndex >= 0 && (currentIndex < frames.length - 1 || hasMoreFrames)
 
+  const visibleSurveySegments = useMemo(
+    () => surveySegments.filter((segment) => !hiddenSurveySegmentIds.has(segment.id)),
+    [hiddenSurveySegmentIds, surveySegments],
+  )
+
   useEffect(() => setHoveredPanoramaPoint(null), [frame?.id])
-  useEffect(() => setTrackLayerVisible(true), [dataset?.id])
+  useEffect(() => {
+    setTrackVisibility((current) =>
+      current.catalogueKey === trackCatalogueKey
+        ? current
+        : { catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set() },
+    )
+  }, [trackCatalogueKey])
+
+  useEffect(() => {
+    surveyGenerationRef.current += 1
+    surveyLoadControllerRef.current?.abort()
+    surveyMutationControllerRef.current?.abort()
+    const controller = new AbortController()
+    surveyLoadControllerRef.current = controller
+    setSurveySegments([])
+    setHiddenSurveySegmentIds(new Set())
+    setSurveyDrawing(false)
+    setSurveyDraft([])
+    setSurveyBusy(false)
+    setSurveyError(null)
+    setSurveyDraftName('현장조사 필요구간 1')
+    if (!dataset || demoMode) return () => controller.abort()
+
+    void api.surveySegments(dataset.id, controller.signal).then(
+      ({ items }) => {
+        if (controller.signal.aborted) return
+        setSurveySegments(items)
+        setSurveyDraftName(`현장조사 필요구간 ${items.length + 1}`)
+        if (surveyLoadControllerRef.current === controller) surveyLoadControllerRef.current = null
+      },
+      (reason) => {
+        if (controller.signal.aborted) return
+        setSurveyError(reason instanceof Error ? reason.message : '현장조사 구간을 불러오지 못했습니다.')
+        if (surveyLoadControllerRef.current === controller) surveyLoadControllerRef.current = null
+      },
+    )
+    return () => {
+      controller.abort()
+      surveyMutationControllerRef.current?.abort()
+    }
+  }, [dataset?.id, demoMode])
+
+  useEffect(() => {
+    if (!overlay?.pickMode || !surveyDrawing) return
+    setSurveyDrawing(false)
+    setSurveyDraft([])
+    setSurveyError(null)
+  }, [overlay?.pickMode, surveyDrawing])
+
+  const addSurveyPoint = useCallback((coordinate: [number, number]) => {
+    setSurveyDraft((current) => [...current, coordinate])
+    setSurveyError(null)
+  }, [])
+
+  const startSurveyDrawing = () => {
+    if (!dataset || overlay?.pickMode) return
+    setSurveyDrawing(true)
+    setSurveyDraft([])
+    setSurveyDraftName(`현장조사 필요구간 ${surveySegments.length + 1}`)
+    setSurveyError(null)
+  }
+
+  const cancelSurveyDrawing = () => {
+    setSurveyDrawing(false)
+    setSurveyDraft([])
+    setSurveyError(null)
+  }
+
+  const saveSurveyDrawing = async () => {
+    if (!dataset || surveyDraft.length < 2 || surveyBusy) return
+    const name = surveyDraftName.trim()
+    if (!name) {
+      setSurveyError('구간 이름을 입력해 주세요.')
+      return
+    }
+    setSurveyBusy(true)
+    setSurveyError(null)
+    surveyLoadControllerRef.current?.abort()
+    const generation = surveyGenerationRef.current
+    const controller = new AbortController()
+    surveyMutationControllerRef.current = controller
+    try {
+      const created = demoMode
+        ? {
+            id: `survey-demo-${Date.now()}`,
+            dataset_id: dataset.id,
+            name,
+            color: surveyDraftColor,
+            geometry: { type: 'LineString' as const, coordinates: surveyDraft },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          }
+        : (await api.createSurveySegment(dataset.id, {
+            name,
+            color: surveyDraftColor,
+            coordinates: surveyDraft,
+          }, controller.signal)).segment
+      if (
+        controller.signal.aborted ||
+        surveyGenerationRef.current !== generation ||
+        surveyDatasetIdRef.current !== dataset.id
+      ) return
+      setSurveySegments((current) => [...current, created])
+      setSurveyDrawing(false)
+      setSurveyDraft([])
+      setSurveyDraftName(`현장조사 필요구간 ${surveySegments.length + 2}`)
+    } catch (reason) {
+      if (controller.signal.aborted || surveyGenerationRef.current !== generation) return
+      setSurveyError(reason instanceof Error ? reason.message : '현장조사 구간을 저장하지 못했습니다.')
+    } finally {
+      if (surveyMutationControllerRef.current === controller) {
+        surveyMutationControllerRef.current = null
+      }
+      if (surveyGenerationRef.current === generation) setSurveyBusy(false)
+    }
+  }
+
+  const deleteSurveySegment = async (segment: SurveySegment, ownerWindow: Window | null) => {
+    if (!dataset || surveyBusy) return
+    if (!ownerWindow?.confirm(`“${segment.name}” 구간을 삭제할까요?`)) return
+    setSurveyBusy(true)
+    setSurveyError(null)
+    surveyLoadControllerRef.current?.abort()
+    const generation = surveyGenerationRef.current
+    const controller = new AbortController()
+    surveyMutationControllerRef.current = controller
+    try {
+      if (!demoMode) await api.deleteSurveySegment(dataset.id, segment.id, controller.signal)
+      if (
+        controller.signal.aborted ||
+        surveyGenerationRef.current !== generation ||
+        surveyDatasetIdRef.current !== dataset.id
+      ) return
+      setSurveySegments((current) => current.filter((candidate) => candidate.id !== segment.id))
+      setHiddenSurveySegmentIds((current) => {
+        const next = new Set(current)
+        next.delete(segment.id)
+        return next
+      })
+    } catch (reason) {
+      if (controller.signal.aborted || surveyGenerationRef.current !== generation) return
+      setSurveyError(reason instanceof Error ? reason.message : '현장조사 구간을 삭제하지 못했습니다.')
+    } finally {
+      if (surveyMutationControllerRef.current === controller) {
+        surveyMutationControllerRef.current = null
+      }
+      if (surveyGenerationRef.current === generation) setSurveyBusy(false)
+    }
+  }
+
+  const toggleTrackLayer = (trackId: string) => {
+    setTrackVisibility((current) => {
+      const nextHidden = new Set(
+        current.catalogueKey === trackCatalogueKey ? current.hiddenTrackIds : [],
+      )
+      if (nextHidden.has(trackId)) nextHidden.delete(trackId)
+      else nextHidden.add(trackId)
+      return { catalogueKey: trackCatalogueKey, hiddenTrackIds: nextHidden }
+    })
+  }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -117,8 +314,11 @@ export function Workspace({
     }
     // Keep the canonical listener in the application window. DetachablePanel
     // relays the same keys from every child popup, including nested popouts.
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    // Capture before focused map/viewer widgets can stop propagation.  A SHP
+    // point pick leaves focus in those widgets, so a bubbling-only listener
+    // made navigation appear dead immediately after create/delete workflows.
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [canMoveNext, canMovePrevious, onMoveFrame])
 
   const togglePanoramaPopup = () => {
@@ -228,12 +428,18 @@ export function Workspace({
                 selectedFrame={frame}
                 activeTrackId={selectedTrack}
                 showAllTracks={settings.showAllMapTracks}
-                trackLayerVisible={trackLayerVisible}
+                visibleTrackIds={visibleTrackIds}
+                trackOrder={trackOrder}
                 frameRange={frameRange}
                 loading={routeLoading}
                 mapMode={mapMode}
                 onMapModeChange={setMapMode}
                 onSelectFrame={onFrameChange}
+                surveySegments={visibleSurveySegments}
+                surveyDraft={surveyDraft}
+                surveyDraftColor={surveyDraftColor}
+                surveyDrawing={surveyDrawing}
+                onAddSurveyPoint={addSurveyPoint}
               />
             </Suspense>
 
@@ -245,8 +451,8 @@ export function Workspace({
                 <span>
                   <Shapes size={14} /> 검출·트랙 레이어
                   <small>
-                    {(trackLayerVisible ? 1 : 0) + (overlay?.visibleLayerIds.size ?? 0)} /{' '}
-                    {1 + (overlay?.layers.length ?? 0)}
+                    {visibleTrackIds.size + (overlay?.visibleLayerIds.size ?? 0) + visibleSurveySegments.length} /{' '}
+                    {sortedTracks.length + (overlay?.layers.length ?? 0) + surveySegments.length}
                   </small>
                 </span>
                 <button
@@ -264,20 +470,35 @@ export function Workspace({
               </header>
               {!layerCardCollapsed && (
                 <div id="map-layer-quick-list" className="map-layer-quick-list">
-                  <button
-                    type="button"
-                    className={trackLayerVisible ? 'active' : ''}
-                    aria-pressed={trackLayerVisible}
-                    onClick={() => setTrackLayerVisible((visible) => !visible)}
-                    title={`MMS 트랙 ${trackLayerVisible ? '숨기기' : '표시'}`}
-                  >
-                    <i className="map-layer-track-swatch">
-                      <Route size={11} />
-                    </i>
-                    <span>MMS 트랙</span>
-                    <small>경로 · 프레임</small>
-                    {trackLayerVisible ? <Eye size={13} /> : <EyeOff size={13} />}
-                  </button>
+                  {sortedTracks.map((track, index) => {
+                    const visible = visibleTrackIds.has(track.id)
+                    const current = selectedTrack === track.id
+                    const trackColor = TRACK_COLORS[index % TRACK_COLORS.length]
+                    return (
+                      <button
+                        type="button"
+                        key={`track:${track.id}`}
+                        className={`${visible ? 'active' : ''} ${current ? 'current-track' : ''}`.trim()}
+                        aria-pressed={visible}
+                        onClick={() => toggleTrackLayer(track.id)}
+                        title={`${track.name || track.id} 트랙 ${visible ? '숨기기' : '표시'}${
+                          current ? ' (현재 작업 트랙)' : ''
+                        }`}
+                      >
+                        <i
+                          className="map-layer-track-swatch"
+                          style={{ color: trackColor, borderColor: trackColor }}
+                        >
+                          <Route size={11} />
+                        </i>
+                        <span>{track.name || track.id}</span>
+                        <small>
+                          {current ? '현재 · ' : ''}{track.frame_count.toLocaleString('ko-KR')}
+                        </small>
+                        {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                      </button>
+                    )
+                  })}
                   {overlay?.layers.map((layer) => {
                     const visible = overlay.visibleLayerIds.has(layer.id)
                     return (
@@ -296,6 +517,91 @@ export function Workspace({
                       </button>
                     )
                   })}
+                  <div className="map-layer-group-title">
+                    <span><Route size={11} /> 현장조사 구간</span>
+                    <button
+                      type="button"
+                      className="map-layer-add-survey"
+                      onClick={surveyDrawing ? cancelSurveyDrawing : startSurveyDrawing}
+                      disabled={!dataset || surveyBusy || Boolean(overlay?.pickMode)}
+                    >
+                      {surveyDrawing ? <X size={11} /> : <Shapes size={11} />}
+                      {surveyDrawing ? '그리기 취소' : '구간 그리기'}
+                    </button>
+                  </div>
+                  {surveySegments.map((segment) => {
+                    const visible = !hiddenSurveySegmentIds.has(segment.id)
+                    return (
+                      <div className={`map-layer-survey-row ${visible ? 'active' : ''}`} key={segment.id}>
+                        <button
+                          type="button"
+                          aria-pressed={visible}
+                          onClick={() => setHiddenSurveySegmentIds((current) => {
+                            const next = new Set(current)
+                            if (next.has(segment.id)) next.delete(segment.id)
+                            else next.add(segment.id)
+                            return next
+                          })}
+                          title={`${segment.name} ${visible ? '숨기기' : '표시'}`}
+                        >
+                          <i className="survey-line-swatch" style={{ background: segment.color }} />
+                          <span>{segment.name}</span>
+                          {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                        </button>
+                        <button
+                          type="button"
+                          className="map-layer-survey-delete"
+                          aria-label={`${segment.name} 삭제`}
+                          title={`${segment.name} 삭제`}
+                          disabled={surveyBusy}
+                          onClick={(event) => void deleteSurveySegment(
+                            segment,
+                            event.currentTarget.ownerDocument.defaultView,
+                          )}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    )
+                  })}
+                  {surveyDrawing && (
+                    <div className="survey-drawing-editor" role="group" aria-label="현장조사 구간 그리기">
+                      <label>
+                        <span>구간 이름</span>
+                        <input
+                          value={surveyDraftName}
+                          maxLength={120}
+                          onChange={(event) => setSurveyDraftName(event.target.value)}
+                        />
+                      </label>
+                      <label className="survey-color-field">
+                        <span>색상</span>
+                        <input
+                          type="color"
+                          value={surveyDraftColor}
+                          onChange={(event) => setSurveyDraftColor(event.target.value)}
+                        />
+                      </label>
+                      <p>지도를 클릭해 꼭짓점을 추가하세요. 현재 {surveyDraft.length}개</p>
+                      <div>
+                        <button
+                          type="button"
+                          onClick={() => setSurveyDraft((current) => current.slice(0, -1))}
+                          disabled={surveyDraft.length === 0 || surveyBusy}
+                        >
+                          <Undo2 size={11} /> 실행 취소
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void saveSurveyDrawing()}
+                          disabled={surveyDraft.length < 2 || surveyBusy}
+                        >
+                          <Save size={11} /> 저장
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {surveyError && <p className="survey-layer-error" role="alert">{surveyError}</p>}
                 </div>
               )}
             </section>

@@ -23,7 +23,7 @@ import {
   cameraTargetForCoordinates,
   createVWorldDataSource,
   moveVWorldMap,
-  pickedEntityId,
+  pickedEntityIdsAtPosition,
   removeVWorldDataSource,
   renderVWorldFrames,
   renderVWorldOverlay,
@@ -85,7 +85,7 @@ import {
   type VWorld2DDataSource,
   type VWorld2DRuntime,
 } from '../lib/vworld2d'
-import type { Frame, FrameRange, RoutePoint } from '../types'
+import type { Frame, FrameRange, RoutePoint, SurveySegment } from '../types'
 
 const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
   type: 'FeatureCollection',
@@ -116,6 +116,55 @@ export function mapProviderForMode(mode: MapMode): string {
     : 'vworld-wmts-base-1.0.0'
 }
 
+export function filterMapTracks<T extends { track_id?: string }>(
+  items: readonly T[],
+  visibleTrackIds: ReadonlySet<string>,
+): T[] {
+  return items.filter((item) => Boolean(item.track_id && visibleTrackIds.has(item.track_id)))
+}
+
+export function buildSurveyFeatureCollection(
+  segments: readonly SurveySegment[],
+  draft: readonly [number, number][],
+  draftColor: string,
+): FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: [
+      ...segments.map((segment) => ({
+        type: 'Feature' as const,
+        id: segment.id,
+        properties: {
+          track_color: segment.color,
+          survey_segment_id: segment.id,
+          survey_name: segment.name,
+        },
+        geometry: segment.geometry,
+      })),
+      ...(draft.length >= 2
+        ? [{
+            type: 'Feature' as const,
+            id: 'survey-draft',
+            properties: { track_color: draftColor, survey_draft: 1 },
+            geometry: { type: 'LineString' as const, coordinates: [...draft] },
+          }]
+        : []),
+    ],
+  }
+}
+
+interface EntityTargetCollection {
+  has(entityId: string): boolean
+}
+
+export function firstTargetEntityId(
+  entityIds: readonly string[],
+  targetCollections: readonly EntityTargetCollection[],
+): string | null {
+  return entityIds.find((entityId) =>
+    targetCollections.some((targets) => targets.has(entityId))) ?? null
+}
+
 interface MapViewProps {
   route: RoutePoint[]
   frames: Frame[]
@@ -123,11 +172,18 @@ interface MapViewProps {
   activeTrackId?: string
   showAllTracks?: boolean
   trackLayerVisible?: boolean
+  visibleTrackIds?: ReadonlySet<string>
+  trackOrder?: readonly string[]
   frameRange?: FrameRange | null
   loading: boolean
   mapMode: MapMode
   onMapModeChange: (mode: MapMode) => void
   onSelectFrame: (frame: Frame) => void
+  surveySegments?: SurveySegment[]
+  surveyDraft?: [number, number][]
+  surveyDraftColor?: string
+  surveyDrawing?: boolean
+  onAddSurveyPoint?: (coordinate: [number, number]) => void
 }
 
 interface VWorldBoot {
@@ -145,6 +201,7 @@ interface VWorldSources {
   routeRange: VWorldCustomDataSource
   frames: VWorldCustomDataSource
   overlay: VWorldCustomDataSource
+  survey: VWorldCustomDataSource
 }
 
 interface VWorld2DSources {
@@ -152,6 +209,7 @@ interface VWorld2DSources {
   routeRange: VWorld2DDataSource
   frames: VWorld2DDataSource
   overlay: VWorld2DDataSource
+  survey: VWorld2DDataSource
 }
 
 async function createVWorldSources(runtime: VWorldRuntime): Promise<VWorldSources> {
@@ -167,6 +225,7 @@ async function createVWorldSources(runtime: VWorldRuntime): Promise<VWorldSource
       routeRange: await create('mms-route-range'),
       frames: await create('mms-frames'),
       overlay: await create('mms-overlay'),
+      survey: await create('mms-field-survey'),
     }
   } catch (reason) {
     created.forEach((source) => removeVWorldDataSource(runtime, source))
@@ -180,6 +239,7 @@ function createVWorld2DSources(runtime: VWorld2DRuntime): VWorld2DSources {
     routeRange: createVWorld2DDataSource(runtime),
     frames: createVWorld2DDataSource(runtime),
     overlay: createVWorld2DDataSource(runtime),
+    survey: createVWorld2DDataSource(runtime),
   }
 }
 
@@ -206,11 +266,18 @@ export function MapView({
   activeTrackId,
   showAllTracks = false,
   trackLayerVisible = true,
+  visibleTrackIds,
+  trackOrder = [],
   frameRange,
   loading,
   mapMode,
   onMapModeChange,
   onSelectFrame,
+  surveySegments = [],
+  surveyDraft = [],
+  surveyDraftColor = '#f59e0b',
+  surveyDrawing = false,
+  onAddSurveyPoint,
 }: MapViewProps) {
   const mapRootRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -242,11 +309,15 @@ export function MapView({
   const overlay = useOptionalOverlayWorkspace()
   const overlayRef = useRef(overlay)
   const mapModeRef = useRef(mapMode)
+  const surveyDrawingRef = useRef(surveyDrawing)
+  const onAddSurveyPointRef = useRef(onAddSurveyPoint)
 
   onSelectRef.current = onSelectFrame
   framesRef.current = frames
   overlayRef.current = overlay
   mapModeRef.current = mapMode
+  surveyDrawingRef.current = surveyDrawing
+  onAddSurveyPointRef.current = onAddSurveyPoint
   mapHoverRef.current = mapHover
   pinnedMapHoverRef.current = pinnedMapHover
   const vworld2DActive = isVWorld2DMapMode(mapMode)
@@ -258,6 +329,10 @@ export function MapView({
       features: (overlay?.mapFeatures ?? []) as FeatureCollection['features'],
     }),
     [overlay?.mapFeatures],
+  )
+  const surveyGeoJson = useMemo(
+    () => buildSurveyFeatureCollection(surveySegments, surveyDraft, surveyDraftColor),
+    [surveyDraft, surveyDraftColor, surveySegments],
   )
   const selectedOverlayCoordinate = useMemo(() => {
     const geometry = overlay?.selectedFeature?.geometry
@@ -277,7 +352,13 @@ export function MapView({
     (layer) => overlay?.visibleLayerIds.has(layer.id) && overlay.features[layer.id]?.errorWgs84,
   ).length
 
-  const trackColors = useMemo(() => buildTrackColorMap(route), [route])
+  const trackOrderKey = trackOrder.join('\u0000')
+  const trackColors = useMemo(
+    () => buildTrackColorMap(route, trackOrder),
+    // The ordered ids are the semantic dependency; callers need not memoize the array.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [route, trackOrderKey],
+  )
   const { effectiveTrackId, showAllTracks: displayAllTracks } = resolveMapTrackScope(
     activeTrackId,
     selectedFrame?.track_id,
@@ -286,17 +367,21 @@ export function MapView({
   )
   const visibleRoute = useMemo(
     () =>
-      displayAllTracks || !effectiveTrackId
-        ? route
-        : route.filter((point) => point.track_id === effectiveTrackId),
-    [displayAllTracks, effectiveTrackId, route],
+      visibleTrackIds
+        ? filterMapTracks(route, visibleTrackIds)
+        : displayAllTracks || !effectiveTrackId
+          ? route
+          : route.filter((point) => point.track_id === effectiveTrackId),
+    [displayAllTracks, effectiveTrackId, route, visibleTrackIds],
   )
   const visibleFrames = useMemo(
     () =>
-      displayAllTracks || !effectiveTrackId
-        ? frames
-        : frames.filter((frame) => frame.track_id === effectiveTrackId),
-    [displayAllTracks, effectiveTrackId, frames],
+      visibleTrackIds
+        ? filterMapTracks(frames, visibleTrackIds)
+        : displayAllTracks || !effectiveTrackId
+          ? frames
+          : frames.filter((frame) => frame.track_id === effectiveTrackId),
+    [displayAllTracks, effectiveTrackId, frames, visibleTrackIds],
   )
   const frameIndexes = useMemo(
     () => new Map(frames.map((frame) => [frame.id, frame.index])),
@@ -326,30 +411,18 @@ export function MapView({
     [frameRange, selectedFrame, trackColors, visibleFrames],
   )
 
-  const renderedFrameGeoJson = collectionForMapLayer(frameGeoJson, trackLayerVisible)
+  const hasVisibleTracks = visibleTrackIds ? visibleTrackIds.size > 0 : trackLayerVisible
+  const renderedFrameGeoJson = collectionForMapLayer(frameGeoJson, hasVisibleTracks)
 
   const routeGeoJson = useMemo(() => {
-    const collection = buildRouteFeatureCollection(route)
-    if (displayAllTracks || !effectiveTrackId) return collection
-    return {
-      ...collection,
-      features: collection.features.filter(
-        (feature) => feature.properties.track_id === effectiveTrackId,
-      ),
-    }
-  }, [displayAllTracks, effectiveTrackId, route])
-  const routeRangeGeoJson = useMemo(() => {
-    const collection = buildRouteRangeFeatureCollection(route, frameIndexes, frameRange)
-    if (displayAllTracks || !effectiveTrackId) return collection
-    return {
-      ...collection,
-      features: collection.features.filter(
-        (feature) => feature.properties.track_id === effectiveTrackId,
-      ),
-    }
-  }, [displayAllTracks, effectiveTrackId, frameIndexes, frameRange, route])
-  const renderedRouteGeoJson = collectionForMapLayer(routeGeoJson, trackLayerVisible)
-  const renderedRouteRangeGeoJson = collectionForMapLayer(routeRangeGeoJson, trackLayerVisible)
+    return buildRouteFeatureCollection(visibleRoute, trackColors)
+  }, [trackColors, visibleRoute])
+  const routeRangeGeoJson = useMemo(
+    () => buildRouteRangeFeatureCollection(visibleRoute, frameIndexes, frameRange, trackColors),
+    [frameIndexes, frameRange, trackColors, visibleRoute],
+  )
+  const renderedRouteGeoJson = collectionForMapLayer(routeGeoJson, hasVisibleTracks)
+  const renderedRouteRangeGeoJson = collectionForMapLayer(routeRangeGeoJson, hasVisibleTracks)
 
   useEffect(() => {
     if (mapMode !== '3d') return
@@ -402,8 +475,23 @@ export function MapView({
         sourcesRef.current = sources
         mapClickHandler = (windowPosition, _ecefPosition, cartographic) => {
           if (!runtime) return
+          if (surveyDrawingRef.current && !overlayRef.current?.pickMode && cartographic) {
+            const longitude = Number(cartographic.longitudeDD)
+            const latitude = Number(cartographic.latitudeDD)
+            if (Number.isFinite(longitude) && Number.isFinite(latitude)) {
+              onAddSurveyPointRef.current?.([longitude, latitude])
+              return
+            }
+          }
           try {
-            const entityId = pickedEntityId(runtime.viewer.scene.pick(windowPosition))
+            const entityId = firstTargetEntityId(
+              pickedEntityIdsAtPosition(runtime.viewer.scene, windowPosition),
+              [
+                overlayHoverTargetsRef.current,
+                frameClickTargetsRef.current,
+                overlayClickTargetsRef.current,
+              ],
+            )
             const hoverTarget = entityId
               ? overlayHoverTargetsRef.current.get(entityId)
               : undefined
@@ -450,16 +538,20 @@ export function MapView({
             // A terrain click can legitimately have no pickable entity.
           }
 
-          const current = overlayRef.current
-          if (!current?.pickMode || !cartographic) return
+          if (!cartographic) return
           const lon = Number(cartographic.longitudeDD)
           const lat = Number(cartographic.latitudeDD)
           const height = Number(cartographic.height ?? 0)
           if (!Number.isFinite(lon) || !Number.isFinite(lat)) return
-          void current.applyPickedCoordinate(
-            [lon, lat, Number.isFinite(height) ? height : 0],
-            'wgs84',
-          )
+          const current = overlayRef.current
+          if (current?.pickMode) {
+            void current.applyPickedCoordinate(
+              [lon, lat, Number.isFinite(height) ? height : 0],
+              'wgs84',
+            )
+          } else if (surveyDrawingRef.current) {
+            onAddSurveyPointRef.current?.([lon, lat])
+          }
         }
         runtime.map.onClick.addEventListener(mapClickHandler)
 
@@ -471,8 +563,9 @@ export function MapView({
           if (!runtime || !pending) return
           let target: VWorldOverlayHoverTarget | undefined
           try {
-            const entityId = pickedEntityId(
-              runtime.viewer.scene.pick({ x: pending.x, y: pending.y }),
+            const entityId = firstTargetEntityId(
+              pickedEntityIdsAtPosition(runtime.viewer.scene, { x: pending.x, y: pending.y }),
+              [overlayHoverTargetsRef.current],
             )
             target = entityId ? overlayHoverTargetsRef.current.get(entityId) : undefined
           } catch {
@@ -519,7 +612,10 @@ export function MapView({
           }
           if (relayed) return
         }
-        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
+        // VWorld/OpenLayers may consume keyboard input on the focused canvas.
+        // Capture first so shortcuts still reach the application after a SHP
+        // point-pick leaves focus inside this isolated iframe document.
+        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler, true)
 
         const resize = () => {
           if (!runtime) return
@@ -555,7 +651,7 @@ export function MapView({
       }
       if (hoverAnimationFrame) iframe.contentWindow?.cancelAnimationFrame(hoverAnimationFrame)
       if (mapKeyDownDocument && mapKeyDownHandler) {
-        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler)
+        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler, true)
       }
       if (runtime && mapClickHandler) {
         try {
@@ -629,6 +725,17 @@ export function MapView({
         sources2DRef.current = sources
         mapClickHandler = (event) => {
           if (!runtime) return
+          if (
+            surveyDrawingRef.current &&
+            !overlayRef.current?.pickMode &&
+            event.coordinate !== undefined
+          ) {
+            const [longitude, latitude] = runtime.ol.proj.toLonLat(event.coordinate)
+            if (Number.isFinite(longitude) && Number.isFinite(latitude)) {
+              onAddSurveyPointRef.current?.([longitude, latitude])
+              return
+            }
+          }
           const hoverTarget = vworld2DOverlayHoverTarget(runtime, event)
           if (hoverTarget) {
             const layerName = overlayRef.current?.layers.find(
@@ -706,7 +813,7 @@ export function MapView({
           }
           if (relayed) return
         }
-        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler)
+        mapKeyDownDocument.addEventListener('keydown', mapKeyDownHandler, true)
 
         const resize = () => runtime?.map.updateSize()
         resizeObserver = new ResizeObserver(resize)
@@ -733,7 +840,7 @@ export function MapView({
       iframe.removeEventListener('load', onLoad)
       resizeObserver?.disconnect()
       if (mapKeyDownDocument && mapKeyDownHandler) {
-        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler)
+        mapKeyDownDocument.removeEventListener('keydown', mapKeyDownHandler, true)
       }
       if (runtime && mapClickHandler) {
         try {
@@ -846,8 +953,26 @@ export function MapView({
   }, [overlayGeoJson, ready2D])
 
   useEffect(() => {
-    if (!ready || !trackLayerVisible || visibleRoute.length === 0) return
-    const routeKey = `${effectiveTrackId ?? 'all'}:${displayAllTracks}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
+    const runtime = runtimeRef.current
+    const source = sourcesRef.current?.survey
+    if (!runtime || !source || !ready3D) return
+    try {
+      renderVWorldRoute(runtime, source, surveyGeoJson)
+    } catch (reason) {
+      setMapError(reason instanceof Error ? reason.message : '현장조사 구간을 갱신하지 못했습니다.')
+    }
+  }, [ready3D, surveyGeoJson])
+
+  useEffect(() => {
+    const runtime = runtime2DRef.current
+    const source = sources2DRef.current?.survey
+    if (!runtime || !source || !ready2D) return
+    renderVWorld2DCollection(runtime, source, surveyGeoJson, 'route')
+  }, [ready2D, surveyGeoJson])
+
+  useEffect(() => {
+    if (!ready || !hasVisibleTracks || visibleRoute.length === 0) return
+    const routeKey = `${visibleTrackIds ? [...visibleTrackIds].sort().join(',') : effectiveTrackId ?? 'all'}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
     if (fittedRouteRef.current === routeKey) return
     fittedRouteRef.current = routeKey
     const coordinates = visibleRoute.map((point) => [point.lon, point.lat] as const)
@@ -858,7 +983,7 @@ export function MapView({
       const runtime = runtimeRef.current
       if (runtime) setVWorldSceneMode(runtime, '3d', cameraTargetForCoordinates(coordinates))
     }
-  }, [displayAllTracks, effectiveTrackId, ready, trackLayerVisible, visibleRoute, vworld2DActive])
+  }, [effectiveTrackId, hasVisibleTracks, ready, visibleRoute, visibleTrackIds, vworld2DActive])
 
   useEffect(() => {
     if (!ready || !selectedOverlayCoordinate) return
@@ -913,10 +1038,16 @@ export function MapView({
       ref={mapRootRef}
       className={`map-view ${highContrast ? 'high-contrast-mode' : ''}`}
       data-map-provider={mapProviderForMode(mapMode)}
-      data-track-scope={displayAllTracks ? 'all' : effectiveTrackId ?? 'none'}
-      data-track-layer-visible={trackLayerVisible}
+      data-track-scope={
+        visibleTrackIds
+          ? trackOrder.filter((trackId) => visibleTrackIds.has(trackId)).join(',') || 'none'
+          : displayAllTracks ? 'all' : effectiveTrackId ?? 'none'
+      }
+      data-track-layer-visible={hasVisibleTracks}
       data-route-feature-count={renderedRouteGeoJson.features.length}
       data-overlay-feature-count={overlayGeoJson.features.length}
+      data-survey-feature-count={surveyGeoJson.features.length}
+      data-survey-drawing={surveyDrawing}
       data-map-mode={mapMode}
     >
       {mapMode === '3d' && (
@@ -1015,26 +1146,28 @@ export function MapView({
         <span className="map-provider-badge">
           VWorld {mapMode === '2d' ? '2D 일반지도' : mapMode === 'satellite' ? '위성지도' : '3D'}
         </span>
-        {trackLayerVisible && (
+        {hasVisibleTracks && (
           <span>
             <i
               className="legend-route"
               style={
-                !displayAllTracks && effectiveTrackId
+                !visibleTrackIds && !displayAllTracks && effectiveTrackId
                   ? { background: trackColors.get(effectiveTrackId) ?? TRACK_COLORS[0] }
                   : undefined
               }
             />
-            {displayAllTracks ? '전체 트랙' : '활성 트랙'}
+            {visibleTrackIds
+              ? `${visibleTrackIds.size.toLocaleString('ko-KR')}개 트랙`
+              : displayAllTracks ? '전체 트랙' : '활성 트랙'}
           </span>
         )}
-        {trackLayerVisible && (
+        {hasVisibleTracks && (
           <span>
             <i className="legend-frame" />
             MMS 프레임
           </span>
         )}
-        {selectedFrame && trackLayerVisible && (
+        {selectedFrame && visibleFrames.some((frame) => frame.id === selectedFrame.id) && (
           <span>
             <i className="legend-selected-frame" style={{ borderColor: MAP_SELECTED_FRAME_COLOR }} />
             선택 프레임

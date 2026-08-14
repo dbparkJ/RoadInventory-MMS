@@ -552,8 +552,11 @@ export function OverlayProvider({
         shortcut.setPickMode(!shortcut.pickMode)
       }
     }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    // Keep edit shortcuts global even when the focused map/viewer surface has
+    // its own key handler.  Point creation deliberately leaves focus on that
+    // surface, and feature deletion can remove the previously focused control.
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [])
 
   const upload = useCallback(

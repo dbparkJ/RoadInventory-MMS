@@ -5,20 +5,19 @@ import {
   ChevronDown,
   Cloud,
   Database,
-  Flag,
   Gauge,
   Layers3,
   LocateFixed,
   LoaderCircle,
   PanelLeftClose,
   PanelLeftOpen,
-  RotateCcw,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
-import type { DatasetSummary, Frame, FrameRange } from '../types'
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import type { DatasetSummary, Frame } from '../types'
 import { formatCount, formatDistance } from '../lib/format'
 import { TRACK_COLORS } from '../lib/route'
+import { naturalSortTracks } from '../lib/tracks'
 import { DatasetOverlayBrowser } from './DatasetOverlayBrowser'
 
 const DATASET_STATUS: Record<DatasetSummary['status'], string> = {
@@ -37,7 +36,6 @@ interface DatasetPanelProps {
   framesLoadingMore: boolean
   frameTotal: number
   hasMoreFrames: boolean
-  frameRange: FrameRange | null
   focusOverlayLayerId?: string
   removingDataset?: boolean
   externalAction?: ReactNode
@@ -45,10 +43,6 @@ interface DatasetPanelProps {
   onDatasetChange: (id: string) => void
   onTrackChange: (id: string) => void
   onFrameChange: (frame: Frame) => void
-  onSetFrameRangeStart: (ordinal: number) => void
-  onSetFrameRangeEnd: (ordinal: number) => void
-  onFrameRangeChange: (range: FrameRange) => void
-  onClearFrameRange: () => void
   onLoadMoreFrames: () => void
   onOpenSource: () => void
   onRemoveDataset?: (dataset: DatasetSummary) => void
@@ -60,37 +54,24 @@ export function DatasetPanel({
   selectedDataset,
   selectedTrack,
   selectedFrame,
-  frameRange,
   focusOverlayLayerId,
   removingDataset = false,
   externalAction,
   collapsed = false,
   onDatasetChange,
   onTrackChange,
-  onSetFrameRangeStart,
-  onSetFrameRangeEnd,
-  onFrameRangeChange,
-  onClearFrameRange,
   onOpenSource,
   onRemoveDataset,
   onToggleCollapsed,
 }: DatasetPanelProps) {
-  const [rangeDraft, setRangeDraft] = useState<[string, string]>(['', ''])
   const [datasetMenuOpen, setDatasetMenuOpen] = useState(false)
   const datasetPickerRef = useRef<HTMLDivElement>(null)
   const datasetTriggerRef = useRef<HTMLButtonElement>(null)
   const datasetListId = useId()
-  const frameLimit = Math.max(1, selectedDataset?.frame_count ?? 1)
-  const parsedRange = rangeDraft.map((value) => Number(value)) as [number, number]
-  const rangeDraftValid = parsedRange.every(
-    (value) => Number.isInteger(value) && value >= 1 && value <= frameLimit,
+  const sortedTracks = useMemo(
+    () => naturalSortTracks(selectedDataset?.tracks ?? []),
+    [selectedDataset?.tracks],
   )
-
-  useEffect(() => {
-    setRangeDraft(
-      frameRange ? [String(frameRange[0] + 1), String(frameRange[1] + 1)] : ['', ''],
-    )
-  }, [frameRange, selectedDataset?.id])
 
   useEffect(() => {
     if (!datasetMenuOpen) return
@@ -114,12 +95,6 @@ export function DatasetPanel({
 
   useEffect(() => setDatasetMenuOpen(false), [selectedDataset?.id])
 
-  const applyRangeDraft = () => {
-    if (!rangeDraftValid) return
-    const start = Math.min(parsedRange[0], parsedRange[1]) - 1
-    const end = Math.max(parsedRange[0], parsedRange[1]) - 1
-    onFrameRangeChange([start, end])
-  }
 
   const focusDatasetOption = (position: 'selected' | 'first' | 'last') => {
     window.requestAnimationFrame(() => {
@@ -350,7 +325,7 @@ export function DatasetPanel({
                 </span>
                 <Box size={15} />
               </button>
-              {selectedDataset.tracks.map((track, index) => (
+              {sortedTracks.map((track, index) => (
                 <button
                   type="button"
                   key={track.id}
@@ -370,113 +345,6 @@ export function DatasetPanel({
                   <Gauge size={15} />
                 </button>
               ))}
-            </div>
-          </section>
-
-          <section className="dataset-range-section" aria-label="실행 프레임 범위">
-            <div className="section-label">
-              <span>실행 프레임 범위</span>
-              <small>지도 또는 A/D 키로 현재 프레임 이동</small>
-            </div>
-            <div className="frame-range-picker compact">
-              <div className="frame-range-inputs">
-                <label>
-                  <span>시작 프레임</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={frameLimit}
-                    value={rangeDraft[0]}
-                    placeholder="1"
-                    aria-label="실행 시작 프레임 번호"
-                    onChange={(event) =>
-                      setRangeDraft((current) => [event.target.value, current[1]])
-                    }
-                    onKeyDown={(event) => event.key === 'Enter' && applyRangeDraft()}
-                  />
-                </label>
-                <span aria-hidden="true">–</span>
-                <label>
-                  <span>끝 프레임</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={frameLimit}
-                    value={rangeDraft[1]}
-                    placeholder={String(frameLimit)}
-                    aria-label="실행 끝 프레임 번호"
-                    onChange={(event) =>
-                      setRangeDraft((current) => [current[0], event.target.value])
-                    }
-                    onKeyDown={(event) => event.key === 'Enter' && applyRangeDraft()}
-                  />
-                </label>
-                <button
-                  type="button"
-                  disabled={!rangeDraftValid}
-                  onClick={applyRangeDraft}
-                  title="입력한 프레임 범위를 작업 구간으로 적용"
-                >
-                  적용
-                </button>
-              </div>
-              <div className="frame-range-actions" role="group" aria-label="실행 프레임 범위 지정">
-                <button
-                  type="button"
-                  disabled={!selectedFrame}
-                  aria-pressed={Boolean(
-                    selectedFrame && frameRange?.[0] === selectedFrame.index,
-                  )}
-                  aria-label={
-                    selectedFrame
-                      ? `현재 프레임 ${selectedFrame.index + 1}을 실행 범위 시작으로 지정`
-                      : '실행 범위 시작으로 지정할 프레임이 없습니다'
-                  }
-                  onClick={() => selectedFrame && onSetFrameRangeStart(selectedFrame.index)}
-                >
-                  시작 지정
-                </button>
-                <button
-                  type="button"
-                  disabled={!selectedFrame}
-                  aria-pressed={Boolean(
-                    selectedFrame && frameRange?.[1] === selectedFrame.index,
-                  )}
-                  aria-label={
-                    selectedFrame
-                      ? `현재 프레임 ${selectedFrame.index + 1}을 실행 범위 끝으로 지정`
-                      : '실행 범위 끝으로 지정할 프레임이 없습니다'
-                  }
-                  onClick={() => selectedFrame && onSetFrameRangeEnd(selectedFrame.index)}
-                >
-                  끝 지정
-                </button>
-                <button
-                  type="button"
-                  disabled={!frameRange}
-                  aria-label="실행 프레임 범위를 현재 작업 구간 전체로 초기화"
-                  onClick={onClearFrameRange}
-                >
-                  <RotateCcw size={11} />
-                  전체
-                </button>
-              </div>
-              <div className="frame-range-row" aria-live="polite">
-                <Flag size={13} />
-                <span>
-                  <small>실행 범위</small>
-                  <strong>
-                    {frameRange
-                      ? `Frame ${String(frameRange[0] + 1).padStart(4, '0')}–${String(
-                          frameRange[1] + 1,
-                        ).padStart(4, '0')}`
-                      : '현재 작업 구간 전체'}
-                  </strong>
-                </span>
-                <code>
-                  {frameRange ? `ordinal ${frameRange[0]}–${frameRange[1]}` : 'ALL'}
-                </code>
-              </div>
             </div>
           </section>
 

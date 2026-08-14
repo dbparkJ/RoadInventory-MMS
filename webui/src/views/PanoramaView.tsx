@@ -25,7 +25,11 @@ import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
 import { panoramaUvToSpherePosition, type PanoramaHoverProjection } from '../lib/panoramaProjection'
-import { directionalPanoramaTarget, panoramaViewRelativeBearing } from '../lib/panoramaNavigation'
+import {
+  directionalPanoramaTarget,
+  panoramaViewRelativeBearing,
+  type DirectionalPanoramaTarget,
+} from '../lib/panoramaNavigation'
 import type { PanoramaQuality } from '../lib/userSettings'
 import type {
   Frame,
@@ -41,6 +45,76 @@ export function panoramaForwardYaw(offsetDeg: number): number {
   // the texture centre. Global GNSS heading belongs on the map, not in this
   // image-space reset, otherwise every frame turn makes the viewer look aside.
   return -180 + offsetDeg
+}
+
+export const PANORAMA_SCENE_CLICK_MAX_MOVEMENT_PX = 5
+
+export function isPanoramaSceneClick(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  maximumMovementPx = PANORAMA_SCENE_CLICK_MAX_MOVEMENT_PX,
+): boolean {
+  return Math.hypot(end.x - start.x, end.y - start.y) <= maximumMovementPx
+}
+
+export function panoramaRayYaw(
+  direction: { x: number; z: number },
+  fallbackYaw: number,
+): number {
+  if (![direction.x, direction.z].every(Number.isFinite)) return fallbackYaw
+  if (Math.hypot(direction.x, direction.z) < 1e-6) return fallbackYaw
+  return Math.atan2(direction.z, direction.x) * 180 / Math.PI
+}
+
+export interface PanoramaSceneNavigationTarget {
+  direction: -1 | 1
+  target: DirectionalPanoramaTarget | null
+}
+
+/**
+ * Resolve navigation for the ray under a scene click. Loaded track neighbors
+ * are preferred; previous/next callbacks provide the paginated fallback.
+ */
+export function panoramaSceneNavigationTarget(
+  current: Frame | null,
+  frames: Frame[],
+  viewYaw: number,
+  forwardYaw: number,
+  canGoPrevious: boolean,
+  canGoNext: boolean,
+): PanoramaSceneNavigationTarget | null {
+  if (!current) return null
+  const target = directionalPanoramaTarget(current, frames, viewYaw, forwardYaw)
+  if (target) return { direction: target.direction, target }
+
+  const direction: -1 | 1 = Math.cos(
+    THREE.MathUtils.degToRad(panoramaViewRelativeBearing(viewYaw, forwardYaw)),
+  ) >= 0 ? 1 : -1
+  if (direction === 1 ? canGoNext : canGoPrevious) return { direction, target: null }
+  return null
+}
+
+const PANORAMA_SCENE_CONTROL_SELECTOR = [
+  'button',
+  'a',
+  'input',
+  'select',
+  'textarea',
+  'summary',
+  '[role="dialog"]',
+  '.viewer-toolbar',
+  '.viewer-data-card',
+  '.viewer-loading',
+  '.viewer-error',
+  '.panorama-point-status',
+  '.panorama-location-bar',
+].join(',')
+
+export function isPanoramaSceneControlTarget(target: EventTarget | null): boolean {
+  // Avoid realm-specific instanceof checks: detached popups have their own
+  // Element constructor even though closest() remains safe to call.
+  const candidate = target as { closest?: (selector: string) => Element | null } | null
+  return Boolean(candidate?.closest?.(PANORAMA_SCENE_CONTROL_SELECTOR))
 }
 
 export function panoramaRequestWidth(
@@ -637,6 +711,14 @@ interface PanoramaRuntime {
   panoramaMaterial: THREE.MeshBasicMaterial
 }
 
+interface PanoramaSceneNavigationHint {
+  x: number
+  y: number
+  direction: -1 | 1
+  targetFrameIndex: number | null
+  available: boolean
+}
+
 export default function PanoramaView({
   datasetId,
   frame,
@@ -685,6 +767,8 @@ export default function PanoramaView({
   const currentFrameIdRef = useRef(frame?.id)
   const hoverFrameRef = useRef(0)
   const pendingHoverRef = useRef<{ x: number; y: number } | null>(null)
+  const navigationFeedbackTimerRef = useRef<{ ownerWindow: Window; id: number } | null>(null)
+  const dragExceededThresholdRef = useRef(false)
   const [source, setSource] = useState<string | null>(demoMode ? demoPanorama : null)
   const [loading, setLoading] = useState(!demoMode)
   const [error, setError] = useState<string | null>(null)
@@ -711,6 +795,10 @@ export default function PanoramaView({
   const [pickFeedback, setPickFeedback] = useState<string | null>(null)
   const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
   const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
+  const [sceneNavigationHint, setSceneNavigationHint] = useState<PanoramaSceneNavigationHint | null>(
+    null,
+  )
+  const [sceneNavigationFeedback, setSceneNavigationFeedback] = useState<string | null>(null)
   const [frameAddress, setFrameAddress] = useState<string | null>(null)
   const [addressLoading, setAddressLoading] = useState(false)
   const runtimeRef = useRef<PanoramaRuntime | null>(null)
@@ -737,9 +825,14 @@ export default function PanoramaView({
   currentFrameIdRef.current = frame?.id
   const viewRef = useRef({ fov, yaw, pitch })
   viewRef.current = { fov, yaw, pitch }
-  const [dragStart, setDragStart] = useState<{ x: number; y: number; yaw: number; pitch: number } | null>(
-    null,
-  )
+  const [dragStart, setDragStart] = useState<{
+    pointerId: number
+    x: number
+    y: number
+    yaw: number
+    pitch: number
+  } | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
   const [reloadKey, setReloadKey] = useState(0)
   const overlayActionsRef = useRef({
     pickMode: false,
@@ -777,11 +870,19 @@ export default function PanoramaView({
     pendingHoverRef.current = null
     setOverlayHover(null)
     setPinnedOverlayHover(null)
+    setSceneNavigationHint(null)
+    setIsDragging(false)
+    dragExceededThresholdRef.current = false
     setFov(72)
     setYaw(panoramaForwardYaw(forwardOffsetDeg))
     setPitch(0)
     setError(null)
   }, [forwardOffsetDeg, frame?.id])
+
+  useEffect(() => () => {
+    const timer = navigationFeedbackTimerRef.current
+    if (timer) timer.ownerWindow.clearTimeout(timer.id)
+  }, [])
 
   useEffect(() => {
     if (!frame?.coordinate || demoMode) {
@@ -1308,31 +1409,54 @@ export default function PanoramaView({
     if (canGoNext) onNextFrame?.()
   }
 
-  const directionalTarget = frame && onFrameChange
-    ? directionalPanoramaTarget(
-        frame,
-        frames,
-        yaw,
-        panoramaForwardYaw(forwardOffsetDeg),
-      )
-    : null
+  const forwardYaw = panoramaForwardYaw(forwardOffsetDeg)
+  const currentSceneNavigation = panoramaSceneNavigationTarget(
+    frame,
+    onFrameChange ? frames : [],
+    yaw,
+    forwardYaw,
+    canGoPrevious,
+    canGoNext,
+  )
+  const directionalTarget = currentSceneNavigation?.target ?? null
+  const viewFacesNext = currentSceneNavigation?.direction === 1
+  const canMoveInViewDirection = Boolean(currentSceneNavigation)
 
-  const viewFacesNext = Math.cos(
-    THREE.MathUtils.degToRad(
-      panoramaViewRelativeBearing(yaw, panoramaForwardYaw(forwardOffsetDeg)),
-    ),
-  ) >= 0
-  const canUseDirectionalFallback = viewFacesNext ? canGoNext : canGoPrevious
-  const canMoveInViewDirection = Boolean(directionalTarget || canUseDirectionalFallback)
+  const showSceneNavigationFeedback = (message: string) => {
+    const ownerWindow = stageRef.current?.ownerDocument.defaultView ?? window
+    const previousTimer = navigationFeedbackTimerRef.current
+    if (previousTimer) previousTimer.ownerWindow.clearTimeout(previousTimer.id)
+    setSceneNavigationFeedback(message)
+    navigationFeedbackTimerRef.current = {
+      ownerWindow,
+      id: ownerWindow.setTimeout(() => {
+        setSceneNavigationFeedback(null)
+        navigationFeedbackTimerRef.current = null
+      }, 1_200),
+    }
+  }
+
+  const moveToSceneNavigation = (navigation: PanoramaSceneNavigationTarget): boolean => {
+    if (navigation.target && onFrameChange) {
+      showSceneNavigationFeedback(`바라보는 방향의 Frame ${navigation.target.frame.index + 1}로 이동합니다.`)
+      onFrameChange(navigation.target.frame)
+      return true
+    }
+    if (navigation.direction === 1 && canGoNext) {
+      showSceneNavigationFeedback('바라보는 방향의 다음 프레임으로 이동합니다.')
+      goToNextFrame()
+      return true
+    }
+    if (navigation.direction === -1 && canGoPrevious) {
+      showSceneNavigationFeedback('바라보는 방향의 이전 프레임으로 이동합니다.')
+      goToPreviousFrame()
+      return true
+    }
+    return false
+  }
 
   const goInViewDirection = () => {
-    if (directionalTarget) {
-      onFrameChange?.(directionalTarget.frame)
-    } else if (viewFacesNext && canGoNext) {
-      goToNextFrame()
-    } else if (!viewFacesNext && canGoPrevious) {
-      goToPreviousFrame()
-    }
+    if (currentSceneNavigation) moveToSceneNavigation(currentSceneNavigation)
   }
 
   const changeQuality = (nextQuality: PanoramaQuality) => {
@@ -1375,11 +1499,13 @@ export default function PanoramaView({
     )
     const raycaster = new THREE.Raycaster()
     raycaster.setFromCamera(pointer, runtime.camera)
+    const viewYaw = panoramaRayYaw(raycaster.ray.direction, yaw)
     const intersection = raycaster.intersectObject(runtime.panoramaMesh, false)[0]
     if (!intersection?.uv) return null
     return {
       u: ((intersection.uv.x % 1) + 1) % 1,
       v: 1 - intersection.uv.y,
+      viewYaw,
       bounds,
     }
   }
@@ -1390,6 +1516,7 @@ export default function PanoramaView({
     hoverFrameRef.current = 0
     pendingHoverRef.current = null
     setOverlayHover(null)
+    setSceneNavigationHint(null)
   }
 
   const scheduleOverlayHover = (clientX: number, clientY: number) => {
@@ -1405,6 +1532,7 @@ export default function PanoramaView({
       const projected = panoramaUvAtPointer(pending.x, pending.y)
       if (!projected) {
         setOverlayHover(null)
+        setSceneNavigationHint(null)
         return
       }
       const entry = panoramaOverlayAtUv(
@@ -1424,6 +1552,32 @@ export default function PanoramaView({
         viewportWidth: projected.bounds.width,
         viewportHeight: projected.bounds.height,
       } : null)
+      const actions = overlayActionsRef.current
+      const navigationAvailable = Boolean(onFrameChange || onPreviousFrame || onNextFrame)
+      if (entry || actions.pickMode || pinnedOverlayHover || !navigationAvailable) {
+        setSceneNavigationHint(null)
+        return
+      }
+      const navigation = panoramaSceneNavigationTarget(
+        frame,
+        onFrameChange ? frames : [],
+        projected.viewYaw,
+        forwardYaw,
+        canGoPrevious,
+        canGoNext,
+      )
+      const direction: -1 | 1 = navigation?.direction ?? (
+        Math.cos(THREE.MathUtils.degToRad(
+          panoramaViewRelativeBearing(projected.viewYaw, forwardYaw),
+        )) >= 0 ? 1 : -1
+      )
+      setSceneNavigationHint({
+        x: pending.x - projected.bounds.left,
+        y: pending.y - projected.bounds.top,
+        direction,
+        targetFrameIndex: navigation?.target?.frame.index ?? null,
+        available: Boolean(navigation),
+      })
     })
   }
 
@@ -1467,6 +1621,7 @@ export default function PanoramaView({
 
     const nearest = panoramaOverlayAtUv(renderedOverlayProjection, u, v, renderedDetectionBoxes)
     if (nearest) {
+      setSceneNavigationHint(null)
       setOverlayHover(null)
       setPinnedOverlayHover({
         layerId: nearest.layerId,
@@ -1481,13 +1636,34 @@ export default function PanoramaView({
       })
     } else {
       setPinnedOverlayHover(null)
+      const navigation = panoramaSceneNavigationTarget(
+        frame,
+        onFrameChange ? frames : [],
+        projected.viewYaw,
+        forwardYaw,
+        canGoPrevious,
+        canGoNext,
+      )
+      setSceneNavigationHint(null)
+      if (navigation) {
+        moveToSceneNavigation(navigation)
+      } else if (onFrameChange || onPreviousFrame || onNextFrame) {
+        showSceneNavigationFeedback('클릭한 방향에 이동할 인접 프레임이 없습니다.')
+      }
     }
   }
 
   return (
     <div
       ref={stageRef}
-      className={`panorama-view ${dragStart ? 'dragging' : ''}`}
+      className={[
+        'panorama-view',
+        isDragging ? 'dragging' : '',
+        !isDragging && sceneNavigationHint?.available ? 'scene-navigation-ready' : '',
+        !isDragging && sceneNavigationHint && !sceneNavigationHint.available
+          ? 'scene-navigation-unavailable'
+          : '',
+      ].filter(Boolean).join(' ')}
       tabIndex={0}
       role="region"
       aria-label="파노라마 뷰어"
@@ -1499,14 +1675,25 @@ export default function PanoramaView({
       data-yolo-box-count={renderedDetectionBoxes.length}
       data-panorama-opacity={effectivePanoramaOpacity}
       onPointerDown={(event) => {
-        if (!source) return
+        if (
+          !source
+          || event.isPrimary === false
+          || (event.pointerType !== 'touch' && event.button !== 0)
+          || isPanoramaSceneControlTarget(event.target)
+        ) return
         clearOverlayHover()
         event.currentTarget.focus({ preventScroll: true })
-        event.currentTarget.setPointerCapture(event.pointerId)
-        setDragStart({ x: event.clientX, y: event.clientY, yaw, pitch })
+        event.currentTarget.setPointerCapture?.(event.pointerId)
+        setIsDragging(false)
+        dragExceededThresholdRef.current = false
+        setDragStart({ pointerId: event.pointerId, x: event.clientX, y: event.clientY, yaw, pitch })
       }}
       onPointerMove={(event) => {
         if (dragStart) {
+          if (event.pointerId !== dragStart.pointerId) return
+          if (isPanoramaSceneClick(dragStart, { x: event.clientX, y: event.clientY })) return
+          dragExceededThresholdRef.current = true
+          setIsDragging(true)
           setYaw(dragStart.yaw - (event.clientX - dragStart.x) * 0.12)
           setPitch(
             Math.max(-78, Math.min(78, dragStart.pitch + (event.clientY - dragStart.y) * 0.1)),
@@ -1516,14 +1703,20 @@ export default function PanoramaView({
         }
       }}
       onPointerUp={(event) => {
-        const clicked = Boolean(
-          dragStart && Math.hypot(event.clientX - dragStart.x, event.clientY - dragStart.y) <= 5,
-        )
+        if (dragStart && event.pointerId !== dragStart.pointerId) return
+        const clicked = Boolean(dragStart && !dragExceededThresholdRef.current && isPanoramaSceneClick(
+          dragStart,
+          { x: event.clientX, y: event.clientY },
+        ))
+        dragExceededThresholdRef.current = false
         setDragStart(null)
+        setIsDragging(false)
         if (clicked) void selectAtPointer(event.clientX, event.clientY)
       }}
       onPointerCancel={() => {
+        dragExceededThresholdRef.current = false
         setDragStart(null)
+        setIsDragging(false)
         clearOverlayHover()
       }}
       onPointerLeave={clearOverlayHover}
@@ -1554,6 +1747,32 @@ export default function PanoramaView({
           openOverlayFeatureDetails(datasetId, hover)
         } : undefined}
       />
+      {sceneNavigationHint && !isDragging && (
+        <div
+          className={`panorama-scene-navigation-hint ${
+            sceneNavigationHint.available ? 'available' : 'unavailable'
+          }`}
+          style={{ left: sceneNavigationHint.x, top: sceneNavigationHint.y }}
+          data-direction={sceneNavigationHint.direction === 1 ? 'next' : 'previous'}
+          data-target-frame-index={sceneNavigationHint.targetFrameIndex ?? undefined}
+          aria-hidden="true"
+        >
+          <span><Navigation size={15} /></span>
+          <small>
+            {sceneNavigationHint.available
+              ? sceneNavigationHint.targetFrameIndex === null
+                ? `클릭하여 ${sceneNavigationHint.direction === 1 ? '다음' : '이전'} 프레임 이동`
+                : `클릭하여 Frame ${sceneNavigationHint.targetFrameIndex + 1} 이동`
+              : '이 방향에 인접 프레임 없음'}
+          </small>
+        </div>
+      )}
+      {sceneNavigationFeedback && (
+        <div className="panorama-scene-navigation-feedback" role="status">
+          <Navigation size={14} aria-hidden="true" />
+          <span>{sceneNavigationFeedback}</span>
+        </div>
+      )}
       {frame && onPreviousFrame && (
         <button
           type="button"
@@ -1680,7 +1899,7 @@ export default function PanoramaView({
       >
         <span>
           <MousePointer2 size={14} />
-          드래그하여 둘러보기
+          드래그하여 둘러보기 · 장면 클릭으로 이동
         </span>
         <i />
         <label className="panorama-quality-control">

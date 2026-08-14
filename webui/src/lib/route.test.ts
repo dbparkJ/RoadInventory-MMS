@@ -82,6 +82,18 @@ describe('buildRouteFeatureCollection', () => {
     expect(colors.get(`track-${TRACK_COLORS.length}`)).toBe(TRACK_COLORS[0])
   })
 
+  it('keeps colors stable when hidden tracks are filtered out', () => {
+    const route = [
+      { lon: 127, lat: 37, track_id: 'sec-2' },
+      { lon: 127.1, lat: 37.1, track_id: 'sec-2' },
+    ]
+    const colors = buildTrackColorMap(route, ['sec-1', 'sec-2', 'sec-5'])
+    const collection = buildRouteFeatureCollection(route, colors)
+
+    expect(colors.get('sec-2')).toBe(TRACK_COLORS[1])
+    expect(collection.features[0]?.properties.track_color).toBe(TRACK_COLORS[1])
+  })
+
   it('builds separate contiguous route segments inside the execution range', () => {
     const route = [
       { lon: 127, lat: 37, track_id: 'a', frame_id: 'a-0' },
