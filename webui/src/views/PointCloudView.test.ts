@@ -7,11 +7,15 @@ import {
   DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
-  pointCloudDetectionPointSize,
+  pointCloudOverlayPointSize,
   pointCloudBudgetsForMaximum,
   pointCloudDetectionWireframePositions,
   pointCloudDetectionsFromObservations,
   pointCloudHoverState,
+  pointCloudYoloBoxHalfSize,
+  POINT_CLOUD_YOLO_HIT_RADIUS_PX,
+  POINT_CLOUD_YOLO_MARKER_SIZE,
+  POINT_CLOUD_YOLO_RAYCAST_THRESHOLD,
   POINT_CLOUD_BUDGETS,
   restorePointCloudViewState,
   type RenderOverlayPoint,
@@ -66,9 +70,14 @@ describe('PointCloudView camera continuity', () => {
     expect(east[1]).toBeCloseTo(0)
   })
 
-  it('keeps detected SHP points visibly larger than the previous sub-metre marker', () => {
-    expect(pointCloudDetectionPointSize(false)).toBeGreaterThan(0.5)
-    expect(pointCloudDetectionPointSize(true)).toBeGreaterThan(pointCloudDetectionPointSize(false))
+  it('keeps SHP points legible while making YOLO object markers and hit areas compact', () => {
+    expect(pointCloudOverlayPointSize(false)).toBeGreaterThan(0.5)
+    expect(pointCloudOverlayPointSize(true)).toBeGreaterThan(pointCloudOverlayPointSize(false))
+    expect(POINT_CLOUD_YOLO_MARKER_SIZE).toBeLessThan(pointCloudOverlayPointSize(false))
+    expect(pointCloudYoloBoxHalfSize(false)).toBeLessThan(0.3)
+    expect(pointCloudYoloBoxHalfSize(true)).toBeGreaterThan(pointCloudYoloBoxHalfSize(false))
+    expect(POINT_CLOUD_YOLO_RAYCAST_THRESHOLD).toBeLessThan(POINT_CLOUD_YOLO_MARKER_SIZE)
+    expect(POINT_CLOUD_YOLO_HIT_RADIUS_PX).toBeLessThan(12)
   })
 
   it('renders only accepted finite YOLO 3D positions within 25m and preserves SHP details', () => {
@@ -207,10 +216,10 @@ describe('PointCloudView camera continuity', () => {
     ])
 
     expect(positions).toHaveLength(2 * 12 * 2 * 3)
-    expect(Math.min(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(9.65)
-    expect(Math.max(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(30.35)
-    expect(Math.min(...positions.slice(12 * 2 * 3))).toBeCloseTo(-0.45)
-    expect(Math.max(...positions.slice(12 * 2 * 3))).toBeCloseTo(0.45)
+    expect(Math.min(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(9.78)
+    expect(Math.max(...positions.slice(0, 12 * 2 * 3))).toBeCloseTo(30.22)
+    expect(Math.min(...positions.slice(12 * 2 * 3))).toBeCloseTo(-0.28)
+    expect(Math.max(...positions.slice(12 * 2 * 3))).toBeCloseTo(0.28)
   })
 
   it('preserves model and SHP layer colors in transient and pinned hover state', () => {

@@ -120,6 +120,7 @@ export function Workspace({
   const [hiddenSurveySegmentIds, setHiddenSurveySegmentIds] = useState<ReadonlySet<string>>(new Set())
   const [surveyDrawing, setSurveyDrawing] = useState(false)
   const [surveyDraft, setSurveyDraft] = useState<[number, number][]>([])
+  const [surveyDraftPreview, setSurveyDraftPreview] = useState<[number, number] | null>(null)
   const [surveyDraftName, setSurveyDraftName] = useState('현장조사 필요구간 1')
   const [surveyDraftColor, setSurveyDraftColor] = useState('#f59e0b')
   const [surveyBusy, setSurveyBusy] = useState(false)
@@ -158,6 +159,7 @@ export function Workspace({
     setHiddenSurveySegmentIds(new Set())
     setSurveyDrawing(false)
     setSurveyDraft([])
+    setSurveyDraftPreview(null)
     setSurveyBusy(false)
     setSurveyError(null)
     setSurveyDraftName('현장조사 필요구간 1')
@@ -186,11 +188,13 @@ export function Workspace({
     if (!overlay?.pickMode || !surveyDrawing) return
     setSurveyDrawing(false)
     setSurveyDraft([])
+    setSurveyDraftPreview(null)
     setSurveyError(null)
   }, [overlay?.pickMode, surveyDrawing])
 
   const addSurveyPoint = useCallback((coordinate: [number, number]) => {
     setSurveyDraft((current) => [...current, coordinate])
+    setSurveyDraftPreview(null)
     setSurveyError(null)
   }, [])
 
@@ -198,6 +202,7 @@ export function Workspace({
     if (!dataset || overlay?.pickMode) return
     setSurveyDrawing(true)
     setSurveyDraft([])
+    setSurveyDraftPreview(null)
     setSurveyDraftName(`현장조사 필요구간 ${surveySegments.length + 1}`)
     setSurveyError(null)
   }
@@ -205,6 +210,7 @@ export function Workspace({
   const cancelSurveyDrawing = () => {
     setSurveyDrawing(false)
     setSurveyDraft([])
+    setSurveyDraftPreview(null)
     setSurveyError(null)
   }
 
@@ -216,6 +222,7 @@ export function Workspace({
       return
     }
     setSurveyBusy(true)
+    setSurveyDraftPreview(null)
     setSurveyError(null)
     surveyLoadControllerRef.current?.abort()
     const generation = surveyGenerationRef.current
@@ -245,6 +252,7 @@ export function Workspace({
       setSurveySegments((current) => [...current, created])
       setSurveyDrawing(false)
       setSurveyDraft([])
+      setSurveyDraftPreview(null)
       setSurveyDraftName(`현장조사 필요구간 ${surveySegments.length + 2}`)
     } catch (reason) {
       if (controller.signal.aborted || surveyGenerationRef.current !== generation) return
@@ -438,8 +446,10 @@ export function Workspace({
                 surveySegments={visibleSurveySegments}
                 surveyDraft={surveyDraft}
                 surveyDraftColor={surveyDraftColor}
+                surveyDraftPreview={surveyDraftPreview}
                 surveyDrawing={surveyDrawing}
                 onAddSurveyPoint={addSurveyPoint}
+                onPreviewSurveyPoint={setSurveyDraftPreview}
               />
             </Suspense>
 
@@ -582,11 +592,19 @@ export function Workspace({
                           onChange={(event) => setSurveyDraftColor(event.target.value)}
                         />
                       </label>
-                      <p>지도를 클릭해 꼭짓점을 추가하세요. 현재 {surveyDraft.length}개</p>
+                      <p className="survey-drawing-guide">
+                        <strong>완료 방법</strong>
+                        지도에서 시작점과 끝점을 포함해 2개 이상 지점을 클릭한 뒤 저장을 누르세요.
+                        마우스를 움직이면 다음 선이 미리 표시됩니다.
+                      </p>
+                      <p className="survey-drawing-progress">현재 {surveyDraft.length}개 지점</p>
                       <div>
                         <button
                           type="button"
-                          onClick={() => setSurveyDraft((current) => current.slice(0, -1))}
+                          onClick={() => {
+                            setSurveyDraft((current) => current.slice(0, -1))
+                            setSurveyDraftPreview(null)
+                          }}
                           disabled={surveyDraft.length === 0 || surveyBusy}
                         >
                           <Undo2 size={11} /> 실행 취소

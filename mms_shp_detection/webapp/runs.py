@@ -20,7 +20,7 @@ from urllib.parse import quote
 import yaml
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
 
 from mms_shp_detection.config import (
@@ -34,6 +34,7 @@ from mms_shp_detection.infrastructure.manifest_writer import (
     validate_manifest_document,
     validate_published_outputs,
 )
+from mms_shp_detection.naming import validate_model_output_names
 
 from .datasets import catalog_path as dataset_catalog_path
 from .datasets import require_ready_dataset, seed_catalog_cache, utc_now
@@ -102,6 +103,23 @@ SHAPEFILE_BUNDLE_SUFFIXES = {
 }
 RESULT_MANIFEST_NAMES = {"run_manifest.json", "models_manifest.json"}
 DETECTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_RUN_NAME_LENGTH = 120
+MAX_SELECTED_MODELS = 64
+
+
+def _validated_display_name(value: str | None, *, label: str) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError(f"{label} cannot be empty.")
+    if len(candidate) > MAX_RUN_NAME_LENGTH:
+        raise ValueError(f"{label} cannot exceed {MAX_RUN_NAME_LENGTH} characters.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in candidate):
+        raise ValueError(f"{label} cannot contain control characters.")
+    if "/" in candidate or "\\" in candidate:
+        raise ValueError(f"{label} cannot contain path separators.")
+    return candidate
 
 
 class RunRequest(BaseModel):
@@ -117,6 +135,152 @@ class RunRequest(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     auto: dict[str, Any] = Field(default_factory=dict)
     profile: str | None = None
+    run_name: str | None = None
+    layer_name: str | None = None
+    model_names: list[str] | None = None
+
+    @field_validator("run_name", "layer_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None, info: Any) -> str | None:
+        label = "Run name" if info.field_name == "run_name" else "Detection layer name"
+        return _validated_display_name(value, label=label)
+
+    @field_validator("model_names")
+    @classmethod
+    def validate_model_names(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("model_names must contain at least one checkpoint.")
+        if len(value) > MAX_SELECTED_MODELS:
+            raise ValueError(
+                "model_names cannot contain more than "
+                f"{MAX_SELECTED_MODELS} checkpoints."
+            )
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_name in value:
+            name = raw_name.strip()
+            if (
+                not name
+                or len(name) > 255
+                or "/" in name
+                or "\\" in name
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in name
+                )
+            ):
+                raise ValueError("model_names contains an invalid checkpoint name.")
+            folded = name.casefold()
+            if folded in seen:
+                raise ValueError(
+                    f"model_names contains a duplicate checkpoint: {name!r}."
+                )
+            seen.add(folded)
+            normalized.append(name)
+        return normalized
+
+
+class RunNamePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    expected_updated_at: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        validated = _validated_display_name(value, label="Run name")
+        if validated is None:  # pragma: no cover - ``name`` is not nullable.
+            raise ValueError("Run name cannot be empty.")
+        return validated
+
+
+def _pipeline_document(app: Any) -> dict[str, Any]:
+    base_path = app.state.config.pipeline_config_path
+    if not base_path.is_file():
+        return {"config_version": 1}
+    from mms_shp_detection.config import _Yaml12SafeLoader
+
+    document = (
+        yaml.load(
+            base_path.read_text(encoding="utf-8-sig"),
+            Loader=_Yaml12SafeLoader,
+        )
+        or {}
+    )
+    if not isinstance(document, dict):
+        raise TypeError("Pipeline configuration root must be an object.")
+    _absolutize_config_paths(document, base_path.parent)
+    return document
+
+
+def _config_value(document: dict[str, Any], key: str) -> Any:
+    matches: list[Any] = []
+
+    def visit(node: dict[str, Any], *, inside_model_filters: bool = False) -> None:
+        for child_key, child in node.items():
+            normalized = child_key.replace("-", "_")
+            child_inside_filters = inside_model_filters or normalized == "model_filters"
+            if normalized == key and not inside_model_filters:
+                matches.append(child)
+            if isinstance(child, dict) and not child_inside_filters:
+                visit(child, inside_model_filters=child_inside_filters)
+
+    visit(document)
+    if len(matches) > 1:
+        raise ValueError(f"Pipeline configuration defines {key} more than once.")
+    return matches[0] if matches else None
+
+
+def _available_model_names(app: Any, document: dict[str, Any]) -> list[str]:
+    raw_model_dir = _config_value(document, "model_dir")
+    raw_model_path = _config_value(document, "model_path")
+    if raw_model_dir not in {None, ""}:
+        model_dir = Path(str(raw_model_dir)).expanduser().resolve()
+        if not model_dir.is_dir():
+            raise FileNotFoundError("Configured model directory does not exist.")
+        names = sorted(
+            (
+                path.name
+                for path in model_dir.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".pt"
+            ),
+            key=lambda name: (name.casefold(), name),
+        )
+    else:
+        model_path = Path(str(raw_model_path or "best.pt")).expanduser()
+        if not model_path.is_absolute():
+            model_path = app.state.config.project_root / model_path
+        model_path = model_path.resolve()
+        names = [model_path.name] if model_path.is_file() else []
+    if not names:
+        raise FileNotFoundError("No configured .pt model checkpoints are available.")
+    folded = [name.casefold() for name in names]
+    if len(set(folded)) != len(folded):
+        raise ValueError("Configured model checkpoint names are ambiguous.")
+    return names
+
+
+def _selected_model_names(
+    app: Any,
+    document: dict[str, Any],
+    requested: list[str] | None,
+) -> list[str]:
+    available = _available_model_names(app, document)
+    if requested is None:
+        return available
+    by_folded = {name.casefold(): name for name in available}
+    unknown = [name for name in requested if name.casefold() not in by_folded]
+    if unknown:
+        raise ValueError(
+            "One or more selected detection models are no longer available."
+        )
+    requested_folded = {name.casefold() for name in requested}
+    selected = [name for name in available if name.casefold() in requested_folded]
+    validate_model_output_names(selected)
+    return selected
 
 
 def _set_config_value(
@@ -239,22 +403,7 @@ def _build_job_config(
     payload: RunRequest,
     core_parameters: dict[str, Any],
 ) -> tuple[Path, dict[str, Any]]:
-    base_path = app.state.config.pipeline_config_path
-    if base_path.is_file():
-        from mms_shp_detection.config import _Yaml12SafeLoader
-
-        document = (
-            yaml.load(
-                base_path.read_text(encoding="utf-8-sig"),
-                Loader=_Yaml12SafeLoader,
-            )
-            or {}
-        )
-        if not isinstance(document, dict):
-            raise ValueError("Pipeline configuration root must be an object.")
-        _absolutize_config_paths(document, base_path.parent)
-    else:
-        document = {"config_version": 1}
+    document = _pipeline_document(app)
 
     work_dir = app.state.config.state_dir / "runs" / run_id
     output_dir = work_dir / "output"
@@ -293,6 +442,20 @@ def _build_job_config(
         _set_config_value(document, "data_root", str(dataset_root))
         _set_config_value(document, "output_dir", str(output_dir))
         _set_config_value(document, "pointcloud_cache_path", str(cache_file))
+        selected_model_names: list[str] | None = None
+        if payload.model_names is not None:
+            selected_model_names = _selected_model_names(
+                app,
+                document,
+                payload.model_names,
+            )
+            _set_config_value(document, "model_names", selected_model_names)
+        else:
+            # A job-local request that omits the selector means "all currently
+            # configured models". Clear any selector copied from an older web
+            # job/base snapshot so compatibility clients cannot inherit a
+            # stale subset accidentally.
+            _set_config_value(document, "model_names", None)
         # The web worker captures stderr/stdout into process.log.  Keep tqdm
         # enabled there so the existing ``current/total`` parser can report
         # real progress to SSE clients.  Disabling it made healthy, long runs
@@ -367,6 +530,8 @@ def _build_job_config(
             "start_index": start_index,
             "limit_images": limit_images,
             "parameters": core_parameters,
+            "model_names": selected_model_names,
+            "layer_name": payload.layer_name,
             "config_file": "config.yaml",
             "output_directory": "output",
             "cache_file": "cache/pointcloud_catalog.json",
@@ -1178,7 +1343,7 @@ def _result_summary(
     }
     shapefiles: list[dict[str, Any]] = []
     published_paths = published_paths if publish_shapefiles else frozenset()
-    completed_primaries = (
+    completed_primaries = list(
         (
             path
             for path in result_paths
@@ -1192,6 +1357,15 @@ def _result_summary(
         if publish_shapefiles
         else ()
     )
+    run_request = run.get("request")
+    layer_name = (
+        run_request.get("layer_name") if isinstance(run_request, dict) else None
+    )
+    display_names = _result_shapefile_display_names(
+        output,
+        completed_primaries,
+        layer_name=layer_name,
+    )
     for primary in completed_primaries:
         try:
             relative = primary.relative_to(output).as_posix()
@@ -1203,9 +1377,11 @@ def _result_summary(
             if path.parent == primary.parent
             and path.stem.casefold() == primary.stem.casefold()
         ]
+        display_name = display_names.get(_output_path_identity(relative))
         shapefiles.append(
             {
                 "name": primary.stem,
+                **({"display_name": display_name} if display_name is not None else {}),
                 "path": relative,
                 "files": sorted(sidecars),
                 "download_url": (
@@ -1266,6 +1442,79 @@ def _result_summary(
     return summary
 
 
+def _result_shapefile_display_names(
+    output: Path,
+    completed_primaries: list[Path],
+    *,
+    layer_name: str | None,
+) -> dict[str, str]:
+    """Build canonical, unique display names for one run's SHP outputs."""
+
+    if not isinstance(layer_name, str) or not layer_name.strip():
+        return {}
+    base_layer_name = layer_name.strip()
+    used_display_names: set[str] = set()
+    display_names: dict[str, str] = {}
+    for primary_index, primary in enumerate(completed_primaries, start=1):
+        try:
+            relative = primary.relative_to(output).as_posix()
+        except ValueError:
+            continue
+        display_name = base_layer_name
+        if len(completed_primaries) > 1:
+            relative_parts = Path(relative).parts
+            model_suffix = relative_parts[0] if len(relative_parts) >= 3 else None
+            suffix = (
+                f"{model_suffix} · {primary.stem}"
+                if model_suffix is not None
+                else primary.stem
+            )
+            maximum_base = max(1, MAX_RUN_NAME_LENGTH - len(suffix) - 3)
+            display_name = f"{display_name[:maximum_base]} · {suffix}"[
+                :MAX_RUN_NAME_LENGTH
+            ]
+        folded_display_name = display_name.casefold()
+        base_display_name = display_name
+        duplicate_index = primary_index
+        while folded_display_name in used_display_names:
+            counter_suffix = f" · {duplicate_index}"
+            display_name = (
+                base_display_name[: MAX_RUN_NAME_LENGTH - len(counter_suffix)]
+                + counter_suffix
+            )
+            folded_display_name = display_name.casefold()
+            duplicate_index += 1
+        used_display_names.add(folded_display_name)
+        display_names[_output_path_identity(relative)] = display_name
+    return display_names
+
+
+def _result_shapefile_display_name(
+    app: Any,
+    run: dict[str, Any],
+    raw_path: str,
+) -> str | None:
+    """Resolve an import name through the same canonical result summary."""
+
+    summary = _result_summary(app, run)
+    if summary is None:
+        return None
+    requested_identity = _output_path_identity(
+        normalize_relative_path(raw_path, allow_empty=False)
+    )
+    for shapefile in summary.get("shapefiles", []):
+        if not isinstance(shapefile, dict):
+            continue
+        path = shapefile.get("path")
+        if (
+            isinstance(path, str)
+            and _output_path_identity(path) == requested_identity
+        ):
+            display_name = shapefile.get("display_name")
+            return display_name if isinstance(display_name, str) else None
+    return None
+
+
 def public_run(
     app: Any,
     item: dict[str, Any],
@@ -1311,6 +1560,7 @@ def public_run(
     dataset = app.state.store.get_dataset(item["dataset_id"], include_unregistered=True)
     result = {
         "id": item["id"],
+        "name": item.get("name"),
         "dataset_id": item["dataset_id"],
         "dataset_name": dataset["name"] if dataset is not None else None,
         "status": public_status,
@@ -1927,6 +2177,28 @@ class RunManager:
             self._active_process = None
 
 
+@router.get("/detection-models")
+def list_detection_models(request: Request) -> dict[str, Any]:
+    """List configured checkpoints without exposing server filesystem paths."""
+
+    try:
+        names = _available_model_names(request.app, _pipeline_document(request.app))
+    except (OSError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    items = [
+        {
+            "id": name,
+            "name": name,
+            "label": Path(name).stem,
+        }
+        for name in names
+    ]
+    return {
+        "items": items,
+        "default_model_ids": [item["id"] for item in items],
+    }
+
+
 @router.post("/runs", status_code=status.HTTP_201_CREATED)
 async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
     dataset = require_ready_dataset(request, payload.dataset_id)
@@ -1952,7 +2224,7 @@ async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
             payload=payload,
             core_parameters=core_parameters,
         )
-    except (ValueError, UnsafePath, OSError) as exc:
+    except (TypeError, ValueError, UnsafePath, OSError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     frame_range = selection["frame_range"]
@@ -1962,6 +2234,17 @@ async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
         "frame_range": frame_range,
         "mode": "manual" if selected_profile == "manual" else "automatic",
         "parameters": ui_parameters,
+        **({"run_name": payload.run_name} if payload.run_name is not None else {}),
+        **(
+            {"layer_name": payload.layer_name}
+            if payload.layer_name is not None
+            else {}
+        ),
+        **(
+            {"model_names": selection["model_names"]}
+            if selection["model_names"] is not None
+            else {}
+        ),
         **(
             {"auto": {**payload.auto, "preset": selected_profile}}
             if selected_profile != "manual"
@@ -1978,6 +2261,7 @@ async def create_run(payload: RunRequest, request: Request) -> dict[str, Any]:
     run = {
         "id": run_id,
         "dataset_id": payload.dataset_id,
+        "name": payload.run_name,
         "request": safe_request,
         "resolved": resolved,
         "work_relative": run_id,
@@ -2089,6 +2373,33 @@ def get_run(run_id: str, request: Request) -> dict[str, Any]:
         include_log=True,
         include_results=run["status"] in TERMINAL_STATUSES,
     )
+
+
+@router.patch("/runs/{run_id}")
+def rename_completed_run(
+    run_id: str,
+    payload: RunNamePatch,
+    request: Request,
+) -> dict[str, Any]:
+    outcome, run = request.app.state.store.rename_completed_run(
+        run_id,
+        payload.name,
+        utc_now(),
+        expected_updated_at=payload.expected_updated_at,
+    )
+    if outcome == "missing" or run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if outcome == "not_completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Only completed detection jobs can be renamed here.",
+        )
+    if outcome == "stale":
+        raise HTTPException(
+            status_code=409,
+            detail="Run metadata changed after it was loaded. Refresh and retry.",
+        )
+    return public_run(request.app, run, include_log=False)
 
 
 @router.get("/runs/{run_id}/results")

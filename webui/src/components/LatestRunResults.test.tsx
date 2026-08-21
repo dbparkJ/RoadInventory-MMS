@@ -159,6 +159,35 @@ describe('LatestRunResults job history', () => {
     )
   })
 
+  it('renames a completed job inline and keeps the selected result identity', async () => {
+    const renamed = {
+      ...RUN,
+      name: '표지판 정밀 검출',
+      updated_at: '2026-08-20T03:00:00Z',
+    }
+    vi.spyOn(api, 'completedRuns').mockResolvedValue({ items: [{ ...RUN, name: '초기 실행' }] })
+    const renameRun = vi.spyOn(api, 'renameRun').mockResolvedValue(renamed)
+
+    render(
+      <LatestRunResults dataset={DATASET} runs={[]} demoMode={false} onOpenQueue={vi.fn()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '검출결과' }))
+    const editButton = await screen.findByRole('button', { name: '초기 실행 실행 이름 수정' })
+    fireEvent.click(editButton)
+    fireEvent.change(screen.getByRole('textbox', { name: '초기 실행 실행 이름' }), {
+      target: { value: '  표지판 정밀 검출  ' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '저장' }))
+
+    await waitFor(() => expect(renameRun).toHaveBeenCalledWith(
+      RUN.id,
+      { name: '표지판 정밀 검출' },
+      expect.any(AbortSignal),
+    ))
+    expect(await screen.findByRole('button', { name: '표지판 정밀 검출 상세 보기' }))
+      .toBeInTheDocument()
+  })
+
   it('moves focus into the history dialog, traps Tab, and restores the trigger on close', async () => {
     render(
       <LatestRunResults dataset={DATASET} runs={[RUN]} demoMode onOpenQueue={vi.fn()} />,

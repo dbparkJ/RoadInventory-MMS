@@ -344,14 +344,36 @@ changes.
   "track_ids": ["track-a"],
   "frame_range": null,
   "mode": "automatic",
+  "run_name": "2026 교통표지 검출",
+  "layer_name": "2026 교통표지 검출",
+  "model_names": ["traffic_sign_best.pt"],
   "auto": { "preset": "balanced" }
 }
 ```
 
 Automatic mode selects a processing-resource profile for the server hardware and operator preset; it
 does not train a model, sample frames, or silently change the validated algorithm thresholds.
-For manual mode, omit `auto` and provide the `parameters` object above. The validated UI defaults
-match the server configuration rather than inventing dataset-independent values.
+`GET /api/detection-models` returns
+`{ "items": [{ "id": "traffic_sign_best.pt", "name": "traffic_sign_best.pt",
+"label": "traffic_sign_best" }], "default_model_ids": ["traffic_sign_best.pt"] }` without server
+filesystem paths. `model_names` is an exact checkpoint allow-list from that catalog. Omitting it keeps
+the legacy behavior of running every configured model; supplying an empty list is rejected, and a
+checkpoint removed between catalog load and submission returns `422` instead of silently running a
+different set. The canonical selected names are persisted in the run request, resolved metadata and
+job-local YAML, and the pipeline filters discovery in stable model-directory order. Output-directory
+name collisions are checked after applying the selection: either colliding checkpoint can run alone,
+but selecting both is rejected by `POST /api/runs` before the job is queued.
+
+`run_name` is the initial operator-facing completed-job name. `layer_name` is the default display name
+for result SHP layers; when a run has multiple SHP outputs the result response appends a short output
+suffix to keep the import choices distinguishable. Direct result imports that omit `name` resolve the
+same canonical `display_name`, including model/SHP suffixes and collision ordinals. Both names are
+trimmed, limited to 120 characters and reject control characters or path separators.
+The model selection and layer name are required by the current UI in both parameter modes. For manual
+mode, omit `auto`, retain those common fields, and provide the `parameters` object above. The validated
+UI defaults match the server configuration rather than inventing dataset-independent values. Only a
+`404` from `/api/detection-models` is treated as a rolling-upgrade legacy server and falls back to the
+server's all-model behavior; configuration and network failures block submission and expose retry.
 
 `GET /api/runs` returns `{ "items": RunRecord[] }`. `POST /api/runs/{id}/cancel` returns the updated
 record. Progress is 0–100 and status is one of `queued`, `preparing`, `running`, `completed`,
@@ -377,6 +399,12 @@ client sends the first response's `snapshot_at` on every later page, so a run co
 history is loading cannot shift OFFSET boundaries and duplicate or hide rows. It follows every
 stable page before showing the job list, and selecting a row opens that exact run's result detail
 rather than silently choosing only the latest run.
+
+`PATCH /api/runs/{id}` accepts
+`{ "name": "야간 표지판 검출", "expected_updated_at": "2026-08-20T00:05:00+00:00" }` for a
+completed run and returns the updated `RunRecord`. The optional timestamp is an optimistic-lock token;
+a stale editor receives `409`, so two open history dialogs cannot silently overwrite each other.
+Renaming changes only durable display metadata and does not rename or invalidate result artifacts.
 
 `frame_range` always contains zero-based **dataset-global ordinals**, even when `track_ids` contains
 one track. The automatic-detection setup therefore validates range inputs against the full dataset

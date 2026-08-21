@@ -2542,6 +2542,17 @@ async def import_result_shapefile(
     dataset = require_ready_dataset(request, run["dataset_id"])
     try:
         primary = _result_shapefile(request.app, run, payload.path)
+        from .runs import _result_shapefile_display_name
+
+        result_display_name = _result_shapefile_display_name(
+            request.app,
+            run,
+            payload.path,
+        )
+        run_request = run.get("request")
+        configured_layer_name = (
+            run_request.get("layer_name") if isinstance(run_request, dict) else None
+        )
         members = _bundle_files(primary)
         layer_id = f"ov_{uuid.uuid4().hex}"
         root = _overlay_root(request.app, dataset["id"])
@@ -2554,7 +2565,12 @@ async def import_result_shapefile(
             dataset,
             staging,
             layer_id=layer_id,
-            name=payload.name or primary.stem,
+            name=(
+                payload.name
+                or result_display_name
+                or configured_layer_name
+                or primary.stem
+            ),
             supplied_crs=payload.crs,
             supplied_encoding=payload.encoding,
             source_kind="run_result",

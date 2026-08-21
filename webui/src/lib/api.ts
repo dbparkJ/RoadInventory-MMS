@@ -1,6 +1,7 @@
 import type {
   BootstrapResponse,
   DatasetDetail,
+  DetectionModelOption,
   FrameDetectionResponse,
   FrameAddressResponse,
   FrameLocateResponse,
@@ -622,6 +623,13 @@ export const api = {
     )
   },
 
+  detectionModels(signal?: AbortSignal) {
+    return json<{ items: DetectionModelOption[]; default_model_ids: string[] }>(
+      '/api/detection-models',
+      { signal },
+    )
+  },
+
   surveySegments(datasetId: string, signal?: AbortSignal) {
     return json<{ items: SurveySegment[] }>(
       `/api/datasets/${encodeURIComponent(datasetId)}/survey-segments`,
@@ -676,6 +684,19 @@ export const api = {
     return json<RunRecord>('/api/runs', {
       method: 'POST',
       ...jsonBody(payload),
+      timeout: 30_000,
+    })
+  },
+
+  renameRun(
+    runId: string,
+    payload: { name: string; expected_updated_at?: string },
+    signal?: AbortSignal,
+  ) {
+    return json<RunRecord>(`/api/runs/${encodeURIComponent(runId)}`, {
+      method: 'PATCH',
+      ...jsonBody(payload),
+      signal,
       timeout: 30_000,
     })
   },

@@ -4,6 +4,7 @@ import {
   FileCheck2,
   ListChecks,
   LoaderCircle,
+  Save,
   X,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
@@ -73,7 +74,12 @@ export function LatestRunResults({
   const [resultRun, setResultRun] = useState<RunRecord | null>(null)
   const [lookupLoading, setLookupLoading] = useState(false)
   const [lookupError, setLookupError] = useState<string | null>(null)
+  const [editingRunId, setEditingRunId] = useState<string | null>(null)
+  const [editName, setEditName] = useState('')
+  const [renameSavingId, setRenameSavingId] = useState<string | null>(null)
+  const [renameError, setRenameError] = useState<{ runId: string; message: string } | null>(null)
   const lookupControllerRef = useRef<AbortController | null>(null)
+  const renameControllerRef = useRef<AbortController | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const historyDialogRef = useRef<HTMLElement>(null)
   const historyCloseRef = useRef<HTMLButtonElement>(null)
@@ -83,10 +89,58 @@ export function LatestRunResults({
   const close = () => {
     lookupControllerRef.current?.abort()
     lookupControllerRef.current = null
+    renameControllerRef.current?.abort()
+    renameControllerRef.current = null
     setOpen(false)
     setResultRun(null)
     setLookupLoading(false)
     setLookupError(null)
+    setEditingRunId(null)
+    setRenameSavingId(null)
+    setRenameError(null)
+  }
+
+  const beginRename = (run: RunRecord) => {
+    setEditingRunId(run.id)
+    setEditName(run.name?.trim() || `자동 검출 ${formatDate(run.created_at)}`)
+    setRenameError(null)
+  }
+
+  const saveRunName = async (run: RunRecord) => {
+    const name = editName.trim()
+    if (!name) {
+      setRenameError({ runId: run.id, message: '실행 이름을 입력해 주세요.' })
+      return
+    }
+    renameControllerRef.current?.abort()
+    const controller = new AbortController()
+    renameControllerRef.current = controller
+    setRenameSavingId(run.id)
+    setRenameError(null)
+    try {
+      const updated = demoMode
+        ? { ...run, name, updated_at: new Date().toISOString() }
+        : await api.renameRun(
+            run.id,
+            { name, ...(run.updated_at ? { expected_updated_at: run.updated_at } : {}) },
+            controller.signal,
+          )
+      if (controller.signal.aborted || renameControllerRef.current !== controller) return
+      setItems((current) => current.map((item) => (item.id === run.id ? updated : item)))
+      setEditingRunId(null)
+      setEditName('')
+    } catch (reason) {
+      if (controller.signal.aborted || renameControllerRef.current !== controller) return
+      setRenameError({
+        runId: run.id,
+        message: reason instanceof Error ? reason.message : '실행 이름을 저장하지 못했습니다.',
+      })
+    } finally {
+      if (renameControllerRef.current === controller) {
+        renameControllerRef.current = null
+        setRenameSavingId(null)
+      }
+    }
   }
 
   const openResults = async () => {
@@ -97,10 +151,15 @@ export function LatestRunResults({
     }
     lookupControllerRef.current?.abort()
     lookupControllerRef.current = null
+    renameControllerRef.current?.abort()
+    renameControllerRef.current = null
     setOpen(true)
     setResultRun(null)
     setItems([])
     setLookupError(null)
+    setEditingRunId(null)
+    setRenameSavingId(null)
+    setRenameError(null)
 
     if (!dataset) {
       setLookupLoading(false)
@@ -176,11 +235,16 @@ export function LatestRunResults({
   useEffect(() => {
     lookupControllerRef.current?.abort()
     lookupControllerRef.current = null
+    renameControllerRef.current?.abort()
+    renameControllerRef.current = null
     setOpen(false)
     setItems([])
     setResultRun(null)
     setLookupLoading(false)
     setLookupError(null)
+    setEditingRunId(null)
+    setRenameSavingId(null)
+    setRenameError(null)
   }, [dataset?.id])
 
   useEffect(() => {
@@ -192,6 +256,14 @@ export function LatestRunResults({
       if (event.key === 'Escape') {
         event.preventDefault()
         event.stopPropagation()
+        if (editingRunId) {
+          renameControllerRef.current?.abort()
+          renameControllerRef.current = null
+          setEditingRunId(null)
+          setRenameSavingId(null)
+          setRenameError(null)
+          return
+        }
         close()
         return
       }
@@ -216,7 +288,7 @@ export function LatestRunResults({
     ownerDocument.addEventListener('keydown', handleDialogKey, true)
     historyCloseRef.current?.focus()
     return () => ownerDocument.removeEventListener('keydown', handleDialogKey, true)
-  }, [open, resultRun])
+  }, [editingRunId, open, resultRun])
 
   useEffect(() => {
     if (open) {
@@ -233,6 +305,7 @@ export function LatestRunResults({
   useEffect(
     () => () => {
       lookupControllerRef.current?.abort()
+      renameControllerRef.current?.abort()
     },
     [],
   )
@@ -308,27 +381,96 @@ export function LatestRunResults({
                   {items.map((run, index) => {
                     const range = run.request?.frame_range
                     const trackCount = run.request?.track_ids.length
+                    const displayName = run.name?.trim() || `자동 검출 ${formatDate(run.created_at)}`
+                    const editing = editingRunId === run.id
                     return (
-                      <button
-                        type="button"
-                        className="result-history-card"
-                        key={run.id}
-                        onClick={() => setResultRun(run)}
-                      >
+                      <article className="result-history-card" key={run.id}>
                         <span className="result-history-index">{String(index + 1).padStart(2, '0')}</span>
-                        <span className="result-history-copy">
-                          <strong>{formatDate(run.finished_at ?? run.updated_at ?? run.created_at)}</strong>
-                          <small>
-                            {trackCount !== undefined ? `${trackCount}개 트랙` : '트랙 정보 없음'}
-                            {' · '}
-                            {range ? `Frame ${range[0] + 1}–${range[1] + 1}` : '전체 프레임'}
-                          </small>
-                          <code>{run.id}</code>
-                        </span>
-                        <span className="result-history-open">
-                          상세 보기 <ChevronRight size={15} />
-                        </span>
-                      </button>
+                        {editing ? (
+                          <form
+                            className="result-history-edit"
+                            onSubmit={(event) => {
+                              event.preventDefault()
+                              void saveRunName(run)
+                            }}
+                          >
+                            <label>
+                              <span>실행 이름</span>
+                              <input
+                                autoFocus
+                                type="text"
+                                value={editName}
+                                maxLength={120}
+                                aria-label={`${displayName} 실행 이름`}
+                                onChange={(event) => setEditName(event.target.value)}
+                              />
+                            </label>
+                            <span className="result-history-edit-actions">
+                              <button
+                                type="button"
+                                className="button ghost"
+                                disabled={renameSavingId === run.id}
+                                onClick={() => {
+                                  renameControllerRef.current?.abort()
+                                  renameControllerRef.current = null
+                                  setEditingRunId(null)
+                                  setRenameSavingId(null)
+                                  setRenameError(null)
+                                }}
+                              >
+                                취소
+                              </button>
+                              <button
+                                type="submit"
+                                className="button primary"
+                                disabled={renameSavingId === run.id || !editName.trim()}
+                              >
+                                {renameSavingId === run.id
+                                  ? <LoaderCircle size={13} className="spin" />
+                                  : <Save size={13} />}
+                                저장
+                              </button>
+                            </span>
+                            {renameError?.runId === run.id && (
+                              <small className="result-history-rename-error" role="alert">
+                                {renameError.message}
+                              </small>
+                            )}
+                          </form>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="result-history-rename"
+                              onClick={() => beginRename(run)}
+                              aria-label={`${displayName} 실행 이름 수정`}
+                            >
+                              이름 수정
+                            </button>
+                            <button
+                              type="button"
+                              className="result-history-main"
+                              onClick={() => setResultRun(run)}
+                              aria-label={`${displayName} 상세 보기`}
+                            >
+                              <span className="result-history-copy">
+                                <strong>{displayName}</strong>
+                                <small>
+                                  {formatDate(run.finished_at ?? run.updated_at ?? run.created_at)}
+                                  {' · '}
+                                  {trackCount !== undefined ? `${trackCount}개 트랙` : '트랙 정보 없음'}
+                                  {' · '}
+                                  {range ? `Frame ${range[0] + 1}–${range[1] + 1}` : '전체 프레임'}
+                                </small>
+                                <code>{run.id}</code>
+                              </span>
+                              <span className="result-history-open">
+                                상세 보기 <ChevronRight size={15} />
+                              </span>
+                            </button>
+                          </>
+                        )}
+                      </article>
                     )
                   })}
                 </div>

@@ -78,9 +78,25 @@ interface VWorldViewer {
     canvas: HTMLCanvasElement
     pick(position: unknown): unknown
     drillPick?(position: unknown, limit?: number): unknown
+    pickPosition?(position: unknown): unknown
+    globe?: {
+      pick?(ray: unknown, scene: unknown): unknown
+      ellipsoid?: {
+        cartesianToCartographic?(cartesian: unknown): VWorldCartographic | null
+      }
+    }
+  }
+  camera?: {
+    getPickRay?(position: unknown): unknown
+    pickEllipsoid?(position: unknown, ellipsoid?: unknown): unknown
   }
   dataSources: VWorldDataSourceCollection
   forceResize?: () => void
+}
+
+interface VWorldCartographic {
+  longitude?: number
+  latitude?: number
 }
 
 interface VWorldColor {
@@ -107,6 +123,15 @@ interface CesiumNamespace {
   }
   ClassificationType?: {
     BOTH: unknown
+  }
+  Cartographic?: {
+    fromCartesian(cartesian: unknown): VWorldCartographic | null
+  }
+  Ellipsoid?: {
+    WGS84?: unknown
+  }
+  Math?: {
+    toDegrees(radians: number): number
   }
 }
 
@@ -158,6 +183,58 @@ export interface VWorldDistanceScale {
 
 export function selectedFrameDistanceScale(): VWorldDistanceScale {
   return { near: 60, nearValue: 0.9, far: 25_000, farValue: 0.3 }
+}
+
+/**
+ * Resolve a canvas pointer to WGS84 without depending on the SDK click event.
+ * Terrain picking is preferred; the ellipsoid fallback keeps the survey
+ * preview responsive when depth picking is unavailable in VWorld.
+ */
+export function vworldCanvasWgs84Coordinate(
+  runtime: VWorldRuntime,
+  windowPosition: unknown,
+): [number, number] | null {
+  const { scene } = runtime.viewer
+  let cartesian: unknown
+  try {
+    cartesian = scene.pickPosition?.(windowPosition)
+  } catch {
+    // Depth picking may be unsupported for the current browser/scene.
+  }
+  if (!cartesian) {
+    try {
+      const ray = runtime.viewer.camera?.getPickRay?.(windowPosition)
+      if (ray) cartesian = scene.globe?.pick?.(ray, scene)
+    } catch {
+      // A ray can miss the globe near the horizon.
+    }
+  }
+  if (!cartesian) {
+    try {
+      cartesian = runtime.viewer.camera?.pickEllipsoid?.(
+        windowPosition,
+        scene.globe?.ellipsoid ?? runtime.Cesium.Ellipsoid?.WGS84,
+      )
+    } catch {
+      // Pointer is outside the rendered globe.
+    }
+  }
+  if (!cartesian) return null
+
+  let cartographic: VWorldCartographic | null | undefined
+  try {
+    cartographic = scene.globe?.ellipsoid?.cartesianToCartographic?.(cartesian)
+      ?? runtime.Cesium.Cartographic?.fromCartesian(cartesian)
+  } catch {
+    return null
+  }
+  const longitude = Number(cartographic?.longitude)
+  const latitude = Number(cartographic?.latitude)
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return null
+  const toDegrees = runtime.Cesium.Math?.toDegrees ?? ((radians: number) => radians * 180 / Math.PI)
+  const lon = toDegrees(longitude)
+  const lat = toDegrees(latitude)
+  return Number.isFinite(lon) && Number.isFinite(lat) ? [lon, lat] : null
 }
 
 export function assertVWorldSdk(frameWindow: Window): {

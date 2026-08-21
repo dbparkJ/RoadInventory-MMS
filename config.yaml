@@ -17,6 +17,9 @@ paths:
   model_path: null
   # 이 폴더 바로 아래의 모든 .pt 모델을 파일명 순서로 각각 실행합니다.
   model_dir: models
+  # null이면 발견된 모든 모델을 실행합니다. 일부만 실행할 때는 파일명 목록을 지정합니다.
+  # 예: [traffic_sign_best.pt]
+  model_names: null
   # 모델별로 완전히 분리된 TXT, SHP, 디버그 영상, LAS crop, 로그가 생성될 상위 폴더입니다.
   output_dir: outputs_Neo700_models_ver2
   # 대용량 LAS/PCDB 공간 인덱스 캐시입니다. 데이터가 바뀌면 자동 갱신됩니다.

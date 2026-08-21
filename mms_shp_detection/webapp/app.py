@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import math
 import os
+import secrets
 import weakref
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -101,6 +104,8 @@ class WebAppConfig:
     max_overlay_response_features: int = 10_000
     enable_run_worker: bool = True
     static_dir: Path | None = None
+    auth_username: str | None = None
+    auth_password: str | None = None
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root).expanduser().resolve(strict=True)
@@ -127,6 +132,12 @@ class WebAppConfig:
                 )
             else:
                 self.allowed_roots = (self.project_root / "data",)
+        if (self.auth_username is None) != (self.auth_password is None):
+            raise ValueError("Web authentication requires both username and password.")
+        if self.auth_username is not None and (
+            not self.auth_username or not self.auth_password
+        ):
+            raise ValueError("Web authentication credentials cannot be empty.")
         normalize_relative_path(self.upload_relative_dir, allow_empty=False)
         if (
             min(
@@ -232,6 +243,36 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         ):
             response.headers["Cache-Control"] = "no-cache"
         return response
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: Any, *, username: str, password: str) -> None:
+        super().__init__(app)
+        self.username = username.encode("utf-8")
+        self.password = password.encode("utf-8")
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        authorization = request.headers.get("Authorization", "")
+        authenticated = False
+        if authorization.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(
+                    authorization.removeprefix("Basic "), validate=True
+                ).decode("utf-8")
+                username, password = decoded.split(":", 1)
+                authenticated = secrets.compare_digest(
+                    username.encode("utf-8"), self.username
+                ) and secrets.compare_digest(password.encode("utf-8"), self.password)
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                pass
+        if not authenticated:
+            return Response(
+                "Authentication required.",
+                status_code=401,
+                media_type="text/plain",
+                headers={"WWW-Authenticate": 'Basic realm="MMS", charset="UTF-8"'},
+            )
+        return await call_next(request)
 
 
 class WorkerProcessLock:
@@ -517,6 +558,12 @@ def create_app(
 
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    if config.auth_username is not None and config.auth_password is not None:
+        app.add_middleware(
+            BasicAuthMiddleware,
+            username=config.auth_username,
+            password=config.auth_password,
+        )
     app.include_router(datasets_router)
     app.include_router(detections_router)
     app.include_router(media_router)

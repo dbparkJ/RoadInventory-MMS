@@ -32,6 +32,7 @@ import {
   resizeVWorldMap,
   setVWorldSceneMode,
   startVWorldMap,
+  vworldCanvasWgs84Coordinate,
   VWORLD_CONTAINER_ID,
   VWORLD_IFRAME_URL,
   type VWorldCustomDataSource,
@@ -109,6 +110,21 @@ export function vworld2DBaseMapForMode(mode: MapMode): VWorld2DBaseMap {
   return mode === 'satellite' ? 'satellite' : 'base'
 }
 
+export function vworld2DPointerWgs84Coordinate(
+  runtime: Pick<VWorld2DRuntime, 'ol'>,
+  coordinate: unknown,
+): [number, number] | null {
+  if (coordinate === undefined || coordinate === null) return null
+  try {
+    const [longitude, latitude] = runtime.ol.proj.toLonLat(coordinate)
+    return Number.isFinite(longitude) && Number.isFinite(latitude)
+      ? [longitude, latitude]
+      : null
+  } catch {
+    return null
+  }
+}
+
 export function mapProviderForMode(mode: MapMode): string {
   if (mode === '3d') return 'vworld-webgl-3.0'
   return mode === 'satellite'
@@ -127,7 +143,11 @@ export function buildSurveyFeatureCollection(
   segments: readonly SurveySegment[],
   draft: readonly [number, number][],
   draftColor: string,
+  preview: [number, number] | null = null,
 ): FeatureCollection {
+  const draftCoordinates = preview && draft.length > 0
+    ? [...draft, preview]
+    : [...draft]
   return {
     type: 'FeatureCollection',
     features: [
@@ -141,12 +161,12 @@ export function buildSurveyFeatureCollection(
         },
         geometry: segment.geometry,
       })),
-      ...(draft.length >= 2
+      ...(draftCoordinates.length >= 2
         ? [{
             type: 'Feature' as const,
             id: 'survey-draft',
             properties: { track_color: draftColor, survey_draft: 1 },
-            geometry: { type: 'LineString' as const, coordinates: [...draft] },
+            geometry: { type: 'LineString' as const, coordinates: draftCoordinates },
           }]
         : []),
     ],
@@ -182,8 +202,10 @@ interface MapViewProps {
   surveySegments?: SurveySegment[]
   surveyDraft?: [number, number][]
   surveyDraftColor?: string
+  surveyDraftPreview?: [number, number] | null
   surveyDrawing?: boolean
   onAddSurveyPoint?: (coordinate: [number, number]) => void
+  onPreviewSurveyPoint?: (coordinate: [number, number] | null) => void
 }
 
 interface VWorldBoot {
@@ -276,8 +298,10 @@ export function MapView({
   surveySegments = [],
   surveyDraft = [],
   surveyDraftColor = '#f59e0b',
+  surveyDraftPreview = null,
   surveyDrawing = false,
   onAddSurveyPoint,
+  onPreviewSurveyPoint,
 }: MapViewProps) {
   const mapRootRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -311,6 +335,7 @@ export function MapView({
   const mapModeRef = useRef(mapMode)
   const surveyDrawingRef = useRef(surveyDrawing)
   const onAddSurveyPointRef = useRef(onAddSurveyPoint)
+  const onPreviewSurveyPointRef = useRef(onPreviewSurveyPoint)
 
   onSelectRef.current = onSelectFrame
   framesRef.current = frames
@@ -318,6 +343,7 @@ export function MapView({
   mapModeRef.current = mapMode
   surveyDrawingRef.current = surveyDrawing
   onAddSurveyPointRef.current = onAddSurveyPoint
+  onPreviewSurveyPointRef.current = onPreviewSurveyPoint
   mapHoverRef.current = mapHover
   pinnedMapHoverRef.current = pinnedMapHover
   const vworld2DActive = isVWorld2DMapMode(mapMode)
@@ -331,8 +357,13 @@ export function MapView({
     [overlay?.mapFeatures],
   )
   const surveyGeoJson = useMemo(
-    () => buildSurveyFeatureCollection(surveySegments, surveyDraft, surveyDraftColor),
-    [surveyDraft, surveyDraftColor, surveySegments],
+    () => buildSurveyFeatureCollection(
+      surveySegments,
+      surveyDraft,
+      surveyDraftColor,
+      surveyDraftPreview,
+    ),
+    [surveyDraft, surveyDraftColor, surveyDraftPreview, surveySegments],
   )
   const selectedOverlayCoordinate = useMemo(() => {
     const geometry = overlay?.selectedFeature?.geometry
@@ -479,6 +510,7 @@ export function MapView({
             const longitude = Number(cartographic.longitudeDD)
             const latitude = Number(cartographic.latitudeDD)
             if (Number.isFinite(longitude) && Number.isFinite(latitude)) {
+              onPreviewSurveyPointRef.current?.(null)
               onAddSurveyPointRef.current?.([longitude, latitude])
               return
             }
@@ -561,6 +593,11 @@ export function MapView({
           const pending = pendingHover
           pendingHover = null
           if (!runtime || !pending) return
+          if (surveyDrawingRef.current && !overlayRef.current?.pickMode) {
+            onPreviewSurveyPointRef.current?.(
+              vworldCanvasWgs84Coordinate(runtime, { x: pending.x, y: pending.y }),
+            )
+          }
           let target: VWorldOverlayHoverTarget | undefined
           try {
             const entityId = firstTargetEntityId(
@@ -590,7 +627,7 @@ export function MapView({
           })
         }
         mapPointerMoveHandler = (event) => {
-          if (pinnedMapHoverRef.current) return
+          if (pinnedMapHoverRef.current && !surveyDrawingRef.current) return
           pendingHover = { x: event.offsetX, y: event.offsetY }
           if (!hoverAnimationFrame) {
             hoverAnimationFrame = frameWindow.requestAnimationFrame(updateHover)
@@ -598,6 +635,7 @@ export function MapView({
         }
         mapPointerLeaveHandler = () => {
           pendingHover = null
+          onPreviewSurveyPointRef.current?.(null)
           if (!pinnedMapHoverRef.current) setMapHover(null)
         }
         hoverCanvas.addEventListener('pointermove', mapPointerMoveHandler)
@@ -674,6 +712,7 @@ export function MapView({
       overlayClickTargetsRef.current = new Map()
       overlayHoverTargetsRef.current = new Map()
       setMapHover(null)
+      onPreviewSurveyPointRef.current?.(null)
       setReady3D(false)
     }
   }, [mapMode, reloadToken])
@@ -689,6 +728,8 @@ export function MapView({
     let resizeObserver: ResizeObserver | null = null
     let mapClickHandler: ((event: { pixel?: unknown; coordinate?: unknown }) => void) | null = null
     let mapPointerMoveHandler: ((event: { pixel?: unknown; coordinate?: unknown }) => void) | null = null
+    let mapPointerLeaveElement: HTMLElement | null = null
+    let mapPointerLeaveHandler: (() => void) | null = null
     let mapKeyDownDocument: Document | null = null
     let mapKeyDownHandler: ((event: KeyboardEvent) => void) | null = null
 
@@ -730,9 +771,10 @@ export function MapView({
             !overlayRef.current?.pickMode &&
             event.coordinate !== undefined
           ) {
-            const [longitude, latitude] = runtime.ol.proj.toLonLat(event.coordinate)
-            if (Number.isFinite(longitude) && Number.isFinite(latitude)) {
-              onAddSurveyPointRef.current?.([longitude, latitude])
+            const coordinate = vworld2DPointerWgs84Coordinate(runtime, event.coordinate)
+            if (coordinate) {
+              onPreviewSurveyPointRef.current?.(null)
+              onAddSurveyPointRef.current?.(coordinate)
               return
             }
           }
@@ -782,6 +824,15 @@ export function MapView({
         runtime.map.on('singleclick', mapClickHandler)
         mapPointerMoveHandler = (event) => {
           if (!runtime) return
+          if (
+            surveyDrawingRef.current &&
+            !overlayRef.current?.pickMode &&
+            event.coordinate !== undefined
+          ) {
+            onPreviewSurveyPointRef.current?.(
+              vworld2DPointerWgs84Coordinate(runtime, event.coordinate),
+            )
+          }
           if (pinnedMapHoverRef.current) return
           const target = vworld2DOverlayHoverTarget(runtime, event)
           if (!target) {
@@ -803,6 +854,9 @@ export function MapView({
           })
         }
         runtime.map.on('pointermove', mapPointerMoveHandler)
+        mapPointerLeaveElement = iframe.contentDocument?.getElementById(VWORLD_2D_CONTAINER_ID) ?? null
+        mapPointerLeaveHandler = () => onPreviewSurveyPointRef.current?.(null)
+        mapPointerLeaveElement?.addEventListener('pointerleave', mapPointerLeaveHandler)
         mapKeyDownDocument = frameWindow.document
         mapKeyDownHandler = (event) => {
           const relayed = relayMapOverlayShortcut(event, iframe.ownerDocument.defaultView ?? window)
@@ -856,6 +910,9 @@ export function MapView({
           // The isolated 2D frame may already be leaving the document.
         }
       }
+      if (mapPointerLeaveElement && mapPointerLeaveHandler) {
+        mapPointerLeaveElement.removeEventListener('pointerleave', mapPointerLeaveHandler)
+      }
       if (runtime && sources) {
         Object.values(sources).forEach((source) => removeVWorld2DDataSource(runtime!, source))
       }
@@ -863,6 +920,7 @@ export function MapView({
       if (runtime2DRef.current === runtime) runtime2DRef.current = null
       if (sources2DRef.current === sources) sources2DRef.current = null
       setMapHover(null)
+      onPreviewSurveyPointRef.current?.(null)
       setReady2D(false)
     }
   }, [reloadToken, vworld2DActive])

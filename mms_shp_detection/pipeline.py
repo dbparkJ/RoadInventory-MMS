@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     ProcessPoolExecutor,
@@ -80,6 +81,7 @@ from .infrastructure.manifest_writer import (
     RunManifestStore,
     validate_published_outputs,
 )
+from .naming import sanitize_name, validate_model_output_names
 from .pointcloud import (
     PointCloudReaderCache,
     build_pointcloud_catalog,
@@ -648,6 +650,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Run every .pt checkpoint directly inside this directory, in name order.",
+    )
+    parser.add_argument(
+        "--model-names",
+        type=parse_name_list,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Optional exact checkpoint file names to run from --model-dir. "
+            "YAML accepts a non-empty list; omitted means every discovered model."
+        ),
     )
     parser.add_argument(
         "--model-filters",
@@ -1402,12 +1414,6 @@ def setup_logging(
     return logger
 
 
-def sanitize_name(value: str) -> str:
-    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", value)
-    safe = safe.strip("._")
-    return safe or "item"
-
-
 _MODEL_FILTER_SCALAR_KEYS = {
     "imgsz",
     "conf",
@@ -1441,6 +1447,7 @@ def _model_filter_key_allowed(key: str) -> bool:
 def discover_model_paths(
     model_dir: Path | None,
     model_path: Path | None,
+    selected_model_names: Sequence[str] | None = None,
 ) -> list[Path]:
     """Resolve the stable, non-recursive model execution list."""
 
@@ -1450,7 +1457,8 @@ def discover_model_paths(
         resolved = model_path.expanduser().resolve()
         if not resolved.is_file():
             raise FileNotFoundError(f"Model checkpoint does not exist: {resolved}")
-        return [resolved]
+        paths = [resolved]
+        return _select_model_paths(paths, selected_model_names)
 
     resolved_dir = model_dir.expanduser().resolve()
     if not resolved_dir.is_dir():
@@ -1466,17 +1474,47 @@ def discover_model_paths(
     if not paths:
         raise FileNotFoundError(f"No .pt model checkpoints found in: {resolved_dir}")
 
-    output_keys: dict[str, Path] = {}
-    for path in paths:
-        output_key = sanitize_name(path.stem).casefold()
-        previous = output_keys.get(output_key)
-        if previous is not None:
-            raise ValueError(
-                "Model names collide after output-path sanitization: "
-                f"{previous.name!r} and {path.name!r}"
-            )
-        output_keys[output_key] = path
-    return paths
+    selected_paths = _select_model_paths(paths, selected_model_names)
+    validate_model_output_names(path.name for path in selected_paths)
+    return selected_paths
+
+
+def _select_model_paths(
+    paths: Sequence[Path],
+    selected_model_names: Sequence[str] | None,
+) -> list[Path]:
+    """Apply an exact, case-insensitive checkpoint allow-list in discovery order."""
+
+    if selected_model_names is None:
+        return list(paths)
+    if not selected_model_names:
+        raise ValueError("model_names must contain at least one checkpoint name")
+
+    selected: set[str] = set()
+    for raw_name in selected_model_names:
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("model_names cannot contain an empty checkpoint name")
+        folded = name.casefold()
+        if folded in selected:
+            raise ValueError(f"model_names contains a duplicate checkpoint: {name!r}")
+        selected.add(folded)
+
+    available = {path.name.casefold(): path.name for path in paths}
+    unknown = sorted(
+        (
+            name
+            for name in selected_model_names
+            if str(name).strip().casefold() not in available
+        ),
+        key=lambda value: (str(value).casefold(), str(value)),
+    )
+    if unknown:
+        raise ValueError(
+            "Requested model checkpoints are not available: "
+            + ", ".join(repr(str(name)) for name in unknown)
+        )
+    return [path for path in paths if path.name.casefold() in selected]
 
 
 def _flatten_model_filter_profile(
@@ -1899,6 +1937,7 @@ def build_run_fingerprint(
     excluded = {
         "output_dir",
         "model_dir",
+        "model_names",
         "model_filters",
         "pointcloud_cache_path",
         "skip_existing",
@@ -9622,6 +9661,7 @@ def _run_pipeline_impl(args: argparse.Namespace) -> dict[str, Any]:
     model_paths = discover_model_paths(
         configured_model_dir,
         getattr(args, "model_path", None),
+        getattr(args, "model_names", None),
     )
     multi_model = configured_model_dir is not None
     base_output_dir = Path(args.output_dir).resolve()
@@ -9906,6 +9946,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             model_paths = discover_model_paths(
                 configured_model_dir,
                 getattr(args, "model_path", None),
+                getattr(args, "model_names", None),
             )
             stage.input_count = 1
             stage.output_count = len(model_paths)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--ssl-certfile",
+        type=Path,
+        help="PEM certificate chain used to serve HTTPS directly.",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=Path,
+        help="PEM private key used to serve HTTPS directly.",
+    )
+    parser.add_argument(
         "--storage-root",
         action="append",
         type=Path,
@@ -50,12 +61,36 @@ def build_parser() -> argparse.ArgumentParser:
             "and an authenticated TLS reverse proxy. The app has no built-in login."
         ),
     )
+    parser.add_argument(
+        "--auth-username",
+        default=os.environ.get("MMS_WEB_USERNAME"),
+        help="Require HTTP Basic authentication with this username.",
+    )
+    parser.add_argument(
+        "--auth-password-env",
+        default="MMS_WEB_PASSWORD",
+        help="Environment variable containing the HTTP Basic password.",
+    )
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if (args.ssl_certfile is None) != (args.ssl_keyfile is None):
+        parser.error("--ssl-certfile and --ssl-keyfile must be provided together")
+    for option, path in (
+        ("--ssl-certfile", args.ssl_certfile),
+        ("--ssl-keyfile", args.ssl_keyfile),
+    ):
+        if path is not None and not path.is_file():
+            parser.error(f"{option} does not exist or is not a file: {path}")
+    auth_password = os.environ.get(args.auth_password_env)
+    if (args.auth_username is None) != (auth_password is None):
+        parser.error(
+            "authentication requires --auth-username (or MMS_WEB_USERNAME) and "
+            f"the {args.auth_password_env} environment variable"
+        )
     if not is_loopback_bind(args.host) and not args.allow_remote_bind:
         parser.error(
             "refusing a non-loopback listener because the app has no built-in "
@@ -69,6 +104,8 @@ def main() -> None:
         # project/data fallback. Explicit --storage-root values still win.
         allowed_roots=args.storage_roots or None,
         enable_run_worker=not args.no_run_worker,
+        auth_username=args.auth_username,
+        auth_password=auth_password,
     )
     app = create_app(config)
     try:
@@ -84,6 +121,8 @@ def main() -> None:
         port=args.port,
         reload=args.reload,
         reload_dirs=[str(PROJECT_ROOT)] if args.reload else None,
+        ssl_certfile=str(args.ssl_certfile) if args.ssl_certfile else None,
+        ssl_keyfile=str(args.ssl_keyfile) if args.ssl_keyfile else None,
     )
 
 

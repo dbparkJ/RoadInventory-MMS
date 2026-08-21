@@ -13,6 +13,7 @@ import {
   renderVWorldScene,
   selectedFrameDistanceScale,
   startVWorldMap,
+  vworldCanvasWgs84Coordinate,
   type VWorldCustomDataSource,
   type VWorldRuntime,
 } from './vworld'
@@ -91,6 +92,33 @@ function fakeRuntime(collection = new FakeCollection()): {
 }
 
 describe('VWorld WebGL 3.0 adapter', () => {
+  it('converts a 3D canvas pointer into WGS84 for the survey ghost line', () => {
+    const runtime = {
+      viewer: {
+        scene: {
+          pickPosition: vi.fn(() => ({ x: 1, y: 2, z: 3 })),
+        },
+      },
+      Cesium: {
+        Cartographic: {
+          fromCartesian: vi.fn(() => ({ longitude: Math.PI / 2, latitude: Math.PI / 4 })),
+        },
+        Math: { toDegrees: (radians: number) => radians * 180 / Math.PI },
+      },
+    } as unknown as VWorldRuntime
+
+    expect(vworldCanvasWgs84Coordinate(runtime, { x: 12, y: 34 })).toEqual([90, 45])
+  })
+
+  it('returns no survey preview coordinate when the pointer misses the globe', () => {
+    const runtime = {
+      viewer: { scene: { pickPosition: vi.fn(), globe: {} }, camera: {} },
+      Cesium: {},
+    } as unknown as VWorldRuntime
+
+    expect(vworldCanvasWgs84Coordinate(runtime, { x: 12, y: 34 })).toBeNull()
+  })
+
   it('derives safe north-up 2D and perspective 3D camera targets', () => {
     const target = { lon: 127, lat: 37, height: 420, heading: 35, tilt: -62 }
 

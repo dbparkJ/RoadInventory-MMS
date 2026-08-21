@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import tempfile
 import unittest
@@ -10,10 +11,37 @@ from fastapi.testclient import TestClient
 
 from mms_shp_detection.webapp import WebAppConfig, create_app
 from mms_shp_detection.webapp.security import UnsafePath, normalize_relative_path
-from scripts.run_web import is_loopback_bind
+from scripts.run_web import build_parser, is_loopback_bind
 
 
 class WebAppHealthSafetyTests(unittest.TestCase):
+    def test_optional_basic_auth_protects_ui_and_api(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                WebAppConfig(
+                    allowed_roots=[Path(root_text)],
+                    state_dir=Path(state_text),
+                    enable_run_worker=False,
+                    auth_username="operator",
+                    auth_password="correct horse battery staple",
+                )
+            )
+            token = base64.b64encode(
+                b"operator:correct horse battery staple"
+            ).decode("ascii")
+            with TestClient(app) as client:
+                denied = client.get("/api/health")
+                allowed = client.get(
+                    "/api/health", headers={"Authorization": f"Basic {token}"}
+                )
+
+            self.assertEqual(denied.status_code, 401)
+            self.assertIn("Basic", denied.headers["WWW-Authenticate"])
+            self.assertEqual(allowed.status_code, 200)
+
     def test_health_bootstrap_and_tree_never_expose_absolute_root(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,
@@ -162,6 +190,18 @@ class WebAppHealthSafetyTests(unittest.TestCase):
         self.assertFalse(is_loopback_bind("0.0.0.0"))
         self.assertFalse(is_loopback_bind("192.0.2.10"))
         self.assertFalse(is_loopback_bind("mms.internal.example"))
+
+    def test_web_runner_accepts_a_tls_certificate_and_key(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--ssl-certfile",
+                "server.crt",
+                "--ssl-keyfile",
+                "server.key",
+            ]
+        )
+        self.assertEqual(args.ssl_certfile, Path("server.crt"))
+        self.assertEqual(args.ssl_keyfile, Path("server.key"))
 
     def test_storage_root_environment_is_used_without_cli_override(self) -> None:
         with (

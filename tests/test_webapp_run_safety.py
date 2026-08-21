@@ -150,7 +150,9 @@ class WebAppRunSafetyTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertIn("dismissed", columns)
+            self.assertIn("name", columns)
             self.assertFalse(store.get_run("legacy-run")["dismissed"])  # type: ignore[index]
+            self.assertIsNone(store.get_run("legacy-run")["name"])  # type: ignore[index]
 
     def test_tqdm_output_drives_web_progress(self) -> None:
         log = "MMS multi-model:  12%|# | 24/200 [00:10<01:03]\r"

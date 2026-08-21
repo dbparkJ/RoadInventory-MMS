@@ -67,4 +67,12 @@ describe('panorama direction navigation', () => {
   it('does not send a forward-facing operator to the only loaded frame behind them', () => {
     expect(directionalPanoramaTarget(current, [previous, current], -180, -180)).toBeNull()
   })
+
+  it('requires a coordinate-backed candidate within the approximately 100 degree total cone', () => {
+    const coordinateLess = { ...next, coordinate: null }
+    expect(directionalPanoramaTarget(current, [current, coordinateLess], -180, -180)).toBeNull()
+    expect(directionalPanoramaTarget(current, [current, next], -130, -180)?.frame.id).toBe('next')
+    expect(directionalPanoramaTarget(current, [current, next], -129, -180)).toBeNull()
+    expect(directionalPanoramaTarget(current, [current, next], 0, -180)).toBeNull()
+  })
 })

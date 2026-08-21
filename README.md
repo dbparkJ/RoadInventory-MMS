@@ -93,6 +93,25 @@ API를 `127.0.0.1`에 유지하고, TLS와 사용자 인증을 적용한 reverse
 노출하십시오. 방화벽과 인증 proxy로 포트 접근을 이미 제한한 별도 컨테이너 구성에서만
 위험을 이해하고 `--allow-remote-bind`를 사용하십시오.
 
+TLS를 애플리케이션에서 직접 종료해야 하는 제한된 네트워크에서는 PEM 인증서와 키를
+함께 지정할 수 있습니다. 자체 로그인이 없으므로 이 포트는 Tailscale 같은 인증된
+사설망 주소에만 바인딩하십시오.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_web.py `
+  --host 100.64.0.10 --port 8443 --allow-remote-bind `
+  --ssl-certfile .\server.crt --ssl-keyfile .\server.key
+```
+
+인터넷 터널이나 reverse proxy 뒤에서 실행할 때는 앱 전체에 HTTP Basic 인증을 적용할
+수 있습니다. 비밀번호가 프로세스 목록에 노출되지 않도록 환경변수로만 전달합니다.
+
+```powershell
+$env:MMS_WEB_USERNAME = "mms"
+$env:MMS_WEB_PASSWORD = "충분히-긴-임의-비밀번호"
+.\.venv\Scripts\python.exe .\scripts\run_web.py --auth-username mms
+```
+
 GPU 작업 큐와 재시작 복구의 단일 소유권을 보장하기 위해 하나의 `--state-dir`에는
 ASGI worker를 1개만 실행합니다. 같은 상태 폴더를 쓰는 두 번째 worker는 시작 단계의
 OS lock에서 거부됩니다. 수평 확장은 API/worker와 상태 저장소를 분리하는 후속 서버

@@ -214,14 +214,17 @@ export function RunResultsDialog({
                 {(results.shapefiles ?? []).map((shapefile) => (
                   <article key={shapefile.path}>
                     <span>
-                      <strong>{shapefile.name}</strong>
+                      <strong>{shapefile.display_name ?? shapefile.name}</strong>
                       <small>{shapefile.path}</small>
                     </span>
                     <button
                       type="button"
                       className="button primary"
                       disabled={importingPath !== null || importedPath === shapefile.path}
-                      onClick={() => void importShapefile(shapefile.path, shapefile.name)}
+                      onClick={() => void importShapefile(
+                        shapefile.path,
+                        shapefile.display_name ?? shapefile.name,
+                      )}
                     >
                       {importingPath === shapefile.path ? <LoaderCircle size={14} className="spin" /> : <Import size={14} />}
                       {importedPath === shapefile.path ? '검수 레이어에 추가됨' : '검수 레이어로 열기'}

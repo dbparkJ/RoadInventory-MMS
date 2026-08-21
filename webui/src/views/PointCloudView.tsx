@@ -116,8 +116,16 @@ interface NearbyOverlayFeature {
   feature: OverlayFeature
 }
 
-export function pointCloudDetectionPointSize(selected: boolean): number {
+export function pointCloudOverlayPointSize(selected: boolean): number {
   return selected ? 1 : 0.62
+}
+
+export const POINT_CLOUD_YOLO_MARKER_SIZE = 0.36
+export const POINT_CLOUD_YOLO_RAYCAST_THRESHOLD = 0.28
+export const POINT_CLOUD_YOLO_HIT_RADIUS_PX = 9
+
+export function pointCloudYoloBoxHalfSize(selected: boolean): number {
+  return selected ? 0.28 : 0.22
 }
 
 const DETECTION_COLORS = ['#ffb84d', '#4dd9ff', '#ff6f91', '#7ee787', '#c59cff']
@@ -147,7 +155,7 @@ export function pointCloudDetectionWireframePositions(
   detections.forEach((entry) => {
     // The cube is an identity marker around the pipeline's accepted 3-D
     // representative point, not an inferred physical object extent.
-    const halfSize = entry.selected ? 0.45 : 0.35
+    const halfSize = pointCloudYoloBoxHalfSize(entry.selected)
     DETECTION_BOX_EDGE_INDICES.forEach((cornerIndex) => {
       const corner = DETECTION_BOX_CORNERS[cornerIndex]
       positions[offset] = entry.position[0] + corner[0] * halfSize
@@ -800,7 +808,7 @@ export default function PointCloudView({
       overlayGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
       overlayGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
       overlayMaterial = new THREE.PointsMaterial({
-        size: pointCloudDetectionPointSize(false),
+        size: pointCloudOverlayPointSize(false),
         sizeAttenuation: true,
         vertexColors: true,
         depthTest: false,
@@ -817,7 +825,7 @@ export default function PointCloudView({
           new THREE.Float32BufferAttribute(selectedEntry.position, 3),
         )
         selectedMaterial = new THREE.PointsMaterial({
-          size: pointCloudDetectionPointSize(true),
+          size: pointCloudOverlayPointSize(true),
           sizeAttenuation: true,
           color: 0xffffff,
           depthTest: false,
@@ -863,7 +871,7 @@ export default function PointCloudView({
       detectionGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
       detectionGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
       detectionMaterial = new THREE.PointsMaterial({
-        size: 0.82,
+        size: POINT_CLOUD_YOLO_MARKER_SIZE,
         sizeAttenuation: true,
         vertexColors: true,
         depthTest: false,
@@ -909,7 +917,7 @@ export default function PointCloudView({
     const overlayRaycaster = new THREE.Raycaster()
     overlayRaycaster.params.Points = { threshold: 0.48 }
     const detectionRaycaster = new THREE.Raycaster()
-    detectionRaycaster.params.Points = { threshold: 0.52 }
+    detectionRaycaster.params.Points = { threshold: POINT_CLOUD_YOLO_RAYCAST_THRESHOLD }
     const pointer = new THREE.Vector2()
     const ownerWindow = host.ownerDocument.defaultView ?? window
     let pointerStart: { x: number; y: number } | null = null
@@ -960,7 +968,7 @@ export default function PointCloudView({
             camera,
             bounds.width,
             bounds.height,
-            14,
+            POINT_CLOUD_YOLO_HIT_RADIUS_PX,
           )
         : null
       const detectionEntry = detectionIndex === null
@@ -1072,7 +1080,7 @@ export default function PointCloudView({
           camera,
           bounds.width,
           bounds.height,
-          14,
+          POINT_CLOUD_YOLO_HIT_RADIUS_PX,
         )
         const entry = detectionIndex === null ? undefined : detectionPoints[detectionIndex]
         if (entry) {

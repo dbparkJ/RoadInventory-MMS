@@ -37,6 +37,13 @@ POST /api/runs
   -> RunManager가 scripts/run_pipeline.py를 별도 프로세스로 실행
 ```
 
+웹 실행은 선택적으로 `model_names` checkpoint allow-list와 `run_name`/`layer_name` 표시
+메타데이터를 저장한다. `model_names`를 생략하면 작업별 YAML에서 과거 selector를 지우고
+현재 `model_dir`의 모든 모델을 실행하며, 빈 목록이나 registry에서 사라진 이름은 실행 전에
+거부한다. 선택 allow-list 적용 뒤의 모델만 output-path 충돌 검사를 받으므로 충돌 모델 하나는
+실행할 수 있지만 둘을 함께 선택한 요청은 queue 저장 전에 거부한다. 완료 실행 이름은 결과
+파일 경로와 분리된 SQLite 메타데이터로 수정된다.
+
 - 웹은 요청마다 격리된 작업 디렉터리를 만들고, `MMS_PIPELINE_JOB_ID=<run_id>`를 자식 프로세스에 전달한다. CLI와 웹 실행은 최종적으로 같은 `pipeline.run_pipeline()` 계약을 사용한다.
 - `RunManager`는 한 `state-dir`에서 하나만 동작하는 로컬 큐 실행기다. Redis/SQS 같은 외부 queue나 분산 worker는 없다.
 - SQLite 상태는 기존 UI 호환 상태(`queued`, `preparing`, `running`, `completed` 등)를 유지한다. 유효한 manifest가 있으면 API가 `canonical_status`, 현재 단계, 진행률, count, 버전, 구조화 오류를 추가한다.

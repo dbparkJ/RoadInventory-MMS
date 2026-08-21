@@ -120,6 +120,7 @@ class WebStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
                     dataset_id TEXT NOT NULL REFERENCES datasets(id),
+                    name TEXT,
                     status TEXT NOT NULL,
                     request_json TEXT NOT NULL,
                     resolved_json TEXT NOT NULL,
@@ -171,6 +172,8 @@ class WebStore:
                 connection.execute(
                     "ALTER TABLE runs ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0"
                 )
+            if "name" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN name TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runs_dismissed_created "
                 "ON runs(dismissed, created_at)"
@@ -703,13 +706,14 @@ class WebStore:
             connection.execute(
                 """
                 INSERT INTO runs(
-                    id,dataset_id,status,request_json,resolved_json,work_relative,
+                    id,dataset_id,name,status,request_json,resolved_json,work_relative,
                     created_at,updated_at
-                ) VALUES(?,?,'queued',?,?,?,?,?)
+                ) VALUES(?,?,?,'queued',?,?,?,?,?)
                 """,
                 (
                     run["id"],
                     run["dataset_id"],
+                    run.get("name"),
                     _json(run["request"]),
                     _json(run["resolved"]),
                     run["work_relative"],
@@ -717,6 +721,39 @@ class WebStore:
                     run["updated_at"],
                 ),
             )
+
+    def rename_completed_run(
+        self,
+        run_id: str,
+        name: str,
+        now: str,
+        *,
+        expected_updated_at: str | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Rename one completed result with an optional optimistic-lock token."""
+
+        with self.connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return "missing", None
+            if str(row["status"]) != "completed":
+                return "not_completed", self.run_from_row(row)
+            if (
+                expected_updated_at is not None
+                and str(row["updated_at"]) != expected_updated_at
+            ):
+                return "stale", self.run_from_row(row)
+            connection.execute(
+                "UPDATE runs SET name=?,updated_at=? WHERE id=?",
+                (name, now, run_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            return "updated", self.run_from_row(updated)
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:

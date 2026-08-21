@@ -10,6 +10,7 @@ import {
   mapProviderForMode,
   relayMapOverlayShortcut,
   vworld2DBaseMapForMode,
+  vworld2DPointerWgs84Coordinate,
 } from './MapView'
 
 const FRAME: Frame = {
@@ -60,6 +61,7 @@ describe('MapView map modes', () => {
       }],
       [[128, 38], [128.1, 38.1]],
       '#22d3ee',
+      [128.2, 38.2],
     )
 
     expect(collection.features).toHaveLength(2)
@@ -68,6 +70,21 @@ describe('MapView map modes', () => {
       '#22d3ee',
     ])
     expect(collection.features[1].properties?.survey_draft).toBe(1)
+    expect(collection.features[1].geometry).toEqual({
+      type: 'LineString',
+      coordinates: [[128, 38], [128.1, 38.1], [128.2, 38.2]],
+    })
+  })
+
+  it('shows a ghost line after the first survey point and removes it on pointer leave', () => {
+    const preview = buildSurveyFeatureCollection([], [[127, 37]], '#f59e0b', [127.1, 37.1])
+    const cleared = buildSurveyFeatureCollection([], [[127, 37]], '#f59e0b', null)
+
+    expect(preview.features[0]?.geometry).toEqual({
+      type: 'LineString',
+      coordinates: [[127, 37], [127.1, 37.1]],
+    })
+    expect(cleared.features).toEqual([])
   })
 
   it('filters route points and frames to independently visible tracks', () => {
@@ -108,6 +125,18 @@ describe('MapView map modes', () => {
     expect(isVWorld2DMapMode('3d')).toBe(false)
     expect(vworld2DBaseMapForMode('2d')).toBe('base')
     expect(vworld2DBaseMapForMode('satellite')).toBe('satellite')
+  })
+
+  it('converts a 2D pointer coordinate to WGS84 for the survey ghost line', () => {
+    const runtime = {
+      ol: { proj: { toLonLat: vi.fn(() => [127.25, 37.5]) } },
+    } as never
+
+    expect(vworld2DPointerWgs84Coordinate(runtime, [14_000_000, 4_500_000])).toEqual([
+      127.25,
+      37.5,
+    ])
+    expect(vworld2DPointerWgs84Coordinate(runtime, undefined)).toBeNull()
   })
 
   it('reports the active VWorld provider for diagnostics', () => {

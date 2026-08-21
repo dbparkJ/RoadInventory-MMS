@@ -13,10 +13,13 @@ import PanoramaView, {
   panoramaDetectionModels,
   panoramaDetectionStrokeWidth,
   panoramaForwardYaw,
+  panoramaFovAfterWheel,
   panoramaOverlayAtUv,
   panoramaRayYaw,
   panoramaRequestWidth,
+  panoramaProgressiveWidths,
   panoramaSceneNavigationTarget,
+  panoramaUvToScreenPosition,
   reconcilePanoramaDetectionBoxes,
   isPanoramaSceneClick,
   isPanoramaSceneControlTarget,
@@ -30,6 +33,12 @@ const threeSpies = vi.hoisted(() => ({
   textureLoads: vi.fn(),
   textureDisposed: vi.fn(),
   canvasFillText: vi.fn(),
+  manualTextureLoads: false,
+  pendingTextureLoads: [] as Array<{
+    source: string
+    succeed: () => void
+    fail: () => void
+  }>,
 }))
 
 vi.mock('three', async (importOriginal) => {
@@ -54,10 +63,23 @@ vi.mock('three', async (importOriginal) => {
   }
 
   class FakeTextureLoader {
-    load(source: string, onLoad?: (texture: FakeTexture) => void) {
+    load(
+      source: string,
+      onLoad?: (texture: FakeTexture) => void,
+      _onProgress?: unknown,
+      onError?: (reason: unknown) => void,
+    ) {
       threeSpies.textureLoads(source)
       const texture = new FakeTexture()
-      queueMicrotask(() => onLoad?.(texture))
+      if (threeSpies.manualTextureLoads) {
+        threeSpies.pendingTextureLoads.push({
+          source,
+          succeed: () => onLoad?.(texture),
+          fail: () => onError?.(new Error(`Could not decode ${source}`)),
+        })
+      } else {
+        queueMicrotask(() => onLoad?.(texture))
+      }
       return texture
     }
   }
@@ -233,6 +255,8 @@ beforeEach(() => {
   threeSpies.textureLoads.mockClear()
   threeSpies.textureDisposed.mockClear()
   threeSpies.canvasFillText.mockClear()
+  threeSpies.manualTextureLoads = false
+  threeSpies.pendingTextureLoads.length = 0
   vi.mocked(api.panorama).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.panoramaPoints).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.frameDetections).mockReset().mockResolvedValue({
@@ -299,12 +323,25 @@ describe('panoramaRequestWidth', () => {
     expect(panoramaRequestWidth(1280, 1, 'fast')).toBe(1920)
     expect(panoramaRequestWidth(1920, 2, 'fast')).toBe(2048)
   })
+
+  it('loads a lightweight panorama before the selected quality', () => {
+    expect(panoramaProgressiveWidths(4096)).toEqual([768, 4096])
+    expect(panoramaProgressiveWidths(512)).toEqual([512])
+  })
 })
 
 describe('panoramaForwardYaw', () => {
   it('resets to image-space forward with the operator correction', () => {
     expect(panoramaForwardYaw(0)).toBe(-180)
     expect(panoramaForwardYaw(7.5)).toBe(-172.5)
+  })
+
+  it('maps wheel direction to the bounded panorama FOV', () => {
+    expect(panoramaFovAfterWheel(72, -1)).toBe(68)
+    expect(panoramaFovAfterWheel(72, 1)).toBe(76)
+    expect(panoramaFovAfterWheel(28, -1)).toBe(28)
+    expect(panoramaFovAfterWheel(95, 1)).toBe(95)
+    expect(panoramaFovAfterWheel(54, 0)).toBe(54)
   })
 })
 
@@ -321,31 +358,31 @@ describe('panorama scene click navigation', () => {
     coordinate: { lon: 126.978, lat: 37.5675 },
   }
 
-  it('resolves the clicked ray to the closest loaded neighbor and paginated fallback', () => {
+  it('resolves the clicked ray only to a loaded neighbor with a coordinate bearing', () => {
     expect(panoramaSceneNavigationTarget(
       current,
       [previous, current, next],
       -180,
       -180,
-      true,
-      true,
     )?.target?.frame.id).toBe('frame-13')
     expect(panoramaSceneNavigationTarget(
       current,
       [previous, current, next],
       0,
       -180,
-      true,
-      true,
     )?.target?.frame.id).toBe('frame-11')
     expect(panoramaSceneNavigationTarget(
       current,
       [],
       -180,
       -180,
-      false,
-      true,
-    )).toEqual({ direction: 1, target: null })
+    )).toBeNull()
+    expect(panoramaSceneNavigationTarget(
+      current,
+      [{ ...next, coordinate: null }, current],
+      -180,
+      -180,
+    )).toBeNull()
   })
 
   it('separates a short click from a panorama drag and derives yaw from the popup ray', () => {
@@ -437,6 +474,48 @@ describe('panoramaDetectionBox', () => {
     expect(panoramaDetectionPointRadius(false, 10)).toBe(2)
     expect(panoramaDetectionPointRadius(false, 30)).toBe(1.5)
     expect(panoramaDetectionPointRadius(true, 30)).toBe(3.5)
+  })
+
+  it('hit-tests boxless SHP points in a fixed 9px screen radius across zoom and viewport sizes', () => {
+    const point: RenderPanoramaOverlayPoint = {
+      feature_id: 'feature-1',
+      layerId: 'layer-1',
+      layerName: '시설물',
+      u: 0.5,
+      v: 0.5,
+      depth: 12,
+      dataset_position: [1, 2, 3],
+      properties: { class_nm: '지주' },
+      color: '#22c55e',
+      selected: false,
+    }
+    const projections = [
+      { viewportWidth: 1200, viewportHeight: 600, verticalFovDeg: 35, yawDeg: -180, pitchDeg: 0 },
+      { viewportWidth: 360, viewportHeight: 640, verticalFovDeg: 95, yawDeg: -180, pitchDeg: 0 },
+    ]
+    projections.forEach((projection) => {
+      const center = panoramaUvToScreenPosition(point.u, point.v, projection)
+      expect(center).not.toBeNull()
+      expect(panoramaOverlayAtUv([point], point.u, point.v, [], {
+        ...projection,
+        pointerX: center!.x + 9,
+        pointerY: center!.y,
+      })).toMatchObject({ featureId: 'feature-1' })
+      expect(panoramaOverlayAtUv([point], point.u, point.v, [], {
+        ...projection,
+        pointerX: center!.x + 10,
+        pointerY: center!.y,
+      })).toBeNull()
+    })
+
+    const wideProjection = projections[0]
+    const oldUvRadiusClick = panoramaUvToScreenPosition(0.525, 0.5, wideProjection)
+    expect(oldUvRadiusClick).not.toBeNull()
+    expect(panoramaOverlayAtUv([point], 0.525, 0.5, [], {
+      ...wideProjection,
+      pointerX: oldUvRadiusClick!.x,
+      pointerY: oldUvRadiusClick!.y,
+    })).toBeNull()
   })
 
   it('uses thin box strokes', () => {
@@ -567,56 +646,22 @@ describe('panoramaDetectionBox', () => {
 })
 
 describe('PanoramaView frame navigation', () => {
-  it('navigates with the directional controls', () => {
-    const onPreviousFrame = vi.fn()
-    const onNextFrame = vi.fn()
-
-    const { getByRole } = render(
+  it('removes the directional side controls and bottom direction action', () => {
+    render(
       <PanoramaView
         datasetId="dataset-1"
         frame={FRAME}
         demoMode={false}
-        onPreviousFrame={onPreviousFrame}
-        onNextFrame={onNextFrame}
+        onPreviousFrame={vi.fn()}
+        onNextFrame={vi.fn()}
       />,
     )
 
-    fireEvent.click(getByRole('button', { name: '이전 프레임으로 이동' }))
-    fireEvent.click(getByRole('button', { name: '다음 프레임으로 이동' }))
-
-    expect(onPreviousFrame).toHaveBeenCalledTimes(1)
-    expect(onNextFrame).toHaveBeenCalledTimes(1)
-  })
-
-  it('moves to the adjacent frame in the current viewing direction', () => {
-    const previous = {
-      ...FRAME,
-      id: 'frame-11',
-      index: 11,
-      coordinate: { lon: 126.978, lat: 37.5655 },
-    }
-    const forward = {
-      ...NEXT_FRAME,
-      coordinate: { lon: 126.978, lat: 37.5675 },
-    }
-    const onFrameChange = vi.fn()
-    const { container } = render(
-      <PanoramaView
-        datasetId="dataset-1"
-        frame={{ ...FRAME, heading: 0 }}
-        frames={[previous, { ...FRAME, heading: 0 }, forward]}
-        onFrameChange={onFrameChange}
-        demoMode={false}
-      />,
-    )
-
-    fireEvent.click(screen.getByRole('button', {
+    expect(screen.queryByRole('button', { name: '이전 프레임으로 이동' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '다음 프레임으로 이동' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', {
       name: '바라보는 방향의 인접 프레임으로 이동',
-    }))
-    expect(container.querySelector('.panorama-location-bar')).toContainElement(
-      screen.getByRole('button', { name: '바라보는 방향의 인접 프레임으로 이동' }),
-    )
-    expect(onFrameChange).toHaveBeenCalledWith(forward)
+    })).not.toBeInTheDocument()
   })
 
   it('moves on a short blank-scene click, shows its target hint, and ignores a drag', () => {
@@ -681,15 +726,15 @@ describe('PanoramaView frame navigation', () => {
     fireEvent.pointerMove(canvas!, { clientX: 500, clientY: 250 })
     const hoverFrame = vi.mocked(window.requestAnimationFrame).mock.calls.at(-1)?.[0]
     act(() => hoverFrame?.(0))
-    expect(screen.getByText('클릭하여 Frame 14 이동')).toBeInTheDocument()
-    expect(container.querySelector('.panorama-scene-navigation-hint')).toHaveAttribute(
-      'data-direction',
-      'next',
-    )
+    expect(container.querySelector('.panorama-scene-navigation-hint')).not.toBeInTheDocument()
 
     fireEvent.pointerDown(canvas!, { button: 0, clientX: 500, clientY: 250 })
     fireEvent.pointerUp(canvas!, { button: 0, clientX: 503, clientY: 254 })
     expect(onFrameChange).toHaveBeenCalledWith(forward)
+    expect(container.querySelector('.panorama-navigation-pulse')).toHaveAttribute(
+      'data-target-frame-index',
+      '13',
+    )
     expect(screen.getByRole('status')).toHaveTextContent('Frame 14로 이동합니다')
 
     onFrameChange.mockClear()
@@ -765,9 +810,13 @@ describe('PanoramaView frame navigation', () => {
         demoMode={false}
       />,
     )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
     await waitFor(() => {
       expect(container.querySelector('[data-yolo-box-count="1"]')).toBeInTheDocument()
       expect(threeSpies.textureLoads).toHaveBeenCalledWith('/pano.jpg')
+      // A scene click is intentionally disabled until TextureLoader has decoded
+      // the current frame; merely starting the load is not sufficient.
+      expect(stage).toHaveAttribute('data-rendered-frame-key', 'dataset-1:frame-12')
     })
     const canvas = container.querySelector<HTMLCanvasElement>('.panorama-canvas')!
     vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
@@ -832,7 +881,7 @@ describe('PanoramaView frame navigation', () => {
     })).not.toBeInTheDocument()
   })
 
-  it('uses paginated next-frame navigation when the forward neighbor is not loaded yet', () => {
+  it('does not use paginated navigation when no forward coordinate candidate is loaded', () => {
     const previous = {
       ...FRAME,
       id: 'frame-11',
@@ -851,19 +900,33 @@ describe('PanoramaView frame navigation', () => {
         demoMode={false}
       />,
     )
-    fireEvent.click(screen.getByRole('button', {
-      name: '바라보는 방향의 인접 프레임으로 이동',
-    }))
-    expect(onNextFrame).toHaveBeenCalledOnce()
+    expect(panoramaSceneNavigationTarget(
+      { ...FRAME, heading: 0 },
+      [previous, { ...FRAME, heading: 0 }],
+      -180,
+      -180,
+    )).toBeNull()
+    expect(onNextFrame).not.toHaveBeenCalled()
   })
 
   it('uses high quality by default and reloads with the fast quality budget', async () => {
+    vi.mocked(api.panorama).mockImplementation((_datasetId, _frameId, width) => (
+      Promise.resolve({ kind: 'url', value: `/panorama-${width}.webp` })
+    ))
     const { getByRole } = render(
       <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
     )
 
     await waitFor(() => {
-      expect(api.panorama).toHaveBeenLastCalledWith(
+      expect(api.panorama).toHaveBeenNthCalledWith(
+        1,
+        'dataset-1',
+        'frame-12',
+        768,
+        expect.any(AbortSignal),
+      )
+      expect(api.panorama).toHaveBeenNthCalledWith(
+        2,
         'dataset-1',
         'frame-12',
         4096,
@@ -883,13 +946,100 @@ describe('PanoramaView frame navigation', () => {
         expect.any(AbortSignal),
       )
     })
+    expect(api.panorama).toHaveBeenCalledTimes(3)
   })
 
-  it('does not navigate beyond the available frame range', () => {
+  it('uses a non-passive native wheel listener in a popup document and cleans it up', () => {
+    const popup = document.createElement('iframe')
+    document.body.append(popup)
+    const popupWindow = popup.contentWindow as Window & typeof globalThis
+    const popupDocument = popup.contentDocument!
+    const addListener = vi.spyOn(popupWindow.HTMLElement.prototype, 'addEventListener')
+    const removeListener = vi.spyOn(popupWindow.HTMLElement.prototype, 'removeEventListener')
+    const popupContainer = popupDocument.createElement('div')
+    popupDocument.body.append(popupContainer)
+
+    const { unmount } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode />,
+      { container: popupContainer },
+    )
+    const stage = popupContainer.querySelector<HTMLElement>('[role="region"]')!
+    expect(stage.ownerDocument).toBe(popupDocument)
+    const addIndex = addListener.mock.calls.findIndex((call, index) => (
+      addListener.mock.contexts[index] === stage
+      && call[0] === 'wheel'
+      && typeof call[2] === 'object'
+      && (call[2] as AddEventListenerOptions)?.passive === false
+    ))
+    expect(addIndex).toBeGreaterThanOrEqual(0)
+    const wheelHandler = addListener.mock.calls[addIndex][1]
+
+    const wheel = new popupWindow.WheelEvent('wheel', {
+      bubbles: true,
+      cancelable: true,
+      deltaY: -1,
+    })
+    let dispatchResult = true
+    act(() => {
+      dispatchResult = stage.dispatchEvent(wheel)
+    })
+    expect(dispatchResult).toBe(false)
+    expect(wheel.defaultPrevented).toBe(true)
+    expect(stage).toHaveAttribute('data-fov', '68')
+
+    unmount()
+    const removed = removeListener.mock.calls.some((call, index) => (
+      removeListener.mock.contexts[index] === stage
+      && call[0] === 'wheel'
+      && call[1] === wheelHandler
+      && typeof call[2] === 'object'
+      && (call[2] as AddEventListenerOptions)?.passive === false
+    ))
+    expect(removed).toBe(true)
+    popup.remove()
+  })
+
+  it('preserves yaw, pitch, and zoom while moving to another frame', () => {
+    class PointerEventMock extends MouseEvent {
+      readonly isPrimary: boolean
+      readonly pointerId: number
+      readonly pointerType: string
+
+      constructor(type: string, init: PointerEventInit = {}) {
+        super(type, init)
+        this.isPrimary = init.isPrimary ?? true
+        this.pointerId = init.pointerId ?? 1
+        this.pointerType = init.pointerType ?? 'mouse'
+      }
+    }
+    vi.stubGlobal('PointerEvent', PointerEventMock)
+    const { rerender } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode />,
+    )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
+
+    fireEvent.pointerDown(stage, { button: 0, clientX: 400, clientY: 220 })
+    fireEvent.pointerMove(stage, { clientX: 500, clientY: 270 })
+    fireEvent.pointerUp(stage, { clientX: 500, clientY: 270 })
+    fireEvent.wheel(stage, { deltaY: -1 })
+
+    expect(stage).toHaveAttribute('data-yaw', '-192')
+    expect(stage).toHaveAttribute('data-pitch', '5')
+    expect(stage).toHaveAttribute('data-fov', '68')
+
+    rerender(<PanoramaView datasetId="dataset-1" frame={NEXT_FRAME} demoMode />)
+
+    expect(stage).toHaveAttribute('data-frame-id', 'frame-13')
+    expect(stage).toHaveAttribute('data-yaw', '-192')
+    expect(stage).toHaveAttribute('data-pitch', '5')
+    expect(stage).toHaveAttribute('data-fov', '68')
+  })
+
+  it('does not render removed controls at the available frame range boundary', () => {
     const onPreviousFrame = vi.fn()
     const onNextFrame = vi.fn()
 
-    const { getByRole } = render(
+    render(
       <PanoramaView
         datasetId="dataset-1"
         frame={FRAME}
@@ -901,19 +1051,59 @@ describe('PanoramaView frame navigation', () => {
       />,
     )
 
-    const previous = getByRole('button', { name: '이전 프레임으로 이동' })
-    const next = getByRole('button', { name: '다음 프레임으로 이동' })
-    expect(previous).toBeDisabled()
-    expect(next).toBeDisabled()
-    fireEvent.click(previous)
-    fireEvent.click(next)
-
+    expect(screen.queryByRole('button', { name: '이전 프레임으로 이동' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '다음 프레임으로 이동' })).not.toBeInTheDocument()
     expect(onPreviousFrame).not.toHaveBeenCalled()
     expect(onNextFrame).not.toHaveBeenCalled()
   })
 })
 
 describe('PanoramaView media lifecycle', () => {
+  it('shows the lightweight texture before upgrading it without blanking the panorama', async () => {
+    const preview = deferred<PanoramaResult>()
+    const full = deferred<PanoramaResult>()
+    vi.mocked(api.panorama).mockImplementation((_datasetId, _frameId, width) => (
+      width === 768 ? preview.promise : full.promise
+    ))
+    const { container } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
+    )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
+
+    expect(api.panorama).toHaveBeenCalledWith(
+      'dataset-1',
+      'frame-12',
+      768,
+      expect.any(AbortSignal),
+    )
+    await act(async () => {
+      preview.resolve({ kind: 'url', value: '/panorama-preview.webp' })
+      await preview.promise
+    })
+    await waitFor(() => {
+      expect(threeSpies.textureLoads).toHaveBeenCalledWith('/panorama-preview.webp')
+      expect(api.panorama).toHaveBeenCalledWith(
+        'dataset-1',
+        'frame-12',
+        4096,
+        expect.any(AbortSignal),
+      )
+    })
+    expect(stage).toHaveAttribute('data-media-stage', 'enhancing')
+    expect(screen.getByRole('status')).toHaveTextContent('고화질로 선명하게 전환 중')
+
+    await act(async () => {
+      full.resolve({ kind: 'url', value: '/panorama-full.webp' })
+      await full.promise
+    })
+    await waitFor(() => {
+      expect(threeSpies.textureLoads).toHaveBeenCalledWith('/panorama-full.webp')
+      expect(stage).toHaveAttribute('data-media-stage', 'ready')
+    })
+    expect(threeSpies.textureDisposed).toHaveBeenCalledTimes(1)
+    expect(container.querySelector('.viewer-loading')).not.toBeInTheDocument()
+  })
+
   it('loads and renders frame YOLO boxes without any SHP layer', async () => {
     vi.mocked(api.frameDetections).mockResolvedValue({
       dataset_id: 'dataset-1',
@@ -1112,8 +1302,10 @@ describe('PanoramaView media lifecycle', () => {
   it('ignores a previous frame response and revokes only the active blob URL', async () => {
     const first = deferred<PanoramaResult>()
     const second = deferred<PanoramaResult>()
-    vi.mocked(api.panorama).mockImplementation((_datasetId, frameId) => {
-      return frameId === FRAME.id ? first.promise : second.promise
+    vi.mocked(api.panorama).mockImplementation((_datasetId, frameId, width) => {
+      if (frameId === FRAME.id) return first.promise
+      if (width === 768) return second.promise
+      return Promise.resolve({ kind: 'url', value: '/new-frame-full.webp' })
     })
     const createObjectUrl = vi.mocked(URL.createObjectURL).mockImplementation(
       (blob) => `blob:${blob instanceof Blob ? blob.size : 0}`,
@@ -1143,8 +1335,47 @@ describe('PanoramaView media lifecycle', () => {
     })
     await waitFor(() => expect(threeSpies.textureLoads).toHaveBeenCalledWith('blob:9'))
     expect(createObjectUrl).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect(threeSpies.textureLoads).toHaveBeenCalledWith('/new-frame-full.webp')
+    })
 
     unmount()
     expect(revokeObjectUrl).toHaveBeenCalledWith('blob:9')
+  })
+
+  it('discards a late decoded texture when the active frame has already changed and failed', async () => {
+    threeSpies.manualTextureLoads = true
+    vi.mocked(api.panorama).mockImplementation((_datasetId, frameId, width) => {
+      if (frameId === FRAME.id && width === 768) {
+        return Promise.resolve({ kind: 'url', value: '/frame-a-preview.webp' })
+      }
+      if (frameId === FRAME.id) return new Promise(() => undefined)
+      return Promise.reject(new Error('B preview failed'))
+    })
+
+    const { rerender } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
+    )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
+    await waitFor(() => {
+      expect(threeSpies.pendingTextureLoads.some(
+        (request) => request.source === '/frame-a-preview.webp',
+      )).toBe(true)
+    })
+    const lateFrameA = threeSpies.pendingTextureLoads.find(
+      (request) => request.source === '/frame-a-preview.webp',
+    )!
+
+    rerender(<PanoramaView datasetId="dataset-1" frame={NEXT_FRAME} demoMode={false} />)
+    await waitFor(() => {
+      expect(screen.getByText('B preview failed')).toBeInTheDocument()
+      expect(stage).toHaveAttribute('data-frame-id', NEXT_FRAME.id)
+    })
+
+    act(() => lateFrameA.succeed())
+
+    expect(threeSpies.textureDisposed).toHaveBeenCalledTimes(1)
+    expect(stage).toHaveAttribute('data-rendered-frame-key', '')
+    expect(screen.getByText('B preview failed')).toBeInTheDocument()
   })
 })

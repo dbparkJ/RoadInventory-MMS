@@ -14,16 +14,20 @@ vi.mock('../views/MapView', () => ({
     visibleTrackIds,
     surveySegments,
     surveyDraft,
+    surveyDraftPreview,
     surveyDrawing,
     onAddSurveyPoint,
+    onPreviewSurveyPoint,
   }: {
     mapMode: MockMapMode
     onMapModeChange: (mode: MockMapMode) => void
     visibleTrackIds?: ReadonlySet<string>
     surveySegments?: unknown[]
     surveyDraft?: [number, number][]
+    surveyDraftPreview?: [number, number] | null
     surveyDrawing?: boolean
     onAddSurveyPoint?: (coordinate: [number, number]) => void
+    onPreviewSurveyPoint?: (coordinate: [number, number] | null) => void
   }) => {
     const instance = useState(() => crypto.randomUUID())[0]
     return (
@@ -35,6 +39,7 @@ vi.mock('../views/MapView', () => ({
         data-visible-tracks={visibleTrackIds ? [...visibleTrackIds].join(',') : ''}
         data-survey-count={surveySegments?.length ?? 0}
         data-survey-draft-count={surveyDraft?.length ?? 0}
+        data-survey-preview={surveyDraftPreview ? surveyDraftPreview.join(',') : 'none'}
         data-survey-drawing={String(Boolean(surveyDrawing))}
       >
         <button type="button" onClick={() => onMapModeChange('satellite')}>mock satellite</button>
@@ -45,6 +50,20 @@ vi.mock('../views/MapView', () => ({
           onClick={() => onAddSurveyPoint?.([127 + (surveyDraft?.length ?? 0) * 0.001, 37])}
         >
           mock survey point
+        </button>
+        <button
+          type="button"
+          aria-label="현장조사 선 미리보기"
+          onClick={() => onPreviewSurveyPoint?.([127.002, 37.002])}
+        >
+          mock survey preview
+        </button>
+        <button
+          type="button"
+          aria-label="현장조사 지도 나가기"
+          onClick={() => onPreviewSurveyPoint?.(null)}
+        >
+          mock survey leave
         </button>
       </div>
     )
@@ -210,13 +229,18 @@ describe('Workspace popup viewers', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '구간 그리기' }))
     expect(map).toHaveAttribute('data-survey-drawing', 'true')
+    expect(screen.getByText(/시작점과 끝점을 포함해 2개 이상 지점을 클릭/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '현장조사 점 추가' }))
+    fireEvent.click(screen.getByRole('button', { name: '현장조사 선 미리보기' }))
+    expect(map).toHaveAttribute('data-survey-preview', '127.002,37.002')
     fireEvent.click(screen.getByRole('button', { name: '현장조사 점 추가' }))
     expect(map).toHaveAttribute('data-survey-draft-count', '2')
+    expect(map).toHaveAttribute('data-survey-preview', 'none')
     fireEvent.click(screen.getByRole('button', { name: '저장' }))
 
     await waitFor(() => expect(create).toHaveBeenCalledOnce())
     expect(map).toHaveAttribute('data-survey-count', '1')
+    expect(map).toHaveAttribute('data-survey-preview', 'none')
     fireEvent.click(screen.getByTitle('현장조사 필요구간 1 숨기기'))
     expect(map).toHaveAttribute('data-survey-count', '0')
     fireEvent.click(screen.getByRole('button', { name: '현장조사 필요구간 1 삭제' }))
@@ -226,6 +250,23 @@ describe('Workspace popup viewers', () => {
       expect.any(AbortSignal),
     ))
     expect(screen.queryByText('현장조사 필요구간 1')).not.toBeInTheDocument()
+  })
+
+  it('clears the survey preview when the pointer leaves or drawing is cancelled', async () => {
+    renderWorkspace()
+    const map = await screen.findByTestId('map-view')
+
+    fireEvent.click(screen.getByRole('button', { name: '구간 그리기' }))
+    fireEvent.click(screen.getByRole('button', { name: '현장조사 점 추가' }))
+    fireEvent.click(screen.getByRole('button', { name: '현장조사 선 미리보기' }))
+    expect(map).toHaveAttribute('data-survey-preview', '127.002,37.002')
+
+    fireEvent.click(screen.getByRole('button', { name: '현장조사 지도 나가기' }))
+    expect(map).toHaveAttribute('data-survey-preview', 'none')
+    fireEvent.click(screen.getByRole('button', { name: '현장조사 선 미리보기' }))
+    fireEvent.click(screen.getByRole('button', { name: '그리기 취소' }))
+    expect(map).toHaveAttribute('data-survey-preview', 'none')
+    expect(map).toHaveAttribute('data-survey-drawing', 'false')
   })
 
   it('toggles the independent track layer and collapses the layer card to one line', async () => {

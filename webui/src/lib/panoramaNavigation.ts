@@ -7,6 +7,9 @@ export interface DirectionalPanoramaTarget {
   direction: -1 | 1
 }
 
+/** Half-angle of the approximately 100° total panorama navigation cone. */
+export const PANORAMA_NAVIGATION_HALF_CONE_DEG = 50
+
 export function normalizePanoramaBearing(value: number): number {
   if (!Number.isFinite(value)) return 0
   return ((value % 360) + 360) % 360
@@ -71,8 +74,9 @@ function nearestTrackNeighbors(current: Frame, frames: Frame[]): Array<{
  *
  * Only the immediately adjacent frame on either side of the current track is
  * considered. This avoids jumping to a distant frame when an MMS route crosses
- * itself. If coordinates or heading are unavailable, the image-space forward
- * hemisphere still provides a deterministic previous/next fallback.
+ * itself. Navigation requires a real coordinate bearing: an index-only or
+ * paginated previous/next fallback cannot prove that a frame lies under the
+ * clicked panorama ray.
  */
 export function directionalPanoramaTarget(
   current: Frame,
@@ -87,40 +91,35 @@ export function directionalPanoramaTarget(
   const heading = typeof current.heading === 'number' && Number.isFinite(current.heading)
     ? current.heading
     : null
-  const fallbackForwardBearing = candidates
+  const forwardBearing = candidates
     .filter((candidate) => candidate.direction === 1)
     .map((candidate) => coordinateBearing(current, candidate.frame))
     .find((bearing): bearing is number => bearing !== null)
-  const baseHeading = heading ?? fallbackForwardBearing
+  const backwardBearing = candidates
+    .filter((candidate) => candidate.direction === -1)
+    .map((candidate) => coordinateBearing(current, candidate.frame))
+    .find((bearing): bearing is number => bearing !== null)
+  const baseHeading = heading
+    ?? forwardBearing
+    ?? (backwardBearing === undefined ? undefined : normalizePanoramaBearing(backwardBearing + 180))
 
-  if (baseHeading === undefined) {
-    const preferredDirection: -1 | 1 = Math.cos(relativeBearing * Math.PI / 180) >= 0 ? 1 : -1
-    const preferred = candidates.find((candidate) => candidate.direction === preferredDirection)
-      ?? candidates[0]
-    return {
-      ...preferred,
-      bearing: null,
-      angularDifference: preferred.direction === preferredDirection ? 0 : 180,
-    }
-  }
+  if (baseHeading === undefined) return null
 
   const viewingBearing = panoramaViewWorldBearing(baseHeading, yaw, forwardYaw)
-  const scored = candidates.map((candidate) => {
+  const scored = candidates.flatMap((candidate) => {
     const bearing = coordinateBearing(current, candidate.frame)
-      ?? normalizePanoramaBearing(baseHeading + (candidate.direction === 1 ? 0 : 180))
-    return {
+    if (bearing === null) return []
+    return [{
       ...candidate,
       bearing,
       angularDifference: Math.abs(signedPanoramaAngle(bearing - viewingBearing)),
-    }
+    }]
   })
   scored.sort((left, right) => (
     left.angularDifference - right.angularDifference
     || right.direction - left.direction
   ))
-  // A single loaded neighbor may sit behind the current view while the
-  // forward page has not been fetched yet. Do not mislabel that opposite
-  // frame as the view-direction target; the caller can use its paginated
-  // previous/next callback instead.
-  return scored[0].angularDifference <= 100 ? scored[0] : null
+  // A single loaded neighbor may sit behind the current view. Do not mislabel
+  // that opposite frame as the clicked direction target.
+  return scored[0]?.angularDifference <= PANORAMA_NAVIGATION_HALF_CONE_DEG ? scored[0] : null
 }

@@ -2359,6 +2359,12 @@ class MultiModelExecutionTests(unittest.TestCase):
 
             paths = discover_model_paths(root, None)
             self.assertEqual([path.name for path in paths], ["Alpha.PT", "zeta.pt"])
+            selected = discover_model_paths(root, None, ["ZETA.PT"])
+            self.assertEqual([path.name for path in selected], ["zeta.pt"])
+            with self.assertRaisesRegex(ValueError, "not available"):
+                discover_model_paths(root, None, ["removed.pt"])
+            with self.assertRaisesRegex(ValueError, "at least one"):
+                discover_model_paths(root, None, [])
 
             args = build_arg_parser().parse_args([])
             args.model_filters = {
@@ -2379,6 +2385,23 @@ class MultiModelExecutionTests(unittest.TestCase):
 
             with self.assertRaises(ConfigError):
                 apply_model_filter(args, paths[1], require_profile=True)
+
+    def test_model_output_collision_is_checked_after_subset_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            (model_dir / "road sign.pt").write_bytes(b"space")
+            (model_dir / "road_sign.pt").write_bytes(b"underscore")
+
+            selected = discover_model_paths(model_dir, None, ["road sign.pt"])
+            self.assertEqual([path.name for path in selected], ["road sign.pt"])
+            with self.assertRaisesRegex(ValueError, "collide"):
+                discover_model_paths(
+                    model_dir,
+                    None,
+                    ["road sign.pt", "road_sign.pt"],
+                )
+            with self.assertRaisesRegex(ValueError, "collide"):
+                discover_model_paths(model_dir, None)
 
     def test_model_filter_rejects_zero_for_new_positive_pole_parameters(self) -> None:
         strictly_positive = (
@@ -2474,6 +2497,57 @@ class MultiModelExecutionTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(item["published_current_run"] for item in manifest["models"])
+            )
+
+    def test_multi_model_wrapper_executes_only_the_selected_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "models"
+            model_dir.mkdir()
+            (model_dir / "b.pt").write_bytes(b"b")
+            (model_dir / "a.pt").write_bytes(b"a")
+            output_dir = root / "outputs"
+            args = build_arg_parser().parse_args(
+                [
+                    "--model-dir",
+                    str(model_dir),
+                    "--model-names",
+                    "B.PT",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            args.model_filters = {
+                "a.pt": {"object_type": "traffic_sign"},
+                "b.pt": {"object_type": "traffic_signal"},
+            }
+
+            def publish_fixture(effective: argparse.Namespace) -> dict[str, object]:
+                shp_path = Path(effective.output_dir) / "shp" / "detected_signals.shp"
+                _write_output_bundle(shp_path)
+                return {
+                    "run_fingerprint": "b" * 64,
+                    "final_shapefiles": {
+                        "detections": str(shp_path.resolve()),
+                        "poles": None,
+                    },
+                    "feature_counts": {"detections": 0, "poles": 0},
+                }
+
+            with mock.patch(
+                "mms_shp_detection.pipeline._run_single_model_pipeline",
+                side_effect=publish_fixture,
+            ) as single_model:
+                run_pipeline(args)
+
+            single_model.assert_called_once()
+            self.assertEqual(single_model.call_args.args[0].model_path.name, "b.pt")
+            manifest = json.loads(
+                (output_dir / "models_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["model_name"] for item in manifest["models"]],
+                ["b.pt"],
             )
 
     def test_parallel_wrapper_uses_one_shared_forward_directory(self) -> None:

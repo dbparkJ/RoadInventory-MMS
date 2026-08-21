@@ -2283,6 +2283,24 @@ button:disabled {
   line-height: 1.45;
 }
 
+.survey-drawing-editor .survey-drawing-guide {
+  display: grid;
+  gap: 2px;
+  padding: 6px 7px;
+  color: #b8c6cf;
+  background: rgba(2, 11, 18, 0.42);
+  border-radius: 5px;
+}
+
+.survey-drawing-editor .survey-drawing-guide strong {
+  color: #f7c867;
+  font-size: 8px;
+}
+
+.survey-drawing-editor .survey-drawing-progress {
+  color: #d7b85f;
+}
+
 .survey-drawing-editor > div {
   display: flex;
   grid-column: 1 / -1;
@@ -2529,67 +2547,49 @@ button:disabled {
   cursor: grabbing;
 }
 
-.panorama-view.scene-navigation-ready {
-  cursor: pointer;
-}
-
-.panorama-view.scene-navigation-unavailable {
-  cursor: not-allowed;
-}
-
-.panorama-scene-navigation-hint {
+.panorama-navigation-pulse {
   position: absolute;
   z-index: 8;
-  display: inline-flex;
-  max-width: min(230px, calc(100% - 20px));
-  align-items: center;
-  gap: 7px;
-  padding: 6px 9px 6px 6px;
   pointer-events: none;
-  background: rgba(5, 16, 27, 0.9);
-  border: 1px solid rgba(126, 156, 174, 0.36);
-  border-radius: 999px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(10px);
-  transform: translate(-50%, calc(-100% - 14px));
+  transform: translate(-50%, -50%);
 }
 
-.panorama-scene-navigation-hint > span {
-  display: grid;
-  width: 27px;
-  height: 27px;
-  flex: none;
-  place-items: center;
-  color: #04130f;
-  background: var(--mint);
+.panorama-navigation-pulse > i,
+.panorama-navigation-pulse > span {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  display: block;
   border-radius: 50%;
+  transform: translate(-50%, -50%);
 }
 
-.panorama-scene-navigation-hint > span svg,
-.panorama-scene-navigation-feedback > svg {
-  transform: rotate(45deg);
+.panorama-navigation-pulse > i {
+  width: 94px;
+  height: 94px;
+  background: rgba(226, 241, 239, 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.64);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28);
+  animation: panorama-navigation-wave 700ms ease-out both;
 }
 
-.panorama-scene-navigation-hint[data-direction='previous'] > span svg {
-  transform: rotate(225deg);
+.panorama-navigation-pulse > span {
+  width: 25px;
+  height: 25px;
+  background: #ffffff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.42);
+  animation: panorama-navigation-dot 700ms ease-out both;
 }
 
-.panorama-scene-navigation-hint small {
-  overflow: hidden;
-  color: #e9f8f4;
-  font-size: 8px;
-  font-weight: 720;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+@keyframes panorama-navigation-wave {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); }
+  18% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.32); }
 }
 
-.panorama-scene-navigation-hint.unavailable {
-  opacity: 0.76;
-}
-
-.panorama-scene-navigation-hint.unavailable > span {
-  color: #c6d2d8;
-  background: rgba(126, 156, 174, 0.2);
+@keyframes panorama-navigation-dot {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.45); }
+  22% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(0.82); }
 }
 
 .panorama-scene-navigation-feedback {
@@ -2618,6 +2618,7 @@ button:disabled {
 .panorama-scene-navigation-feedback > svg {
   flex: none;
   color: var(--mint);
+  transform: rotate(45deg);
 }
 
 .panorama-scene-navigation-feedback > span {
@@ -2626,49 +2627,29 @@ button:disabled {
   white-space: nowrap;
 }
 
-.panorama-step-zone {
+.panorama-quality-upgrade {
   position: absolute;
-  top: 26%;
-  bottom: 24%;
+  top: 14px;
+  left: 50%;
   z-index: 7;
-  display: flex;
-  width: clamp(64px, 13%, 118px);
+  display: inline-flex;
+  min-height: 28px;
   align-items: center;
-  gap: 4px;
-  padding: 0 12px;
-  color: rgba(235, 247, 247, 0.72);
-  font-size: 9px;
-  font-weight: 720;
-  text-shadow: 0 2px 7px rgba(0, 0, 0, 0.8);
-  opacity: 0.48;
-  cursor: pointer;
-  border: 0;
-  transition: opacity 150ms ease, background 150ms ease;
-}
-
-.panorama-step-zone.previous {
-  left: 0;
-  justify-content: flex-start;
-  background: linear-gradient(90deg, rgba(7, 17, 31, 0.62), transparent);
-}
-
-.panorama-step-zone.next {
-  right: 0;
-  justify-content: flex-end;
-  background: linear-gradient(-90deg, rgba(7, 17, 31, 0.62), transparent);
-}
-
-.panorama-step-zone:hover,
-.panorama-step-zone:focus-visible {
-  color: #ffffff;
-  opacity: 1;
-  outline: 0;
-}
-
-.panorama-step-zone:disabled {
+  gap: 7px;
+  padding: 0 10px;
+  color: rgba(235, 248, 246, 0.9);
+  font-size: 8px;
+  font-weight: 680;
   pointer-events: none;
-  opacity: 0;
-  cursor: default;
+  background: rgba(5, 16, 27, 0.74);
+  border: 1px solid rgba(126, 156, 174, 0.28);
+  border-radius: 999px;
+  backdrop-filter: blur(8px);
+  transform: translateX(-50%);
+}
+
+.panorama-quality-upgrade svg {
+  color: var(--mint);
 }
 
 .panorama-location-bar {
@@ -2678,11 +2659,11 @@ button:disabled {
   z-index: 7;
   display: inline-flex;
   width: max-content;
-  max-width: min(620px, calc(100% - 360px));
+  max-width: min(620px, calc(100% - 32px));
   min-height: 42px;
   align-items: center;
   gap: 10px;
-  padding: 0 7px 0 14px;
+  padding: 0 14px;
   color: #f0f8f8;
   font-size: 9px;
   font-weight: 720;
@@ -2710,41 +2691,6 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.panorama-location-bar > i {
-  width: 1px;
-  height: 20px;
-  flex: none;
-  background: rgba(143, 171, 190, 0.22);
-}
-
-.panorama-location-bar button {
-  display: inline-flex;
-  min-height: 30px;
-  flex: none;
-  align-items: center;
-  gap: 6px;
-  padding: 0 9px;
-  color: #c9d7db;
-  font-size: 8px;
-  font-weight: 690;
-  cursor: pointer;
-  background: transparent;
-  border: 0;
-  border-radius: 999px;
-}
-
-.panorama-location-bar button svg {
-  color: var(--mint);
-  transform: rotate(45deg);
-}
-
-.panorama-location-bar button:hover,
-.panorama-location-bar button:focus-visible {
-  color: #ffffff;
-  background: rgba(57, 215, 174, 0.1);
-  outline: 0;
 }
 
 .panorama-canvas {
@@ -3352,6 +3298,125 @@ button:disabled {
 .setup-section {
   padding: 16px 0;
   border-bottom: 1px solid var(--border);
+}
+
+.detection-run-identity {
+  display: grid;
+  gap: 10px;
+}
+
+.detection-layer-name {
+  display: grid;
+  gap: 5px;
+  color: #8da1ae;
+  font-size: 8px;
+}
+
+.detection-layer-name input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  color: #d5e1e6;
+  font-size: 9px;
+  background: #09141f;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: 0;
+}
+
+.detection-layer-name input:focus {
+  border-color: rgba(56, 213, 174, 0.42);
+  box-shadow: 0 0 0 2px rgba(56, 213, 174, 0.07);
+}
+
+.detection-layer-name > small,
+.detection-model-status {
+  margin: 0;
+  color: #587083;
+  font-size: 7px;
+  line-height: 1.45;
+}
+
+.detection-model-status.error {
+  color: #d79876;
+}
+
+div.detection-model-status.error {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+}
+
+div.detection-model-status.error small {
+  color: #9d6c55;
+  overflow-wrap: anywhere;
+}
+
+.detection-model-picker {
+  display: grid;
+  gap: 7px;
+}
+
+.detection-model-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #8da1ae;
+  font-size: 8px;
+}
+
+.detection-model-list {
+  display: grid;
+  max-height: 154px;
+  gap: 5px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.detection-model-list label {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  background: rgba(125, 151, 171, 0.035);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.detection-model-list label:has(input:checked) {
+  background: rgba(56, 213, 174, 0.065);
+  border-color: rgba(56, 213, 174, 0.2);
+}
+
+.detection-model-list input {
+  flex: none;
+  accent-color: var(--mint);
+}
+
+.detection-model-list span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.detection-model-list strong,
+.detection-model-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detection-model-list strong {
+  color: #b8c7ce;
+  font-size: 8px;
+}
+
+.detection-model-list small {
+  color: #5f7687;
+  font-size: 7px;
 }
 
 .mode-switch {

@@ -205,6 +205,9 @@ export interface RunRequest {
   track_ids: string[]
   frame_range: FrameRange | null
   mode: ParameterMode
+  run_name?: string
+  layer_name?: string
+  model_names?: string[]
   parameters?: ManualParameters
   auto?: {
     preset: AutoPreset
@@ -213,6 +216,7 @@ export interface RunRequest {
 
 export interface RunRecord {
   id: string
+  name?: string | null
   job_id?: string
   dataset_id: string
   dataset_name?: string
@@ -260,9 +264,16 @@ export interface RunResultFile {
   url: string
 }
 
+export interface DetectionModelOption {
+  id: string
+  name: string
+  label: string
+}
+
 export interface RunResultShapefile {
   path: string
   name: string
+  display_name?: string
   files?: string[]
   download_url: string
   import_url?: string

@@ -12,9 +12,11 @@ import {
   WandSparkles,
 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
+import { api, ApiError } from '../lib/api'
 import type {
   AutoPreset,
   DatasetSummary,
+  DetectionModelOption,
   Frame,
   FrameRange,
   ManualParameters,
@@ -141,16 +143,80 @@ export function OptimizationPanel({
   const [preset, setPreset] = useState<AutoPreset>('balanced')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [optimizing, setOptimizing] = useState(false)
+  const [layerName, setLayerName] = useState('')
+  const [layerNameDatasetId, setLayerNameDatasetId] = useState<string | null>(null)
+  const [modelOptions, setModelOptions] = useState<DetectionModelOption[]>([])
+  const [selectedModelNames, setSelectedModelNames] = useState<Set<string>>(new Set())
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
+  const [legacyModelApi, setLegacyModelApi] = useState(false)
+  const [modelsDatasetId, setModelsDatasetId] = useState<string | null>(null)
+  const [modelRequestVersion, setModelRequestVersion] = useState(0)
 
   useEffect(() => {
     setParameters(DEFAULT_PARAMETERS)
+    setLayerName(dataset ? `${dataset.name} 검출레이어` : '')
+    setLayerNameDatasetId(dataset?.id ?? null)
   }, [dataset?.id])
 
   const datasetReady = dataset?.status === 'ready'
+  useEffect(() => {
+    setModelOptions([])
+    setSelectedModelNames(new Set())
+    setModelsError(null)
+    setLegacyModelApi(false)
+    setModelsDatasetId(null)
+    if (!datasetReady) {
+      setModelsLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setModelsLoading(true)
+    void api.detectionModels(controller.signal)
+      .then((response) => {
+        if (controller.signal.aborted) return
+        setModelOptions(response.items)
+        const available = new Set(response.items.map((model) => model.id))
+        const defaults = response.default_model_ids.filter((id) => available.has(id))
+        setSelectedModelNames(new Set(defaults.length ? defaults : available))
+        setLegacyModelApi(false)
+        setModelsDatasetId(dataset?.id ?? null)
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) {
+          const legacyApi = reason instanceof ApiError && reason.status === 404
+          setLegacyModelApi(legacyApi)
+          setModelsError(legacyApi
+            ? null
+            : reason instanceof Error
+              ? reason.message
+              : '검출 모델 목록을 불러오지 못했습니다.')
+          setModelsDatasetId(dataset?.id ?? null)
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setModelsLoading(false)
+      })
+    return () => controller.abort()
+  }, [dataset?.id, datasetReady, modelRequestVersion])
+
   const selectedScopeFrameCount = selectedTrack
     ? dataset?.tracks.find((track) => track.id === selectedTrack)?.frame_count
     : dataset?.frame_count
-  const request: RunRequest | null = dataset && datasetReady
+  const normalizedLayerName = layerName.trim()
+  const runIdentityValid = (
+    layerNameDatasetId === dataset?.id && normalizedLayerName.length > 0
+  )
+  const modelSelectionValid = (
+    modelsDatasetId === dataset?.id
+    && !modelsLoading
+    && (legacyModelApi
+      || (modelsError === null && modelOptions.length > 0 && selectedModelNames.size > 0))
+  )
+  const request: RunRequest | null = dataset
+    && datasetReady
+    && runIdentityValid
+    && modelSelectionValid
     ? {
         dataset_id: dataset.id,
         track_ids: selectedTrack
@@ -158,11 +224,27 @@ export function OptimizationPanel({
           : dataset.tracks.map((track) => track.id),
         frame_range: frameRange,
         mode,
+        run_name: normalizedLayerName,
+        layer_name: normalizedLayerName,
+        ...(!legacyModelApi && modelOptions.length
+          ? { model_names: modelOptions
+              .filter((model) => selectedModelNames.has(model.id))
+              .map((model) => model.name) }
+          : {}),
         ...(mode === 'manual'
           ? { parameters }
           : { auto: { preset } }),
       }
     : null
+
+  const toggleModel = (modelId: string) => {
+    setSelectedModelNames((current) => {
+      const next = new Set(current)
+      if (next.has(modelId)) next.delete(modelId)
+      else next.add(modelId)
+      return next
+    })
+  }
 
   const autoTune = async () => {
     if (!request) return
@@ -235,6 +317,81 @@ export function OptimizationPanel({
               </span>
             </button>
           </div>
+        </section>
+
+        <section className="setup-section detection-run-identity">
+          <div className="section-label">
+            <span>검출 레이어와 모델</span>
+            <small>모델 1개 이상</small>
+          </div>
+          <label className="detection-layer-name">
+            <span>검출 레이어 이름</span>
+            <input
+              type="text"
+              value={layerName}
+              maxLength={120}
+              aria-label="검출 레이어 이름"
+              placeholder="예: 2026년 표지판 검출"
+              onChange={(event) => setLayerName(event.target.value)}
+            />
+            <small>완료 작업의 기본 실행 이름과 SHP 검수 레이어 이름으로 사용합니다.</small>
+          </label>
+          {modelsLoading ? (
+            <p className="detection-model-status" role="status">검출 모델을 확인하고 있습니다.</p>
+          ) : modelsError ? (
+            <div className="detection-model-status error" role="alert">
+              <span>모델 목록을 불러오지 못했습니다. 모델을 확인한 뒤 다시 시도해 주세요.</span>
+              <small>{modelsError}</small>
+              <button
+                type="button"
+                className="text-action"
+                onClick={() => setModelRequestVersion((version) => version + 1)}
+              >
+                다시 시도
+              </button>
+            </div>
+          ) : legacyModelApi ? (
+            <p className="detection-model-status" role="status">
+              구버전 서버에서는 모델 목록을 제공하지 않아 기존 전체 모델 설정으로 실행합니다.
+            </p>
+          ) : (
+            <div className="detection-model-picker">
+              <div className="detection-model-actions">
+                <strong>사용 모델</strong>
+                <button
+                  type="button"
+                  className="text-action"
+                  onClick={() => setSelectedModelNames(
+                    selectedModelNames.size === modelOptions.length
+                      ? new Set()
+                      : new Set(modelOptions.map((model) => model.id)),
+                  )}
+                >
+                  {selectedModelNames.size === modelOptions.length ? '전체 해제' : '전체 선택'}
+                </button>
+              </div>
+              <div className="detection-model-list">
+                {modelOptions.map((model) => (
+                  <label key={model.id}>
+                    <input
+                      type="checkbox"
+                      checked={selectedModelNames.has(model.id)}
+                      onChange={() => toggleModel(model.id)}
+                    />
+                    <span><strong>{model.label}</strong><small>{model.name}</small></span>
+                  </label>
+                ))}
+              </div>
+              {!modelOptions.length && (
+                <p className="detection-model-status error">사용 가능한 모델이 없습니다.</p>
+              )}
+              {modelOptions.length > 0 && selectedModelNames.size === 0 && (
+                <p className="detection-model-status error" role="alert">
+                  실행할 모델을 한 개 이상 선택해 주세요.
+                </p>
+              )}
+            </div>
+          )}
         </section>
 
         {mode === 'automatic' ? (

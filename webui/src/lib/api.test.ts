@@ -220,6 +220,39 @@ describe('run API', () => {
       fetchMock.mockRestore()
     }
   })
+
+  it('loads detection models and renames a run with its optimistic timestamp', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        items: [{ id: 'sign.pt', name: 'sign.pt', label: 'sign' }],
+        default_model_ids: ['sign.pt'],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'run/a',
+        name: '교통표지 검출',
+        dataset_id: 'dataset-a',
+        status: 'completed',
+        progress: 100,
+        created_at: '2026-08-20T00:00:00Z',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    try {
+      await api.detectionModels()
+      await api.renameRun('run/a', {
+        name: '교통표지 검출',
+        expected_updated_at: '2026-08-20T00:05:00Z',
+      })
+      expect(fetchMock.mock.calls[0][0]).toBe('/api/detection-models')
+      expect(fetchMock.mock.calls[1][0]).toBe('/api/runs/run%2Fa')
+      expect(fetchMock.mock.calls[1][1]?.method).toBe('PATCH')
+      expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+        name: '교통표지 검출',
+        expected_updated_at: '2026-08-20T00:05:00Z',
+      })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
 })
 
 describe('field survey API', () => {

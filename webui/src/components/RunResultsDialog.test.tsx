@@ -23,6 +23,7 @@ const RESULTS: RunResults = {
     {
       path: 'shp/detected_signs.shp',
       name: 'detected_signs',
+      display_name: '2026 교통표지 검출',
       download_url: '/api/runs/run-42/shapefile?path=shp%2Fdetected_signs.shp',
     },
   ],
@@ -161,7 +162,7 @@ describe('RunResultsDialog', () => {
         expect(importRunShapefile).toHaveBeenCalledWith(
           RUN.id,
           'shp/detected_signs.shp',
-          'detected_signs',
+          '2026 교통표지 검출',
         )
         expect(changed).toHaveBeenCalledTimes(1)
       })
