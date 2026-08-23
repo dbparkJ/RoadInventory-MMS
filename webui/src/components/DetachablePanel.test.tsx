@@ -174,6 +174,9 @@ describe('DetachablePanel keyboard relay', () => {
         ['ArrowRight', 'ArrowRight'],
         ['n', 'KeyN'],
         ['p', 'KeyP'],
+        ['b', 'KeyB'],
+        ['r', 'KeyR'],
+        ['Enter', 'Enter'],
         ['Escape', 'Escape'],
       ] as const
       shortcuts.forEach(([key, code]) => {
@@ -190,6 +193,39 @@ describe('DetachablePanel keyboard relay', () => {
       expect(onKeyDown.mock.calls.map(([event]) => event.code)).toEqual(
         shortcuts.map(([, code]) => code),
       )
+    } finally {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  })
+
+  it('does not relay pole-base shortcuts while typing in popup controls', () => {
+    const { popup, addEventListener } = fakePopup()
+    vi.spyOn(window, 'open').mockReturnValue(popup)
+    const onKeyDown = vi.fn()
+    window.addEventListener('keydown', onKeyDown)
+    try {
+      render(<Harness />)
+      fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
+      const input = popup.document.createElement('input')
+      popup.document.body.appendChild(input)
+      const relay = addEventListener.mock.calls.find(([type]) => type === 'keydown')?.[1] as
+        | ((event: KeyboardEvent) => void)
+        | undefined
+      expect(relay).toBeDefined()
+
+      ;['KeyB', 'KeyR', 'Enter', 'Escape'].forEach((code) => {
+        const key = code.startsWith('Key') ? code.slice(3).toLowerCase() : code
+        const event = new KeyboardEvent('keydown', {
+          key,
+          code,
+          bubbles: true,
+          cancelable: true,
+        })
+        Object.defineProperty(event, 'target', { value: input })
+        relay?.(event)
+      })
+
+      expect(onKeyDown).not.toHaveBeenCalled()
     } finally {
       window.removeEventListener('keydown', onKeyDown)
     }

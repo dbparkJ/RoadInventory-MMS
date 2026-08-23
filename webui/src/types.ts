@@ -175,6 +175,7 @@ export interface BootstrapResponse {
     shp_overlays?: boolean
     shp_feature_editing?: boolean
     shp_result_download?: boolean
+    pole_base_inference?: boolean
     max_point_budget?: number
     max_overlay_upload_bytes?: number
     max_overlay_features?: number
@@ -369,6 +370,75 @@ export interface OverlayFeatureCreateRequest {
   coordinate_space?: OverlayCoordinateSpace
   copy_geometry_from?: string | number
   expected_revision?: number
+  properties?: Record<string, unknown>
+}
+
+export type PoleBaseInferStatus = 'auto' | 'review' | 'failed'
+
+export interface PoleBaseInferRequest {
+  coordinate_space: 'dataset'
+  seed_position: [number, number, number]
+  profile: 'balanced'
+  debug?: boolean
+}
+
+export interface PoleBaseAxisResult {
+  point: [number, number, number]
+  direction: [number, number, number]
+  point_count: number
+  observed_z_min: number
+  observed_z_max: number
+  vertical_span_m: number
+  vertical_bin_count: number
+  longest_consecutive_bin_count: number
+  occupancy_ratio: number
+  rmse_m: number
+  tilt_deg: number
+  seed_distance_m: number
+}
+
+export interface PoleBaseGroundResult {
+  method: string
+  z_at_base: number
+  rmse_m: number
+  cell_count: number
+  candidate_cell_count: number
+  nearest_support_distance_m: number
+  plane_coefficients: [number, number, number]
+  reference_xy: [number, number]
+}
+
+export interface PoleBaseQualityComponents {
+  seed: number
+  axis: number
+  span: number
+  continuity: number
+  ground: number
+  bottom_gap: number
+}
+
+export interface PoleBaseQualityResult {
+  score: number
+  candidate_count: number
+  ambiguous: boolean
+  bottom_gap_m: number | null
+  components: PoleBaseQualityComponents
+}
+
+export interface PoleBaseInferResponse {
+  status: PoleBaseInferStatus
+  algorithm: string
+  algorithm_version: string
+  coordinate_space: 'dataset'
+  seed_position: [number, number, number]
+  snapped_seed_position?: [number, number, number] | null
+  base_position: [number, number, number] | null
+  axis?: PoleBaseAxisResult | null
+  ground?: PoleBaseGroundResult | null
+  quality: PoleBaseQualityResult
+  reason_codes: string[]
+  warnings: string[]
+  debug?: Record<string, unknown> | null
 }
 
 export interface OverlayFeatureCollection {

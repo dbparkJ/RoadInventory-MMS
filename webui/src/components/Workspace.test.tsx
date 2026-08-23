@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useState, type ComponentProps } from 'react'
 import type { DatasetSummary, Frame } from '../types'
 import { api } from '../lib/api'
-import { Workspace } from './Workspace'
+import { OPEN_POINT_CLOUD_EVENT, Workspace } from './Workspace'
 
 type MockMapMode = '2d' | 'satellite' | '3d'
 
@@ -394,6 +394,24 @@ describe('Workspace popup viewers', () => {
       new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', cancelable: true }),
     )
     expect(onMoveFrame).toHaveBeenCalledWith(1)
+  })
+
+  it('opens or focuses the 3D popup when a point-cloud tool requests it', async () => {
+    const pointPopup = fakePopup()
+    const open = vi.spyOn(window, 'open').mockReturnValue(pointPopup)
+    render(<ControlledWorkspace />)
+    await screen.findByTestId('map-view')
+
+    fireEvent(window, new CustomEvent(OPEN_POINT_CLOUD_EVENT))
+
+    expect(open).toHaveBeenCalledOnce()
+    await waitFor(() => {
+      expect(pointPopup.document.querySelector('[data-testid="point-cloud-view"]')).not.toBeNull()
+    })
+
+    fireEvent(window, new CustomEvent(OPEN_POINT_CLOUD_EVENT))
+    expect(open).toHaveBeenCalledOnce()
+    expect(pointPopup.focus).toHaveBeenCalledTimes(2)
   })
 })
 

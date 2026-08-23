@@ -121,7 +121,14 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
         !event.metaKey &&
         !event.shiftKey &&
         !isTextEntryTarget(event.target) &&
-        (event.code === 'KeyP' || event.code === 'KeyN' || event.key === 'Escape')
+        (
+          event.code === 'KeyP' ||
+          event.code === 'KeyN' ||
+          event.code === 'KeyB' ||
+          event.code === 'KeyR' ||
+          event.key === 'Enter' ||
+          event.key === 'Escape'
+        )
       if (!frameNavigationDirection(event) && !globalOverlayKey) return
       event.preventDefault()
       sourceWindow.dispatchEvent(

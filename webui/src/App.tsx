@@ -659,7 +659,13 @@ function App() {
   if (booting) return <BootScreen />
 
   return (
-    <OverlayProvider datasetId={datasetId} demoMode={demoMode} notify={toast}>
+    <OverlayProvider
+      datasetId={datasetId}
+      activeFrameId={selectedFrame?.id ?? null}
+      poleBaseInferenceEnabled={Boolean(boot?.capabilities?.pole_base_inference)}
+      demoMode={demoMode}
+      notify={toast}
+    >
       <div className={`app-shell ${dataPanelCollapsed ? 'data-collapsed' : ''}`}>
       <header className="topbar">
         <div className="topbar-left">

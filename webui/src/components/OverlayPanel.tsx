@@ -14,6 +14,7 @@ import {
   Table2,
   Trash2,
   Upload,
+  UtilityPole,
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
@@ -150,6 +151,7 @@ function OverlayWorkspacePanel({
   const [actionError, setActionError] = useState<string | null>(null)
   const [uploadOpen, setUploadOpen] = useState(overlay.layers.length === 0)
   const [selectedFieldName, setSelectedFieldName] = useState<string | null>(null)
+  const [continuousPoleBaseCreate, setContinuousPoleBaseCreate] = useState(true)
   const previousLayerCountRef = useRef(overlay.layers.length)
   const appliedFocusLayerRef = useRef<string | undefined>(undefined)
 
@@ -218,6 +220,25 @@ function OverlayWorkspacePanel({
     overlay.selected?.layerId === activeLayerId ? overlay.selectedDatasetFeature : null
   const selectedIsPoint = selected?.geometry?.type === 'Point'
   const movingSelected = overlay.pickTarget?.kind === 'move'
+  const creatingPoleBase =
+    overlay.pickTarget?.kind === 'pole-base-create' &&
+    overlay.pickTarget.layerId === activeLayerId
+  const recomputingPoleBase =
+    overlay.pickTarget?.kind === 'pole-base-move' &&
+    overlay.pickTarget.layerId === activeLayerId &&
+    String(overlay.pickTarget.featureId) === String(selected?.id)
+
+  const beginPoleBaseCreate = () => {
+    if (!activeLayer || activeLayer.geometry_type !== 'Point') return
+    overlay.beginCreatePoleBase(activeLayer.id, continuousPoleBaseCreate)
+    onClose()
+  }
+
+  const beginSelectedPoleBaseRecompute = () => {
+    if (!selectedIsPoint) return
+    overlay.beginRecomputeSelectedPoleBase()
+    onClose()
+  }
 
   useEffect(() => {
     setLayerNameDraft(activeLayer?.name ?? '')
@@ -431,6 +452,14 @@ function OverlayWorkspacePanel({
           지도·파노라마·3D 포인트 뷰에서 신규 피처 위치를 클릭하세요. N 또는 Esc로 취소할 수 있습니다.
         </small>
       )}
+      {mode === 'attributes' && (
+        overlay.pickTarget?.kind === 'pole-base-create' ||
+        overlay.pickTarget?.kind === 'pole-base-move'
+      ) && (
+        <small className="pick-instruction overlay-create-instruction" role="status">
+          3D 포인트 뷰에서 지주 몸체의 실제 포인트를 클릭하세요. 바닥점은 서버가 산출합니다.
+        </small>
+      )}
 
       <div className={`overlay-workspace-grid overlay-workspace-${mode}`}>
         <aside className="overlay-layer-list">
@@ -548,6 +577,41 @@ function OverlayWorkspacePanel({
         {mode === 'attributes' && <div className="overlay-table-area">
           <div className="overlay-table-toolbar">
             <span><Table2 size={14} /> 속성표</span>
+            <div className="pole-base-tools">
+              <button
+                type="button"
+                className={`button compact ${creatingPoleBase ? 'primary' : 'secondary'}`}
+                disabled={
+                  !overlay.poleBaseInferenceEnabled ||
+                  !activeLayer ||
+                  activeLayer.geometry_type !== 'Point' ||
+                  overlay.creatingFeature
+                }
+                title={
+                  !overlay.poleBaseInferenceEnabled
+                    ? '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.'
+                    : activeLayer?.geometry_type === 'Point'
+                    ? '3D에서 지주 몸체를 클릭해 미검출 지주의 바닥점을 산출 (B)'
+                    : 'Point 레이어에서만 지주 하단을 산출할 수 있습니다.'
+                }
+                onClick={beginPoleBaseCreate}
+              >
+                <UtilityPole size={13} /> 미검출 지주 추가
+              </button>
+              <label className="pole-base-continuous-toggle" title="저장 후 다음 지주 시드 선택을 계속합니다.">
+                <input
+                  type="checkbox"
+                  checked={continuousPoleBaseCreate}
+                  disabled={
+                    !overlay.poleBaseInferenceEnabled ||
+                    !activeLayer ||
+                    activeLayer.geometry_type !== 'Point'
+                  }
+                  onChange={(event) => setContinuousPoleBaseCreate(event.target.checked)}
+                />
+                연속 추가
+              </label>
+            </div>
             <button
               type="button"
               className={`button compact ${overlay.pickTarget?.kind === 'create' && overlay.pickTarget.layerId === activeLayerId ? 'primary' : 'secondary'}`}
@@ -698,6 +762,23 @@ function OverlayWorkspacePanel({
               >
                 <Crosshair size={15} />
                 {movingSelected ? '위치 지정 취소' : '뷰에서 실제 포인트 선택 (P)'}
+              </button>
+              <button
+                type="button"
+                className={`button ${recomputingPoleBase ? 'primary' : 'secondary'} overlay-pick-button`}
+                disabled={
+                  !overlay.poleBaseInferenceEnabled ||
+                  !selectedIsPoint ||
+                  overlay.creatingFeature
+                }
+                title={
+                  overlay.poleBaseInferenceEnabled
+                    ? '선택한 Point의 지주 하단을 3D 시드로 다시 산출'
+                    : '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.'
+                }
+                onClick={beginSelectedPoleBaseRecompute}
+              >
+                <UtilityPole size={15} /> 지주 하단 재산출
               </button>
               {movingSelected && (
                 <p className="pick-instruction">지도 위치 또는 파노라마/3D의 점군을 클릭하세요. Esc로 취소할 수 있습니다.</p>

@@ -446,6 +446,45 @@ class _AxisFitResult:
 
 
 @dataclass(frozen=True)
+class PoleAxisFit:
+    """Public, seed-agnostic result from the shared robust shaft fitter.
+
+    The automatic sign pipeline and the manual seed workflow both use the
+    same private numerical implementation.  This immutable view exposes only
+    the stable geometric metrics needed by callers outside this module.
+    """
+
+    point: np.ndarray
+    direction: np.ndarray
+    coefficients: np.ndarray
+    z_reference: float
+    inlier_indices: np.ndarray
+    point_count: int
+    observed_z_min: float
+    observed_z_max: float
+    vertical_span_m: float
+    vertical_bin_count: int
+    longest_consecutive_bin_count: int
+    max_observed_z_gap_m: float
+    vertical_occupancy_ratio: float
+    radial_rmse_m: float
+    tilt_deg: float
+    stabilized: bool
+    bin_inlier_count: int
+    bin_count: int
+    plumb_adjusted: bool
+    endpoint_tilt_deg: float | None
+    endpoint_drift_m: float | None
+
+    def xy_at_z(self, z_value: float) -> np.ndarray:
+        design = np.asarray(
+            [float(z_value) - self.z_reference, 1.0],
+            dtype=np.float64,
+        )
+        return np.asarray(design @ self.coefficients, dtype=np.float64)
+
+
+@dataclass(frozen=True)
 class _HorizontalConnection:
     occupied_bin_count: int
     expected_bin_count: int
@@ -1252,6 +1291,88 @@ def _robust_axis_fit(
     )
 
 
+def fit_pole_axis(
+    points_xyz: np.ndarray,
+    parameters: PoleSearchParameters,
+    *,
+    source_indices: np.ndarray | None = None,
+) -> PoleAxisFit | None:
+    """Fit one pole shaft with the numerical primitive used by auto detection.
+
+    Candidate discovery and seed association intentionally stay outside this
+    function.  That keeps the existing automatic pipeline unchanged while
+    giving manual tools a supported entry point instead of importing private
+    helpers or pretending a click is a detected sign.
+    """
+
+    points = np.asarray(points_xyz, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_xyz must have shape (N, 3)")
+    if points.shape[0] and not np.all(np.isfinite(points)):
+        raise ValueError("points_xyz must contain only finite coordinates")
+    indices = (
+        np.arange(points.shape[0], dtype=np.int64)
+        if source_indices is None
+        else np.asarray(source_indices, dtype=np.int64)
+    )
+    if indices.shape != (points.shape[0],):
+        raise ValueError("source_indices must have one value per point")
+    fitted = _robust_axis_fit(points, indices, parameters)
+    if fitted is None:
+        return None
+    inlier_points = points[
+        np.isin(indices, fitted.inlier_indices, assume_unique=False)
+    ]
+    if inlier_points.shape[0] != fitted.inlier_indices.shape[0]:
+        # Duplicate source IDs would make the public metrics ambiguous.
+        position_by_index = {int(value): offset for offset, value in enumerate(indices)}
+        inlier_points = points[
+            [position_by_index[int(value)] for value in fitted.inlier_indices]
+        ]
+    continuity = fitted.continuity
+    point = np.asarray(
+        [
+            fitted.coefficients[1, 0],
+            fitted.coefficients[1, 1],
+            fitted.z_reference,
+        ],
+        dtype=np.float64,
+    )
+    tilt_deg = math.degrees(
+        math.atan2(
+            float(np.linalg.norm(fitted.axis_direction[:2])),
+            abs(float(fitted.axis_direction[2])),
+        )
+    )
+    return PoleAxisFit(
+        point=point,
+        direction=np.asarray(fitted.axis_direction, dtype=np.float64),
+        coefficients=np.asarray(fitted.coefficients, dtype=np.float64),
+        z_reference=float(fitted.z_reference),
+        inlier_indices=np.asarray(fitted.inlier_indices, dtype=np.int64),
+        point_count=int(inlier_points.shape[0]),
+        observed_z_min=float(continuity.observed_z_min),
+        observed_z_max=float(continuity.observed_z_max),
+        vertical_span_m=float(
+            continuity.observed_z_max - continuity.observed_z_min
+        ),
+        vertical_bin_count=int(continuity.vertical_bin_count),
+        longest_consecutive_bin_count=int(
+            continuity.longest_consecutive_bin_count
+        ),
+        max_observed_z_gap_m=float(continuity.max_observed_z_gap_m),
+        vertical_occupancy_ratio=float(continuity.vertical_occupancy_ratio),
+        radial_rmse_m=float(fitted.radial_rmse_m),
+        tilt_deg=float(tilt_deg),
+        stabilized=bool(fitted.stabilized),
+        bin_inlier_count=int(fitted.bin_inlier_count),
+        bin_count=int(fitted.bin_count),
+        plumb_adjusted=bool(fitted.plumb_adjusted),
+        endpoint_tilt_deg=fitted.endpoint_tilt_deg,
+        endpoint_drift_m=fitted.endpoint_drift_m,
+    )
+
+
 def _fit_local_ground_hypothesis(
     points: np.ndarray,
     pole_xy: np.ndarray,
@@ -2037,7 +2158,9 @@ def _axis_ground_intersection(
     coefficients: np.ndarray,
     z_reference: float,
     ground: GroundEstimate,
-) -> np.ndarray:
+    *,
+    fallback_to_ground_z: bool = True,
+) -> np.ndarray | None:
     """Intersect x(z), y(z) with the fitted local ground plane."""
 
     slope_xy = np.asarray(coefficients[0], dtype=np.float64)
@@ -2047,6 +2170,8 @@ def _axis_ground_intersection(
     slope_coupling = float(np.dot(plane[:2], slope_xy))
     denominator = 1.0 - slope_coupling
     if abs(denominator) <= 1e-6:
+        if not fallback_to_ground_z:
+            return None
         z_value = float(ground.z)
     else:
         constant = (
@@ -2056,10 +2181,26 @@ def _axis_ground_intersection(
         )
         z_value = constant / denominator
     if not math.isfinite(z_value):
+        if not fallback_to_ground_z:
+            return None
         z_value = float(ground.z)
     design = np.asarray([z_value - z_reference, 1.0], dtype=np.float64)
     xy_value = design @ coefficients
     return np.asarray([xy_value[0], xy_value[1], z_value], dtype=np.float64)
+
+
+def intersect_pole_axis_with_ground(
+    axis: PoleAxisFit,
+    ground: GroundEstimate,
+) -> np.ndarray | None:
+    """Return the shaft/plane intersection, or ``None`` when it is degenerate."""
+
+    return _axis_ground_intersection(
+        axis.coefficients,
+        axis.z_reference,
+        ground,
+        fallback_to_ground_z=False,
+    )
 
 
 def find_pole_bases(

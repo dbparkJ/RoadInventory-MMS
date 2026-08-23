@@ -29,6 +29,7 @@ from .media import POINT_PREVIEW_MAX_BUDGET, VWORLD_DEVELOPMENT_KEY
 from .media import router as media_router
 from .optimizer import router as optimizer_router
 from .overlays import router as overlays_router
+from .pole_tools import router as pole_tools_router
 from .runs import RunManager, public_run
 from .runs import router as runs_router
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
@@ -492,6 +493,11 @@ def create_app(
                 media_owners = list(app.state.media_owner_tasks)
                 if media_owners:
                     await asyncio.gather(*media_owners, return_exceptions=True)
+                # Pole inference also reads through the shared point reader in a
+                # non-cancellable worker thread.  Drain owners before closing it.
+                pole_tool_owners = list(app.state.pole_tool_owner_tasks)
+                if pole_tool_owners:
+                    await asyncio.gather(*pole_tool_owners, return_exceptions=True)
                 tasks = [
                     *app.state.scan_tasks.values(),
                     *app.state.catalog_tasks.values(),
@@ -532,8 +538,10 @@ def create_app(
     app.state.upload_coordinators = weakref.WeakValueDictionary()
     app.state.upload_owner_tasks = set()
     app.state.media_owner_tasks = set()
+    app.state.pole_tool_owner_tasks = set()
     app.state.panorama_semaphore = asyncio.Semaphore(config.max_panorama_previews)
     app.state.point_preview_semaphore = asyncio.Semaphore(config.max_point_previews)
+    app.state.pole_tool_semaphore = asyncio.Semaphore(2)
     app.state.run_archive_semaphore = asyncio.Semaphore(2)
     app.state.address_semaphore = asyncio.Semaphore(2)
     app.state.address_failure_cache = {}
@@ -568,6 +576,7 @@ def create_app(
     app.include_router(detections_router)
     app.include_router(media_router)
     app.include_router(overlays_router)
+    app.include_router(pole_tools_router)
     app.include_router(optimizer_router)
     app.include_router(uploads_router)
     app.include_router(runs_router)
@@ -639,6 +648,7 @@ def create_app(
                 "upload": True,
                 "panorama": True,
                 "point_cloud": app.state.point_preview_available,
+                "pole_base_inference": app.state.point_preview_available,
                 "auto_optimize": True,
                 "folder_browser": True,
                 "resumable_uploads": True,

@@ -31,6 +31,8 @@ import type { MapMode } from '../views/MapView'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
 
+export const OPEN_POINT_CLOUD_EVENT = 'mms-open-pointcloud'
+
 const MapView = lazy(() =>
   import('../views/MapView').then((module) => ({ default: module.MapView })),
 )
@@ -99,6 +101,8 @@ export function Workspace({
   const overlay = useOptionalOverlayWorkspace()
   const panoramaPanelRef = useRef<DetachablePanelHandle>(null)
   const pointCloudPanelRef = useRef<DetachablePanelHandle>(null)
+  const pointCloudOpenRequestRef = useRef(pointCloudOpen)
+  pointCloudOpenRequestRef.current = pointCloudOpen
   const [mapMode, setMapMode] = useState<MapMode>('2d')
   const sortedTracks = useMemo(() => naturalSortTracks(dataset?.tracks ?? []), [dataset?.tracks])
   const trackCatalogueKey = `${dataset?.id ?? ''}:${sortedTracks.map((track) => track.id).join('\u0000')}`
@@ -345,6 +349,18 @@ export function Workspace({
     }
     if (pointCloudPanelRef.current?.detach()) onTogglePointCloud()
   }
+
+  useEffect(() => {
+    const openPointCloudForTool = () => {
+      const opened = pointCloudPanelRef.current?.detach() ?? false
+      if (opened && !pointCloudOpenRequestRef.current) {
+        pointCloudOpenRequestRef.current = true
+        onTogglePointCloud()
+      }
+    }
+    window.addEventListener(OPEN_POINT_CLOUD_EVENT, openPointCloudForTool)
+    return () => window.removeEventListener(OPEN_POINT_CLOUD_EVENT, openPointCloudForTool)
+  }, [onTogglePointCloud])
 
   return (
     <main className="workspace">

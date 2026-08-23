@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import * as THREE from 'three'
+import type { PoleBaseInferResponse } from '../types'
 import {
   capturePointCloudViewState,
   captureHeadingDirection,
   closestPointHitIndex,
+  applyPointCloudPickedCoordinate,
   DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
@@ -12,7 +14,11 @@ import {
   pointCloudDetectionWireframePositions,
   pointCloudDetectionsFromObservations,
   pointCloudHoverState,
+  pointCloudPickTargetAcceptsPoint,
   pointCloudYoloBoxHalfSize,
+  poleBasePreviewGeometry,
+  poleBasePrimaryWarning,
+  poleBaseStatusLabel,
   POINT_CLOUD_YOLO_HIT_RADIUS_PX,
   POINT_CLOUD_YOLO_MARKER_SIZE,
   POINT_CLOUD_YOLO_RAYCAST_THRESHOLD,
@@ -364,5 +370,125 @@ describe('PointCloudView camera continuity', () => {
         7,
       ),
     ).toBeNull()
+  })
+
+  it('builds seed, axis, base, and guide previews in frame-local coordinates', () => {
+    const result: PoleBaseInferResponse = {
+      status: 'review',
+      algorithm: 'manual_seed_axis_ground_intersection',
+      algorithm_version: '1',
+      coordinate_space: 'dataset',
+      seed_position: [1002.05, 2003.05, 35],
+      snapped_seed_position: [1002, 2003, 35],
+      base_position: [1002.1, 2003.1, 30],
+      axis: {
+        point: [1002, 2003, 33],
+        direction: [0, 0, 1],
+        point_count: 120,
+        observed_z_min: 31,
+        observed_z_max: 37,
+        vertical_span_m: 6,
+        vertical_bin_count: 24,
+        longest_consecutive_bin_count: 22,
+        occupancy_ratio: 0.9,
+        rmse_m: 0.04,
+        tilt_deg: 0,
+        seed_distance_m: 0.05,
+      },
+      ground: {
+        method: 'plane',
+        z_at_base: 30,
+        rmse_m: 0.05,
+        cell_count: 12,
+        candidate_cell_count: 15,
+        nearest_support_distance_m: 0.2,
+        plane_coefficients: [0, 0, 30],
+        reference_xy: [1002.1, 2003.1],
+      },
+      quality: {
+        score: 0.84,
+        candidate_count: 1,
+        ambiguous: false,
+        bottom_gap_m: 1,
+        components: {
+          seed: 1,
+          axis: 1,
+          span: 1,
+          continuity: 0.9,
+          ground: 0.9,
+          bottom_gap: 0.7,
+        },
+      },
+      reason_codes: ['BOTTOM_EXTRAPOLATED'],
+      warnings: ['Bottom extrapolation is longer than the automatic gate.'],
+    }
+
+    const preview = poleBasePreviewGeometry(
+      result.seed_position,
+      result,
+      [1000, 2000, 30],
+    )
+    expect(preview.seed[0]).toBeCloseTo(2.05)
+    expect(preview.seed[1]).toBeCloseTo(3.05)
+    expect(preview.seed[2]).toBe(5)
+    expect(preview.base?.[0]).toBeCloseTo(2.1)
+    expect(preview.base?.[1]).toBeCloseTo(3.1)
+    expect(preview.base?.[2]).toBe(0)
+    expect(preview.axis).toEqual([[2, 3, 1], [2, 3, 7]])
+    expect(preview.guide?.[0]).toEqual(preview.seed)
+    expect(preview.guide?.[1]).toEqual(preview.base)
+    expect(poleBaseStatusLabel(result.status)).toBe('검토 필요')
+    expect(poleBasePrimaryWarning(result)).toBe(
+      '관측된 지주 끝에서 바닥까지 외삽 거리가 깁니다.',
+    )
+  })
+
+  it('keeps a seed-only preview while inference is loading', () => {
+    expect(poleBasePreviewGeometry([11, 22, 33], null, [10, 20, 30])).toEqual({
+      seed: [1, 2, 3],
+      base: null,
+      axis: null,
+      guide: null,
+    })
+  })
+
+  it('routes a pole target to inference with the unchanged dataset XYZ', async () => {
+    const actions = {
+      applyPickedCoordinate: vi.fn().mockResolvedValue(undefined),
+      applyPoleSeed: vi.fn().mockResolvedValue(undefined),
+    }
+    const datasetCoordinates: [number, number, number] = [209123.456, 412345.678, 35.912]
+
+    await applyPointCloudPickedCoordinate(
+      { kind: 'pole-base-create', layerId: 'poles', continuous: true },
+      'frame-17',
+      datasetCoordinates,
+      actions,
+    )
+
+    expect(actions.applyPoleSeed).toHaveBeenCalledWith('frame-17', datasetCoordinates)
+    expect(actions.applyPickedCoordinate).not.toHaveBeenCalled()
+
+    await applyPointCloudPickedCoordinate(
+      { kind: 'move', layerId: 'poles', featureId: 'pole-1' },
+      'frame-17',
+      datasetCoordinates,
+      actions,
+    )
+    expect(actions.applyPickedCoordinate).toHaveBeenCalledWith(datasetCoordinates, 'dataset')
+  })
+
+  it('accepts pole clicks only while the proposal is picking', () => {
+    const target = { kind: 'pole-base-move', layerId: 'poles', featureId: 'pole-1' } as const
+    expect(pointCloudPickTargetAcceptsPoint(target, 'picking')).toBe(true)
+    expect(pointCloudPickTargetAcceptsPoint(target, 'loading')).toBe(false)
+    expect(pointCloudPickTargetAcceptsPoint(target, 'ready')).toBe(false)
+    expect(pointCloudPickTargetAcceptsPoint(target, 'error')).toBe(false)
+    expect(
+      pointCloudPickTargetAcceptsPoint(
+        { kind: 'move', layerId: 'poles', featureId: 'pole-1' },
+        'ready',
+      ),
+    ).toBe(true)
   })
 })

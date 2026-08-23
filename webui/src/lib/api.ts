@@ -17,6 +17,8 @@ import type {
   PanoramaOverlayFeature,
   PanoramaDetectionBoxObservation,
   PanoramaProjectionMetadata,
+  PoleBaseInferRequest,
+  PoleBaseInferResponse,
   RouteResponse,
   RunEvent,
   RunRecord,
@@ -375,6 +377,49 @@ export const api = {
       `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features/${encodeURIComponent(String(featureId))}`,
       { method: 'PATCH', ...jsonBody(payload), timeout: 30_000 },
     )
+  },
+
+  async inferPoleBase(
+    datasetId: string,
+    frameId: string,
+    payload: PoleBaseInferRequest,
+    signal?: AbortSignal,
+  ) {
+    const response = await request(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/pole-base/infer`,
+      {
+        method: 'POST',
+        ...jsonBody(payload),
+        signal,
+        timeout: 30_000,
+        retries: 0,
+      },
+    )
+    if (response.status === 202) {
+      let payload: unknown
+      try {
+        payload = await response.json()
+      } catch {
+        payload = undefined
+      }
+      const payloadRecord =
+        payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : undefined
+      const detailRecord =
+        payloadRecord?.detail && typeof payloadRecord.detail === 'object'
+          ? (payloadRecord.detail as Record<string, unknown>)
+          : undefined
+      const code =
+        (typeof payloadRecord?.code === 'string' && payloadRecord.code) ||
+        (typeof detailRecord?.code === 'string' && detailRecord.code) ||
+        'CATALOG_PREPARING'
+      throw new ApiError(
+        errorMessageFromPayload(payload, '원본 점군을 준비하고 있습니다. 잠시 후 다시 선택해 주세요.'),
+        202,
+        code,
+        payload,
+      )
+    }
+    return response.json() as Promise<PoleBaseInferResponse>
   },
 
   deleteOverlayFeature(

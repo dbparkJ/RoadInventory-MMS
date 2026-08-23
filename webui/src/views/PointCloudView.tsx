@@ -1,4 +1,17 @@
-import { Box, Camera, CircleGauge, Crosshair, LoaderCircle, MapPin, RefreshCcw, Rotate3D, Scan } from 'lucide-react'
+import {
+  AlertTriangle,
+  Box,
+  Camera,
+  Check,
+  CircleGauge,
+  Crosshair,
+  LoaderCircle,
+  MapPin,
+  RefreshCcw,
+  Rotate3D,
+  Scan,
+  X,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
@@ -7,7 +20,13 @@ import {
   OverlayHoverTooltip,
   type OverlayHoverState,
 } from '../components/OverlayHoverTooltip'
-import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
+import {
+  POLE_BASE_REASON_MESSAGES,
+  poleBaseReasonMessage,
+  useOptionalOverlayWorkspace,
+  type OverlayPickTarget,
+  type PoleBaseProposalState,
+} from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPointCloud } from '../lib/demo'
 import { formatCount } from '../lib/format'
@@ -21,6 +40,7 @@ import type {
   OverlayFeature,
   PanoramaDetectionBoxObservation,
   PanoramaProjectionMetadata,
+  PoleBaseInferResponse,
   PointCloudPayload,
 } from '../types'
 
@@ -286,6 +306,110 @@ export function datasetPointToFrameLocal(
   ]
 }
 
+export interface PoleBasePreviewGeometry {
+  seed: [number, number, number]
+  base: [number, number, number] | null
+  axis: [[number, number, number], [number, number, number]] | null
+  guide: [[number, number, number], [number, number, number]] | null
+}
+
+/** Build the proposal in the same frame-local coordinates used by MMSP. */
+export function poleBasePreviewGeometry(
+  seed: [number, number, number],
+  result: PoleBaseInferResponse | null,
+  frameOrigin: [number, number, number],
+): PoleBasePreviewGeometry {
+  const local = (point: [number, number, number]): [number, number, number] => [
+    point[0] - frameOrigin[0],
+    point[1] - frameOrigin[1],
+    point[2] - frameOrigin[2],
+  ]
+  const localSeed = local(seed)
+  const localBase = result?.base_position ? local(result.base_position) : null
+  const axis = result?.axis
+  let localAxis: PoleBasePreviewGeometry['axis'] = null
+  if (axis) {
+    const direction = new THREE.Vector3(...axis.direction)
+    const point = new THREE.Vector3(...axis.point)
+    let start: THREE.Vector3
+    let end: THREE.Vector3
+    if (Math.abs(direction.z) > 1e-8) {
+      start = point.clone().addScaledVector(
+        direction,
+        (axis.observed_z_min - point.z) / direction.z,
+      )
+      end = point.clone().addScaledVector(
+        direction,
+        (axis.observed_z_max - point.z) / direction.z,
+      )
+    } else {
+      const halfSpan = Math.max(0.5, axis.vertical_span_m / 2)
+      start = point.clone().addScaledVector(direction.clone().normalize(), -halfSpan)
+      end = point.clone().addScaledVector(direction.clone().normalize(), halfSpan)
+    }
+    localAxis = [
+      local(start.toArray() as [number, number, number]),
+      local(end.toArray() as [number, number, number]),
+    ]
+  }
+  return {
+    seed: localSeed,
+    base: localBase,
+    axis: localAxis,
+    guide: localBase ? [localSeed, localBase] : null,
+  }
+}
+
+export function poleBaseStatusLabel(status: PoleBaseInferResponse['status']): string {
+  if (status === 'auto') return '자동 산출 가능'
+  if (status === 'review') return '검토 필요'
+  return '산출 실패'
+}
+
+export function poleBasePrimaryWarning(result: PoleBaseInferResponse): string | null {
+  const knownReason = result.reason_codes.find((entry) => POLE_BASE_REASON_MESSAGES[entry])
+  if (knownReason) return poleBaseReasonMessage(knownReason)
+  const warning = result.warnings.find((entry) => entry.trim())
+  if (warning) return warning
+  const reason = result.reason_codes.find((entry) => entry.trim())
+  if (reason) return poleBaseReasonMessage(reason)
+  if (result.status === 'review') return '자동 품질 기준을 일부 통과하지 못했습니다.'
+  return null
+}
+
+export async function applyPointCloudPickedCoordinate(
+  target: OverlayPickTarget,
+  frameId: string,
+  coordinates: [number, number, number],
+  actions: {
+    applyPickedCoordinate: (
+      coordinates: [number, number, number?],
+      coordinateSpace: 'dataset',
+    ) => Promise<void>
+    applyPoleSeed: (
+      frameId: string,
+      coordinates: [number, number, number],
+    ) => Promise<void>
+  },
+): Promise<void> {
+  if (target.kind === 'pole-base-create' || target.kind === 'pole-base-move') {
+    await actions.applyPoleSeed(frameId, coordinates)
+    return
+  }
+  await actions.applyPickedCoordinate(coordinates, 'dataset')
+}
+
+export function pointCloudPickTargetAcceptsPoint(
+  target: OverlayPickTarget | null | undefined,
+  poleBaseStatus: PoleBaseProposalState['status'],
+): boolean {
+  if (target?.kind === 'move' || target?.kind === 'create') return true
+  return Boolean(
+    (target?.kind === 'pole-base-create' || target?.kind === 'pole-base-move') &&
+      poleBaseStatus === 'picking',
+  )
+}
+
 export function captureHeadingDirection(heading: number | null | undefined): [number, number, number] {
   const radians = ((Number.isFinite(heading) ? Number(heading) : 0) * Math.PI) / 180
   return [Math.sin(radians), Math.cos(radians), 0]
@@ -426,6 +550,12 @@ export default function PointCloudView({
   }, [maximumAvailableBudget])
   const overlayHoverRef = useRef<OverlayHoverState | null>(null)
   const selectedOverlay = overlay?.selected
+  const poleBaseProposal = overlay?.poleBaseProposal
+  const poleBasePicking = poleBaseProposal?.status === 'picking'
+  const coordinatePickActive = pointCloudPickTargetAcceptsPoint(
+    overlay?.pickTarget,
+    poleBaseProposal?.status ?? 'idle',
+  )
   const visibleOverlayLayers = useMemo(
     () => (overlay?.layers ?? []).filter((layer) => overlay?.visibleLayerIds.has(layer.id)),
     [overlay?.layers, overlay?.visibleLayerIds],
@@ -435,7 +565,7 @@ export default function PointCloudView({
     .join('|')
   const overlayLayerColor = overlay?.layerColor
   const overlayActionsRef = useRef({
-    pickMode: false,
+    pickTarget: null as OverlayPickTarget | null,
     selectFeature: (
       _selection: { layerId: string; featureId: string | number } | null,
       _options?: { navigate?: boolean },
@@ -444,12 +574,22 @@ export default function PointCloudView({
       _coordinates: [number, number, number?],
       _coordinateSpace: 'dataset',
     ) => {},
+    applyPoleSeed: async (
+      _frameId: string,
+      _coordinates: [number, number, number],
+    ) => {},
   })
   overlayActionsRef.current = {
-    pickMode: overlay?.pickMode ?? false,
+    pickTarget: overlay?.pickTarget ?? null,
     selectFeature: overlay?.selectFeature ?? (() => {}),
     applyPickedCoordinate: overlay?.applyPickedCoordinate ?? (async () => {}),
+    applyPoleSeed: overlay?.applyPoleSeed ?? (async () => {}),
   }
+
+  useEffect(() => {
+    if (frame?.id) overlay?.handlePoleBaseFrameChange(frame.id)
+  }, [frame?.id, overlay?.handlePoleBaseFrameChange])
+
   const viewScope = `${demoMode}:${datasetId}`
   if (viewScopeRef.current !== viewScope) {
     viewScopeRef.current = viewScope
@@ -882,6 +1022,80 @@ export default function PointCloudView({
       scene.add(detectionObject)
     }
 
+    let poleBaseGroup: THREE.Group | null = null
+    if (
+      frame?.dataset_position &&
+      poleBaseProposal &&
+      poleBaseProposal.status !== 'idle' &&
+      poleBaseProposal.status !== 'picking' &&
+      poleBaseProposal.frameId === frame.id &&
+      poleBaseProposal.seed
+    ) {
+      const preview = poleBasePreviewGeometry(
+        poleBaseProposal.seed,
+        poleBaseProposal.status === 'ready' ? poleBaseProposal.result : null,
+        frame.dataset_position,
+      )
+      poleBaseGroup = new THREE.Group()
+      poleBaseGroup.name = 'pole-base-proposal'
+
+      const addMarker = (
+        name: string,
+        position: [number, number, number],
+        color: number,
+        radius: number,
+      ) => {
+        const markerGeometry = new THREE.SphereGeometry(radius, 18, 12)
+        const markerMaterial = new THREE.MeshBasicMaterial({
+          color,
+          depthTest: false,
+          transparent: true,
+          opacity: 0.98,
+        })
+        const proposalMarker = new THREE.Mesh(markerGeometry, markerMaterial)
+        proposalMarker.name = name
+        proposalMarker.position.fromArray(position)
+        proposalMarker.renderOrder = 31
+        poleBaseGroup?.add(proposalMarker)
+      }
+      const addLine = (
+        name: string,
+        segment: [[number, number, number], [number, number, number]],
+        color: number,
+        dashed = false,
+      ) => {
+        const lineGeometry = new THREE.BufferGeometry().setFromPoints(
+          segment.map((point) => new THREE.Vector3(...point)),
+        )
+        const lineMaterial = dashed
+          ? new THREE.LineDashedMaterial({
+              color,
+              depthTest: false,
+              transparent: true,
+              opacity: 0.9,
+              dashSize: 0.16,
+              gapSize: 0.1,
+            })
+          : new THREE.LineBasicMaterial({
+              color,
+              depthTest: false,
+              transparent: true,
+              opacity: 0.98,
+            })
+        const proposalLine = new THREE.Line(lineGeometry, lineMaterial)
+        proposalLine.name = name
+        proposalLine.renderOrder = 30
+        if (dashed) proposalLine.computeLineDistances()
+        poleBaseGroup?.add(proposalLine)
+      }
+
+      addMarker('pole-base-seed', preview.seed, 0xffc857, 0.17)
+      if (preview.axis) addLine('pole-base-axis', preview.axis, 0xff6f91)
+      if (preview.guide) addLine('pole-base-guide', preview.guide, 0xffc857, true)
+      if (preview.base) addMarker('pole-base-result', preview.base, 0x2bcfa8, 0.24)
+      scene.add(poleBaseGroup)
+    }
+
     const grid = new THREE.GridHelper(Math.ceil(span * 1.4), 24, 0x2bcfa8, 0x213548)
     grid.rotation.x = Math.PI / 2
     grid.position.z = payload.bounds.min[2] - 0.1
@@ -1051,7 +1265,12 @@ export default function PointCloudView({
       if (!bounds) return
       setPinnedOverlayHover(null)
       const actions = overlayActionsRef.current
-      if (actions.pickMode && frame?.dataset_position) {
+      const target = actions.pickTarget
+      const targetAcceptsPoint = pointCloudPickTargetAcceptsPoint(
+        target,
+        poleBaseProposal?.status ?? 'idle',
+      )
+      if (target && targetAcceptsPoint && frame?.dataset_position) {
         const pointIndex = closestPointHitIndex(
           pointRaycaster.intersectObject(points, false),
           pointer,
@@ -1062,14 +1281,12 @@ export default function PointCloudView({
         )
         if (pointIndex !== null) {
           const offset = pointIndex * 3
-          void actions.applyPickedCoordinate(
-            [
-              payload.positions[offset] + frame.dataset_position[0],
-              payload.positions[offset + 1] + frame.dataset_position[1],
-              payload.positions[offset + 2] + frame.dataset_position[2],
-            ],
-            'dataset',
-          )
+          const datasetCoordinates: [number, number, number] = [
+            payload.positions[offset] + frame.dataset_position[0],
+            payload.positions[offset + 1] + frame.dataset_position[1],
+            payload.positions[offset + 2] + frame.dataset_position[2],
+          ]
+          void applyPointCloudPickedCoordinate(target, frame.id, datasetCoordinates, actions)
         }
         return
       }
@@ -1154,6 +1371,18 @@ export default function PointCloudView({
       detectionMaterial?.dispose()
       detectionBoxGeometry?.dispose()
       detectionBoxMaterial?.dispose()
+      poleBaseGroup?.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          geometry?: THREE.BufferGeometry
+          material?: THREE.Material | THREE.Material[]
+        }
+        renderable.geometry?.dispose()
+        if (Array.isArray(renderable.material)) {
+          renderable.material.forEach((entry) => entry.dispose())
+        } else {
+          renderable.material?.dispose()
+        }
+      })
       capturePose.traverse((object) => {
         const renderable = object as THREE.Object3D & {
           geometry?: THREE.BufferGeometry
@@ -1170,7 +1399,15 @@ export default function PointCloudView({
       renderer.dispose()
       renderer.domElement.remove()
     }
-  }, [detectionPoints, frame?.dataset_position, frame?.heading, overlayPoints, payload])
+  }, [
+    detectionPoints,
+    frame?.dataset_position,
+    frame?.heading,
+    frame?.id,
+    overlayPoints,
+    payload,
+    poleBaseProposal,
+  ])
 
   useEffect(() => {
     const material = pointMaterialRef.current
@@ -1178,11 +1415,21 @@ export default function PointCloudView({
     material.size = pointSize * 0.045
   }, [pointSize])
 
+  const readyPoleBaseResult = poleBaseProposal?.status === 'ready'
+    ? poleBaseProposal.result
+    : null
+  const poleBaseWarning = readyPoleBaseResult
+    ? poleBasePrimaryWarning(readyPoleBaseResult)
+    : null
+  const formatMetric = (value: number | null | undefined) =>
+    Number.isFinite(value) ? `${Number(value).toFixed(3)} m` : '—'
+
   return (
     <div
-      className={`pointcloud-view ${overlay?.pickMode ? 'coordinate-pick-active' : ''}`}
+      className={`pointcloud-view ${coordinatePickActive ? 'coordinate-pick-active' : ''}`}
       data-shp-point-count={overlayPoints.length}
       data-yolo-point-count={detectionPoints.length}
+      data-pole-base-status={poleBaseProposal?.status ?? 'idle'}
     >
       <div ref={hostRef} className="pointcloud-canvas" />
       <OverlayHoverTooltip
@@ -1264,12 +1511,120 @@ export default function PointCloudView({
         {detectionError && <span className="viewer-overlay-error" title={detectionError}>YOLO 3D 일부 오류</span>}
         {overlayLoading && <LoaderCircle size={14} className="spin" aria-label="SHP 포인트 불러오는 중" />}
         {overlayError && <span className="viewer-overlay-error" title={overlayError}>SHP 일부 오류</span>}
-        {overlay?.pickMode && (
+        {poleBasePicking && (
+          <strong className="viewer-pick-indicator pole-base-pick-indicator">
+            <Crosshair size={14} /> 지주 몸체의 실제 포인트를 클릭해 하단 산출 (B)
+          </strong>
+        )}
+        {!poleBasePicking && coordinatePickActive && (
           <strong className="viewer-pick-indicator">
             <Crosshair size={14} /> 실제 포인트를 클릭해 좌표 적용
           </strong>
         )}
       </div>
+
+      {poleBaseProposal && poleBaseProposal.status !== 'idle' && poleBaseProposal.status !== 'picking' && (
+        <section
+          className={`pole-base-result-card pole-base-result-${
+            readyPoleBaseResult?.status ?? poleBaseProposal.status
+          }`}
+          aria-label="지주 하단 산출 결과"
+          aria-live="polite"
+        >
+          <header>
+            <span>
+              {poleBaseProposal.status === 'loading' ? (
+                <LoaderCircle className="spin" size={16} />
+              ) : readyPoleBaseResult?.status === 'auto' ? (
+                <Check size={16} />
+              ) : (
+                <AlertTriangle size={16} />
+              )}
+              <strong>
+                {poleBaseProposal.status === 'loading'
+                  ? '지주 하단 계산 중'
+                  : poleBaseProposal.status === 'error'
+                    ? '산출 오류'
+                    : poleBaseStatusLabel(readyPoleBaseResult!.status)}
+              </strong>
+            </span>
+            <small>POLE BASE · DATASET XYZ</small>
+          </header>
+
+          {poleBaseProposal.status === 'loading' && (
+            <p className="pole-base-result-message">
+              원본 점군에서 지주 축과 국지 지면을 계산하고 있습니다.
+            </p>
+          )}
+
+          {poleBaseProposal.status === 'error' && (
+            <>
+              <p className="pole-base-result-message error">{poleBaseProposal.message}</p>
+              {poleBaseProposal.reasonCodes.length > 0 && (
+                <small className="pole-base-result-warning">
+                  {poleBaseReasonMessage(poleBaseProposal.reasonCodes[0])}
+                </small>
+              )}
+            </>
+          )}
+
+          {readyPoleBaseResult && (
+            <>
+              <dl>
+                <div className="pole-base-coordinate-row">
+                  <dt>최종 X / Y / Z</dt>
+                  <dd>
+                    {readyPoleBaseResult.base_position
+                      ? readyPoleBaseResult.base_position.map((value) => value.toFixed(3)).join(' / ')
+                      : '산출 결과 없음'}
+                  </dd>
+                </div>
+                <div><dt>품질 점수</dt><dd>{Math.round(readyPoleBaseResult.quality.score * 100)}%</dd></div>
+                <div><dt>축 RMSE</dt><dd>{formatMetric(readyPoleBaseResult.axis?.rmse_m)}</dd></div>
+                <div><dt>지면 RMSE</dt><dd>{formatMetric(readyPoleBaseResult.ground?.rmse_m)}</dd></div>
+                <div><dt>바닥 외삽</dt><dd>{formatMetric(readyPoleBaseResult.quality.bottom_gap_m)}</dd></div>
+              </dl>
+              {poleBaseWarning && (
+                <p className="pole-base-result-warning" role="alert">
+                  <AlertTriangle size={13} /> {poleBaseWarning}
+                </p>
+              )}
+            </>
+          )}
+
+          <footer>
+            {readyPoleBaseResult && (
+              <button
+                type="button"
+                className="button primary compact"
+                disabled={readyPoleBaseResult.status === 'failed' || !readyPoleBaseResult.base_position}
+                title="산출한 PointZ를 저장 (Enter)"
+                onClick={() => void overlay?.confirmPoleBaseProposal()}
+              >
+                <Check size={13} /> 저장
+              </button>
+            )}
+            {poleBaseProposal.status !== 'loading' && (
+              <button
+                type="button"
+                className="button secondary compact"
+                title="같은 대상에서 지주점 다시 선택 (R)"
+                onClick={() => overlay?.retryPoleBasePick()}
+              >
+                <RefreshCcw size={13} /> 다시 선택
+              </button>
+            )}
+            <button
+              type="button"
+              className="button ghost compact"
+              title="지주 하단 산출 취소 (Esc)"
+              onClick={() => overlay?.cancelPoleBaseProposal()}
+            >
+              <X size={13} /> 취소
+            </button>
+          </footer>
+        </section>
+      )}
       <div className="point-size-control">
         <Scan size={14} />
         <input

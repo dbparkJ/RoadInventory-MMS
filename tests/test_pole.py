@@ -14,8 +14,9 @@ from mms_shp_detection.pole import (
     cluster_pole_observations,
     estimate_local_ground,
     find_pole_bases,
-    pole_connection_coverage,
+    intersect_pole_axis_with_ground,
     pole_candidate_rank_key,
+    pole_connection_coverage,
     remote_pole_junction_cost,
     select_pole_candidate,
 )
@@ -96,6 +97,18 @@ def _rising_arm(
 
 
 class PoleSearchTests(unittest.TestCase):
+    def test_public_axis_ground_intersection_rejects_parallel_geometry(self) -> None:
+        axis = SimpleNamespace(
+            coefficients=np.asarray([[0.25, 0.0], [2.0, 3.0]], dtype=np.float64),
+            z_reference=0.0,
+        )
+        ground = SimpleNamespace(
+            z=10.0,
+            plane_coefficients=np.asarray([4.0, 0.0, 10.0], dtype=np.float64),
+            reference_xy=np.asarray([2.0, 3.0], dtype=np.float64),
+        )
+        self.assertIsNone(intersect_pole_axis_with_ground(axis, ground))
+
     def test_coherent_arm_keeps_endpoint_anchors_across_large_middle_gap(
         self,
     ) -> None:

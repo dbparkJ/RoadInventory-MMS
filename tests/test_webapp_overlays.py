@@ -85,6 +85,21 @@ def _write_bundle(
     return sorted(directory.glob(f"{stem}.*"))
 
 
+def _write_2d_point_bundle(directory: Path, stem: str = "poles_2d") -> list[Path]:
+    primary = directory / f"{stem}.shp"
+    writer = shapefile.Writer(str(primary), shapeType=shapefile.POINT, encoding="utf-8")
+    writer.field("NAME", "C", size=40)
+    writer.field("VALUE", "N", size=10, decimal=0)
+    writer.point(300_010.0, 4_100_000.0)
+    writer.record("existing", 1)
+    writer.close()
+    primary.with_suffix(".prj").write_text(
+        CRS.from_epsg(32652).to_wkt(version="WKT1_ESRI"), encoding="utf-8"
+    )
+    primary.with_suffix(".cpg").write_text("UTF-8", encoding="ascii")
+    return sorted(directory.glob(f"{stem}.*"))
+
+
 def _write_id_bundle(directory: Path, stem: str = "assets") -> list[Path]:
     primary = directory / f"{stem}.shp"
     writer = shapefile.Writer(str(primary), shapeType=shapefile.POINTZ, encoding="utf-8")
@@ -1134,6 +1149,127 @@ class WebAppOverlayTests(unittest.TestCase):
                     params={"max_distance": 100},
                 )
                 self.assertEqual(mismatch.json()["detection_boxes"], [])
+
+    def test_feature_create_commits_geometry_and_validated_properties_atomically(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as bundle_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            _seed_dataset(app)
+            with TestClient(app) as client:
+                uploaded = client.post(
+                    "/api/datasets/dataset-a/overlays",
+                    files=_multipart(_write_bundle(Path(bundle_text))),
+                )
+                self.assertEqual(uploaded.status_code, 201, uploaded.text)
+                layer_id = uploaded.json()["layer"]["id"]
+                feature_url = (
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features"
+                )
+                created = client.post(
+                    feature_url,
+                    json={
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [300_015.0, 4_100_001.0, 9.75],
+                        },
+                        "coordinate_space": "dataset",
+                        "properties": {"NAME": "manual pole", "VALUE": 42},
+                        "expected_revision": 1,
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                self.assertEqual(created.json()["revision"], 2)
+                self.assertEqual(
+                    created.json()["feature"]["geometry"]["coordinates"],
+                    [300015.0, 4100001.0, 9.75],
+                )
+                self.assertEqual(
+                    created.json()["feature"]["properties"],
+                    {"NAME": "manual pole", "VALUE": 42},
+                )
+
+                invalid = client.post(
+                    feature_url,
+                    json={
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [300_016.0, 4_100_001.0, 9.5],
+                        },
+                        "properties": {"NOT_A_FIELD": "must roll back"},
+                        "expected_revision": 2,
+                    },
+                )
+                self.assertEqual(invalid.status_code, 422, invalid.text)
+                after = client.get(
+                    feature_url, params={"coordinate_space": "dataset"}
+                )
+                self.assertEqual(after.status_code, 200, after.text)
+                self.assertEqual(after.json()["revision"], 2)
+                self.assertEqual(after.json()["total"], 3)
+
+    def test_xyz_edit_promotes_a_2d_point_download_to_pointz(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as bundle_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            _seed_dataset(app)
+            with TestClient(app) as client:
+                uploaded = client.post(
+                    "/api/datasets/dataset-a/overlays",
+                    files=_multipart(_write_2d_point_bundle(Path(bundle_text))),
+                )
+                self.assertEqual(uploaded.status_code, 201, uploaded.text)
+                layer_id = uploaded.json()["layer"]["id"]
+                feature_url = (
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features"
+                )
+                created = client.post(
+                    feature_url,
+                    json={
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [300_015.0, 4_100_001.0, 9.75],
+                        },
+                        "coordinate_space": "dataset",
+                        "expected_revision": 1,
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+
+                exported = client.get(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/download"
+                )
+                self.assertEqual(exported.status_code, 200, exported.text)
+                with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                    shp_name = next(
+                        name for name in archive.namelist() if name.endswith(".shp")
+                    )
+                    stem = Path(shp_name).stem
+                    reader = shapefile.Reader(
+                        shp=io.BytesIO(archive.read(f"{stem}.shp")),
+                        shx=io.BytesIO(archive.read(f"{stem}.shx")),
+                        dbf=io.BytesIO(archive.read(f"{stem}.dbf")),
+                        encoding="utf-8",
+                    )
+                    try:
+                        self.assertEqual(reader.shapeType, shapefile.POINTZ)
+                        self.assertEqual(tuple(reader.shape(0).z), (0.0,))
+                        self.assertEqual(tuple(reader.shape(1).z), (9.75,))
+                    finally:
+                        reader.close()
 
 
 if __name__ == "__main__":

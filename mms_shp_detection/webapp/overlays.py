@@ -107,6 +107,7 @@ class FeatureCreate(BaseModel):
     coordinate_space: Literal["dataset", "wgs84"] = "dataset"
     copy_geometry_from: str | None = Field(None, min_length=1, max_length=160)
     expected_revision: int | None = Field(None, ge=1)
+    properties: dict[str, Any] | None = None
 
 
 class OverlayLayerPatch(BaseModel):
@@ -1348,6 +1349,26 @@ def _write_edited_bundle(
         shapefile.POLYGONM: shapefile.POLYGON,
         shapefile.MULTIPOINTM: shapefile.MULTIPOINT,
     }.get(original_shape_type, original_shape_type)
+    if original_shape_type == shapefile.POINT:
+        # A manual pole-base confirmation writes an authoritative XYZ geometry.
+        # Promote an originally 2-D point edit bundle when any active feature now
+        # carries Z; otherwise pyshp would silently discard that coordinate.
+        with _feature_db(layer_dir) as connection:
+            geometry_rows = connection.execute(
+                "SELECT geometry_json FROM features WHERE deleted=0 "
+                "AND geometry_json IS NOT NULL"
+            )
+            for geometry_row in geometry_rows:
+                geometry = json.loads(geometry_row["geometry_json"])
+                coordinates = geometry.get("coordinates")
+                if (
+                    geometry.get("type") == "Point"
+                    and isinstance(coordinates, list)
+                    and len(coordinates) >= 3
+                    and coordinates[2] is not None
+                ):
+                    export_shape_type = shapefile.POINTZ
+                    break
     writer = shapefile.Writer(
         str(shp_path),
         shapeType=export_shape_type,
@@ -1985,6 +2006,19 @@ async def create_overlay_feature(
                             _from_wgs84_transformer(manifest["dataset_crs"]),
                         )
                 properties = _blank_properties_with_next_id(connection, manifest)
+                if payload.properties is not None:
+                    field_map = {field["name"]: field for field in manifest["fields"]}
+                    unknown = set(payload.properties) - set(field_map)
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown SHP field(s): {', '.join(sorted(unknown))}"
+                        )
+                    for key, value in payload.properties.items():
+                        properties[key] = _coerce_property(
+                            value,
+                            field_map[key],
+                            encoding=str(manifest.get("source_encoding", "utf-8")),
+                        )
                 feature_id, ordinal = _next_feature_identity(connection)
                 x, y, z = _point_columns(geometry)
                 now = utc_now()

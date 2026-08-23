@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
 import { isTextEntryTarget } from '../lib/frameNavigation'
 import type {
   OverlayCoordinateSpace,
@@ -16,7 +16,9 @@ import type {
   OverlayFeature,
   OverlayFeatureCollection,
   OverlayFeatureCreateRequest,
+  OverlayField,
   OverlayLayer,
+  PoleBaseInferResponse,
 } from '../types'
 
 const LAYER_COLORS = ['#2bcfa8', '#ffb84d', '#65a9ff', '#ff6f91', '#b38cff', '#f4e04d']
@@ -58,9 +60,191 @@ export interface OverlaySelectionOptions {
 export type OverlayPickTarget =
   | { kind: 'move'; layerId: string; featureId: string | number }
   | { kind: 'create'; layerId: string }
+  | PoleBaseTarget
+
+export type PoleBaseTarget =
+  | { kind: 'pole-base-create'; layerId: string; continuous: boolean }
+  | { kind: 'pole-base-move'; layerId: string; featureId: string | number }
+
+export type PoleBaseProposalState =
+  | { status: 'idle' }
+  | { status: 'picking'; target: PoleBaseTarget }
+  | {
+      status: 'loading'
+      target: PoleBaseTarget
+      frameId: string
+      seed: [number, number, number]
+    }
+  | {
+      status: 'ready'
+      target: PoleBaseTarget
+      frameId: string
+      seed: [number, number, number]
+      result: PoleBaseInferResponse
+    }
+  | {
+      status: 'error'
+      target: PoleBaseTarget
+      frameId?: string
+      seed?: [number, number, number]
+      message: string
+      reasonCodes: string[]
+    }
+
+export const POLE_BASE_REASON_MESSAGES: Readonly<Record<string, string>> = {
+  CATALOG_PREPARING: '원본 점군을 준비하고 있습니다. 잠시 후 다시 선택해 주세요.',
+  INVALID_SEED: '선택한 지주점 좌표가 올바르지 않습니다.',
+  METRIC_CRS_REQUIRED: '미터 단위 좌표계가 필요한 데이터셋입니다.',
+  SEED_OUTSIDE_FRAME_WINDOW: '선택한 점이 현재 프레임의 작업 범위를 벗어났습니다.',
+  SEED_NOT_ON_SOURCE_POINT: '선택한 점 주변에서 원본 점군을 찾지 못했습니다.',
+  NO_LOCAL_POINTS: '선택한 점 주변에 분석할 원본 점이 없습니다.',
+  LOCAL_POINT_LIMIT_EXCEEDED: '주변 점이 너무 많아 안전 제한을 초과했습니다.',
+  TOO_MANY_CANDIDATE_BLOCKS: '조회할 점군 블록이 너무 많습니다.',
+  NO_VERTICAL_AXIS: '지주로 판단할 수 있는 수직 축을 찾지 못했습니다.',
+  AXIS_TOO_SHORT: '검출된 지주 축의 길이가 너무 짧습니다.',
+  AXIS_DISCONTINUOUS: '지주 축의 점 분포가 연속적이지 않습니다.',
+  AXIS_RMSE_HIGH: '지주 축 맞춤 오차가 큽니다.',
+  AXIS_TILT_EXCESS: '검출된 축의 기울기가 지주 허용 범위를 벗어났습니다.',
+  AMBIGUOUS_AXES: '서로 비슷한 지주 후보가 여러 개 있어 확인이 필요합니다.',
+  NO_GROUND_SUPPORT: '지주 주변에서 지면을 찾지 못했습니다.',
+  GROUND_RMSE_HIGH: '지면 맞춤 오차가 큽니다.',
+  GROUND_HYPOTHESES_CONFLICT: '서로 다른 지면 후보가 충돌합니다.',
+  GROUND_TOO_FAR: '신뢰할 수 있는 지면 점이 지주에서 너무 멉니다.',
+  GROUND_PENETRATION: '검출된 지주가 추정 지면 아래로 지나치게 들어갑니다.',
+  BOTTOM_EXTRAPOLATED: '관측된 지주 끝에서 바닥까지 외삽 거리가 깁니다.',
+  BASE_OUTSIDE_LOCAL_WINDOW: '추정 바닥점이 분석 범위를 벗어났습니다.',
+}
+
+export function poleBaseReasonMessage(reasonCode: string): string {
+  return POLE_BASE_REASON_MESSAGES[reasonCode] ?? reasonCode
+}
+
+export function poleBaseReasonMessages(reasonCodes: readonly string[]): string[] {
+  return [...new Set(reasonCodes)].map(poleBaseReasonMessage)
+}
+
+function poleBaseReasonCodesFromUnknown(value: unknown): string[] {
+  const found: string[] = []
+  const visit = (candidate: unknown, depth: number) => {
+    if (!candidate || typeof candidate !== 'object' || depth > 3) return
+    const record = candidate as Record<string, unknown>
+    const reasonCodes = record.reason_codes ?? record.reasonCodes
+    if (Array.isArray(reasonCodes)) {
+      reasonCodes.forEach((reasonCode) => {
+        if (typeof reasonCode === 'string' && reasonCode) found.push(reasonCode)
+      })
+    }
+    if (
+      typeof record.code === 'string' &&
+      Object.prototype.hasOwnProperty.call(POLE_BASE_REASON_MESSAGES, record.code)
+    ) {
+      found.push(record.code)
+    }
+    visit(record.detail, depth + 1)
+    visit(record.details, depth + 1)
+  }
+  visit(value, 0)
+  return [...new Set(found)]
+}
+
+function isAbortError(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === 'AbortError'
+}
+
+const POLE_BASE_FIELD_ALIASES: Record<
+  'x' | 'y' | 'z' | 'method' | 'quality' | 'status' | 'frame',
+  ReadonlySet<string>
+> = {
+  x: new Set(['BASE_X', 'BAS_X', 'POLE_X']),
+  y: new Set(['BASE_Y', 'BAS_Y', 'POLE_Y']),
+  z: new Set(['BASE_Z', 'BAS_Z', 'POLE_Z', 'ELEV']),
+  method: new Set(['BASE_MTH', 'BAS_MTH']),
+  quality: new Set(['BASE_Q', 'BAS_Q']),
+  status: new Set(['BASE_ST', 'BAS_ST', 'QA_STATUS']),
+  frame: new Set(['SRC_FRAME', 'FRAME_ID']),
+}
+
+function normalizedPoleBaseFieldName(name: string): string {
+  return name.trim().toUpperCase().replace(/\s+/g, '_')
+}
+
+function normalizedOverlayFieldType(field: OverlayField): string {
+  return (field.type ?? '').trim().toUpperCase()
+}
+
+function isNumericOverlayField(field: OverlayField): boolean {
+  return new Set([
+    'N',
+    'F',
+    'I',
+    'B',
+    'O',
+    'NUMBER',
+    'NUMERIC',
+    'DECIMAL',
+    'FLOAT',
+    'DOUBLE',
+    'INTEGER',
+    'INT',
+  ]).has(normalizedOverlayFieldType(field))
+}
+
+function isIntegerOverlayField(field: OverlayField): boolean {
+  const type = normalizedOverlayFieldType(field)
+  return (
+    type === 'I' ||
+    type === 'INTEGER' ||
+    type === 'INT' ||
+    ((type === 'N' || type === 'F') && field.decimal === 0)
+  )
+}
+
+function poleBaseFieldValue(
+  field: OverlayField,
+  value: number | string,
+  quality = false,
+): number | string {
+  if (!isNumericOverlayField(field)) return String(value)
+  const numericValue = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numericValue)) return String(value)
+  if (quality && isIntegerOverlayField(field)) return Math.round(numericValue * 100)
+  if (isIntegerOverlayField(field)) return Math.round(numericValue)
+  return numericValue
+}
+
+export function buildPoleBasePropertyPatch(
+  fields: OverlayField[],
+  currentProperties: Record<string, unknown>,
+  result: PoleBaseInferResponse,
+  frameId: string,
+): Record<string, unknown> {
+  if (!result.base_position || result.status === 'failed') return {}
+  const [baseX, baseY, baseZ] = result.base_position
+  const sourceValues = {
+    x: baseX,
+    y: baseY,
+    z: baseZ,
+    method: 'MAN_SEED',
+    quality: result.quality.score,
+    status: result.status === 'review' ? 'REVIEW' : 'AUTO',
+    frame: frameId,
+  } as const
+  const patch: Record<string, unknown> = {}
+  fields.forEach((field) => {
+    if (!field.name || field.internal) return
+    const normalizedName = normalizedPoleBaseFieldName(field.name)
+    const semantic = (Object.keys(POLE_BASE_FIELD_ALIASES) as Array<keyof typeof POLE_BASE_FIELD_ALIASES>)
+      .find((candidate) => POLE_BASE_FIELD_ALIASES[candidate].has(normalizedName))
+    if (!semantic) return
+    const value = poleBaseFieldValue(field, sourceValues[semantic], semantic === 'quality')
+    if (!Object.is(currentProperties[field.name], value)) patch[field.name] = value
+  })
+  return patch
+}
 
 export interface OverlayContextValue {
   datasetId: string
+  poleBaseInferenceEnabled: boolean
   layers: OverlayLayer[]
   features: Record<string, LayerFeatures>
   visibleLayerIds: Set<string>
@@ -77,8 +261,16 @@ export interface OverlayContextValue {
   creatingFeature: boolean
   pickMode: boolean
   pickTarget: OverlayPickTarget | null
+  poleBaseProposal: PoleBaseProposalState
   setPickMode: (enabled: boolean) => void
   beginCreatePoint: (layerId: string) => void
+  beginCreatePoleBase: (layerId: string, continuous?: boolean) => void
+  beginRecomputeSelectedPoleBase: () => void
+  applyPoleSeed: (frameId: string, coordinates: [number, number, number]) => Promise<void>
+  confirmPoleBaseProposal: () => Promise<void>
+  retryPoleBasePick: () => void
+  cancelPoleBaseProposal: () => void
+  handlePoleBaseFrameChange: (frameId: string) => void
   refresh: () => Promise<void>
   ensureDatasetFeatures: (layerId: string) => Promise<void>
   loadMoreDatasetFeatures: (layerId: string) => Promise<void>
@@ -145,11 +337,15 @@ function emptyCollection(revision = 0): OverlayFeatureCollection {
 
 export function OverlayProvider({
   datasetId,
+  activeFrameId,
+  poleBaseInferenceEnabled = true,
   demoMode,
   notify,
   children,
 }: {
   datasetId: string
+  activeFrameId?: string | null
+  poleBaseInferenceEnabled?: boolean
   demoMode: boolean
   notify?: (entry: { tone: 'success' | 'error' | 'info'; title: string; message?: string }) => void
   children: ReactNode
@@ -167,6 +363,7 @@ export function OverlayProvider({
   const [uploading, setUploading] = useState(false)
   const [creatingFeature, setCreatingFeature] = useState(false)
   const [pickTarget, setPickTarget] = useState<OverlayPickTarget | null>(null)
+  const [poleBaseProposal, setPoleBaseProposal] = useState<PoleBaseProposalState>({ status: 'idle' })
   const pickMode = pickTarget !== null
   const requestGeneration = useRef(0)
   const refreshControllerRef = useRef<AbortController | null>(null)
@@ -175,8 +372,36 @@ export function OverlayProvider({
   const coordinateLoadsRef = useRef<Set<string>>(new Set())
   const selectionRequestRef = useRef(0)
   const selectionControllerRef = useRef<AbortController | null>(null)
+  const poleBaseProposalRef = useRef<PoleBaseProposalState>({ status: 'idle' })
+  const poleBaseRequestRef = useRef<{ requestId: number; controller: AbortController } | null>(null)
+  const poleBaseRequestIdRef = useRef(0)
+  const poleBaseSaveIdRef = useRef(0)
+  const poleBaseConfirmingRef = useRef(false)
+  const activeDatasetIdRef = useRef(datasetId)
+  activeDatasetIdRef.current = datasetId
   const visibleLayerIdsRef = useRef(visibleLayerIds)
   visibleLayerIdsRef.current = visibleLayerIds
+
+  const commitPoleBaseProposal = useCallback((proposal: PoleBaseProposalState) => {
+    poleBaseProposalRef.current = proposal
+    setPoleBaseProposal(proposal)
+  }, [])
+
+  const abortPoleBaseRequest = useCallback(() => {
+    poleBaseRequestIdRef.current += 1
+    poleBaseRequestRef.current?.controller.abort()
+    poleBaseRequestRef.current = null
+  }, [])
+
+  const clearPoleBaseWorkflow = useCallback(() => {
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    commitPoleBaseProposal({ status: 'idle' })
+    setPickTarget((current) =>
+      current?.kind === 'pole-base-create' || current?.kind === 'pole-base-move' ? null : current,
+    )
+  }, [abortPoleBaseRequest, commitPoleBaseProposal])
 
   const clearSelectedDetails = useCallback(() => {
     selectionRequestRef.current += 1
@@ -203,19 +428,21 @@ export function OverlayProvider({
     (enabled: boolean) => {
       if (!enabled) {
         setPickTarget(null)
+        if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
         return
       }
       if (!selected) {
         notify?.({ tone: 'info', title: '먼저 위치를 수정할 SHP 피처를 선택해 주세요.' })
         return
       }
+      if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
       setPickTarget({
         kind: 'move',
         layerId: selected.layerId,
         featureId: selected.featureId,
       })
     },
-    [notify, selected],
+    [clearPoleBaseWorkflow, notify, selected],
   )
 
   const beginCreatePoint = useCallback(
@@ -233,11 +460,139 @@ export function OverlayProvider({
         notify?.({ tone: 'info', title: '지도 클릭 신규 추가는 Point 레이어에서만 사용할 수 있습니다.' })
         return
       }
+      if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
       setActiveLayerId(layerId)
       setPickTarget({ kind: 'create', layerId })
     },
-    [demoMode, layers, notify],
+    [clearPoleBaseWorkflow, demoMode, layers, notify],
   )
+
+  const beginCreatePoleBase = useCallback(
+    (layerId: string, continuous = true) => {
+      if (!poleBaseInferenceEnabled) {
+        notify?.({ tone: 'info', title: '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.' })
+        return
+      }
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!layer) {
+        notify?.({ tone: 'error', title: '지주를 추가할 SHP 레이어가 없습니다.' })
+        return
+      }
+      if (demoMode) {
+        notify?.({ tone: 'info', title: '데모 모드에서는 지주 피처를 추가할 수 없습니다.' })
+        return
+      }
+      if (layer.geometry_type !== 'Point') {
+        notify?.({ tone: 'info', title: '지주 하단 자동 산출은 Point 레이어에서만 사용할 수 있습니다.' })
+        return
+      }
+      abortPoleBaseRequest()
+      poleBaseSaveIdRef.current += 1
+      poleBaseConfirmingRef.current = false
+      const target: PoleBaseTarget = { kind: 'pole-base-create', layerId, continuous }
+      setActiveLayerId(layerId)
+      setPickTarget(target)
+      commitPoleBaseProposal({ status: 'picking', target })
+      window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
+    },
+    [
+      abortPoleBaseRequest,
+      commitPoleBaseProposal,
+      demoMode,
+      layers,
+      notify,
+      poleBaseInferenceEnabled,
+    ],
+  )
+
+  const beginRecomputeSelectedPoleBase = useCallback(() => {
+    if (!poleBaseInferenceEnabled) {
+      notify?.({ tone: 'info', title: '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.' })
+      return
+    }
+    const layer = layers.find((candidate) => candidate.id === selected?.layerId)
+    if (!selected || !layer) {
+      notify?.({ tone: 'info', title: '지주 하단을 재산출할 Point 피처를 먼저 선택해 주세요.' })
+      return
+    }
+    if (demoMode) {
+      notify?.({ tone: 'info', title: '데모 모드에서는 지주 위치를 수정할 수 없습니다.' })
+      return
+    }
+    if (layer.geometry_type !== 'Point') {
+      notify?.({ tone: 'info', title: '지주 하단 자동 산출은 Point 레이어에서만 사용할 수 있습니다.' })
+      return
+    }
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    const target: PoleBaseTarget = {
+      kind: 'pole-base-move',
+      layerId: selected.layerId,
+      featureId: selected.featureId,
+    }
+    setActiveLayerId(selected.layerId)
+    setPickTarget(target)
+    commitPoleBaseProposal({ status: 'picking', target })
+    window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
+  }, [
+    abortPoleBaseRequest,
+    commitPoleBaseProposal,
+    demoMode,
+    layers,
+    notify,
+    poleBaseInferenceEnabled,
+    selected,
+  ])
+
+  const retryPoleBasePick = useCallback(() => {
+    const proposal = poleBaseProposalRef.current
+    if (proposal.status === 'idle') return
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    const target = proposal.target
+    setPickTarget(target)
+    commitPoleBaseProposal({ status: 'picking', target })
+  }, [abortPoleBaseRequest, commitPoleBaseProposal])
+
+  const cancelPoleBaseProposal = useCallback(() => {
+    clearPoleBaseWorkflow()
+  }, [clearPoleBaseWorkflow])
+
+  const handlePoleBaseFrameChange = useCallback(
+    (frameId: string) => {
+      const proposal = poleBaseProposalRef.current
+      if (proposal.status === 'idle' || proposal.status === 'picking') return
+      if (proposal.frameId === frameId) return
+      abortPoleBaseRequest()
+      poleBaseSaveIdRef.current += 1
+      poleBaseConfirmingRef.current = false
+      const target = proposal.target
+      setPickTarget(target)
+      commitPoleBaseProposal({ status: 'picking', target })
+    },
+    [abortPoleBaseRequest, commitPoleBaseProposal],
+  )
+
+  useEffect(() => {
+    if (activeFrameId === undefined) return
+    handlePoleBaseFrameChange(activeFrameId ?? '')
+  }, [activeFrameId, handlePoleBaseFrameChange])
+
+  useEffect(() => {
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    commitPoleBaseProposal({ status: 'idle' })
+    setPickTarget((current) =>
+      current?.kind === 'pole-base-create' || current?.kind === 'pole-base-move' ? null : current,
+    )
+    return () => {
+      abortPoleBaseRequest()
+      poleBaseSaveIdRef.current += 1
+    }
+  }, [abortPoleBaseRequest, commitPoleBaseProposal, datasetId, demoMode])
 
   const loadFeaturePage = useCallback(
     async (
@@ -503,62 +858,6 @@ export function OverlayProvider({
     [features, layers, loadFeaturePage],
   )
 
-  const shortcutStateRef = useRef({
-    activeLayerId,
-    beginCreatePoint,
-    pickMode,
-    pickTarget,
-    selected,
-    setPickMode,
-  })
-  shortcutStateRef.current = {
-    activeLayerId,
-    beginCreatePoint,
-    pickMode,
-    pickTarget,
-    selected,
-    setPickMode,
-  }
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.altKey ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.shiftKey ||
-        isTextEntryTarget(event.target)
-      ) {
-        return
-      }
-      const shortcut = shortcutStateRef.current
-      if (event.key === 'Escape' && shortcut.pickMode) {
-        event.preventDefault()
-        shortcut.setPickMode(false)
-      } else if (event.code === 'KeyN') {
-        event.preventDefault()
-        if (event.repeat) return
-        if (
-          shortcut.pickTarget?.kind === 'create' &&
-          shortcut.pickTarget.layerId === shortcut.activeLayerId
-        ) {
-          shortcut.setPickMode(false)
-        } else {
-          shortcut.beginCreatePoint(shortcut.activeLayerId)
-        }
-      } else if (event.code === 'KeyP' && shortcut.selected) {
-        event.preventDefault()
-        shortcut.setPickMode(!shortcut.pickMode)
-      }
-    }
-    // Keep edit shortcuts global even when the focused map/viewer surface has
-    // its own key handler.  Point creation deliberately leaves focus on that
-    // surface, and feature deletion can remove the previously focused control.
-    window.addEventListener('keydown', onKeyDown, true)
-    return () => window.removeEventListener('keydown', onKeyDown, true)
-  }, [])
-
   const upload = useCallback(
     async (files: File[], name?: string, crs?: string, encoding: OverlayEncoding = 'auto') => {
       if (!datasetId || !files.length) return
@@ -602,10 +901,23 @@ export function OverlayProvider({
       }
       if (activeLayerId === layerId) setActiveLayerId('')
       setPickTarget((current) => (current?.layerId === layerId ? null : current))
+      const proposal = poleBaseProposalRef.current
+      if (proposal.status !== 'idle' && proposal.target.layerId === layerId) {
+        clearPoleBaseWorkflow()
+      }
       notify?.({ tone: 'info', title: 'SHP 레이어 등록을 제거했습니다', message: '업로드 원본은 보존됩니다.' })
       await refresh()
     },
-    [activeLayerId, clearSelectedDetails, datasetId, demoMode, notify, refresh, selected?.layerId],
+    [
+      activeLayerId,
+      clearPoleBaseWorkflow,
+      clearSelectedDetails,
+      datasetId,
+      demoMode,
+      notify,
+      refresh,
+      selected?.layerId,
+    ],
   )
 
   const updateLayerMetadata = useCallback(
@@ -814,7 +1126,11 @@ export function OverlayProvider({
   )
 
   const createFeature = useCallback(
-    async (layerId: string, payload: Omit<OverlayFeatureCreateRequest, 'expected_revision'>) => {
+    async (
+      layerId: string,
+      payload: Omit<OverlayFeatureCreateRequest, 'expected_revision'>,
+      selectionOptions?: OverlaySelectionOptions,
+    ) => {
       const layer = layers.find((candidate) => candidate.id === layerId)
       if (!datasetId || !layer || demoMode) return
       const currentRevision =
@@ -828,7 +1144,7 @@ export function OverlayProvider({
           expected_revision: currentRevision,
         })
         const nextSelection = { layerId, featureId: response.feature.id }
-        selectFeature(nextSelection)
+        selectFeature(nextSelection, selectionOptions)
         const detail: SelectedFeatureDetailCache = {
           datasetId,
           ...nextSelection,
@@ -900,6 +1216,199 @@ export function OverlayProvider({
     [clearSelectedDetails, datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer],
   )
 
+  const applyPoleSeed = useCallback(
+    async (frameId: string, coordinates: [number, number, number]) => {
+      const proposal = poleBaseProposalRef.current
+      if (proposal.status === 'idle' || !datasetId || !frameId) return
+      const proposalFrameId = 'frameId' in proposal ? proposal.frameId : undefined
+      if (proposal.status !== 'picking' && proposalFrameId === frameId) return
+      if (coordinates.length !== 3 || coordinates.some((coordinate) => !Number.isFinite(coordinate))) {
+        const message = poleBaseReasonMessage('INVALID_SEED')
+        commitPoleBaseProposal({
+          status: 'error',
+          target: proposal.target,
+          frameId,
+          seed: coordinates,
+          message,
+          reasonCodes: ['INVALID_SEED'],
+        })
+        notify?.({ tone: 'error', title: '지주 하단을 산출하지 못했습니다', message })
+        return
+      }
+
+      abortPoleBaseRequest()
+      const requestId = poleBaseRequestIdRef.current + 1
+      poleBaseRequestIdRef.current = requestId
+      const controller = new AbortController()
+      poleBaseRequestRef.current = { requestId, controller }
+      const requestDatasetId = datasetId
+      const target = proposal.target
+      commitPoleBaseProposal({ status: 'loading', target, frameId, seed: coordinates })
+      try {
+        const result = await api.inferPoleBase(
+          requestDatasetId,
+          frameId,
+          {
+            coordinate_space: 'dataset',
+            seed_position: coordinates,
+            profile: 'balanced',
+            debug: false,
+          },
+          controller.signal,
+        )
+        if (
+          controller.signal.aborted ||
+          poleBaseRequestIdRef.current !== requestId ||
+          activeDatasetIdRef.current !== requestDatasetId
+        ) {
+          return
+        }
+        commitPoleBaseProposal({ status: 'ready', target, frameId, seed: coordinates, result })
+        const reasonMessage = poleBaseReasonMessages(result.reason_codes).join(' · ')
+        if (result.status === 'failed') {
+          notify?.({
+            tone: 'info',
+            title: '지주 하단을 산출하지 못했습니다',
+            message: reasonMessage || '다른 지주점을 선택해 다시 시도해 주세요.',
+          })
+        } else if (result.status === 'review') {
+          notify?.({
+            tone: 'info',
+            title: '지주 하단 산출 결과를 확인해 주세요',
+            message: reasonMessage || result.warnings.join(' · ') || undefined,
+          })
+        }
+      } catch (reason) {
+        if (
+          controller.signal.aborted ||
+          isAbortError(reason) ||
+          poleBaseRequestIdRef.current !== requestId ||
+          activeDatasetIdRef.current !== requestDatasetId
+        ) {
+          return
+        }
+        const reasonCodes = poleBaseReasonCodesFromUnknown(reason)
+        const mappedMessage = poleBaseReasonMessages(reasonCodes).join(' · ')
+        const message = mappedMessage || (reason instanceof Error ? reason.message : '지주 하단 추론 요청에 실패했습니다.')
+        commitPoleBaseProposal({
+          status: 'error',
+          target,
+          frameId,
+          seed: coordinates,
+          message,
+          reasonCodes,
+        })
+        notify?.({ tone: 'error', title: '지주 하단을 산출하지 못했습니다', message })
+      } finally {
+        if (poleBaseRequestRef.current?.requestId === requestId) {
+          poleBaseRequestRef.current = null
+        }
+      }
+    },
+    [abortPoleBaseRequest, commitPoleBaseProposal, datasetId, notify],
+  )
+
+  const confirmPoleBaseProposal = useCallback(async () => {
+    const proposal = poleBaseProposalRef.current
+    if (
+      proposal.status !== 'ready' ||
+      proposal.result.status === 'failed' ||
+      !proposal.result.base_position ||
+      poleBaseConfirmingRef.current
+    ) {
+      return
+    }
+    const layer = layers.find((candidate) => candidate.id === proposal.target.layerId)
+    if (!layer || !datasetId || demoMode) return
+    const target = proposal.target
+    if (
+      target.kind === 'pole-base-move' &&
+      (!selected ||
+        selected.layerId !== target.layerId ||
+        String(selected.featureId) !== String(target.featureId))
+    ) {
+      notify?.({ tone: 'info', title: '재산출을 시작한 SHP 피처를 다시 선택해 주세요.' })
+      return
+    }
+
+    const fields =
+      layer.fields ??
+      features[target.layerId]?.dataset?.fields ??
+      features[target.layerId]?.wgs84?.fields ??
+      []
+    const currentProperties =
+      target.kind === 'pole-base-move'
+        ? (selectedDatasetFeature?.properties ?? selectedFeature?.properties ?? {})
+        : {}
+    const properties = buildPoleBasePropertyPatch(
+      fields,
+      currentProperties,
+      proposal.result,
+      proposal.frameId,
+    )
+    const propertyPayload = Object.keys(properties).length > 0 ? { properties } : {}
+    const saveId = poleBaseSaveIdRef.current + 1
+    poleBaseSaveIdRef.current = saveId
+    poleBaseConfirmingRef.current = true
+    try {
+      if (target.kind === 'pole-base-create') {
+        await createFeature(target.layerId, {
+          geometry: { type: 'Point', coordinates: proposal.result.base_position },
+          coordinate_space: 'dataset',
+          ...propertyPayload,
+        }, { navigate: false })
+      } else {
+        await updateSelected({
+          geometry: { type: 'Point', coordinates: proposal.result.base_position },
+          coordinate_space: 'dataset',
+          ...propertyPayload,
+        })
+      }
+      if (
+        poleBaseSaveIdRef.current !== saveId ||
+        activeDatasetIdRef.current !== datasetId ||
+        poleBaseProposalRef.current !== proposal
+      ) {
+        return
+      }
+      if (target.kind === 'pole-base-create' && target.continuous) {
+        setPickTarget(target)
+        commitPoleBaseProposal({ status: 'picking', target })
+      } else {
+        setPickTarget((current) => (current === target ? null : current))
+        commitPoleBaseProposal({ status: 'idle' })
+      }
+    } catch (reason) {
+      // The existing create/update helpers show the actionable server error.
+      // Keep the ready proposal so a revision conflict can be refreshed and retried.
+      if (reason instanceof ApiError && reason.status === 409) {
+        await refresh()
+        if (poleBaseProposalRef.current === proposal) {
+          notify?.({
+            tone: 'info',
+            title: 'SHP 레이어의 최신 변경 내용을 불러왔습니다',
+            message: '검토 중인 지주 하단 결과를 다시 저장해 주세요.',
+          })
+        }
+      }
+    } finally {
+      if (poleBaseSaveIdRef.current === saveId) poleBaseConfirmingRef.current = false
+    }
+  }, [
+    commitPoleBaseProposal,
+    createFeature,
+    datasetId,
+    demoMode,
+    features,
+    layers,
+    notify,
+    refresh,
+    selected,
+    selectedDatasetFeature,
+    selectedFeature,
+    updateSelected,
+  ])
+
   const applyPickedCoordinate = useCallback(
     async (
       coordinates: [number, number, number?],
@@ -907,6 +1416,7 @@ export function OverlayProvider({
     ) => {
       const target = pickTarget
       if (!target) return
+      if (target.kind === 'pole-base-create' || target.kind === 'pole-base-move') return
       if (target.kind === 'create') {
         try {
           await createFeature(target.layerId, {
@@ -941,6 +1451,101 @@ export function OverlayProvider({
     [createFeature, notify, pickTarget, selected, updateSelected],
   )
 
+  const shortcutStateRef = useRef({
+    activeLayerId,
+    beginCreatePoint,
+    beginCreatePoleBase,
+    cancelPoleBaseProposal,
+    confirmPoleBaseProposal,
+    pickMode,
+    pickTarget,
+    poleBaseProposal,
+    retryPoleBasePick,
+    selected,
+    setPickMode,
+  })
+  shortcutStateRef.current = {
+    activeLayerId,
+    beginCreatePoint,
+    beginCreatePoleBase,
+    cancelPoleBaseProposal,
+    confirmPoleBaseProposal,
+    pickMode,
+    pickTarget,
+    poleBaseProposal,
+    retryPoleBasePick,
+    selected,
+    setPickMode,
+  }
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.shiftKey ||
+        isTextEntryTarget(event.target)
+      ) {
+        return
+      }
+      const shortcut = shortcutStateRef.current
+      if (event.key === 'Escape') {
+        if (shortcut.poleBaseProposal.status !== 'idle') {
+          event.preventDefault()
+          if (shortcut.poleBaseProposal.status === 'picking') {
+            shortcut.cancelPoleBaseProposal()
+          } else {
+            shortcut.retryPoleBasePick()
+          }
+        } else if (shortcut.pickMode) {
+          event.preventDefault()
+          shortcut.setPickMode(false)
+        }
+      } else if (event.code === 'KeyB') {
+        event.preventDefault()
+        if (event.repeat) return
+        shortcut.beginCreatePoleBase(shortcut.activeLayerId)
+      } else if (event.key === 'Enter' && shortcut.poleBaseProposal.status === 'ready') {
+        event.preventDefault()
+        if (event.repeat) return
+        void shortcut.confirmPoleBaseProposal()
+      } else if (event.code === 'KeyR' && shortcut.poleBaseProposal.status !== 'idle') {
+        event.preventDefault()
+        if (event.repeat) return
+        shortcut.retryPoleBasePick()
+      } else if (event.code === 'KeyN') {
+        event.preventDefault()
+        if (event.repeat) return
+        if (
+          shortcut.pickTarget?.kind === 'create' &&
+          shortcut.pickTarget.layerId === shortcut.activeLayerId
+        ) {
+          shortcut.setPickMode(false)
+        } else {
+          shortcut.beginCreatePoint(shortcut.activeLayerId)
+        }
+      } else if (event.code === 'KeyP') {
+        if (shortcut.poleBaseProposal.status !== 'idle') {
+          event.preventDefault()
+          if (shortcut.poleBaseProposal.target.kind === 'pole-base-create') {
+            shortcut.beginCreatePoint(shortcut.poleBaseProposal.target.layerId)
+          } else if (shortcut.selected) {
+            shortcut.setPickMode(true)
+          }
+        } else if (shortcut.selected) {
+          event.preventDefault()
+          shortcut.setPickMode(!shortcut.pickMode)
+        }
+      }
+    }
+    // Keep edit shortcuts global even when the focused map/viewer surface has
+    // its own key handler. Point creation deliberately leaves focus there.
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+
   const copySelectedLocation = useCallback(async () => {
     if (!selected || !selectedLayer) {
       notify?.({ tone: 'info', title: '위치를 복사할 SHP 피처를 먼저 선택해 주세요.' })
@@ -959,6 +1564,15 @@ export function OverlayProvider({
     clearSelectedDetails()
     setSelected(null)
     setPickTarget(null)
+    const proposal = poleBaseProposalRef.current
+    if (
+      proposal.status !== 'idle' &&
+      proposal.target.kind === 'pole-base-move' &&
+      proposal.target.layerId === selected.layerId &&
+      String(proposal.target.featureId) === String(selected.featureId)
+    ) {
+      clearPoleBaseWorkflow()
+    }
     notify?.({ tone: 'info', title: '선택한 SHP 피처를 삭제했습니다' })
     const generation = requestGeneration.current
     const reloadDataset = Boolean(features[selected.layerId]?.dataset)
@@ -966,7 +1580,17 @@ export function OverlayProvider({
       loadFeaturePage(selectedLayer, 'wgs84', generation),
       ...(reloadDataset ? [loadFeaturePage(selectedLayer, 'dataset', generation)] : []),
     ])
-  }, [clearSelectedDetails, datasetId, demoMode, features, loadFeaturePage, notify, selected, selectedLayer])
+  }, [
+    clearPoleBaseWorkflow,
+    clearSelectedDetails,
+    datasetId,
+    demoMode,
+    features,
+    loadFeaturePage,
+    notify,
+    selected,
+    selectedLayer,
+  ])
 
   const deleteField = useCallback(
     async (layerId: string, fieldName: string) => {
@@ -1062,8 +1686,17 @@ export function OverlayProvider({
       creatingFeature,
       pickMode,
       pickTarget,
+      poleBaseProposal,
+      poleBaseInferenceEnabled,
       setPickMode,
       beginCreatePoint,
+      beginCreatePoleBase,
+      beginRecomputeSelectedPoleBase,
+      applyPoleSeed,
+      confirmPoleBaseProposal,
+      retryPoleBasePick,
+      cancelPoleBaseProposal,
+      handlePoleBaseFrameChange,
       refresh,
       ensureDatasetFeatures,
       loadMoreDatasetFeatures,
@@ -1081,8 +1714,13 @@ export function OverlayProvider({
     }),
     [
       applyPickedCoordinate,
+      applyPoleSeed,
       activeLayerId,
       beginCreatePoint,
+      beginCreatePoleBase,
+      beginRecomputeSelectedPoleBase,
+      cancelPoleBaseProposal,
+      confirmPoleBaseProposal,
       copySelectedLocation,
       creatingFeature,
       datasetFeatures,
@@ -1091,6 +1729,7 @@ export function OverlayProvider({
       deleteField,
       features,
       ensureDatasetFeatures,
+      handlePoleBaseFrameChange,
       layerColor,
       layers,
       loading,
@@ -1098,6 +1737,8 @@ export function OverlayProvider({
       mapFeatures,
       pickMode,
       pickTarget,
+      poleBaseProposal,
+      poleBaseInferenceEnabled,
       refresh,
       removeLayer,
       selected,
@@ -1106,6 +1747,7 @@ export function OverlayProvider({
       selectedLayer,
       selectFeature,
       setPickMode,
+      retryPoleBasePick,
       toggleLayer,
       updateSelected,
       updateLayerMetadata,

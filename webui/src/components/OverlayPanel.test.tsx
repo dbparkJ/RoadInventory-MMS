@@ -59,6 +59,7 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
   const dataset = collection(selectedFeature ? [selectedFeature] : [], total)
   return {
     datasetId: 'dataset-1',
+    poleBaseInferenceEnabled: true,
     layers: [LAYER],
     features: {
       [LAYER.id]: {
@@ -82,8 +83,15 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
     creatingFeature: false,
     pickMode: false,
     pickTarget: null,
+    poleBaseProposal: { status: 'idle' as const },
     setPickMode: vi.fn(),
     beginCreatePoint: vi.fn(),
+    beginCreatePoleBase: vi.fn(),
+    beginRecomputeSelectedPoleBase: vi.fn(),
+    applyPoleSeed: vi.fn().mockResolvedValue(undefined),
+    confirmPoleBaseProposal: vi.fn().mockResolvedValue(undefined),
+    retryPoleBasePick: vi.fn(),
+    cancelPoleBaseProposal: vi.fn(),
     refresh: vi.fn().mockResolvedValue(undefined),
     ensureDatasetFeatures: vi.fn().mockResolvedValue(undefined),
     loadMoreDatasetFeatures: vi.fn().mockResolvedValue(undefined),
@@ -300,6 +308,58 @@ describe('OverlayPanel feature editing', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /위치만 복사/ }))
     await waitFor(() => expect(overlay.copySelectedLocation).toHaveBeenCalledOnce())
+  })
+
+  it('starts missing-pole creation with a default-on continuous toggle', () => {
+    const overlay = overlayWorkspace(pointFeature())
+    const onClose = vi.fn()
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayAttributePanel onClose={onClose} />)
+    const continuous = screen.getByRole('checkbox', { name: '연속 추가' })
+    expect(continuous).toBeChecked()
+
+    fireEvent.click(screen.getByRole('button', { name: /미검출 지주 추가/ }))
+    expect(overlay.beginCreatePoleBase).toHaveBeenLastCalledWith(LAYER.id, true)
+
+    fireEvent.click(continuous)
+    fireEvent.click(screen.getByRole('button', { name: /미검출 지주 추가/ }))
+    expect(overlay.beginCreatePoleBase).toHaveBeenLastCalledWith(LAYER.id, false)
+    expect(onClose).toHaveBeenCalledTimes(2)
+  })
+
+  it('recomputes only a selected Point through the pole-base workflow', () => {
+    const overlay = overlayWorkspace(pointFeature())
+    const onClose = vi.fn()
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayAttributePanel onClose={onClose} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /지주 하단 재산출/ }))
+
+    expect(overlay.beginRecomputeSelectedPoleBase).toHaveBeenCalledOnce()
+    expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('disables pole-base tools for a non-Point layer or feature', () => {
+    const overlay = overlayWorkspace(lineFeature())
+    overlay.layers = [{ ...LAYER, geometry_type: 'LineString' }]
+    overlay.selectedLayer = overlay.layers[0]
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayAttributePanel onClose={vi.fn()} />)
+
+    expect(screen.getByRole('button', { name: /미검출 지주 추가/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: '연속 추가' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /지주 하단 재산출/ })).toBeDisabled()
+  })
+
+  it('disables pole-base tools when the server capability is unavailable', () => {
+    const overlay = overlayWorkspace(pointFeature())
+    overlay.poleBaseInferenceEnabled = false
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayAttributePanel onClose={vi.fn()} />)
+
+    expect(screen.getByRole('button', { name: /미검출 지주 추가/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: '연속 추가' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /지주 하단 재산출/ })).toBeDisabled()
   })
 
   it('deletes the selected attribute column after confirmation in its owner window', async () => {
