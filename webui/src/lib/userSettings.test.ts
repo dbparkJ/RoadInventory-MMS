@@ -19,6 +19,8 @@ describe('user settings', () => {
         panoramaPointOverlayOpacity: -3,
         panoramaDefaultQuality: 'original',
         detectionVisibilityDistanceM: 900,
+        poleBaseMarkerColor: 'mint',
+        poleBaseMarkerSizeM: 9,
         showAllMapTracks: 'yes',
       }),
     ).toEqual({
@@ -27,7 +29,19 @@ describe('user settings', () => {
       panoramaImageOpacity: 0,
       panoramaDefaultQuality: 'high',
       detectionVisibilityDistanceM: 200,
+      poleBaseMarkerColor: '#2bcfa8',
+      poleBaseMarkerSizeM: 0.3,
       showAllMapTracks: false,
+    })
+  })
+
+  it('normalizes a valid pole-base color and clamps the marker radius', () => {
+    expect(sanitizeUserSettings({
+      poleBaseMarkerColor: ' #FF00AA ',
+      poleBaseMarkerSizeM: 0.001,
+    })).toMatchObject({
+      poleBaseMarkerColor: '#ff00aa',
+      poleBaseMarkerSizeM: 0.03,
     })
   })
 
@@ -53,6 +67,8 @@ describe('user settings', () => {
       result.current.updateSettings({
         panoramaForwardOffsetDeg: -12.5,
         panoramaPointOverlayEnabled: true,
+        poleBaseMarkerColor: '#ff00aa',
+        poleBaseMarkerSizeM: 0.12,
         showAllMapTracks: true,
       })
     })
@@ -61,6 +77,8 @@ describe('user settings', () => {
       expect.objectContaining({
         panoramaForwardOffsetDeg: -12.5,
         panoramaPointOverlayEnabled: true,
+        poleBaseMarkerColor: '#ff00aa',
+        poleBaseMarkerSizeM: 0.12,
         showAllMapTracks: true,
       }),
     )

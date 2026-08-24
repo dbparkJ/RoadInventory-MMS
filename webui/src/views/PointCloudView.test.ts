@@ -6,10 +6,12 @@ import {
   captureHeadingDirection,
   closestPointHitIndex,
   applyPointCloudPickedCoordinate,
+  createPointCloudRenderLoop,
   DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
   pointCloudOverlayPointSize,
+  pointCloudOwnerWindow,
   pointCloudBudgetsForMaximum,
   pointCloudDetectionWireframePositions,
   pointCloudDetectionsFromObservations,
@@ -28,6 +30,69 @@ import {
 } from './PointCloudView'
 
 describe('PointCloudView camera continuity', () => {
+  it('uses the detached canvas owner Window instead of the opener realm', () => {
+    const detachedWindow = { name: 'detached-point-cloud' } as unknown as Window
+    const host = {
+      ownerDocument: { defaultView: detachedWindow } as unknown as Document,
+    } as Pick<HTMLElement, 'ownerDocument'>
+
+    expect(pointCloudOwnerWindow(host)).toBe(detachedWindow)
+  })
+
+  it('restarts one owner-window RAF chain after inactivity and cleans it up', () => {
+    let nextFrame = 0
+    let visible = true
+    const callbacks = new Map<number, FrameRequestCallback>()
+    const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      nextFrame += 1
+      callbacks.set(nextFrame, callback)
+      return nextFrame
+    })
+    const cancelAnimationFrame = vi.fn((handle: number) => {
+      callbacks.delete(handle)
+    })
+    const draw = vi.fn()
+    const loop = createPointCloudRenderLoop(
+      { requestAnimationFrame, cancelAnimationFrame },
+      draw,
+      () => visible,
+    )
+
+    loop.wake()
+    expect(draw).toHaveBeenCalledTimes(1)
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1)
+    const firstFrame = requestAnimationFrame.mock.results[0].value
+    const firstCallback = callbacks.get(firstFrame)
+    expect(firstCallback).toBeDefined()
+    callbacks.delete(firstFrame)
+    firstCallback?.(16)
+    expect(draw).toHaveBeenCalledTimes(2)
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(2)
+
+    const pendingBeforeHide = requestAnimationFrame.mock.results[1].value
+    visible = false
+    loop.stop()
+    loop.wake()
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(pendingBeforeHide)
+    expect(draw).toHaveBeenCalledTimes(2)
+
+    visible = true
+    loop.wake()
+    expect(draw).toHaveBeenCalledTimes(3)
+    const pendingBeforeContextLoss = requestAnimationFrame.mock.results[2].value
+    loop.suspend()
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(pendingBeforeContextLoss)
+
+    loop.resume()
+    expect(draw).toHaveBeenCalledTimes(4)
+    const pendingBeforeDispose = requestAnimationFrame.mock.results[3].value
+    loop.dispose()
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(pendingBeforeDispose)
+    loop.wake()
+    expect(draw).toHaveBeenCalledTimes(4)
+    expect(callbacks.size).toBe(0)
+  })
+
   it('uses 250k as the minimum and offers 500k and 1m previews', () => {
     expect(DEFAULT_POINT_CLOUD_BUDGET).toBe(250_000)
     expect(POINT_CLOUD_BUDGETS.map((entry) => entry.value)).toEqual([
@@ -454,7 +519,7 @@ describe('PointCloudView camera continuity', () => {
 
   it('routes a pole target to inference with the unchanged dataset XYZ', async () => {
     const actions = {
-      applyPickedCoordinate: vi.fn().mockResolvedValue(undefined),
+      applyPointCloudCoordinate: vi.fn().mockResolvedValue(undefined),
       applyPoleSeed: vi.fn().mockResolvedValue(undefined),
     }
     const datasetCoordinates: [number, number, number] = [209123.456, 412345.678, 35.912]
@@ -467,7 +532,7 @@ describe('PointCloudView camera continuity', () => {
     )
 
     expect(actions.applyPoleSeed).toHaveBeenCalledWith('frame-17', datasetCoordinates)
-    expect(actions.applyPickedCoordinate).not.toHaveBeenCalled()
+    expect(actions.applyPointCloudCoordinate).not.toHaveBeenCalled()
 
     await applyPointCloudPickedCoordinate(
       { kind: 'move', layerId: 'poles', featureId: 'pole-1' },
@@ -475,7 +540,7 @@ describe('PointCloudView camera continuity', () => {
       datasetCoordinates,
       actions,
     )
-    expect(actions.applyPickedCoordinate).toHaveBeenCalledWith(datasetCoordinates, 'dataset')
+    expect(actions.applyPointCloudCoordinate).toHaveBeenCalledWith('frame-17', datasetCoordinates)
   })
 
   it('accepts pole clicks only while the proposal is picking', () => {

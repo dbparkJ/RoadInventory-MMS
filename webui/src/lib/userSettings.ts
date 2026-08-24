@@ -8,12 +8,19 @@ export interface UserSettings {
   panoramaImageOpacity: number
   panoramaDefaultQuality: PanoramaQuality
   detectionVisibilityDistanceM: number
+  poleBaseMarkerColor: string
+  poleBaseMarkerSizeM: number
   showAllMapTracks: boolean
 }
 
 export type UserSettingsPatch = Partial<UserSettings>
 
 export const USER_SETTINGS_STORAGE_KEY = 'mms-operator-console:user-settings:v1'
+
+export const DEFAULT_POLE_BASE_MARKER_COLOR = '#2bcfa8'
+export const DEFAULT_POLE_BASE_MARKER_SIZE_M = 0.08
+export const MIN_POLE_BASE_MARKER_SIZE_M = 0.03
+export const MAX_POLE_BASE_MARKER_SIZE_M = 0.3
 
 export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = Object.freeze({
   panoramaForwardOffsetDeg: 0,
@@ -25,6 +32,10 @@ export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = Object.freeze({
   // Keep panorama detections local to the current vehicle pose so distant
   // objects do not pile up at the same viewing angle.
   detectionVisibilityDistanceM: 45,
+  poleBaseMarkerColor: DEFAULT_POLE_BASE_MARKER_COLOR,
+  // Marker radius in dataset metres. Keep the default compact enough to
+  // identify the inferred ground contact without covering the pole itself.
+  poleBaseMarkerSizeM: DEFAULT_POLE_BASE_MARKER_SIZE_M,
   // A dense delivery can contain many overlapping routes. Keep only the
   // active track visible until an operator explicitly asks for all tracks.
   showAllMapTracks: false,
@@ -40,6 +51,12 @@ function finiteNumber(value: unknown, fallback: number, minimum: number, maximum
 
 function isPanoramaQuality(value: unknown): value is PanoramaQuality {
   return value === 'fast' || value === 'high' || value === 'ultra'
+}
+
+function markerColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim().toLowerCase()
+  return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : fallback
 }
 
 export function sanitizeUserSettings(value: unknown): UserSettings {
@@ -70,6 +87,16 @@ export function sanitizeUserSettings(value: unknown): UserSettings {
       DEFAULT_USER_SETTINGS.detectionVisibilityDistanceM,
       5,
       200,
+    ),
+    poleBaseMarkerColor: markerColor(
+      candidate.poleBaseMarkerColor,
+      DEFAULT_USER_SETTINGS.poleBaseMarkerColor,
+    ),
+    poleBaseMarkerSizeM: finiteNumber(
+      candidate.poleBaseMarkerSizeM,
+      DEFAULT_USER_SETTINGS.poleBaseMarkerSizeM,
+      MIN_POLE_BASE_MARKER_SIZE_M,
+      MAX_POLE_BASE_MARKER_SIZE_M,
     ),
     showAllMapTracks:
       typeof candidate.showAllMapTracks === 'boolean'

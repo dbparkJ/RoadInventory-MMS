@@ -62,6 +62,39 @@ export type OverlayPickTarget =
   | { kind: 'create'; layerId: string }
   | PoleBaseTarget
 
+type DirectPointPickTarget = Extract<OverlayPickTarget, { kind: 'move' | 'create' }>
+
+interface StagedPointWorkflow {
+  target: DirectPointPickTarget
+  continuous: boolean
+}
+
+interface StagedPointCloudCoordinate extends StagedPointWorkflow {
+  frameId: string
+  coordinates: [number, number, number]
+}
+
+function directPointTargetsMatch(
+  left: DirectPointPickTarget,
+  right: DirectPointPickTarget,
+): boolean {
+  if (left.kind !== right.kind || left.layerId !== right.layerId) return false
+  if (left.kind === 'create') return true
+  return right.kind === 'move' && String(left.featureId) === String(right.featureId)
+}
+
+function stagedWorkflowMatchesPoleTarget(
+  workflow: StagedPointWorkflow,
+  target: PoleBaseTarget,
+): boolean {
+  if (workflow.target.layerId !== target.layerId) return false
+  if (workflow.target.kind === 'create') return target.kind === 'pole-base-create'
+  return (
+    target.kind === 'pole-base-move' &&
+    String(workflow.target.featureId) === String(target.featureId)
+  )
+}
+
 export type PoleBaseTarget =
   | { kind: 'pole-base-create'; layerId: string; continuous: boolean }
   | { kind: 'pole-base-move'; layerId: string; featureId: string | number }
@@ -264,6 +297,8 @@ export interface OverlayContextValue {
   poleBaseProposal: PoleBaseProposalState
   setPickMode: (enabled: boolean) => void
   beginCreatePoint: (layerId: string) => void
+  beginStagedPointCreate: (layerId: string, continuous?: boolean) => void
+  beginStagedSelectedPointMove: () => void
   beginCreatePoleBase: (layerId: string, continuous?: boolean) => void
   beginRecomputeSelectedPoleBase: () => void
   applyPoleSeed: (frameId: string, coordinates: [number, number, number]) => Promise<void>
@@ -290,6 +325,10 @@ export interface OverlayContextValue {
   applyPickedCoordinate: (
     coordinates: [number, number, number?],
     coordinateSpace: OverlayCoordinateSpace,
+  ) => Promise<void>
+  applyPointCloudCoordinate: (
+    frameId: string,
+    coordinates: [number, number, number],
   ) => Promise<void>
   copySelectedLocation: () => Promise<void>
   deleteSelected: () => Promise<void>
@@ -377,6 +416,9 @@ export function OverlayProvider({
   const poleBaseRequestIdRef = useRef(0)
   const poleBaseSaveIdRef = useRef(0)
   const poleBaseConfirmingRef = useRef(false)
+  const stagedPointWorkflowRef = useRef<StagedPointWorkflow | null>(null)
+  const stagedPointCloudCoordinateRef = useRef<StagedPointCloudCoordinate | null>(null)
+  const directActualPointPickRef = useRef(false)
   const activeDatasetIdRef = useRef(datasetId)
   activeDatasetIdRef.current = datasetId
   const visibleLayerIdsRef = useRef(visibleLayerIds)
@@ -393,10 +435,25 @@ export function OverlayProvider({
     poleBaseRequestRef.current = null
   }, [])
 
+  const restoreStagedPointWorkflow = useCallback(
+    (workflow: StagedPointWorkflow) => {
+      stagedPointWorkflowRef.current = workflow
+      stagedPointCloudCoordinateRef.current = null
+      directActualPointPickRef.current = false
+      setActiveLayerId(workflow.target.layerId)
+      setPickTarget(workflow.target)
+      commitPoleBaseProposal({ status: 'idle' })
+    },
+    [commitPoleBaseProposal],
+  )
+
   const clearPoleBaseWorkflow = useCallback(() => {
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    stagedPointWorkflowRef.current = null
+    stagedPointCloudCoordinateRef.current = null
+    directActualPointPickRef.current = false
     commitPoleBaseProposal({ status: 'idle' })
     setPickTarget((current) =>
       current?.kind === 'pole-base-create' || current?.kind === 'pole-base-move' ? null : current,
@@ -427,6 +484,9 @@ export function OverlayProvider({
   const setPickMode = useCallback(
     (enabled: boolean) => {
       if (!enabled) {
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
         setPickTarget(null)
         if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
         return
@@ -436,6 +496,9 @@ export function OverlayProvider({
         return
       }
       if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
+      stagedPointWorkflowRef.current = null
+      stagedPointCloudCoordinateRef.current = null
+      directActualPointPickRef.current = true
       setPickTarget({
         kind: 'move',
         layerId: selected.layerId,
@@ -461,11 +524,42 @@ export function OverlayProvider({
         return
       }
       if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
+      stagedPointWorkflowRef.current = null
+      stagedPointCloudCoordinateRef.current = null
+      directActualPointPickRef.current = true
       setActiveLayerId(layerId)
       setPickTarget({ kind: 'create', layerId })
     },
     [clearPoleBaseWorkflow, demoMode, layers, notify],
   )
+
+  const beginStagedPointCreate = useCallback(
+    (layerId: string, continuous = false) => {
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      beginCreatePoint(layerId)
+      if (!layer || layer.geometry_type !== 'Point' || demoMode) return
+      directActualPointPickRef.current = false
+      stagedPointWorkflowRef.current = {
+        target: { kind: 'create', layerId },
+        continuous,
+      }
+    },
+    [beginCreatePoint, demoMode, layers],
+  )
+
+  const beginStagedSelectedPointMove = useCallback(() => {
+    setPickMode(true)
+    if (!selected) return
+    directActualPointPickRef.current = false
+    stagedPointWorkflowRef.current = {
+      target: {
+        kind: 'move',
+        layerId: selected.layerId,
+        featureId: selected.featureId,
+      },
+      continuous: false,
+    }
+  }, [selected, setPickMode])
 
   const beginCreatePoleBase = useCallback(
     (layerId: string, continuous = true) => {
@@ -489,6 +583,9 @@ export function OverlayProvider({
       abortPoleBaseRequest()
       poleBaseSaveIdRef.current += 1
       poleBaseConfirmingRef.current = false
+      stagedPointWorkflowRef.current = null
+      stagedPointCloudCoordinateRef.current = null
+      directActualPointPickRef.current = false
       const target: PoleBaseTarget = { kind: 'pole-base-create', layerId, continuous }
       setActiveLayerId(layerId)
       setPickTarget(target)
@@ -526,6 +623,9 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    stagedPointWorkflowRef.current = null
+    stagedPointCloudCoordinateRef.current = null
+    directActualPointPickRef.current = false
     const target: PoleBaseTarget = {
       kind: 'pole-base-move',
       layerId: selected.layerId,
@@ -545,16 +645,47 @@ export function OverlayProvider({
     selected,
   ])
 
+  const beginDirectActualPointPick = useCallback(
+    (target: DirectPointPickTarget) => {
+      const layer = layers.find((candidate) => candidate.id === target.layerId)
+      if (!layer || layer.geometry_type !== 'Point' || demoMode) return
+      if (
+        target.kind === 'move' &&
+        (!selected ||
+          selected.layerId !== target.layerId ||
+          String(selected.featureId) !== String(target.featureId))
+      ) {
+        notify?.({ tone: 'info', title: '먼저 속성표에서 수정할 피처를 선택해 주세요.' })
+        return
+      }
+      if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
+      stagedPointWorkflowRef.current = null
+      stagedPointCloudCoordinateRef.current = null
+      directActualPointPickRef.current = true
+      setActiveLayerId(target.layerId)
+      setPickTarget(target)
+    },
+    [clearPoleBaseWorkflow, demoMode, layers, notify, selected],
+  )
+
   const retryPoleBasePick = useCallback(() => {
     const proposal = poleBaseProposalRef.current
     if (proposal.status === 'idle') return
+    const workflow = stagedPointWorkflowRef.current
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
     const target = proposal.target
+    if (workflow && stagedWorkflowMatchesPoleTarget(workflow, target)) {
+      restoreStagedPointWorkflow(workflow)
+      return
+    }
+    stagedPointWorkflowRef.current = null
+    stagedPointCloudCoordinateRef.current = null
+    directActualPointPickRef.current = false
     setPickTarget(target)
     commitPoleBaseProposal({ status: 'picking', target })
-  }, [abortPoleBaseRequest, commitPoleBaseProposal])
+  }, [abortPoleBaseRequest, commitPoleBaseProposal, restoreStagedPointWorkflow])
 
   const cancelPoleBaseProposal = useCallback(() => {
     clearPoleBaseWorkflow()
@@ -562,17 +693,26 @@ export function OverlayProvider({
 
   const handlePoleBaseFrameChange = useCallback(
     (frameId: string) => {
+      const staged = stagedPointCloudCoordinateRef.current
+      if (staged && staged.frameId !== frameId) stagedPointCloudCoordinateRef.current = null
       const proposal = poleBaseProposalRef.current
       if (proposal.status === 'idle' || proposal.status === 'picking') return
       if (proposal.frameId === frameId) return
+      const workflow = stagedPointWorkflowRef.current
       abortPoleBaseRequest()
       poleBaseSaveIdRef.current += 1
       poleBaseConfirmingRef.current = false
       const target = proposal.target
+      if (workflow && stagedWorkflowMatchesPoleTarget(workflow, target)) {
+        restoreStagedPointWorkflow(workflow)
+        return
+      }
+      stagedPointWorkflowRef.current = null
+      stagedPointCloudCoordinateRef.current = null
       setPickTarget(target)
       commitPoleBaseProposal({ status: 'picking', target })
     },
-    [abortPoleBaseRequest, commitPoleBaseProposal],
+    [abortPoleBaseRequest, commitPoleBaseProposal, restoreStagedPointWorkflow],
   )
 
   useEffect(() => {
@@ -584,6 +724,9 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    stagedPointWorkflowRef.current = null
+    stagedPointCloudCoordinateRef.current = null
+    directActualPointPickRef.current = false
     commitPoleBaseProposal({ status: 'idle' })
     setPickTarget((current) =>
       current?.kind === 'pole-base-create' || current?.kind === 'pole-base-move' ? null : current,
@@ -1321,6 +1464,11 @@ export function OverlayProvider({
     const layer = layers.find((candidate) => candidate.id === proposal.target.layerId)
     if (!layer || !datasetId || demoMode) return
     const target = proposal.target
+    const stagedWorkflow = stagedPointWorkflowRef.current
+    const matchingStagedWorkflow =
+      stagedWorkflow && stagedWorkflowMatchesPoleTarget(stagedWorkflow, target)
+        ? stagedWorkflow
+        : null
     if (
       target.kind === 'pole-base-move' &&
       (!selected ||
@@ -1371,10 +1519,25 @@ export function OverlayProvider({
       ) {
         return
       }
-      if (target.kind === 'pole-base-create' && target.continuous) {
+      if (
+        matchingStagedWorkflow?.target.kind === 'create' &&
+        matchingStagedWorkflow.continuous
+      ) {
+        restoreStagedPointWorkflow(matchingStagedWorkflow)
+      } else if (
+        !matchingStagedWorkflow &&
+        target.kind === 'pole-base-create' &&
+        target.continuous
+      ) {
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
         setPickTarget(target)
         commitPoleBaseProposal({ status: 'picking', target })
       } else {
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
         setPickTarget((current) => (current === target ? null : current))
         commitPoleBaseProposal({ status: 'idle' })
       }
@@ -1403,6 +1566,7 @@ export function OverlayProvider({
     layers,
     notify,
     refresh,
+    restoreStagedPointWorkflow,
     selected,
     selectedDatasetFeature,
     selectedFeature,
@@ -1423,6 +1587,9 @@ export function OverlayProvider({
             geometry: { type: 'Point', coordinates },
             coordinate_space: coordinateSpace,
           })
+          stagedPointWorkflowRef.current = null
+          stagedPointCloudCoordinateRef.current = null
+          directActualPointPickRef.current = false
           setPickTarget(null)
         } catch {
           // createFeature already emitted the actionable server error.
@@ -1435,6 +1602,9 @@ export function OverlayProvider({
         String(selected.featureId) !== String(target.featureId)
       ) {
         notify?.({ tone: 'info', title: '먼저 속성표에서 수정할 피처를 선택해 주세요.' })
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
         setPickTarget(null)
         return
       }
@@ -1443,6 +1613,9 @@ export function OverlayProvider({
           geometry: { type: 'Point', coordinates },
           coordinate_space: coordinateSpace,
         })
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
         setPickTarget(null)
       } catch {
         // updateSelected already emitted the actionable server error.
@@ -1451,11 +1624,146 @@ export function OverlayProvider({
     [createFeature, notify, pickTarget, selected, updateSelected],
   )
 
+  const applyPointCloudCoordinate = useCallback(
+    async (frameId: string, coordinates: [number, number, number]) => {
+      const target = pickTarget
+      if (!target || target.kind === 'pole-base-create' || target.kind === 'pole-base-move') return
+      if (directActualPointPickRef.current) {
+        await applyPickedCoordinate(coordinates, 'dataset')
+        return
+      }
+      if (!frameId || coordinates.some((coordinate) => !Number.isFinite(coordinate))) {
+        notify?.({ tone: 'error', title: '선택한 Point 좌표가 올바르지 않습니다.' })
+        return
+      }
+      if (
+        target.kind === 'move' &&
+        (!selected ||
+          selected.layerId !== target.layerId ||
+          String(selected.featureId) !== String(target.featureId))
+      ) {
+        notify?.({ tone: 'info', title: '먼저 속성표에서 수정할 피처를 선택해 주세요.' })
+        return
+      }
+      const existingWorkflow = stagedPointWorkflowRef.current
+      const workflow =
+        existingWorkflow && directPointTargetsMatch(existingWorkflow.target, target)
+          ? existingWorkflow
+          : { target, continuous: false }
+      if (poleBaseProposalRef.current.status !== 'idle') {
+        clearPoleBaseWorkflow()
+        setPickTarget(target)
+      }
+      stagedPointWorkflowRef.current = workflow
+      stagedPointCloudCoordinateRef.current = { ...workflow, frameId, coordinates }
+      directActualPointPickRef.current = false
+      notify?.({
+        tone: 'info',
+        title: 'Point 좌표를 선택했습니다',
+        message: 'B를 눌러 지주 하단을 산출하거나 P를 눌러 선택 좌표를 그대로 저장하세요.',
+      })
+    },
+    [applyPickedCoordinate, clearPoleBaseWorkflow, notify, pickTarget, selected],
+  )
+
+  const startStagedPoleBaseInference = useCallback((): boolean => {
+    const staged = stagedPointCloudCoordinateRef.current
+    if (!staged) return false
+    if (!poleBaseInferenceEnabled) {
+      notify?.({ tone: 'info', title: '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.' })
+      return true
+    }
+    const target: PoleBaseTarget =
+      staged.target.kind === 'create'
+        ? {
+            kind: 'pole-base-create',
+            layerId: staged.target.layerId,
+            continuous: staged.continuous,
+          }
+        : {
+            kind: 'pole-base-move',
+            layerId: staged.target.layerId,
+            featureId: staged.target.featureId,
+          }
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    directActualPointPickRef.current = false
+    setPickTarget(target)
+    commitPoleBaseProposal({ status: 'picking', target })
+    void applyPoleSeed(staged.frameId, staged.coordinates)
+    return true
+  }, [
+    abortPoleBaseRequest,
+    applyPoleSeed,
+    commitPoleBaseProposal,
+    notify,
+    poleBaseInferenceEnabled,
+  ])
+
+  const confirmStagedActualPoint = useCallback(async () => {
+    const staged = stagedPointCloudCoordinateRef.current
+    if (!staged) return
+    abortPoleBaseRequest()
+    poleBaseSaveIdRef.current += 1
+    poleBaseConfirmingRef.current = false
+    commitPoleBaseProposal({ status: 'idle' })
+    directActualPointPickRef.current = true
+    setPickTarget(staged.target)
+    try {
+      if (staged.target.kind === 'create') {
+        await createFeature(
+          staged.target.layerId,
+          {
+            geometry: { type: 'Point', coordinates: staged.coordinates },
+            coordinate_space: 'dataset',
+          },
+          staged.continuous ? { navigate: false } : undefined,
+        )
+      } else {
+        if (
+          !selected ||
+          selected.layerId !== staged.target.layerId ||
+          String(selected.featureId) !== String(staged.target.featureId)
+        ) {
+          notify?.({ tone: 'info', title: '먼저 속성표에서 수정할 피처를 선택해 주세요.' })
+          return
+        }
+        await updateSelected({
+          geometry: { type: 'Point', coordinates: staged.coordinates },
+          coordinate_space: 'dataset',
+        })
+      }
+      if (stagedPointCloudCoordinateRef.current === staged) {
+        if (staged.target.kind === 'create' && staged.continuous) {
+          restoreStagedPointWorkflow({ target: staged.target, continuous: true })
+        } else {
+          stagedPointWorkflowRef.current = null
+          stagedPointCloudCoordinateRef.current = null
+          directActualPointPickRef.current = false
+          setPickTarget(null)
+        }
+      }
+    } catch {
+      // Existing create/update helpers already emitted the actionable error.
+    }
+  }, [
+    abortPoleBaseRequest,
+    commitPoleBaseProposal,
+    createFeature,
+    notify,
+    restoreStagedPointWorkflow,
+    selected,
+    updateSelected,
+  ])
+
   const shortcutStateRef = useRef({
     activeLayerId,
     beginCreatePoint,
     beginCreatePoleBase,
+    beginDirectActualPointPick,
     cancelPoleBaseProposal,
+    confirmStagedActualPoint,
     confirmPoleBaseProposal,
     pickMode,
     pickTarget,
@@ -1463,12 +1771,15 @@ export function OverlayProvider({
     retryPoleBasePick,
     selected,
     setPickMode,
+    startStagedPoleBaseInference,
   })
   shortcutStateRef.current = {
     activeLayerId,
     beginCreatePoint,
     beginCreatePoleBase,
+    beginDirectActualPointPick,
     cancelPoleBaseProposal,
+    confirmStagedActualPoint,
     confirmPoleBaseProposal,
     pickMode,
     pickTarget,
@@ -1476,6 +1787,7 @@ export function OverlayProvider({
     retryPoleBasePick,
     selected,
     setPickMode,
+    startStagedPoleBaseInference,
   }
 
   useEffect(() => {
@@ -1506,7 +1818,13 @@ export function OverlayProvider({
       } else if (event.code === 'KeyB') {
         event.preventDefault()
         if (event.repeat) return
-        shortcut.beginCreatePoleBase(shortcut.activeLayerId)
+        if (shortcut.poleBaseProposal.status === 'ready') {
+          void shortcut.confirmPoleBaseProposal()
+        } else if (shortcut.poleBaseProposal.status === 'idle') {
+          if (!shortcut.startStagedPoleBaseInference()) {
+            shortcut.beginCreatePoleBase(shortcut.activeLayerId)
+          }
+        }
       } else if (event.key === 'Enter' && shortcut.poleBaseProposal.status === 'ready') {
         event.preventDefault()
         if (event.repeat) return
@@ -1527,16 +1845,39 @@ export function OverlayProvider({
           shortcut.beginCreatePoint(shortcut.activeLayerId)
         }
       } else if (event.code === 'KeyP') {
-        if (shortcut.poleBaseProposal.status !== 'idle') {
+        if (stagedPointCloudCoordinateRef.current) {
+          event.preventDefault()
+          void shortcut.confirmStagedActualPoint()
+        } else if (shortcut.poleBaseProposal.status !== 'idle') {
           event.preventDefault()
           if (shortcut.poleBaseProposal.target.kind === 'pole-base-create') {
-            shortcut.beginCreatePoint(shortcut.poleBaseProposal.target.layerId)
+            shortcut.beginDirectActualPointPick({
+              kind: 'create',
+              layerId: shortcut.poleBaseProposal.target.layerId,
+            })
           } else if (shortcut.selected) {
-            shortcut.setPickMode(true)
+            shortcut.beginDirectActualPointPick({
+              kind: 'move',
+              layerId: shortcut.poleBaseProposal.target.layerId,
+              featureId: shortcut.poleBaseProposal.target.featureId,
+            })
           }
         } else if (shortcut.selected) {
           event.preventDefault()
-          shortcut.setPickMode(!shortcut.pickMode)
+          if (
+            directActualPointPickRef.current &&
+            shortcut.pickTarget?.kind === 'move' &&
+            shortcut.pickTarget.layerId === shortcut.selected.layerId &&
+            String(shortcut.pickTarget.featureId) === String(shortcut.selected.featureId)
+          ) {
+            shortcut.setPickMode(false)
+          } else {
+            shortcut.beginDirectActualPointPick({
+              kind: 'move',
+              layerId: shortcut.selected.layerId,
+              featureId: shortcut.selected.featureId,
+            })
+          }
         }
       }
     }
@@ -1690,6 +2031,8 @@ export function OverlayProvider({
       poleBaseInferenceEnabled,
       setPickMode,
       beginCreatePoint,
+      beginStagedPointCreate,
+      beginStagedSelectedPointMove,
       beginCreatePoleBase,
       beginRecomputeSelectedPoleBase,
       applyPoleSeed,
@@ -1707,6 +2050,7 @@ export function OverlayProvider({
       selectFeature,
       updateSelected,
       applyPickedCoordinate,
+      applyPointCloudCoordinate,
       copySelectedLocation,
       deleteSelected,
       deleteField,
@@ -1714,9 +2058,12 @@ export function OverlayProvider({
     }),
     [
       applyPickedCoordinate,
+      applyPointCloudCoordinate,
       applyPoleSeed,
       activeLayerId,
       beginCreatePoint,
+      beginStagedPointCreate,
+      beginStagedSelectedPointMove,
       beginCreatePoleBase,
       beginRecomputeSelectedPoleBase,
       cancelPoleBaseProposal,

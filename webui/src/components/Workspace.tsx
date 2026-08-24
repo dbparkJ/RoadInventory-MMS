@@ -680,6 +680,8 @@ export function Workspace({
                           pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
                           panoramaOpacity={settings.panoramaImageOpacity}
                           maxOverlayDistanceM={settings.detectionVisibilityDistanceM}
+                          poleBaseMarkerColor={settings.poleBaseMarkerColor}
+                          poleBaseMarkerSizeM={settings.poleBaseMarkerSizeM}
                           linkedHoverPoint={hoveredPanoramaPoint}
                           onQualityChange={(quality) =>
                             onSettingsChange?.({ panoramaDefaultQuality: quality })
@@ -735,6 +737,8 @@ export function Workspace({
                           demoMode={demoMode}
                           maxPointBudget={maxPointBudget}
                           detectionRevisionKey={detectionRevisionKey}
+                          poleBaseMarkerColor={settings.poleBaseMarkerColor}
+                          poleBaseMarkerSizeM={settings.poleBaseMarkerSizeM}
                           onHoverPanoramaPoint={setHoveredPanoramaPoint}
                         />
                       </Suspense>

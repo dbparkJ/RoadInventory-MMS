@@ -178,6 +178,15 @@ function WorkspaceProbe() {
       <button type="button" onClick={() => overlay.beginCreatePoint(LAYER.id)}>
         begin create
       </button>
+      <button type="button" onClick={() => overlay.beginStagedPointCreate(LAYER.id, false)}>
+        begin staged create
+      </button>
+      <button type="button" onClick={() => overlay.beginStagedPointCreate(LAYER.id, true)}>
+        begin staged continuous create
+      </button>
+      <button type="button" onClick={() => overlay.beginStagedSelectedPointMove()}>
+        begin staged move
+      </button>
       <button type="button" onClick={() => overlay.beginCreatePoleBase(LAYER.id, false)}>
         begin pole once
       </button>
@@ -198,6 +207,18 @@ function WorkspaceProbe() {
         onClick={() => void overlay.applyPoleSeed('frame-2', [11, 21, 36])}
       >
         apply next-frame pole seed
+      </button>
+      <button
+        type="button"
+        onClick={() => void overlay.applyPointCloudCoordinate('frame-1', [10, 20, 35])}
+      >
+        apply pointcloud coordinate
+      </button>
+      <button
+        type="button"
+        onClick={() => void overlay.applyPointCloudCoordinate('frame-2', [11, 21, 36])}
+      >
+        apply next-frame pointcloud coordinate
       </button>
       <button type="button" onClick={() => void overlay.confirmPoleBaseProposal()}>
         confirm pole
@@ -658,6 +679,248 @@ describe('manual pole-base proposals', () => {
     expect(poleBaseReasonMessage('NO_GROUND_SUPPORT')).toContain('지면')
   })
 
+  it('stages a regular create click, infers on the first B, and creates on the second B', async () => {
+    mockFeaturePages(POLE_LAYER)
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const created: OverlayFeature = {
+      ...feature('staged-pole-new', 10.1, ''),
+      geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+    }
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+    expect(inferPoleBase).not.toHaveBeenCalled()
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    expect(inferPoleBase).toHaveBeenCalledOnce()
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith(
+      'dataset-1',
+      LAYER.id,
+      expect.objectContaining({
+        geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+        coordinate_space: 'dataset',
+        expected_revision: LAYER.revision,
+      }),
+    )
+  })
+
+  it('returns a continuous staged create to click waiting and repeats the B-to-infer, B-to-save cycle', async () => {
+    mockFeaturePages(POLE_LAYER)
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const created: OverlayFeature = {
+      ...feature('staged-pole-continuous', 10.1, ''),
+      geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+    }
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged continuous create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    expect(inferPoleBase).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle'))
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    expect(inferPoleBase).toHaveBeenCalledTimes(1)
+    expect(createOverlayFeature).toHaveBeenCalledTimes(1)
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(inferPoleBase).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle'))
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+  })
+
+  it('returns retry and frame changes from staged inference to a fresh staged click', async () => {
+    mockFeaturePages(POLE_LAYER)
+    const pendingResolvers: Array<(result: PoleBaseInferResponse) => void> = []
+    const signals: AbortSignal[] = []
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase').mockImplementation(
+      async (_datasetId, _frameId, _payload, signal) => {
+        if (signal) signals.push(signal)
+        return await new Promise<PoleBaseInferResponse>((resolve) => pendingResolvers.push(resolve))
+      },
+    )
+    const rendered = renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged continuous create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(signals).toHaveLength(1))
+
+    fireEvent.keyDown(window, { key: 'r', code: 'KeyR' })
+    expect(signals[0].aborted).toBe(true)
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    expect(inferPoleBase).toHaveBeenCalledTimes(1)
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(signals).toHaveLength(2))
+
+    rendered.rerender(
+      <OverlayProvider datasetId="dataset-1" activeFrameId="frame-2" demoMode={false}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    expect(signals[1].aborted).toBe(true)
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
+
+    pendingResolvers[0](AUTO_POLE_BASE_RESULT)
+    pendingResolvers[1](AUTO_POLE_BASE_RESULT)
+    await Promise.resolve()
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+
+    fireEvent.click(screen.getByRole('button', { name: 'apply next-frame pointcloud coordinate' }))
+    expect(inferPoleBase).toHaveBeenCalledTimes(2)
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(inferPoleBase).toHaveBeenCalledTimes(3))
+    pendingResolvers[2](AUTO_POLE_BASE_RESULT)
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+  })
+
+  it('stages a regular move click, infers on the first B, and patches on the second B', async () => {
+    mockFeaturePages(POLE_LAYER)
+    mockOutsideFeature()
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const updated: OverlayFeature = {
+      ...feature('outside-42', 10.1, '첫 페이지 밖 피처'),
+      geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+    }
+    const patchOverlayFeature = vi.spyOn(api, 'patchOverlayFeature').mockResolvedValue({
+      feature: updated,
+      revision: 5,
+      coordinate_space: 'dataset',
+    })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged move' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    expect(inferPoleBase).not.toHaveBeenCalled()
+    expect(patchOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    expect(patchOverlayFeature).not.toHaveBeenCalled()
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+
+    await waitFor(() => expect(patchOverlayFeature).toHaveBeenCalledOnce())
+    expect(patchOverlayFeature).toHaveBeenCalledWith(
+      'dataset-1',
+      LAYER.id,
+      'outside-42',
+      expect.objectContaining({
+        geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+        coordinate_space: 'dataset',
+        expected_revision: LAYER.revision,
+      }),
+    )
+  })
+
+  it('keeps keyboard P as one-key direct raw-XYZ picking and lets P confirm a staged raw point', async () => {
+    mockFeaturePages(POLE_LAYER)
+    mockOutsideFeature()
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase')
+    const rawUpdated = feature('outside-42', 10, '첫 페이지 밖 피처')
+    const patchOverlayFeature = vi.spyOn(api, 'patchOverlayFeature').mockResolvedValue({
+      feature: rawUpdated,
+      revision: 5,
+      coordinate_space: 'dataset',
+    })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+
+    fireEvent.keyDown(window, { key: 'p', code: 'KeyP' })
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+
+    await waitFor(() => expect(patchOverlayFeature).toHaveBeenCalledOnce())
+    expect(patchOverlayFeature).toHaveBeenCalledWith(
+      'dataset-1',
+      LAYER.id,
+      'outside-42',
+      {
+        geometry: { type: 'Point', coordinates: [10, 20, 35] },
+        coordinate_space: 'dataset',
+        expected_revision: LAYER.revision,
+      },
+    )
+    expect(inferPoleBase).not.toHaveBeenCalled()
+
+    const rawCreated = feature('raw-staged-new', 10, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: rawCreated,
+      revision: 6,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    fireEvent.keyDown(window, { key: 'p', code: 'KeyP' })
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
+      geometry: { type: 'Point', coordinates: [10, 20, 35] },
+      coordinate_space: 'dataset',
+      expected_revision: LAYER.revision,
+    })
+    expect(inferPoleBase).not.toHaveBeenCalled()
+  })
+
   it('keeps create inference read-only until confirmation and atomically creates geometry and aliases', async () => {
     mockFeaturePages(POLE_LAYER)
     let resolveInference!: (result: PoleBaseInferResponse) => void
@@ -822,6 +1085,39 @@ describe('manual pole-base proposals', () => {
     fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
     expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
     expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+  })
+
+  it('keeps N as one-key direct raw-XYZ creation in PointCloud', async () => {
+    mockFeaturePages()
+    const created = feature('raw-n-point', 10, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: [{ name: 'label', type: 'C' }],
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: [{ name: 'label', type: 'C' }],
+    })
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase')
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
+      geometry: { type: 'Point', coordinates: [10, 20, 35] },
+      coordinate_space: 'dataset',
+      expected_revision: LAYER.revision,
+    })
+    expect(inferPoleBase).not.toHaveBeenCalled()
   })
 
   it('aborts and ignores an old inference when the frame or dataset changes', async () => {

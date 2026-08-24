@@ -31,6 +31,7 @@ import { api, ApiError } from '../lib/api'
 import { createDemoPointCloud } from '../lib/demo'
 import { formatCount } from '../lib/format'
 import { parseMmsp } from '../lib/mmsp'
+import { DEFAULT_USER_SETTINGS } from '../lib/userSettings'
 import {
   projectFrameLocalPointToPanorama,
   type PanoramaHoverProjection,
@@ -65,6 +66,86 @@ export interface PointCloudViewState {
   position: [number, number, number]
   target: [number, number, number]
   zoom: number
+}
+
+export interface PointCloudAnimationScheduler {
+  requestAnimationFrame: (callback: FrameRequestCallback) => number
+  cancelAnimationFrame: (handle: number) => void
+}
+
+export interface PointCloudRenderLoop {
+  wake: () => void
+  stop: () => void
+  suspend: () => void
+  resume: () => void
+  dispose: () => void
+}
+
+export function pointCloudOwnerWindow(
+  host: Pick<HTMLElement, 'ownerDocument'>,
+): Window {
+  return host.ownerDocument.defaultView ?? window
+}
+
+/**
+ * Keep one restartable RAF chain in the Window that owns the WebGL canvas.
+ * A detached viewer must not inherit the opener's throttled animation clock.
+ */
+export function createPointCloudRenderLoop(
+  scheduler: PointCloudAnimationScheduler,
+  draw: () => void,
+  canDraw: () => boolean = () => true,
+): PointCloudRenderLoop {
+  let animationFrame = 0
+  let disposed = false
+  let suspended = false
+
+  const stop = () => {
+    if (!animationFrame) return
+    scheduler.cancelAnimationFrame(animationFrame)
+    animationFrame = 0
+  }
+
+  const schedule = () => {
+    if (disposed || suspended || animationFrame || !canDraw()) return
+    animationFrame = scheduler.requestAnimationFrame(tick)
+  }
+
+  const tick = () => {
+    animationFrame = 0
+    if (disposed || suspended || !canDraw()) return
+    draw()
+    schedule()
+  }
+
+  const wake = () => {
+    if (disposed) return
+    // Replace a potentially stale callback after a browser/popup suspension.
+    stop()
+    if (suspended || !canDraw()) return
+    draw()
+    schedule()
+  }
+
+  return {
+    wake,
+    stop,
+    suspend: () => {
+      if (disposed) return
+      suspended = true
+      stop()
+    },
+    resume: () => {
+      if (disposed) return
+      suspended = false
+      wake()
+    },
+    dispose: () => {
+      if (disposed) return
+      stop()
+      disposed = true
+    },
+  }
 }
 
 export function capturePointCloudViewState(
@@ -382,9 +463,9 @@ export async function applyPointCloudPickedCoordinate(
   frameId: string,
   coordinates: [number, number, number],
   actions: {
-    applyPickedCoordinate: (
-      coordinates: [number, number, number?],
-      coordinateSpace: 'dataset',
+    applyPointCloudCoordinate: (
+      frameId: string,
+      coordinates: [number, number, number],
     ) => Promise<void>
     applyPoleSeed: (
       frameId: string,
@@ -396,7 +477,7 @@ export async function applyPointCloudPickedCoordinate(
     await actions.applyPoleSeed(frameId, coordinates)
     return
   }
-  await actions.applyPickedCoordinate(coordinates, 'dataset')
+  await actions.applyPointCloudCoordinate(frameId, coordinates)
 }
 
 export function pointCloudPickTargetAcceptsPoint(
@@ -504,6 +585,8 @@ export default function PointCloudView({
   demoMode,
   maxPointBudget = 1_000_000,
   detectionRevisionKey = '',
+  poleBaseMarkerColor = DEFAULT_USER_SETTINGS.poleBaseMarkerColor,
+  poleBaseMarkerSizeM = DEFAULT_USER_SETTINGS.poleBaseMarkerSizeM,
   onHoverPanoramaPoint,
 }: {
   datasetId: string
@@ -511,6 +594,8 @@ export default function PointCloudView({
   demoMode: boolean
   maxPointBudget?: number
   detectionRevisionKey?: string
+  poleBaseMarkerColor?: string
+  poleBaseMarkerSizeM?: number
   onHoverPanoramaPoint?: (point: PanoramaHoverProjection | null) => void
 }) {
   const overlay = useOptionalOverlayWorkspace()
@@ -570,9 +655,9 @@ export default function PointCloudView({
       _selection: { layerId: string; featureId: string | number } | null,
       _options?: { navigate?: boolean },
     ) => {},
-    applyPickedCoordinate: async (
-      _coordinates: [number, number, number?],
-      _coordinateSpace: 'dataset',
+    applyPointCloudCoordinate: async (
+      _frameId: string,
+      _coordinates: [number, number, number],
     ) => {},
     applyPoleSeed: async (
       _frameId: string,
@@ -582,7 +667,7 @@ export default function PointCloudView({
   overlayActionsRef.current = {
     pickTarget: overlay?.pickTarget ?? null,
     selectFeature: overlay?.selectFeature ?? (() => {}),
-    applyPickedCoordinate: overlay?.applyPickedCoordinate ?? (async () => {}),
+    applyPointCloudCoordinate: overlay?.applyPointCloudCoordinate ?? (async () => {}),
     applyPoleSeed: overlay?.applyPoleSeed ?? (async () => {}),
   }
 
@@ -812,12 +897,20 @@ export default function PointCloudView({
   useEffect(() => {
     const host = hostRef.current
     if (!host || !payload) return
+    const ownerDocument = host.ownerDocument
+    const ownerWindow = pointCloudOwnerWindow(host)
+    const ownerPixelRatio = () => {
+      const ratio = ownerWindow.devicePixelRatio
+      return Number.isFinite(ratio) && ratio > 0 ? Math.min(ratio, 1.75) : 1
+    }
+    const initialWidth = Math.max(1, host.clientWidth)
+    const initialHeight = Math.max(1, host.clientHeight)
 
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0x07111f)
     scene.fog = new THREE.FogExp2(0x07111f, 0.009)
 
-    const camera = new THREE.PerspectiveCamera(52, host.clientWidth / host.clientHeight, 0.05, 2000)
+    const camera = new THREE.PerspectiveCamera(52, initialWidth / initialHeight, 0.05, 2000)
     camera.up.set(0, 0, 1)
     const spanX = payload.bounds.max[0] - payload.bounds.min[0]
     const spanY = payload.bounds.max[1] - payload.bounds.min[1]
@@ -834,8 +927,8 @@ export default function PointCloudView({
       setError('이 브라우저에서 WebGL을 시작할 수 없습니다. 그래픽 가속 설정을 확인해 주세요.')
       return
     }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75))
-    renderer.setSize(host.clientWidth, host.clientHeight)
+    renderer.setPixelRatio(ownerPixelRatio())
+    renderer.setSize(initialWidth, initialHeight)
     renderer.outputColorSpace = THREE.SRGBColorSpace
     host.appendChild(renderer.domElement)
 
@@ -1092,7 +1185,14 @@ export default function PointCloudView({
       addMarker('pole-base-seed', preview.seed, 0xffc857, 0.17)
       if (preview.axis) addLine('pole-base-axis', preview.axis, 0xff6f91)
       if (preview.guide) addLine('pole-base-guide', preview.guide, 0xffc857, true)
-      if (preview.base) addMarker('pole-base-result', preview.base, 0x2bcfa8, 0.24)
+      if (preview.base) {
+        addMarker(
+          'pole-base-result',
+          preview.base,
+          new THREE.Color(poleBaseMarkerColor).getHex(),
+          poleBaseMarkerSizeM,
+        )
+      }
       scene.add(poleBaseGroup)
     }
 
@@ -1103,29 +1203,63 @@ export default function PointCloudView({
     ;(grid.material as THREE.Material).transparent = true
     scene.add(grid)
 
-    let animationFrame = 0
     const render = () => {
       controls.update()
       renderer.render(scene, camera)
-      animationFrame = requestAnimationFrame(render)
     }
-    render()
 
-    const resizeObserver = new ResizeObserver(() => {
+    let rendererDisposed = false
+    const syncViewport = () => {
+      if (rendererDisposed) return false
       const width = host.clientWidth
       const height = host.clientHeight
+      if (width <= 0 || height <= 0) return false
+      renderer.setPixelRatio(ownerPixelRatio())
       camera.aspect = width / height
       camera.updateProjectionMatrix()
       renderer.setSize(width, height)
+      return true
+    }
+    const renderLoop = createPointCloudRenderLoop(
+      ownerWindow,
+      render,
+      () => ownerDocument.visibilityState !== 'hidden',
+    )
+    const wakeRenderer = () => {
+      if (syncViewport()) renderLoop.wake()
+      else renderLoop.stop()
+    }
+
+    const ResizeObserverConstructor = (
+      ownerWindow as Window & typeof globalThis
+    ).ResizeObserver ?? ResizeObserver
+    const resizeObserver = new ResizeObserverConstructor(() => {
+      wakeRenderer()
     })
     resizeObserver.observe(host)
+    const onVisibilityChange = () => {
+      if (ownerDocument.visibilityState === 'hidden') renderLoop.stop()
+      else wakeRenderer()
+    }
+    const onPageHide = () => renderLoop.stop()
     const onContextLost = (event: Event) => {
       event.preventDefault()
-      cancelAnimationFrame(animationFrame)
-      animationFrame = 0
-      setError('그래픽 컨텍스트가 중단되었습니다. 다시 불러오기를 눌러 주세요.')
+      renderLoop.suspend()
+      setError('그래픽 컨텍스트가 중단되어 복구를 기다리고 있습니다.')
     }
+    const onContextRestored = () => {
+      syncViewport()
+      setError(null)
+      renderLoop.resume()
+    }
+    ownerWindow.addEventListener('resize', wakeRenderer)
+    ownerWindow.addEventListener('focus', wakeRenderer)
+    ownerWindow.addEventListener('pageshow', wakeRenderer)
+    ownerWindow.addEventListener('pagehide', onPageHide)
+    ownerDocument.addEventListener('visibilitychange', onVisibilityChange)
     renderer.domElement.addEventListener('webglcontextlost', onContextLost)
+    renderer.domElement.addEventListener('webglcontextrestored', onContextRestored)
+    wakeRenderer()
     const pointRaycaster = new THREE.Raycaster()
     pointRaycaster.params.Points = { threshold: 0.18 }
     const overlayRaycaster = new THREE.Raycaster()
@@ -1133,7 +1267,6 @@ export default function PointCloudView({
     const detectionRaycaster = new THREE.Raycaster()
     detectionRaycaster.params.Points = { threshold: POINT_CLOUD_YOLO_RAYCAST_THRESHOLD }
     const pointer = new THREE.Vector2()
-    const ownerWindow = host.ownerDocument.defaultView ?? window
     let pointerStart: { x: number; y: number } | null = null
     let hoverFrame = 0
     let pendingHover: { x: number; y: number } | null = null
@@ -1349,9 +1482,16 @@ export default function PointCloudView({
     renderer.domElement.addEventListener('click', onCanvasClick)
 
     return () => {
-      cancelAnimationFrame(animationFrame)
+      rendererDisposed = true
+      renderLoop.dispose()
       resizeObserver.disconnect()
+      ownerWindow.removeEventListener('resize', wakeRenderer)
+      ownerWindow.removeEventListener('focus', wakeRenderer)
+      ownerWindow.removeEventListener('pageshow', wakeRenderer)
+      ownerWindow.removeEventListener('pagehide', onPageHide)
+      ownerDocument.removeEventListener('visibilitychange', onVisibilityChange)
       renderer.domElement.removeEventListener('webglcontextlost', onContextLost)
+      renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored)
       renderer.domElement.removeEventListener('pointerdown', onPointerDown)
       renderer.domElement.removeEventListener('pointermove', onPointerMove)
       renderer.domElement.removeEventListener('pointerleave', onPointerLeave)
@@ -1406,6 +1546,8 @@ export default function PointCloudView({
     frame?.id,
     overlayPoints,
     payload,
+    poleBaseMarkerColor,
+    poleBaseMarkerSizeM,
     poleBaseProposal,
   ])
 

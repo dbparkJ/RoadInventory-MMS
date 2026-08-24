@@ -221,22 +221,24 @@ function OverlayWorkspacePanel({
   const selectedIsPoint = selected?.geometry?.type === 'Point'
   const movingSelected = overlay.pickTarget?.kind === 'move'
   const creatingPoleBase =
-    overlay.pickTarget?.kind === 'pole-base-create' &&
+    overlay.pickTarget?.kind === 'create' &&
     overlay.pickTarget.layerId === activeLayerId
   const recomputingPoleBase =
-    overlay.pickTarget?.kind === 'pole-base-move' &&
+    overlay.pickTarget?.kind === 'move' &&
     overlay.pickTarget.layerId === activeLayerId &&
     String(overlay.pickTarget.featureId) === String(selected?.id)
 
   const beginPoleBaseCreate = () => {
     if (!activeLayer || activeLayer.geometry_type !== 'Point') return
-    overlay.beginCreatePoleBase(activeLayer.id, continuousPoleBaseCreate)
+    overlay.beginStagedPointCreate(activeLayer.id, continuousPoleBaseCreate)
+    window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
     onClose()
   }
 
   const beginSelectedPoleBaseRecompute = () => {
     if (!selectedIsPoint) return
-    overlay.beginRecomputeSelectedPoleBase()
+    overlay.beginStagedSelectedPointMove()
+    window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
     onClose()
   }
 
@@ -591,7 +593,7 @@ function OverlayWorkspacePanel({
                   !overlay.poleBaseInferenceEnabled
                     ? '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.'
                     : activeLayer?.geometry_type === 'Point'
-                    ? '3D에서 지주 몸체를 클릭해 미검출 지주의 바닥점을 산출 (B)'
+                    ? '3D에서 목적 좌표 클릭 → B로 하단 산출 → 결과 확인 후 B로 저장'
                     : 'Point 레이어에서만 지주 하단을 산출할 수 있습니다.'
                 }
                 onClick={beginPoleBaseCreate}
@@ -616,10 +618,11 @@ function OverlayWorkspacePanel({
               type="button"
               className={`button compact ${overlay.pickTarget?.kind === 'create' && overlay.pickTarget.layerId === activeLayerId ? 'primary' : 'secondary'}`}
               disabled={!activeLayer || activeLayer.geometry_type !== 'Point' || overlay.creatingFeature}
-              title={activeLayer?.geometry_type === 'Point' ? '뷰에서 클릭한 위치에 신규 Point 피처 추가' : 'Point 레이어에서만 신규 위치를 클릭해 추가할 수 있습니다.'}
+              title={activeLayer?.geometry_type === 'Point' ? '3D에서 목적 좌표 클릭 → B로 하단 산출 → 결과 확인 후 B로 신규 Point 저장' : 'Point 레이어에서만 신규 위치를 클릭해 추가할 수 있습니다.'}
               onClick={() => {
                 if (!activeLayer || activeLayer.geometry_type !== 'Point') return
-                overlay.beginCreatePoint(activeLayer.id)
+                overlay.beginStagedPointCreate(activeLayer.id, false)
+                window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
                 onClose()
               }}
             >
@@ -758,7 +761,14 @@ function OverlayWorkspacePanel({
                 type="button"
                 className={`button ${movingSelected ? 'primary' : 'secondary'} overlay-pick-button`}
                 disabled={!selectedIsPoint}
-                onClick={() => overlay.setPickMode(!movingSelected)}
+                onClick={() => {
+                  if (movingSelected) overlay.setPickMode(false)
+                  else {
+                    overlay.beginStagedSelectedPointMove()
+                    window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
+                  }
+                }}
+                title="3D에서 목적 좌표 클릭 → B로 하단 산출 → 결과 확인 후 B로 저장"
               >
                 <Crosshair size={15} />
                 {movingSelected ? '위치 지정 취소' : '뷰에서 실제 포인트 선택 (P)'}
@@ -773,7 +783,7 @@ function OverlayWorkspacePanel({
                 }
                 title={
                   overlay.poleBaseInferenceEnabled
-                    ? '선택한 Point의 지주 하단을 3D 시드로 다시 산출'
+                    ? '3D에서 목적 좌표 클릭 → B로 하단 재산출 → 결과 확인 후 B로 저장'
                     : '이 서버에서는 지주 하단 자동 산출을 사용할 수 없습니다.'
                 }
                 onClick={beginSelectedPoleBaseRecompute}
@@ -781,7 +791,7 @@ function OverlayWorkspacePanel({
                 <UtilityPole size={15} /> 지주 하단 재산출
               </button>
               {movingSelected && (
-                <p className="pick-instruction">지도 위치 또는 파노라마/3D의 점군을 클릭하세요. Esc로 취소할 수 있습니다.</p>
+                <p className="pick-instruction">3D에서 목적 좌표를 클릭한 뒤 B로 산출하고, 결과 확인 후 B로 저장하세요. Esc로 취소할 수 있습니다.</p>
               )}
               {!selectedIsPoint && (
                 <p className="pick-instruction">선·면 피처는 속성만 수정할 수 있습니다. 좌표 지정은 Point 피처에서 사용하세요.</p>

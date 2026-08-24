@@ -22,17 +22,28 @@ import {
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
-import { panoramaUvToSpherePosition, type PanoramaHoverProjection } from '../lib/panoramaProjection'
+import {
+  panoramaUvToSpherePosition,
+  projectDatasetPointToPanorama,
+  type PanoramaHoverProjection,
+} from '../lib/panoramaProjection'
 import {
   directionalPanoramaTarget,
   type DirectionalPanoramaTarget,
 } from '../lib/panoramaNavigation'
-import type { PanoramaQuality } from '../lib/userSettings'
+import {
+  DEFAULT_POLE_BASE_MARKER_COLOR,
+  DEFAULT_POLE_BASE_MARKER_SIZE_M,
+  MAX_POLE_BASE_MARKER_SIZE_M,
+  MIN_POLE_BASE_MARKER_SIZE_M,
+  type PanoramaQuality,
+} from '../lib/userSettings'
 import type {
   Frame,
   PanoramaDetectionModel,
   PanoramaOverlayFeature,
   PanoramaPointPayload,
+  PanoramaProjectionMetadata,
 } from '../types'
 
 export type { PanoramaQuality } from '../lib/userSettings'
@@ -246,6 +257,73 @@ export function panoramaDetectionPointRadius(selected: boolean, depth: number): 
   return depth < 20 ? 2 : 1.5
 }
 
+export interface PanoramaPoleBasePreview extends PanoramaHoverProjection {
+  datasetPosition: readonly [number, number, number]
+  color: string
+  sizeM: number
+}
+
+function normalizedPoleBaseMarkerColor(value: string): string {
+  const normalized = value.trim().toLowerCase()
+  return /^#[0-9a-f]{6}$/.test(normalized)
+    ? normalized
+    : DEFAULT_POLE_BASE_MARKER_COLOR
+}
+
+/** Project only a proposal that belongs to the panorama currently on screen. */
+export function panoramaPoleBasePreviewProjection({
+  datasetPosition,
+  proposalFrameId,
+  currentFrameId,
+  metadata,
+  color = DEFAULT_POLE_BASE_MARKER_COLOR,
+  sizeM = DEFAULT_POLE_BASE_MARKER_SIZE_M,
+}: {
+  datasetPosition: readonly [number, number, number] | null | undefined
+  proposalFrameId: string | null | undefined
+  currentFrameId: string | null | undefined
+  metadata: PanoramaProjectionMetadata | null | undefined
+  color?: string
+  sizeM?: number
+}): PanoramaPoleBasePreview | null {
+  if (
+    !datasetPosition
+    || !proposalFrameId
+    || !currentFrameId
+    || !metadata
+    || proposalFrameId !== currentFrameId
+    || metadata.frame_id !== currentFrameId
+  ) return null
+  const projection = projectDatasetPointToPanorama(datasetPosition, metadata)
+  if (!projection) return null
+  const normalizedSize = Number.isFinite(sizeM)
+    ? Math.min(MAX_POLE_BASE_MARKER_SIZE_M, Math.max(MIN_POLE_BASE_MARKER_SIZE_M, sizeM))
+    : DEFAULT_POLE_BASE_MARKER_SIZE_M
+  return {
+    frameId: currentFrameId,
+    ...projection,
+    datasetPosition,
+    color: normalizedPoleBaseMarkerColor(color),
+    sizeM: normalizedSize,
+  }
+}
+
+/** Convert a physical marker radius to equirectangular texture pixels. */
+export function panoramaPoleBaseMarkerRadiusPx(
+  sizeM: number,
+  depth: number,
+  textureWidth = 4096,
+): number {
+  const normalizedSize = Number.isFinite(sizeM)
+    ? Math.min(MAX_POLE_BASE_MARKER_SIZE_M, Math.max(MIN_POLE_BASE_MARKER_SIZE_M, sizeM))
+    : DEFAULT_POLE_BASE_MARKER_SIZE_M
+  if (!Number.isFinite(depth) || depth <= 0 || !Number.isFinite(textureWidth) || textureWidth <= 0) {
+    return 3
+  }
+  const angularRadius = Math.atan2(normalizedSize, depth)
+  return Math.min(36, Math.max(3, angularRadius * textureWidth / (Math.PI * 2)))
+}
+
 export function panoramaDetectionStrokeWidth(selected: boolean): number {
   return selected ? 3 : 1.5
 }
@@ -440,6 +518,7 @@ function createPanoramaOverlayTexture(
   ownerDocument: Document,
   points: RenderPanoramaOverlayPoint[],
   detectionBoxes: RenderPanoramaDetectionBox[],
+  poleBasePreview: PanoramaPoleBasePreview | null = null,
 ): THREE.CanvasTexture {
   // A 4K overlay texture keeps compact labels legible when the sphere is
   // enlarged, while the equirectangular seam remains repeat-wrapped.
@@ -488,6 +567,31 @@ function createPanoramaOverlayTexture(
     context.strokeStyle = '#ffffff'
     context.stroke()
   })
+
+  if (poleBasePreview) {
+    const x = (((poleBasePreview.u % 1) + 1) % 1) * width
+    const y = Math.min(1, Math.max(0, poleBasePreview.v)) * height
+    const radius = panoramaPoleBaseMarkerRadiusPx(
+      poleBasePreview.sizeM,
+      poleBasePreview.depth,
+      width,
+    )
+    ;[-width, 0, width].forEach((shift) => {
+      const shiftedX = x + shift
+      if (shiftedX + radius + 3 < 0 || shiftedX - radius - 3 > width) return
+      context.beginPath()
+      context.arc(shiftedX, y, radius + 2.5, 0, Math.PI * 2)
+      context.fillStyle = 'rgba(7, 17, 31, 0.92)'
+      context.fill()
+      context.beginPath()
+      context.arc(shiftedX, y, radius, 0, Math.PI * 2)
+      context.fillStyle = poleBasePreview.color
+      context.fill()
+      context.lineWidth = 1.5
+      context.strokeStyle = '#ffffff'
+      context.stroke()
+    })
+  }
 
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
@@ -813,6 +917,8 @@ export default function PanoramaView({
   pointOverlayEnabled: controlledPointOverlayEnabled,
   panoramaOpacity: controlledPanoramaOpacity,
   maxOverlayDistanceM = 45,
+  poleBaseMarkerColor: requestedPoleBaseMarkerColor = DEFAULT_POLE_BASE_MARKER_COLOR,
+  poleBaseMarkerSizeM: requestedPoleBaseMarkerSizeM = DEFAULT_POLE_BASE_MARKER_SIZE_M,
   linkedHoverPoint = null,
   onPointOverlayEnabledChange,
   onPanoramaOpacityChange,
@@ -833,6 +939,8 @@ export default function PanoramaView({
   pointOverlayEnabled?: boolean
   panoramaOpacity?: number
   maxOverlayDistanceM?: number
+  poleBaseMarkerColor?: string
+  poleBaseMarkerSizeM?: number
   linkedHoverPoint?: PanoramaHoverProjection | null
   onPointOverlayEnabledChange?: (enabled: boolean) => void
   onPanoramaOpacityChange?: (opacity: number) => void
@@ -886,12 +994,56 @@ export default function PanoramaView({
   const [sceneNavigationFeedback, setSceneNavigationFeedback] = useState<string | null>(null)
   const [frameAddress, setFrameAddress] = useState<string | null>(null)
   const [addressLoading, setAddressLoading] = useState(false)
+  const [poleBaseProjectionMetadata, setPoleBaseProjectionMetadata] = useState<{
+    datasetId: string
+    metadata: PanoramaProjectionMetadata
+  } | null>(null)
   const runtimeRef = useRef<PanoramaRuntime | null>(null)
   const panoramaTextureRef = useRef<THREE.Texture | null>(null)
   const lastMediaFrameKeyRef = useRef<string | null>(null)
   const quality = controlledQuality ?? localQuality
   const pointOverlayEnabled = controlledPointOverlayEnabled ?? localPointOverlayEnabled
   const panoramaOpacity = controlledPanoramaOpacity ?? localPanoramaOpacity
+  const poleBaseMarkerColor = normalizedPoleBaseMarkerColor(requestedPoleBaseMarkerColor)
+  const poleBaseMarkerSizeM = Number.isFinite(requestedPoleBaseMarkerSizeM)
+    ? Math.min(
+        MAX_POLE_BASE_MARKER_SIZE_M,
+        Math.max(MIN_POLE_BASE_MARKER_SIZE_M, requestedPoleBaseMarkerSizeM),
+      )
+    : DEFAULT_POLE_BASE_MARKER_SIZE_M
+  const poleBaseProposal = overlay?.poleBaseProposal
+  const readyPoleBaseFrameId =
+    poleBaseProposal?.status === 'ready'
+    && poleBaseProposal.result.status !== 'failed'
+    && poleBaseProposal.result.base_position
+      ? poleBaseProposal.frameId
+      : null
+  const readyPoleBasePosition =
+    poleBaseProposal?.status === 'ready'
+    && poleBaseProposal.result.status !== 'failed'
+      ? poleBaseProposal.result.base_position
+      : null
+  const activePoleBaseMetadata = poleBaseProjectionMetadata?.datasetId === datasetId
+    ? poleBaseProjectionMetadata.metadata
+    : null
+  const poleBasePreview = useMemo(
+    () => panoramaPoleBasePreviewProjection({
+      datasetPosition: readyPoleBasePosition,
+      proposalFrameId: readyPoleBaseFrameId,
+      currentFrameId: frame?.id,
+      metadata: activePoleBaseMetadata,
+      color: poleBaseMarkerColor,
+      sizeM: poleBaseMarkerSizeM,
+    }),
+    [
+      activePoleBaseMetadata,
+      frame?.id,
+      poleBaseMarkerColor,
+      poleBaseMarkerSizeM,
+      readyPoleBaseFrameId,
+      readyPoleBasePosition,
+    ],
+  )
   const pointPayloadRequired = pointOverlayEnabled || Boolean(overlay?.pickMode)
   const visibleDetectionBoxes = useMemo(
     () => detectionBoxes.filter((box) => {
@@ -903,6 +1055,7 @@ export default function PanoramaView({
   const hasVisualOverlay = pointOverlayEnabled
     || overlayProjection.length > 0
     || visibleDetectionBoxes.length > 0
+    || Boolean(poleBasePreview)
   // SHP markers are already composited with a transparent texture. Only the
   // dense point-cloud overlay may dim the camera image at the user's request.
   const effectivePanoramaOpacity = pointOverlayEnabled ? panoramaOpacity : 1
@@ -992,6 +1145,23 @@ export default function PanoramaView({
       host.removeEventListener('wheel', handleWheel, PANORAMA_WHEEL_LISTENER_OPTIONS)
     }
   }, [])
+
+  useEffect(() => {
+    setPoleBaseProjectionMetadata(null)
+    if (!frame || demoMode || readyPoleBaseFrameId !== frame.id) return
+    const controller = new AbortController()
+    const expectedFrameId = frame.id
+    void api.panoramaProjectionMetadata(datasetId, expectedFrameId, controller.signal)
+      .then((metadata) => {
+        if (controller.signal.aborted || metadata.frame_id !== expectedFrameId) return
+        setPoleBaseProjectionMetadata({ datasetId, metadata })
+      })
+      .catch(() => {
+        // The proposal remains available in the 3D viewer when panorama
+        // calibration metadata is unavailable; no approximate projection is drawn.
+      })
+    return () => controller.abort()
+  }, [datasetId, demoMode, frame?.id, readyPoleBaseFrameId])
 
   useEffect(() => {
     if (!frame?.coordinate || demoMode) {
@@ -1466,7 +1636,7 @@ export default function PanoramaView({
     if (
       !runtime
       || !host
-      || (!renderedOverlayProjection.length && !renderedDetectionBoxes.length)
+      || (!renderedOverlayProjection.length && !renderedDetectionBoxes.length && !poleBasePreview)
     ) return
     const geometry = new THREE.SphereGeometry(9.92, 64, 40)
     geometry.scale(-1, 1, 1)
@@ -1474,6 +1644,7 @@ export default function PanoramaView({
       host.ownerDocument,
       renderedOverlayProjection,
       renderedDetectionBoxes,
+      poleBasePreview,
     )
     const material = new THREE.MeshBasicMaterial({
       map: texture,
@@ -1492,7 +1663,7 @@ export default function PanoramaView({
       material.dispose()
       texture.dispose()
     }
-  }, [renderedDetectionBoxes, renderedOverlayProjection])
+  }, [poleBasePreview, renderedDetectionBoxes, renderedOverlayProjection])
 
   useEffect(() => {
     if (!frame || !pointPayloadRequired) {
@@ -1843,6 +2014,9 @@ export default function PanoramaView({
       data-shp-point-count={renderedOverlayProjection.length}
       data-yolo-box-count={renderedDetectionBoxes.length}
       data-panorama-opacity={effectivePanoramaOpacity}
+      data-pole-base-preview={String(Boolean(poleBasePreview))}
+      data-pole-base-marker-color={poleBaseMarkerColor}
+      data-pole-base-marker-size-m={poleBaseMarkerSizeM}
       onPointerDown={(event) => {
         if (
           !source
@@ -2083,6 +2257,11 @@ export default function PanoramaView({
         {renderedOverlayProjection.length > 0 && (
           <span title="현재 파노라마에 투영된 SHP 포인트">
             <MapPin size={14} /> SHP {renderedOverlayProjection.length.toLocaleString('ko-KR')}
+          </span>
+        )}
+        {poleBasePreview && (
+          <span title="확정 전 지주 바닥점">
+            <MapPin size={14} /> 임시 바닥점
           </span>
         )}
         {detectionModels.length > 0 && (

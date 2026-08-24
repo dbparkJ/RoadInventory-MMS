@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as THREE from 'three'
 import { api } from '../lib/api'
-import type { Frame } from '../types'
+import type { Frame, PanoramaProjectionMetadata } from '../types'
 import PanoramaView, {
   deduplicatePanoramaDetectionBoxes,
   nearestPanoramaPointIndex,
@@ -15,6 +15,8 @@ import PanoramaView, {
   panoramaForwardYaw,
   panoramaFovAfterWheel,
   panoramaOverlayAtUv,
+  panoramaPoleBaseMarkerRadiusPx,
+  panoramaPoleBasePreviewProjection,
   panoramaRayYaw,
   panoramaRequestWidth,
   panoramaProgressiveWidths,
@@ -39,6 +41,12 @@ const threeSpies = vi.hoisted(() => ({
     succeed: () => void
     fail: () => void
   }>,
+}))
+
+const overlayWorkspaceMock = vi.hoisted(() => ({ current: null as unknown }))
+
+vi.mock('../components/OverlayContext', () => ({
+  useOptionalOverlayWorkspace: () => overlayWorkspaceMock.current,
 }))
 
 vi.mock('three', async (importOriginal) => {
@@ -180,6 +188,17 @@ vi.mock('../lib/api', () => ({
   api: {
     panorama: vi.fn(() => new Promise(() => undefined)),
     panoramaPoints: vi.fn(() => new Promise(() => undefined)),
+    panoramaProjectionMetadata: vi.fn(() => Promise.resolve({
+      frame_id: 'frame-12',
+      coordinate_space: 'dataset',
+      projection: 'normalized_equirectangular',
+      origin: [0, 0, 0],
+      forward: [1, 0, 0],
+      right: [0, 1, 0],
+      up: [0, 0, 1],
+      yaw_offset_deg: 0,
+      pitch_offset_deg: 0,
+    })),
     frameDetections: vi.fn(() => Promise.resolve({
       dataset_id: 'dataset-1',
       frame_id: 'frame-12',
@@ -220,6 +239,18 @@ const NEXT_FRAME: Frame = {
   timestamp: '2026-08-03T09:30:01.000Z',
 }
 
+const PROJECTION_METADATA: PanoramaProjectionMetadata = {
+  frame_id: FRAME.id,
+  coordinate_space: 'dataset',
+  projection: 'normalized_equirectangular',
+  origin: [0, 0, 0],
+  forward: [1, 0, 0],
+  right: [0, 1, 0],
+  up: [0, 0, 1],
+  yaw_offset_deg: 0,
+  pitch_offset_deg: 0,
+}
+
 type PanoramaResult =
   | { kind: 'url'; value: string }
   | { kind: 'blob'; value: Blob }
@@ -250,6 +281,7 @@ function mmsoPayload(): ArrayBuffer {
 }
 
 beforeEach(() => {
+  overlayWorkspaceMock.current = null
   threeSpies.rendererConstructed.mockClear()
   threeSpies.rendererDisposed.mockClear()
   threeSpies.textureLoads.mockClear()
@@ -259,6 +291,7 @@ beforeEach(() => {
   threeSpies.pendingTextureLoads.length = 0
   vi.mocked(api.panorama).mockReset().mockImplementation(() => new Promise(() => undefined))
   vi.mocked(api.panoramaPoints).mockReset().mockImplementation(() => new Promise(() => undefined))
+  vi.mocked(api.panoramaProjectionMetadata).mockReset().mockResolvedValue(PROJECTION_METADATA)
   vi.mocked(api.frameDetections).mockReset().mockResolvedValue({
     dataset_id: 'dataset-1',
     frame_id: 'frame-12',
@@ -342,6 +375,49 @@ describe('panoramaForwardYaw', () => {
     expect(panoramaFovAfterWheel(28, -1)).toBe(28)
     expect(panoramaFovAfterWheel(95, 1)).toBe(95)
     expect(panoramaFovAfterWheel(54, 0)).toBe(54)
+  })
+})
+
+describe('panorama pole-base preview projection', () => {
+  it('projects the dataset base with the current frame calibration', () => {
+    expect(panoramaPoleBasePreviewProjection({
+      datasetPosition: [10, 0, 0],
+      proposalFrameId: FRAME.id,
+      currentFrameId: FRAME.id,
+      metadata: PROJECTION_METADATA,
+      color: '#FF00AA',
+      sizeM: 0.08,
+    })).toMatchObject({
+      frameId: FRAME.id,
+      u: 0.5,
+      v: 0.5,
+      depth: 10,
+      color: '#ff00aa',
+      sizeM: 0.08,
+    })
+  })
+
+  it('rejects proposal and calibration frame mismatches', () => {
+    expect(panoramaPoleBasePreviewProjection({
+      datasetPosition: [10, 0, 0],
+      proposalFrameId: NEXT_FRAME.id,
+      currentFrameId: FRAME.id,
+      metadata: PROJECTION_METADATA,
+    })).toBeNull()
+    expect(panoramaPoleBasePreviewProjection({
+      datasetPosition: [10, 0, 0],
+      proposalFrameId: FRAME.id,
+      currentFrameId: FRAME.id,
+      metadata: { ...PROJECTION_METADATA, frame_id: NEXT_FRAME.id },
+    })).toBeNull()
+  })
+
+  it('scales physical marker radius by distance and clamps tiny screen markers', () => {
+    expect(panoramaPoleBaseMarkerRadiusPx(0.08, 10)).toBeCloseTo(5.21, 1)
+    expect(panoramaPoleBaseMarkerRadiusPx(0.16, 10)).toBeGreaterThan(
+      panoramaPoleBaseMarkerRadiusPx(0.08, 10),
+    )
+    expect(panoramaPoleBaseMarkerRadiusPx(0.08, 1_000)).toBe(3)
   })
 })
 
@@ -646,6 +722,53 @@ describe('panoramaDetectionBox', () => {
 })
 
 describe('PanoramaView frame navigation', () => {
+  it('shows a ready pole-base proposal only on its calibrated source frame', async () => {
+    overlayWorkspaceMock.current = {
+      poleBaseProposal: {
+        status: 'ready',
+        target: { kind: 'pole-base-create', layerId: 'poles', continuous: false },
+        frameId: FRAME.id,
+        seed: [10, 0, 2],
+        result: {
+          status: 'auto',
+          base_position: [10, 0, 0],
+        },
+      },
+    }
+    const { rerender } = render(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={FRAME}
+        demoMode={false}
+        poleBaseMarkerColor="#ff00aa"
+        poleBaseMarkerSizeM={0.12}
+      />,
+    )
+    const stage = screen.getByRole('region', { name: '파노라마 뷰어' })
+
+    await waitFor(() => expect(stage).toHaveAttribute('data-pole-base-preview', 'true'))
+    expect(api.panoramaProjectionMetadata).toHaveBeenCalledWith(
+      'dataset-1',
+      FRAME.id,
+      expect.any(AbortSignal),
+    )
+    expect(stage).toHaveAttribute('data-pole-base-marker-color', '#ff00aa')
+    expect(stage).toHaveAttribute('data-pole-base-marker-size-m', '0.12')
+    expect(screen.getByText('임시 바닥점')).toBeInTheDocument()
+
+    rerender(
+      <PanoramaView
+        datasetId="dataset-1"
+        frame={NEXT_FRAME}
+        demoMode={false}
+        poleBaseMarkerColor="#ff00aa"
+        poleBaseMarkerSizeM={0.12}
+      />,
+    )
+    expect(stage).toHaveAttribute('data-pole-base-preview', 'false')
+    expect(screen.queryByText('임시 바닥점')).not.toBeInTheDocument()
+  })
+
   it('removes the directional side controls and bottom direction action', () => {
     render(
       <PanoramaView

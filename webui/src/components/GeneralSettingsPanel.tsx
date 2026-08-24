@@ -1,6 +1,11 @@
-import { Image, Map, RotateCcw, ScanLine, Settings, View, X } from 'lucide-react'
+import { Image, Map, MapPin, RotateCcw, ScanLine, Settings, View, X } from 'lucide-react'
 import type { ReactNode } from 'react'
-import type { UserSettings, UserSettingsPatch } from '../lib/userSettings'
+import {
+  MAX_POLE_BASE_MARKER_SIZE_M,
+  MIN_POLE_BASE_MARKER_SIZE_M,
+  type UserSettings,
+  type UserSettingsPatch,
+} from '../lib/userSettings'
 import './GeneralSettingsPanel.css'
 
 export function GeneralSettingsPanel({
@@ -157,6 +162,49 @@ export function GeneralSettingsPanel({
               }
             />
             <small>현재 프레임에서 이 거리보다 먼 검출점과 클래스 표시는 숨깁니다.</small>
+          </label>
+        </section>
+
+        <section className="general-settings-section" aria-labelledby="pole-base-settings-title">
+          <div className="general-settings-section-title">
+            <MapPin size={17} aria-hidden="true" />
+            <span>
+              <h3 id="pole-base-settings-title">지주 바닥점</h3>
+              <small>3D와 파노라마에서 지주 바닥점 마커를 표시하는 방식을 정합니다.</small>
+            </span>
+          </div>
+
+          <label className="general-settings-field">
+            <span>
+              <strong>마커 색상</strong>
+              <small>새 바닥점과 수정 중인 임시 바닥점에 함께 적용됩니다.</small>
+            </span>
+            <span className="general-settings-color">
+              <input
+                type="color"
+                aria-label="지주 바닥점 마커 색상"
+                value={settings.poleBaseMarkerColor}
+                onChange={(event) => onChange({ poleBaseMarkerColor: event.target.value })}
+              />
+              <code>{settings.poleBaseMarkerColor.toUpperCase()}</code>
+            </span>
+          </label>
+
+          <label className="general-settings-slider">
+            <span>
+              <strong>마커 크기</strong>
+              <output>{Math.round(settings.poleBaseMarkerSizeM * 100)} cm</output>
+            </span>
+            <input
+              type="range"
+              aria-label="지주 바닥점 마커 크기"
+              min={MIN_POLE_BASE_MARKER_SIZE_M}
+              max={MAX_POLE_BASE_MARKER_SIZE_M}
+              step={0.01}
+              value={settings.poleBaseMarkerSizeM}
+              onChange={(event) => onChange({ poleBaseMarkerSizeM: Number(event.target.value) })}
+            />
+            <small>데이터셋 좌표계 기준의 마커 반지름입니다.</small>
           </label>
         </section>
 

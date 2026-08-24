@@ -86,6 +86,8 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
     poleBaseProposal: { status: 'idle' as const },
     setPickMode: vi.fn(),
     beginCreatePoint: vi.fn(),
+    beginStagedPointCreate: vi.fn(),
+    beginStagedSelectedPointMove: vi.fn(),
     beginCreatePoleBase: vi.fn(),
     beginRecomputeSelectedPoleBase: vi.fn(),
     applyPoleSeed: vi.fn().mockResolvedValue(undefined),
@@ -102,6 +104,7 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
     selectFeature: vi.fn(),
     updateSelected: vi.fn().mockResolvedValue(undefined),
     applyPickedCoordinate: vi.fn().mockResolvedValue(undefined),
+    applyPointCloudCoordinate: vi.fn().mockResolvedValue(undefined),
     copySelectedLocation: vi.fn().mockResolvedValue(undefined),
     deleteSelected: vi.fn().mockResolvedValue(undefined),
     deleteField: vi.fn().mockResolvedValue(undefined),
@@ -303,14 +306,15 @@ describe('OverlayPanel feature editing', () => {
     render(<OverlayAttributePanel onClose={onClose} />)
 
     fireEvent.click(screen.getByRole('button', { name: /신규 포인트/ }))
-    expect(overlay.beginCreatePoint).toHaveBeenCalledWith(LAYER.id)
+    expect(overlay.beginStagedPointCreate).toHaveBeenCalledWith(LAYER.id, false)
+    expect(overlay.beginCreatePoint).not.toHaveBeenCalled()
     expect(onClose).toHaveBeenCalledOnce()
 
     fireEvent.click(screen.getByRole('button', { name: /위치만 복사/ }))
     await waitFor(() => expect(overlay.copySelectedLocation).toHaveBeenCalledOnce())
   })
 
-  it('starts missing-pole creation with a default-on continuous toggle', () => {
+  it('starts missing-pole creation as a staged Point workflow with a default-on continuous toggle', () => {
     const overlay = overlayWorkspace(pointFeature())
     const onClose = vi.fn()
     useOverlayWorkspace.mockReturnValue(overlay)
@@ -319,11 +323,12 @@ describe('OverlayPanel feature editing', () => {
     expect(continuous).toBeChecked()
 
     fireEvent.click(screen.getByRole('button', { name: /미검출 지주 추가/ }))
-    expect(overlay.beginCreatePoleBase).toHaveBeenLastCalledWith(LAYER.id, true)
+    expect(overlay.beginStagedPointCreate).toHaveBeenLastCalledWith(LAYER.id, true)
 
     fireEvent.click(continuous)
     fireEvent.click(screen.getByRole('button', { name: /미검출 지주 추가/ }))
-    expect(overlay.beginCreatePoleBase).toHaveBeenLastCalledWith(LAYER.id, false)
+    expect(overlay.beginStagedPointCreate).toHaveBeenLastCalledWith(LAYER.id, false)
+    expect(overlay.beginCreatePoleBase).not.toHaveBeenCalled()
     expect(onClose).toHaveBeenCalledTimes(2)
   })
 
@@ -335,8 +340,20 @@ describe('OverlayPanel feature editing', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /지주 하단 재산출/ }))
 
-    expect(overlay.beginRecomputeSelectedPoleBase).toHaveBeenCalledOnce()
+    expect(overlay.beginStagedSelectedPointMove).toHaveBeenCalledOnce()
+    expect(overlay.beginRecomputeSelectedPoleBase).not.toHaveBeenCalled()
     expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('starts the regular selected-point button through the staged B workflow', () => {
+    const overlay = overlayWorkspace(pointFeature())
+    useOverlayWorkspace.mockReturnValue(overlay)
+    render(<OverlayAttributePanel onClose={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /뷰에서 실제 포인트 선택/ }))
+
+    expect(overlay.beginStagedSelectedPointMove).toHaveBeenCalledOnce()
+    expect(overlay.setPickMode).not.toHaveBeenCalled()
   })
 
   it('disables pole-base tools for a non-Point layer or feature', () => {

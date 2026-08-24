@@ -28,6 +28,13 @@ describe('GeneralSettingsPanel', () => {
     fireEvent.change(screen.getByRole('combobox', { name: '파노라마 기본 화질' }), {
       target: { value: 'ultra' },
     })
+    expect(screen.getByText('8 cm')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('지주 바닥점 마커 색상'), {
+      target: { value: '#ff00aa' },
+    })
+    fireEvent.change(screen.getByRole('slider', { name: '지주 바닥점 마커 크기' }), {
+      target: { value: '0.12' },
+    })
     fireEvent.click(screen.getByRole('checkbox', { name: '지도에 모든 트랙 표시' }))
     fireEvent.click(screen.getByRole('button', { name: '기본 설정으로 복원' }))
 
@@ -35,7 +42,9 @@ describe('GeneralSettingsPanel', () => {
     expect(onChange).toHaveBeenNthCalledWith(2, { panoramaPointOverlayEnabled: false })
     expect(onChange).toHaveBeenNthCalledWith(3, { panoramaImageOpacity: 0.35 })
     expect(onChange).toHaveBeenNthCalledWith(4, { panoramaDefaultQuality: 'ultra' })
-    expect(onChange).toHaveBeenNthCalledWith(5, { showAllMapTracks: true })
+    expect(onChange).toHaveBeenNthCalledWith(5, { poleBaseMarkerColor: '#ff00aa' })
+    expect(onChange).toHaveBeenNthCalledWith(6, { poleBaseMarkerSizeM: 0.12 })
+    expect(onChange).toHaveBeenNthCalledWith(7, { showAllMapTracks: true })
     expect(onReset).toHaveBeenCalledTimes(1)
   })
 
