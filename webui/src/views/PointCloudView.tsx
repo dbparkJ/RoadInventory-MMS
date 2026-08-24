@@ -7,12 +7,14 @@ import {
   Crosshair,
   LoaderCircle,
   MapPin,
+  Palette,
   RefreshCcw,
+  Ruler,
   Rotate3D,
   Scan,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import {
@@ -23,10 +25,12 @@ import {
 import {
   POLE_BASE_REASON_MESSAGES,
   poleBaseReasonMessage,
+  poleBaseTemplateValidationBlocksSave,
   useOptionalOverlayWorkspace,
   type OverlayPickTarget,
   type PoleBaseProposalState,
 } from '../components/OverlayContext'
+import { useOptionalManualObjectWorkspace } from '../components/ManualObjectContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPointCloud } from '../lib/demo'
 import { formatCount } from '../lib/format'
@@ -61,6 +65,99 @@ export function pointCloudBudgetsForMaximum(maximum: number) {
 }
 const POINT_PREVIEW_DENSE_RADIUS_M = 15
 const POINT_PREVIEW_MAX_RADIUS_M = 25
+
+export type PointCloudColorMode = 'rgb' | 'intensity' | 'classification' | 'height'
+
+export interface PointCloudDisplayOptions {
+  clipRadiusM: number | null
+  clipCenter?: [number, number]
+  zRange?: [number, number] | null
+  proposalPosition?: [number, number, number] | null
+  isolateProposal?: boolean
+  proposalRadiusM?: number
+}
+
+export function pointCloudMeasurement(
+  first: [number, number, number],
+  second: [number, number, number],
+): { distance3d: number; distanceXy: number; vertical: number } {
+  const dx = second[0] - first[0]
+  const dy = second[1] - first[1]
+  const dz = second[2] - first[2]
+  return {
+    distance3d: Math.hypot(dx, dy, dz),
+    distanceXy: Math.hypot(dx, dy),
+    vertical: Math.abs(dz),
+  }
+}
+
+export function buildPointCloudDisplayPayload(
+  payload: PointCloudPayload,
+  options: PointCloudDisplayOptions,
+): PointCloudPayload {
+  const filtering =
+    options.clipRadiusM !== null ||
+    options.zRange !== null && options.zRange !== undefined ||
+    Boolean(options.isolateProposal && options.proposalPosition)
+  if (!filtering) return payload
+
+  const positions = new Float32Array(payload.positions.length)
+  const colors = payload.colors ? new Uint8Array(payload.pointCount * 3) : undefined
+  const clipCenter = options.clipCenter ?? (
+    options.proposalPosition ? [options.proposalPosition[0], options.proposalPosition[1]] : [0, 0]
+  )
+  const proposalRadius = options.proposalRadiusM ?? 3
+  const bounds = {
+    min: [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY] as [number, number, number],
+    max: [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY] as [number, number, number],
+  }
+  let count = 0
+  for (let index = 0; index < payload.pointCount; index += 1) {
+    const sourceOffset = index * 3
+    const x = payload.positions[sourceOffset]
+    const y = payload.positions[sourceOffset + 1]
+    const z = payload.positions[sourceOffset + 2]
+    if (options.clipRadiusM !== null && Math.hypot(x - clipCenter[0], y - clipCenter[1]) > options.clipRadiusM) continue
+    if (options.zRange && (z < options.zRange[0] || z > options.zRange[1])) continue
+    if (
+      options.isolateProposal &&
+      options.proposalPosition &&
+      Math.hypot(
+        x - options.proposalPosition[0],
+        y - options.proposalPosition[1],
+        z - options.proposalPosition[2],
+      ) > proposalRadius
+    ) continue
+
+    const targetOffset = count * 3
+    positions[targetOffset] = x
+    positions[targetOffset + 1] = y
+    positions[targetOffset + 2] = z
+    bounds.min[0] = Math.min(bounds.min[0], x)
+    bounds.min[1] = Math.min(bounds.min[1], y)
+    bounds.min[2] = Math.min(bounds.min[2], z)
+    bounds.max[0] = Math.max(bounds.max[0], x)
+    bounds.max[1] = Math.max(bounds.max[1], y)
+    bounds.max[2] = Math.max(bounds.max[2], z)
+
+    if (colors && payload.colors) {
+      colors[targetOffset] = payload.colors[sourceOffset]
+      colors[targetOffset + 1] = payload.colors[sourceOffset + 1]
+      colors[targetOffset + 2] = payload.colors[sourceOffset + 2]
+    }
+    count += 1
+  }
+  if (count === 0) {
+    bounds.min = [0, 0, 0]
+    bounds.max = [0, 0, 0]
+  }
+  return {
+    positions: positions.slice(0, count * 3),
+    colors: colors ? colors.slice(0, count * 3) : null,
+    bounds,
+    pointCount: count,
+  }
+}
 
 export interface PointCloudViewState {
   position: [number, number, number]
@@ -599,9 +696,13 @@ export default function PointCloudView({
   onHoverPanoramaPoint?: (point: PanoramaHoverProjection | null) => void
 }) {
   const overlay = useOptionalOverlayWorkspace()
+  const manualObject = useOptionalManualObjectWorkspace()
   const hostRef = useRef<HTMLDivElement>(null)
   const pointMaterialRef = useRef<THREE.PointsMaterial | null>(null)
+  const renderSceneRef = useRef<THREE.Scene | null>(null)
+  const wakeRenderSceneRef = useRef<(() => void) | null>(null)
   const viewStateRef = useRef<PointCloudViewState | null>(null)
+  const viewResetRequestedRef = useRef(false)
   const viewScopeRef = useRef(`${demoMode}:${datasetId}`)
   const pointSizeRef = useRef(1.4)
   const projectionMetadataRef = useRef<PanoramaProjectionMetadata | null>(null)
@@ -629,13 +730,131 @@ export default function PointCloudView({
   const [overlayError, setOverlayError] = useState<string | null>(null)
   const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
   const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
+  const [colorMode, setColorMode] = useState<PointCloudColorMode>('rgb')
+  const [clipEnabled, setClipEnabled] = useState(false)
+  const [clipRadiusM, setClipRadiusM] = useState(8)
+  const [clipRadiusDraftM, setClipRadiusDraftM] = useState(8)
+  const [zSliceEnabled, setZSliceEnabled] = useState(false)
+  const [zMinimum, setZMinimum] = useState(-5)
+  const [zMaximum, setZMaximum] = useState(10)
+  const [zMinimumDraft, setZMinimumDraft] = useState(-5)
+  const [zMaximumDraft, setZMaximumDraft] = useState(10)
+  const [isolateProposal, setIsolateProposal] = useState(false)
+  const [measureMode, setMeasureMode] = useState(false)
+  const [measurementPoints, setMeasurementPoints] = useState<Array<[number, number, number]>>([])
+  const [renderSceneGeneration, setRenderSceneGeneration] = useState(0)
+  const [toolSettingsDatasetId, setToolSettingsDatasetId] = useState('')
+  const measureModeRef = useRef(measureMode)
+  measureModeRef.current = measureMode
 
   useEffect(() => {
+    setToolSettingsDatasetId('')
     setBudget((current) => Math.min(current, maximumAvailableBudget))
   }, [maximumAvailableBudget])
+  useEffect(() => {
+    setColorMode('rgb')
+    setClipEnabled(false)
+    setClipRadiusM(8)
+    setClipRadiusDraftM(8)
+    setZSliceEnabled(false)
+    setZMinimum(-5)
+    setZMaximum(10)
+    setZMinimumDraft(-5)
+    setZMaximumDraft(10)
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(`mms.pointcloud-tools:${datasetId}`) ?? '{}') as Record<string, unknown>
+      if (['rgb', 'intensity', 'classification', 'height'].includes(String(stored.colorMode))) {
+        setColorMode(stored.colorMode as PointCloudColorMode)
+      }
+      if (typeof stored.clipEnabled === 'boolean') setClipEnabled(stored.clipEnabled)
+      if (Number.isFinite(stored.clipRadiusM)) {
+        const radius = Math.min(25, Math.max(1, Number(stored.clipRadiusM)))
+        setClipRadiusM(radius)
+        setClipRadiusDraftM(radius)
+      }
+      if (typeof stored.zSliceEnabled === 'boolean') setZSliceEnabled(stored.zSliceEnabled)
+      if (Number.isFinite(stored.zMinimum)) {
+        setZMinimum(Number(stored.zMinimum))
+        setZMinimumDraft(Number(stored.zMinimum))
+      }
+      if (Number.isFinite(stored.zMaximum)) {
+        setZMaximum(Number(stored.zMaximum))
+        setZMaximumDraft(Number(stored.zMaximum))
+      }
+    } catch {
+      // Local viewer settings are optional.
+    }
+    setIsolateProposal(false)
+    setMeasureMode(false)
+    setMeasurementPoints([])
+    setToolSettingsDatasetId(datasetId)
+  }, [datasetId])
+  useEffect(() => {
+    setMeasureMode(false)
+    setMeasurementPoints([])
+  }, [frame?.id])
+  useEffect(() => {
+    if (toolSettingsDatasetId !== datasetId) return
+    try {
+      window.localStorage.setItem(`mms.pointcloud-tools:${datasetId}`, JSON.stringify({
+        colorMode,
+        clipEnabled,
+        clipRadiusM,
+        zSliceEnabled,
+        zMinimum,
+        zMaximum,
+      }))
+    } catch {
+      // Local viewer settings are optional.
+    }
+  }, [clipEnabled, clipRadiusM, colorMode, datasetId, toolSettingsDatasetId, zMaximum, zMinimum, zSliceEnabled])
+  useEffect(() => {
+    if (!payload) return
+    if (!zSliceEnabled) {
+      setZMinimum(payload.bounds.min[2])
+      setZMaximum(payload.bounds.max[2])
+      setZMinimumDraft(payload.bounds.min[2])
+      setZMaximumDraft(payload.bounds.max[2])
+    }
+  }, [payload, zSliceEnabled])
   const overlayHoverRef = useRef<OverlayHoverState | null>(null)
   const selectedOverlay = overlay?.selected
   const poleBaseProposal = overlay?.poleBaseProposal
+  const manualProposalLocalPosition = useMemo(
+    () => datasetPointToFrameLocal(
+      manualObject?.proposalPosition ?? null,
+      frame?.dataset_position,
+    ),
+    [frame?.dataset_position, manualObject?.proposalPosition],
+  )
+  const selectedOverlayLocalPosition = useMemo(() => {
+    const feature = overlay?.selectedDatasetFeature
+    if (feature?.geometry?.type !== 'Point') return null
+    return datasetPointToFrameLocal(feature.geometry.coordinates, frame?.dataset_position)
+  }, [frame?.dataset_position, overlay?.selectedDatasetFeature])
+  const displayOptions = useMemo<PointCloudDisplayOptions>(() => ({
+      clipRadiusM: clipEnabled ? clipRadiusM : null,
+      clipCenter: selectedOverlayLocalPosition
+        ? [selectedOverlayLocalPosition[0], selectedOverlayLocalPosition[1]]
+        : [0, 0],
+      zRange: zSliceEnabled ? [Math.min(zMinimum, zMaximum), Math.max(zMinimum, zMaximum)] : null,
+      proposalPosition: manualProposalLocalPosition,
+      isolateProposal: isolateProposal && Boolean(manualProposalLocalPosition),
+      proposalRadiusM: Math.min(clipRadiusM, 4),
+    }),
+    [clipEnabled, clipRadiusM, isolateProposal, manualProposalLocalPosition, selectedOverlayLocalPosition, zMaximum, zMinimum, zSliceEnabled],
+  )
+  const deferredDisplayOptions = useDeferredValue(displayOptions)
+  const displayPayload = useMemo(
+    () => payload ? buildPointCloudDisplayPayload(payload, deferredDisplayOptions) : null,
+    [deferredDisplayOptions, payload],
+  )
+  const measurement = measurementPoints.length === 2
+    ? pointCloudMeasurement(measurementPoints[0], measurementPoints[1])
+    : null
+  useEffect(() => {
+    if (!manualProposalLocalPosition) setIsolateProposal(false)
+  }, [manualProposalLocalPosition])
   const poleBasePicking = poleBaseProposal?.status === 'picking'
   const coordinatePickActive = pointCloudPickTargetAcceptsPoint(
     overlay?.pickTarget,
@@ -869,7 +1088,7 @@ export default function PointCloudView({
       try {
         const data = demoMode
           ? createDemoPointCloud(budget)
-          : parseMmsp(await api.points(datasetId, frame.id, budget, controller.signal))
+          : parseMmsp(await api.points(datasetId, frame.id, budget, controller.signal, colorMode))
         if (!controller.signal.aborted) {
           setPayload(data)
           setLoading(false)
@@ -892,11 +1111,11 @@ export default function PointCloudView({
       controller.abort()
       if (retryTimer) window.clearTimeout(retryTimer)
     }
-  }, [budget, datasetId, demoMode, frame, reloadKey])
+  }, [budget, colorMode, datasetId, demoMode, frame, reloadKey])
 
   useEffect(() => {
     const host = hostRef.current
-    if (!host || !payload) return
+    if (!host || !displayPayload) return
     const ownerDocument = host.ownerDocument
     const ownerWindow = pointCloudOwnerWindow(host)
     const ownerPixelRatio = () => {
@@ -912,8 +1131,8 @@ export default function PointCloudView({
 
     const camera = new THREE.PerspectiveCamera(52, initialWidth / initialHeight, 0.05, 2000)
     camera.up.set(0, 0, 1)
-    const spanX = payload.bounds.max[0] - payload.bounds.min[0]
-    const spanY = payload.bounds.max[1] - payload.bounds.min[1]
+    const spanX = displayPayload.bounds.max[0] - displayPayload.bounds.min[0]
+    const spanY = displayPayload.bounds.max[1] - displayPayload.bounds.min[1]
     const span = Math.max(20, spanX, spanY)
     const savedView = viewStateRef.current
     if (!savedView) {
@@ -936,9 +1155,9 @@ export default function PointCloudView({
     controls.enableDamping = true
     controls.dampingFactor = 0.07
     controls.target.set(
-      (payload.bounds.min[0] + payload.bounds.max[0]) / 2,
-      (payload.bounds.min[1] + payload.bounds.max[1]) / 2,
-      (payload.bounds.min[2] + payload.bounds.max[2]) / 2,
+      (displayPayload.bounds.min[0] + displayPayload.bounds.max[0]) / 2,
+      (displayPayload.bounds.min[1] + displayPayload.bounds.max[1]) / 2,
+      (displayPayload.bounds.min[2] + displayPayload.bounds.max[2]) / 2,
     )
     if (savedView) restorePointCloudViewState(camera, controls.target, savedView)
     controls.update()
@@ -949,17 +1168,17 @@ export default function PointCloudView({
     controls.addEventListener('change', rememberView)
 
     const geometry = new THREE.BufferGeometry()
-    geometry.setAttribute('position', new THREE.BufferAttribute(payload.positions, 3))
-    if (payload.colors) {
-      geometry.setAttribute('color', new THREE.Uint8BufferAttribute(payload.colors, 3, true))
+    geometry.setAttribute('position', new THREE.BufferAttribute(displayPayload.positions, 3))
+    if (displayPayload.colors) {
+      geometry.setAttribute('color', new THREE.Uint8BufferAttribute(displayPayload.colors, 3, true))
     }
     geometry.computeBoundingSphere()
 
     const material = new THREE.PointsMaterial({
       size: pointSizeRef.current * 0.045,
       sizeAttenuation: true,
-      vertexColors: Boolean(payload.colors),
-      color: payload.colors ? 0xffffff : 0x69e0be,
+      vertexColors: Boolean(displayPayload.colors),
+      color: displayPayload.colors ? 0xffffff : 0x69e0be,
       transparent: true,
       opacity: 0.94,
     })
@@ -1196,9 +1415,33 @@ export default function PointCloudView({
       scene.add(poleBaseGroup)
     }
 
+    let manualProposalGroup: THREE.Group | null = null
+    if (manualProposalLocalPosition) {
+      manualProposalGroup = new THREE.Group()
+      manualProposalGroup.name = 'manual-object-proposal'
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffb84d,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.98,
+      })
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(0.28, 18, 12), material)
+      marker.position.fromArray(manualProposalLocalPosition)
+      marker.renderOrder = 34
+      manualProposalGroup.add(marker)
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.48, 0.055, 8, 28),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }),
+      )
+      ring.position.fromArray(manualProposalLocalPosition)
+      ring.renderOrder = 33
+      manualProposalGroup.add(ring)
+      scene.add(manualProposalGroup)
+    }
+
     const grid = new THREE.GridHelper(Math.ceil(span * 1.4), 24, 0x2bcfa8, 0x213548)
     grid.rotation.x = Math.PI / 2
-    grid.position.z = payload.bounds.min[2] - 0.1
+    grid.position.z = displayPayload.bounds.min[2] - 0.1
     ;(grid.material as THREE.Material).opacity = 0.22
     ;(grid.material as THREE.Material).transparent = true
     scene.add(grid)
@@ -1260,6 +1503,9 @@ export default function PointCloudView({
     renderer.domElement.addEventListener('webglcontextlost', onContextLost)
     renderer.domElement.addEventListener('webglcontextrestored', onContextRestored)
     wakeRenderer()
+    renderSceneRef.current = scene
+    wakeRenderSceneRef.current = wakeRenderer
+    setRenderSceneGeneration((value) => value + 1)
     const pointRaycaster = new THREE.Raycaster()
     pointRaycaster.params.Points = { threshold: 0.18 }
     const overlayRaycaster = new THREE.Raycaster()
@@ -1360,7 +1606,7 @@ export default function PointCloudView({
       lastHoveredPointIndex = pointIndex
       const offset = pointIndex * 3
       const projected = projectFrameLocalPointToPanorama(
-        [payload.positions[offset], payload.positions[offset + 1], payload.positions[offset + 2]],
+        [displayPayload.positions[offset], displayPayload.positions[offset + 1], displayPayload.positions[offset + 2]],
         metadata,
       )
       onHoverPanoramaPointRef.current?.(
@@ -1415,11 +1661,31 @@ export default function PointCloudView({
         if (pointIndex !== null) {
           const offset = pointIndex * 3
           const datasetCoordinates: [number, number, number] = [
-            payload.positions[offset] + frame.dataset_position[0],
-            payload.positions[offset + 1] + frame.dataset_position[1],
-            payload.positions[offset + 2] + frame.dataset_position[2],
+            displayPayload.positions[offset] + frame.dataset_position[0],
+            displayPayload.positions[offset + 1] + frame.dataset_position[1],
+            displayPayload.positions[offset + 2] + frame.dataset_position[2],
           ]
           void applyPointCloudPickedCoordinate(target, frame.id, datasetCoordinates, actions)
+        }
+        return
+      }
+      if (measureModeRef.current) {
+        const pointIndex = closestPointHitIndex(
+          pointRaycaster.intersectObject(points, false),
+          pointer,
+          camera,
+          bounds.width,
+          bounds.height,
+          7,
+        )
+        if (pointIndex !== null) {
+          const offset = pointIndex * 3
+          const point: [number, number, number] = [
+            displayPayload.positions[offset],
+            displayPayload.positions[offset + 1],
+            displayPayload.positions[offset + 2],
+          ]
+          setMeasurementPoints((current) => current.length >= 2 ? [point] : [...current, point])
         }
         return
       }
@@ -1498,7 +1764,12 @@ export default function PointCloudView({
       renderer.domElement.removeEventListener('click', onCanvasClick)
       if (hoverFrame) ownerWindow.cancelAnimationFrame(hoverFrame)
       clearHover()
-      rememberView()
+      if (viewResetRequestedRef.current) {
+        viewStateRef.current = null
+        viewResetRequestedRef.current = false
+      } else {
+        rememberView()
+      }
       controls.removeEventListener('change', rememberView)
       controls.dispose()
       geometry.dispose()
@@ -1523,6 +1794,20 @@ export default function PointCloudView({
           renderable.material?.dispose()
         }
       })
+      ;[manualProposalGroup].forEach((group) => {
+        group?.traverse((object) => {
+          const renderable = object as THREE.Object3D & {
+            geometry?: THREE.BufferGeometry
+            material?: THREE.Material | THREE.Material[]
+          }
+          renderable.geometry?.dispose()
+          if (Array.isArray(renderable.material)) {
+            renderable.material.forEach((entry) => entry.dispose())
+          } else {
+            renderable.material?.dispose()
+          }
+        })
+      })
       capturePose.traverse((object) => {
         const renderable = object as THREE.Object3D & {
           geometry?: THREE.BufferGeometry
@@ -1536,6 +1821,8 @@ export default function PointCloudView({
         }
       })
       if (pointMaterialRef.current === material) pointMaterialRef.current = null
+      if (renderSceneRef.current === scene) renderSceneRef.current = null
+      if (wakeRenderSceneRef.current === wakeRenderer) wakeRenderSceneRef.current = null
       renderer.dispose()
       renderer.domElement.remove()
     }
@@ -1545,11 +1832,59 @@ export default function PointCloudView({
     frame?.heading,
     frame?.id,
     overlayPoints,
-    payload,
+    displayPayload,
+    manualProposalLocalPosition,
     poleBaseMarkerColor,
     poleBaseMarkerSizeM,
     poleBaseProposal,
   ])
+
+  useEffect(() => {
+    const scene = renderSceneRef.current
+    if (!scene || measurementPoints.length === 0) return
+    const group = new THREE.Group()
+    group.name = 'point-measurement'
+    measurementPoints.forEach((position, index) => {
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.14, 12, 8),
+        new THREE.MeshBasicMaterial({
+          color: index === 0 ? 0x65a9ff : 0xff6f91,
+          depthTest: false,
+        }),
+      )
+      marker.position.fromArray(position)
+      marker.renderOrder = 36
+      group.add(marker)
+    })
+    if (measurementPoints.length === 2) {
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(
+          measurementPoints.map((point) => new THREE.Vector3(...point)),
+        ),
+        new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false }),
+      )
+      line.renderOrder = 35
+      group.add(line)
+    }
+    scene.add(group)
+    wakeRenderSceneRef.current?.()
+    return () => {
+      scene.remove(group)
+      group.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          geometry?: THREE.BufferGeometry
+          material?: THREE.Material | THREE.Material[]
+        }
+        renderable.geometry?.dispose()
+        if (Array.isArray(renderable.material)) {
+          renderable.material.forEach((entry) => entry.dispose())
+        } else {
+          renderable.material?.dispose()
+        }
+      })
+      wakeRenderSceneRef.current?.()
+    }
+  }, [measurementPoints, renderSceneGeneration])
 
   useEffect(() => {
     const material = pointMaterialRef.current
@@ -1565,6 +1900,24 @@ export default function PointCloudView({
     : null
   const formatMetric = (value: number | null | undefined) =>
     Number.isFinite(value) ? `${Number(value).toFixed(3)} m` : '—'
+  const resetPointTools = () => {
+    setColorMode('rgb')
+    setClipEnabled(false)
+    setClipRadiusM(8)
+    setClipRadiusDraftM(8)
+    setZSliceEnabled(false)
+    if (payload) {
+      setZMinimum(payload.bounds.min[2])
+      setZMaximum(payload.bounds.max[2])
+      setZMinimumDraft(payload.bounds.min[2])
+      setZMaximumDraft(payload.bounds.max[2])
+    }
+    setIsolateProposal(false)
+    setMeasureMode(false)
+    setMeasurementPoints([])
+    viewResetRequestedRef.current = true
+    viewStateRef.current = null
+  }
 
   return (
     <div
@@ -1572,6 +1925,8 @@ export default function PointCloudView({
       data-shp-point-count={overlayPoints.length}
       data-yolo-point-count={detectionPoints.length}
       data-pole-base-status={poleBaseProposal?.status ?? 'idle'}
+      data-manual-proposal-preview={String(Boolean(manualProposalLocalPosition))}
+      data-visible-point-count={displayPayload?.pointCount ?? 0}
     >
       <div ref={hostRef} className="pointcloud-canvas" />
       <OverlayHoverTooltip
@@ -1638,6 +1993,46 @@ export default function PointCloudView({
         <span title="촬영 위치 기준 15m 안쪽은 고밀도, 15~25m는 저밀도로 샘플링합니다.">
           범위 · 15m 고밀도 · 최대 25m
         </span>
+        <details className="pointcloud-tool-menu">
+          <summary><Palette size={14} /> 판독 도구</summary>
+          <div>
+            <label>
+              <span>색상</span>
+              <select aria-label="점군 색상 모드" value={colorMode} onChange={(event) => setColorMode(event.target.value as PointCloudColorMode)}>
+                <option value="rgb">RGB</option>
+                <option value="intensity">Intensity</option>
+                <option value="classification">Classification</option>
+                <option value="height">Height</option>
+              </select>
+            </label>
+            <label className="pointcloud-tool-check"><input type="checkbox" checked={clipEnabled} onChange={(event) => setClipEnabled(event.target.checked)} /> Local clip</label>
+            <label>
+              <span>XY 반경 {clipRadiusDraftM.toFixed(0)}m</span>
+              <input
+                type="range"
+                min="1"
+                max="25"
+                step="1"
+                value={clipRadiusDraftM}
+                disabled={!clipEnabled}
+                aria-label="점군 local clip 반경"
+                onChange={(event) => setClipRadiusDraftM(Number(event.target.value))}
+                onPointerUp={() => setClipRadiusM(clipRadiusDraftM)}
+                onKeyUp={() => setClipRadiusM(clipRadiusDraftM)}
+                onBlur={() => setClipRadiusM(clipRadiusDraftM)}
+              />
+            </label>
+            <label className="pointcloud-tool-check"><input type="checkbox" checked={zSliceEnabled} onChange={(event) => setZSliceEnabled(event.target.checked)} /> Z slice</label>
+            <div className="pointcloud-z-range">
+              <label><span>Z 최소</span><input type="number" step="0.1" value={Number(zMinimumDraft.toFixed(2))} disabled={!zSliceEnabled} aria-label="점군 Z 최소" onChange={(event) => setZMinimumDraft(Number(event.target.value))} onBlur={() => setZMinimum(zMinimumDraft)} onKeyUp={(event) => { if (event.key === 'Enter' || event.key.startsWith('Arrow')) setZMinimum(zMinimumDraft) }} /></label>
+              <label><span>Z 최대</span><input type="number" step="0.1" value={Number(zMaximumDraft.toFixed(2))} disabled={!zSliceEnabled} aria-label="점군 Z 최대" onChange={(event) => setZMaximumDraft(Number(event.target.value))} onBlur={() => setZMaximum(zMaximumDraft)} onKeyUp={(event) => { if (event.key === 'Enter' || event.key.startsWith('Arrow')) setZMaximum(zMaximumDraft) }} /></label>
+            </div>
+            <label className="pointcloud-tool-check"><input type="checkbox" checked={isolateProposal} disabled={!manualProposalLocalPosition} onChange={(event) => setIsolateProposal(event.target.checked)} /> 제안 주변만 표시</label>
+            <button type="button" className={`button compact ${measureMode ? 'primary' : 'secondary'}`} disabled={coordinatePickActive} onClick={() => { setMeasureMode((value) => !value); setMeasurementPoints([]) }}><Ruler size={13} /> 2점 측정</button>
+            <button type="button" className="button secondary compact" onClick={resetPointTools}><RefreshCcw size={13} /> 초기화</button>
+            <small>{formatCount(displayPayload?.pointCount ?? 0)} / {formatCount(payload?.pointCount ?? 0)} 표시</small>
+          </div>
+        </details>
         {overlayPoints.length > 0 && (
           <span title="현재 프레임 주변에 표시된 SHP 포인트">
             <MapPin size={14} /> SHP {overlayPoints.length.toLocaleString('ko-KR')}
@@ -1658,12 +2053,31 @@ export default function PointCloudView({
             <Crosshair size={14} /> 지주 몸체의 실제 포인트를 클릭해 하단 산출 (B)
           </strong>
         )}
+        {manualProposalLocalPosition && (
+          <strong className="viewer-pick-indicator manual-proposal-indicator">
+            <MapPin size={14} /> 수동 객체 제안 미리보기
+          </strong>
+        )}
         {!poleBasePicking && coordinatePickActive && (
           <strong className="viewer-pick-indicator">
             <Crosshair size={14} /> 실제 포인트를 클릭해 좌표 적용
           </strong>
         )}
       </div>
+
+      {measureMode && (
+        <section className="pointcloud-measure-card" aria-label="점군 2점 측정">
+          <strong><Ruler size={14} /> 2점 측정</strong>
+          {measurement ? (
+            <dl>
+              <div><dt>3D 거리</dt><dd>{measurement.distance3d.toFixed(3)} m</dd></div>
+              <div><dt>XY 거리</dt><dd>{measurement.distanceXy.toFixed(3)} m</dd></div>
+              <div><dt>수직 높이</dt><dd>{measurement.vertical.toFixed(3)} m</dd></div>
+            </dl>
+          ) : <span>{measurementPoints.length === 0 ? '첫 번째 점을 선택하세요.' : '두 번째 점을 선택하세요.'}</span>}
+          <button type="button" className="button secondary compact" onClick={() => setMeasurementPoints([])}>측정 초기화</button>
+        </section>
+      )}
 
       {poleBaseProposal && poleBaseProposal.status !== 'idle' && poleBaseProposal.status !== 'picking' && (
         <section
@@ -1731,6 +2145,27 @@ export default function PointCloudView({
                   <AlertTriangle size={13} /> {poleBaseWarning}
                 </p>
               )}
+              {poleBaseProposal.status === 'ready' &&
+                poleBaseProposal.templateValidation?.duplicate.exact_duplicate && (
+                  <p className="pole-base-result-warning" role="alert">
+                    <AlertTriangle size={13} /> 동일 지주 객체가 이미 존재합니다.
+                  </p>
+                )}
+              {poleBaseProposal.status === 'ready' &&
+                poleBaseProposal.templateValidation &&
+                poleBaseProposal.templateValidation.duplicate.warning_count > 0 &&
+                !poleBaseProposal.templateValidation.duplicate.exact_duplicate && (
+                  <p className="pole-base-result-warning" role="alert">
+                    <AlertTriangle size={13} /> 근접 지주 확인과 3자 이상의 저장 사유가 필요합니다.
+                  </p>
+                )}
+              {poleBaseProposal.status === 'ready' &&
+                poleBaseProposal.templateValidation &&
+                poleBaseProposal.templateValidation.missingRequiredFields.length > 0 && (
+                  <p className="pole-base-result-warning" role="alert">
+                    <AlertTriangle size={13} /> 필수 속성: {poleBaseProposal.templateValidation.missingRequiredFields.join(', ')}
+                  </p>
+                )}
             </>
           )}
 
@@ -1739,14 +2174,23 @@ export default function PointCloudView({
               <button
                 type="button"
                 className="button primary compact"
-                disabled={readyPoleBaseResult.status === 'failed' || !readyPoleBaseResult.base_position}
+                disabled={
+                  readyPoleBaseResult.status === 'failed' ||
+                  !readyPoleBaseResult.base_position ||
+                  (poleBaseProposal.status === 'ready' &&
+                    poleBaseTemplateValidationBlocksSave(poleBaseProposal.templateValidation))
+                }
                 title="산출한 PointZ를 저장 (Enter)"
                 onClick={() => void overlay?.confirmPoleBaseProposal()}
               >
                 <Check size={13} /> 저장
               </button>
             )}
-            {poleBaseProposal.status !== 'loading' && (
+            {poleBaseProposal.status !== 'loading' &&
+              !(
+                poleBaseProposal.status === 'error' &&
+                poleBaseProposal.reasonCodes.includes('TASK_RESOLUTION_PENDING')
+              ) && (
               <button
                 type="button"
                 className="button secondary compact"
@@ -1795,8 +2239,8 @@ export default function PointCloudView({
       {payload && !loading && (
         <div className="viewer-data-card">
           <span>LIVE SAMPLE · MMSP</span>
-          <strong>{formatCount(payload.pointCount)} points</strong>
-          <small>원본 LAS 대신 프레임 주변 경량 바이너리</small>
+          <strong>{formatCount(displayPayload?.pointCount ?? payload.pointCount)} points</strong>
+          <small>{displayPayload && displayPayload.pointCount !== payload.pointCount ? `경량 샘플 ${formatCount(payload.pointCount)}개에서 로컬 필터` : '원본 LAS 대신 프레임 주변 경량 바이너리'}</small>
         </div>
       )}
     </div>

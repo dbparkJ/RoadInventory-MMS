@@ -176,6 +176,12 @@ describe('DetachablePanel keyboard relay', () => {
         ['p', 'KeyP'],
         ['b', 'KeyB'],
         ['r', 'KeyR'],
+        ['j', 'KeyJ'],
+        ['k', 'KeyK'],
+        ['m', 'KeyM'],
+        ['q', 'KeyQ'],
+        ['x', 'KeyX'],
+        ['f', 'KeyF'],
         ['Enter', 'Enter'],
         ['Escape', 'Escape'],
       ] as const
@@ -193,12 +199,25 @@ describe('DetachablePanel keyboard relay', () => {
       expect(onKeyDown.mock.calls.map(([event]) => event.code)).toEqual(
         shortcuts.map(([, code]) => code),
       )
+
+      const shiftEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
+      popup.dispatchEvent(shiftEnter)
+      expect(shiftEnter.defaultPrevented).toBe(true)
+      expect(onKeyDown).toHaveBeenLastCalledWith(
+        expect.objectContaining({ code: 'Enter', shiftKey: true }),
+      )
     } finally {
       window.removeEventListener('keydown', onKeyDown)
     }
   })
 
-  it('does not relay pole-base shortcuts while typing in popup controls', () => {
+  it('does not relay workspace shortcuts while typing in popup controls', () => {
     const { popup, addEventListener } = fakePopup()
     vi.spyOn(window, 'open').mockReturnValue(popup)
     const onKeyDown = vi.fn()
@@ -213,7 +232,7 @@ describe('DetachablePanel keyboard relay', () => {
         | undefined
       expect(relay).toBeDefined()
 
-      ;['KeyB', 'KeyR', 'Enter', 'Escape'].forEach((code) => {
+      ;['KeyB', 'KeyR', 'KeyJ', 'KeyK', 'KeyM', 'KeyQ', 'KeyX', 'KeyF', 'Enter', 'Escape'].forEach((code) => {
         const key = code.startsWith('Key') ? code.slice(3).toLowerCase() : code
         const event = new KeyboardEvent('keydown', {
           key,

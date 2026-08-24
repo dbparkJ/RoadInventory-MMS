@@ -1,16 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
 import * as THREE from 'three'
-import type { PoleBaseInferResponse } from '../types'
+import type { PointCloudPayload, PoleBaseInferResponse } from '../types'
 import {
   capturePointCloudViewState,
   captureHeadingDirection,
   closestPointHitIndex,
   applyPointCloudPickedCoordinate,
+  buildPointCloudDisplayPayload,
   createPointCloudRenderLoop,
   DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
   pointCloudOverlayPointSize,
+  pointCloudMeasurement,
   pointCloudOwnerWindow,
   pointCloudBudgetsForMaximum,
   pointCloudDetectionWireframePositions,
@@ -28,6 +30,59 @@ import {
   restorePointCloudViewState,
   type RenderOverlayPoint,
 } from './PointCloudView'
+
+describe('PointCloudView local tools', () => {
+  const payload: PointCloudPayload = {
+    positions: new Float32Array([
+      0, 0, 0,
+      5, 0, 1,
+      5, 5, 2,
+    ]),
+    colors: new Uint8Array([
+      10, 20, 30,
+      40, 50, 60,
+      70, 80, 90,
+    ]),
+    bounds: { min: [0, 0, 0], max: [5, 5, 2] },
+    pointCount: 3,
+  }
+
+  it('reuses the bounded MMSP payload while no local geometry filter is active', () => {
+    expect(buildPointCloudDisplayPayload(payload, {
+      clipRadiusM: null,
+      zRange: null,
+    })).toBe(payload)
+  })
+
+  it('filters around the selected center while preserving server-derived RGB bytes', () => {
+    const filtered = buildPointCloudDisplayPayload(payload, {
+      clipRadiusM: 1,
+      clipCenter: [5, 0],
+      zRange: [0.5, 1.5],
+    })
+
+    expect(filtered.pointCount).toBe(1)
+    expect([...filtered.positions]).toEqual([5, 0, 1])
+    expect([...(filtered.colors ?? [])]).toEqual([40, 50, 60])
+    expect(filtered.bounds).toEqual({ min: [5, 0, 1], max: [5, 0, 1] })
+    expect([...payload.positions]).toEqual([0, 0, 0, 5, 0, 1, 5, 5, 2])
+  })
+
+  it('isolates the proposal in 3D and reports 3D/XY/vertical measurements', () => {
+    const filtered = buildPointCloudDisplayPayload(payload, {
+      clipRadiusM: null,
+      proposalPosition: [5, 5, 2],
+      isolateProposal: true,
+      proposalRadiusM: 0.2,
+    })
+    expect([...filtered.positions]).toEqual([5, 5, 2])
+    expect(pointCloudMeasurement([0, 0, 1], [3, 4, 13])).toEqual({
+      distance3d: 13,
+      distanceXy: 5,
+      vertical: 12,
+    })
+  })
+})
 
 describe('PointCloudView camera continuity', () => {
   it('uses the detached canvas owner Window instead of the opener realm', () => {

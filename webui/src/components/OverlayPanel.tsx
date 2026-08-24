@@ -771,7 +771,7 @@ function OverlayWorkspacePanel({
                 title="3D에서 목적 좌표 클릭 → B로 하단 산출 → 결과 확인 후 B로 저장"
               >
                 <Crosshair size={15} />
-                {movingSelected ? '위치 지정 취소' : '뷰에서 실제 포인트 선택 (P)'}
+                {movingSelected ? '위치 지정 취소' : '뷰에서 목적 좌표 선택'}
               </button>
               <button
                 type="button"

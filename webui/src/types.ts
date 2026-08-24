@@ -176,6 +176,8 @@ export interface BootstrapResponse {
     shp_feature_editing?: boolean
     shp_result_download?: boolean
     pole_base_inference?: boolean
+    review_workspace?: boolean
+    active_learning_export?: boolean
     max_point_budget?: number
     max_overlay_upload_bytes?: number
     max_overlay_features?: number
@@ -310,6 +312,391 @@ export interface RunResults {
 export type OverlayCoordinateSpace = 'wgs84' | 'dataset'
 export type OverlayEncoding = 'auto' | 'UTF-8' | 'CP949' | 'EUC-KR'
 
+export type ReviewSessionStatus = 'draft' | 'active' | 'paused' | 'completed' | 'archived'
+
+export interface ReviewSession {
+  id: string
+  dataset_id: string
+  source_run_ids: string[]
+  target_layer_ids: string[]
+  track_ids: string[]
+  frame_range: FrameRange | null
+  class_filters: string[]
+  status: ReviewSessionStatus
+  created_by: string
+  created_at: string
+  updated_at: string
+  last_task_id: string | null
+  qa_layer_revisions: Record<string, number> | null
+  qa_ran_at: string | null
+}
+
+export type ReviewTaskType =
+  | 'MANUAL_SCAN'
+  | 'LOW_CONFIDENCE'
+  | 'PROJECTION_FAILED'
+  | 'GEOMETRY_REVIEW'
+  | 'POLE_BASE_REVIEW'
+  | 'SPACING_ANOMALY'
+  | 'UNREVIEWED_INTERVAL'
+  | 'MANUAL_FLAG'
+
+export type ReviewTaskStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'confirmed'
+  | 'corrected'
+  | 'manual_added'
+  | 'false_positive'
+  | 'skipped'
+  | 'field_survey'
+
+export type ReviewTaskResolution = Exclude<ReviewTaskStatus, 'todo' | 'in_progress'>
+
+export interface ReviewTask {
+  id: string
+  session_id: string
+  dataset_id: string
+  task_type: ReviewTaskType
+  status: ReviewTaskStatus
+  priority: number
+  frame_id: string | null
+  track_id: string | null
+  frame_start: number | null
+  frame_end: number | null
+  source_run_id: string | null
+  source_detection_id: string | null
+  target_layer_id: string | null
+  class_hint: string | null
+  reason_codes: string[]
+  location_hint: [number, number, number] | null
+  source_fingerprint?: string | null
+  priority_evidence?: Record<string, unknown>
+  claimed_by: string | null
+  resolved_feature_ids: Array<string | number>
+  resolution: ReviewTaskResolution | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ReviewSessionPage {
+  items: ReviewSession[]
+  total: number
+  offset: number
+  limit: number
+  next_offset: number | null
+}
+
+export interface ReviewTaskPage {
+  items: ReviewTask[]
+  total: number
+  offset: number
+  limit: number
+  next_offset: number | null
+  next_cursor?: string | null
+  status_counts?: Partial<Record<ReviewTaskStatus, number>>
+}
+
+export interface ReviewSessionCreateRequest {
+  source_run_ids?: string[]
+  target_layer_ids?: string[]
+  track_ids?: string[]
+  frame_range?: FrameRange | null
+  class_filters?: string[]
+  status?: Extract<ReviewSessionStatus, 'draft' | 'active'>
+  created_by?: string
+}
+
+export interface ReviewSessionPatch {
+  source_run_ids?: string[]
+  target_layer_ids?: string[]
+  track_ids?: string[]
+  frame_range?: FrameRange | null
+  class_filters?: string[]
+  status?: ReviewSessionStatus
+  last_task_id?: string | null
+}
+
+export interface ReviewTaskPatch {
+  status?: ReviewTaskStatus
+  claimed_by?: string | null
+}
+
+export interface ReviewTaskResolveRequest {
+  resolution: ReviewTaskResolution
+  resolved_feature_ids?: string[]
+}
+
+export interface ReviewCandidateSources {
+  low_confidence: boolean
+  projection_failed: boolean
+  geometry_review: boolean
+  pole_base_review: boolean
+  unreviewed_interval: boolean
+  spacing_anomaly: boolean
+}
+
+export interface ReviewTaskGenerateRequest {
+  tasks?: Array<{
+    task_type: ReviewTaskType
+    priority?: number
+    frame_id?: string
+    track_id?: string
+    frame_start?: number
+    frame_end?: number
+    source_run_id?: string
+    source_detection_id?: string
+    target_layer_id?: string
+    class_hint?: string
+    reason_codes?: string[]
+    location_hint?: [number, number, number]
+    claimed_by?: string
+  }>
+  sources?: ReviewCandidateSources
+  low_confidence_threshold?: number
+  unreviewed_interval_frames?: number
+}
+
+export interface ReviewTaskGenerateResponse {
+  items: ReviewTask[]
+  created: number
+  existing: number
+  total_candidates?: number
+  returned?: number
+  source_counts: Partial<Record<ReviewTaskType, number>>
+  sources?: ReviewCandidateSources
+  discovery?: Record<string, number | boolean>
+}
+
+export interface ReviewTaskFrameResponse {
+  frame: Frame
+  page_offset: number
+}
+
+export interface EquirectangularBBoxGeometry {
+  type: 'equirectangular_bbox'
+  u_intervals: Array<[number, number]>
+  v_min: number
+  v_max: number
+  image_width: number
+  image_height: number
+}
+
+export interface ManualObservation {
+  observation_id: string
+  dataset_id: string
+  frame_id: string
+  view_type: 'panorama'
+  class_name: string
+  geometry_2d: EquirectangularBBoxGeometry
+  created_by: string
+}
+
+export type ManualObjectTemplateId = 'TRAFFIC_SIGN' | 'SIGN_SUPPORT_POLE'
+
+export interface ManualObjectTemplate {
+  template_id: ManualObjectTemplateId
+  class_name: string
+  geometry_type: 'Point'
+  tool_id: 'panorama_bbox_point_v1' | 'manual_pole_base_v1' | string
+  duplicate_radius_m: number
+  continuous: boolean
+  required_semantics: string[]
+  relation_semantics: string[]
+  fixed_values?: Record<string, unknown>
+  default_values?: Record<string, unknown>
+  domains?: Record<string, Array<string | number>>
+  /** Compatibility aliases accepted from early P1 servers. */
+  default_properties?: Record<string, unknown>
+  property_domains?: Record<string, Array<string | number>>
+}
+
+export interface ManualObservationCreateRequest {
+  target_layer_id: string
+  template_id: 'TRAFFIC_SIGN'
+  geometry_2d: EquirectangularBBoxGeometry
+  created_by?: string
+}
+
+export interface ManualObservationCreateResponse {
+  observation: ManualObservation
+  target_layer_id: string
+}
+
+export interface ManualObjectProposalCreateRequest {
+  target_layer_id: string
+  observation_id: string
+  template_id: 'TRAFFIC_SIGN'
+  property_patch?: Record<string, unknown>
+  max_range_m?: number
+  yaw_offset_deg?: number
+  pitch_offset_deg?: number
+}
+
+export interface ManualObjectProposalResponse {
+  proposal: GeometryProposal
+  target_layer_id: string
+  expires_in_seconds: number
+}
+
+export interface ManualDuplicateCandidate {
+  feature_id: string
+  xy_distance_m: number
+  z_difference_m: number | null
+  match: 'exact' | 'near'
+  reason_codes: string[]
+}
+
+export interface ManualDuplicatePreflightResponse {
+  exact_duplicate: boolean
+  blocked: boolean
+  candidates: ManualDuplicateCandidate[]
+  warning_count: number
+  radius_m: number
+}
+
+export interface OverlayManualObjectValidation {
+  template_id: 'SIGN_SUPPORT_POLE'
+  allow_near_duplicate?: boolean
+  override_reason?: string
+}
+
+export interface ManualProposalCommitRequest {
+  expected_revision: number
+  idempotency_key: string
+  task_id?: string
+  created_by?: string
+  properties?: Record<string, unknown>
+  allow_near_duplicate?: boolean
+  override_reason?: string
+}
+
+export interface ManualProposalCommitResponse {
+  feature: OverlayFeature
+  revision: number
+  coordinate_space: 'dataset'
+  idempotent_replay: boolean
+  edit_transaction_id: string
+  duplicate_warnings: ManualDuplicateCandidate[]
+  provenance?: FeatureProvenance
+  task_resolution_pending: boolean
+}
+
+export type GeometryProposalStatus = 'auto' | 'review' | 'failed'
+
+export interface GeometryProposalQuality {
+  score: number
+  support_point_count?: number
+  depth_spread_m?: number | null
+  reprojection_error_px?: number | null
+}
+
+export interface GeometryProposalEvidence {
+  frame_id: string
+  observation_id?: string | null
+  seed_position?: [number, number, number] | null
+}
+
+export interface GeometryProposal {
+  proposal_id: string
+  tool_id: string
+  status: GeometryProposalStatus
+  coordinate_space: 'dataset'
+  geometry: { type: 'Point'; coordinates: [number, number, number] } | null
+  property_patch: Record<string, unknown>
+  quality: GeometryProposalQuality
+  reason_codes: string[]
+  evidence: GeometryProposalEvidence
+}
+
+export type FeatureOrigin = 'AI' | 'MANUAL' | 'CORRECTED'
+export type FeatureReviewStatus = 'unreviewed' | ReviewTaskStatus
+
+export interface FeatureProvenance {
+  layer_id: string
+  feature_id: string | number
+  origin: FeatureOrigin
+  source_run_id: string | null
+  source_frame_ids: string[]
+  source_detection_ids: string[]
+  manual_observation_ids: string[]
+  creation_tool: string
+  proposal_quality: number | null
+  review_status: FeatureReviewStatus
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
+export type QaIssueSeverity = 'info' | 'warning' | 'error'
+export type QaIssueStatus = 'open' | 'resolved' | 'dismissed'
+
+export interface QaIssue {
+  id: string
+  session_id: string
+  layer_id: string
+  feature_id: string | null
+  rule_id: string
+  severity: QaIssueSeverity
+  message: string
+  related_feature_ids: string[]
+  status: QaIssueStatus
+  created_at?: string
+  updated_at?: string
+  override_reason?: string | null
+  frame_id?: string | null
+  location_hint?: [number, number, number] | null
+}
+
+export interface QaIssuePage {
+  items: QaIssue[]
+  total: number
+  offset: number
+  limit: number
+  next_offset: number | null
+}
+
+export interface QaRunResponse {
+  items: QaIssue[]
+  total: number
+  counts: Record<QaIssueSeverity, number>
+  ran_at: string
+  layer_revisions: Record<string, number>
+}
+
+export interface QaIssuePatch {
+  status: QaIssueStatus
+  override_reason?: string
+}
+
+export interface OverlayEditHistoryItem {
+  audit_id: number
+  revision: number
+  action: string
+  feature_id: string
+  created_at: string
+  undone: boolean
+}
+
+export interface OverlayHistoryMutationRequest {
+  expected_revision: number
+  idempotency_key: string
+  actor: string
+}
+
+export interface OverlayHistoryMutationResponse {
+  operation: 'undo' | 'redo'
+  revision: number
+  target_revision: number
+  target_action: string
+  feature_id: string
+  feature: OverlayFeature | null
+  deleted: boolean
+  linked_task_id: string | null
+  idempotent_replay: boolean
+  task_transition_pending: boolean
+}
+
 export interface OverlayLayer {
   id: string
   dataset_id: string
@@ -363,6 +750,17 @@ export interface OverlayFeature {
   id: string | number
   geometry: OverlayGeometry | null
   properties: Record<string, unknown>
+  provenance?: FeatureProvenance
+}
+
+export interface OverlayReviewMetadata {
+  source_frame_ids?: string[]
+  source_detection_ids?: string[]
+  manual_observation_ids?: string[]
+  creation_tool: string
+  proposal_quality?: number | null
+  created_by?: string
+  task_id?: string
 }
 
 export interface OverlayFeatureCreateRequest {
@@ -370,7 +768,10 @@ export interface OverlayFeatureCreateRequest {
   coordinate_space?: OverlayCoordinateSpace
   copy_geometry_from?: string | number
   expected_revision?: number
+  idempotency_key?: string
   properties?: Record<string, unknown>
+  review_metadata?: OverlayReviewMetadata
+  manual_object_validation?: OverlayManualObjectValidation
 }
 
 export type PoleBaseInferStatus = 'auto' | 'review' | 'failed'
@@ -465,6 +866,7 @@ export interface OverlayFeatureDetail {
   coordinate_space: OverlayCoordinateSpace
   crs: string
   fields: OverlayField[]
+  task_resolution_pending?: boolean
 }
 
 export interface PanoramaOverlayFeature {

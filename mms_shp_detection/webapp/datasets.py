@@ -743,8 +743,9 @@ async def get_dataset(dataset_id: str, request: Request) -> dict[str, Any]:
     return public_dataset(dataset)
 
 
-@router.delete("/datasets/{dataset_id}")
-async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any]:
+async def _unregister_dataset_locked(
+    dataset_id: str, request: Request
+) -> dict[str, Any]:
     """Remove a dataset from the workspace registry, never its source folder."""
 
     store = request.app.state.store
@@ -772,6 +773,30 @@ async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any
     if pending_tasks:
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
+    from .task_resolution_outbox import reconcile_dataset_task_resolutions
+
+    reconciliation = await asyncio.to_thread(
+        reconcile_dataset_task_resolutions, request.app, dataset_id
+    )
+    if (
+        reconciliation["pending"]
+        or reconciliation["error"]
+        or reconciliation["truncated"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "Dataset has unresolved or unverified review task transitions."
+                ),
+                "pending_task_resolutions": reconciliation["pending"],
+                "task_resolution_errors": reconciliation["error"],
+                "task_resolution_scan_truncated": int(
+                    bool(reconciliation["truncated"])
+                ),
+            },
+        )
+
     result = store.unregister_dataset(dataset_id, now=utc_now())
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Dataset not found.")
@@ -783,6 +808,15 @@ async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any
                 f"{result['run_id']} is {result['run_status']}."
             ),
         )
+    if result["status"] == "review_work":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Dataset has non-terminal review work.",
+                "open_review_sessions": result["open_sessions"],
+                "open_review_tasks": result["open_tasks"],
+            },
+        )
     request.app.state.catalogs.pop(dataset_id, None)
     return {
         "id": dataset_id,
@@ -790,6 +824,14 @@ async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any
         "source_deleted": False,
         "detail": "Dataset was removed from the workspace; source files were preserved.",
     }
+
+
+@router.delete("/datasets/{dataset_id}")
+async def unregister_dataset(dataset_id: str, request: Request) -> dict[str, Any]:
+    from .task_resolution_outbox import review_dataset_lock
+
+    async with review_dataset_lock(request.app, dataset_id):
+        return await _unregister_dataset_locked(dataset_id, request)
 
 
 @router.get("/datasets/{dataset_id}/frames")
@@ -813,6 +855,29 @@ async def get_frames(
         "limit": limit,
         "total": total,
         "next_offset": next_offset,
+    }
+
+
+@router.get("/datasets/{dataset_id}/frames/{frame_id}")
+def get_frame(
+    dataset_id: str,
+    frame_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Return one opaque frame and a track-relative page offset for navigation."""
+
+    require_ready_dataset(request, dataset_id)
+    frame = request.app.state.store.get_frame(dataset_id, frame_id)
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    track_offset = request.app.state.store.frame_offset_in_track(
+        dataset_id,
+        track_id=str(frame["track_id"]),
+        ordinal=int(frame["ordinal"]),
+    )
+    return {
+        "frame": public_frame(frame),
+        "page_offset": max(0, track_offset - 120),
     }
 
 

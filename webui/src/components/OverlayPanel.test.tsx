@@ -88,10 +88,11 @@ function overlayWorkspace(selectedFeature: OverlayFeature | null, total?: number
     beginCreatePoint: vi.fn(),
     beginStagedPointCreate: vi.fn(),
     beginStagedSelectedPointMove: vi.fn(),
+    updateStagedPoleBaseTemplateOptions: vi.fn(),
     beginCreatePoleBase: vi.fn(),
     beginRecomputeSelectedPoleBase: vi.fn(),
     applyPoleSeed: vi.fn().mockResolvedValue(undefined),
-    confirmPoleBaseProposal: vi.fn().mockResolvedValue(undefined),
+    confirmPoleBaseProposal: vi.fn().mockResolvedValue(true),
     retryPoleBasePick: vi.fn(),
     cancelPoleBaseProposal: vi.fn(),
     refresh: vi.fn().mockResolvedValue(undefined),
@@ -350,7 +351,7 @@ describe('OverlayPanel feature editing', () => {
     useOverlayWorkspace.mockReturnValue(overlay)
     render(<OverlayAttributePanel onClose={vi.fn()} />)
 
-    fireEvent.click(screen.getByRole('button', { name: /뷰에서 실제 포인트 선택/ }))
+    fireEvent.click(screen.getByRole('button', { name: /뷰에서 목적 좌표 선택/ }))
 
     expect(overlay.beginStagedSelectedPointMove).toHaveBeenCalledOnce()
     expect(overlay.setPickMode).not.toHaveBeenCalled()

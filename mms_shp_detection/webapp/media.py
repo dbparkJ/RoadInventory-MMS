@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
@@ -49,6 +49,37 @@ VWORLD_ADDRESS_FAILURE_TTL_SECONDS = 30.0
 VWORLD_ADDRESS_FAILURE_CACHE_MAX_ENTRIES = 2048
 VWORLD_ADDRESS_MAX_INFLIGHT = 32
 T = TypeVar("T")
+PointPreviewColorMode = Literal["rgb", "intensity", "classification", "height"]
+
+_CLASSIFICATION_COLORS = np.asarray(
+    [
+        (150, 150, 150),  # 0: created/never classified
+        (178, 178, 178),  # 1: unclassified
+        (150, 105, 65),  # 2: ground
+        (126, 190, 105),  # 3: low vegetation
+        (76, 170, 86),  # 4: medium vegetation
+        (35, 125, 62),  # 5: high vegetation
+        (210, 75, 65),  # 6: building
+        (220, 70, 190),  # 7: low point / noise
+        (235, 205, 80),  # 8: reserved/model key point
+        (80, 140, 235),  # 9: water
+        (225, 185, 80),  # 10: rail
+        (215, 145, 65),  # 11: road surface
+        (170, 105, 210),  # 12: overlap / reserved
+        (230, 135, 75),
+        (110, 165, 225),
+        (210, 115, 145),
+        (120, 195, 185),
+        (190, 155, 95),
+        (130, 115, 200),
+    ],
+    dtype=np.uint8,
+)
+_UNKNOWN_CLASSIFICATION_COLOR = np.asarray((118, 128, 138), dtype=np.uint8)
+_HEIGHT_COLOR_STOPS = np.asarray(
+    ((40, 80, 210), (35, 185, 180), (235, 215, 70), (225, 65, 50)),
+    dtype=np.float64,
+)
 
 
 def _metadata_frame_address(task: dict[str, Any]) -> str | None:
@@ -438,6 +469,93 @@ def _task_point_fingerprint(task: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _read_preview_block(
+    reader: Any,
+    point_file: dict[str, Any],
+    block: dict[str, Any],
+    *,
+    include_classification: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read one block with optional LAS classification and bounded fallbacks."""
+
+    records_reader = getattr(reader, "read_block_records", None)
+    if include_classification and callable(records_reader):
+        records = records_reader(point_file, block)
+        xyz = np.asarray(records.get("xyz", ()), dtype=np.float64)
+        rgb = np.asarray(records.get("rgb", ()), dtype=np.uint8)
+        intensity = np.asarray(records.get("intensity", ()))
+        classification = np.asarray(records.get("classification", ()))
+    else:
+        xyz, rgb, intensity = reader.read_block_points(point_file, block)
+        xyz = np.asarray(xyz, dtype=np.float64)
+        rgb = np.asarray(rgb, dtype=np.uint8)
+        intensity = np.asarray(intensity)
+        classification = np.full((xyz.shape[0],), -1, dtype=np.int16)
+    if xyz.ndim != 2 or xyz.shape[1:] != (3,):
+        raise ValueError("Point preview XYZ records must have shape (N, 3).")
+    count = int(xyz.shape[0])
+    if rgb.shape != (count, 3):
+        rgb = np.full((count, 3), 210, dtype=np.uint8)
+    if intensity.shape != (count,):
+        intensity = np.zeros((count,), dtype=np.uint16)
+    if classification.shape != (count,):
+        classification = np.full((count,), -1, dtype=np.int16)
+    return xyz, rgb, intensity, classification
+
+
+def _point_preview_colors(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    intensity: np.ndarray,
+    classification: np.ndarray,
+    color_mode: PointPreviewColorMode,
+) -> np.ndarray:
+    count = int(xyz.shape[0])
+    if color_mode == "rgb" or count == 0:
+        return np.asarray(rgb, dtype=np.uint8)
+    if color_mode == "intensity":
+        values = np.asarray(intensity, dtype=np.float64)
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            return np.full((count, 3), 128, dtype=np.uint8)
+        valid = values[finite]
+        low = float(np.quantile(valid, 0.02))
+        high = float(np.quantile(valid, 0.98))
+        if high <= low + 1e-12:
+            level = 170 if high > 0.0 else 90
+            gray = np.full((count,), level, dtype=np.uint8)
+        else:
+            normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+            normalized[~finite] = 0.35
+            gray = np.asarray(np.rint(35.0 + (normalized * 220.0)), dtype=np.uint8)
+        return np.repeat(gray[:, None], 3, axis=1)
+    if color_mode == "classification":
+        classes = np.asarray(classification, dtype=np.int64)
+        colors = np.tile(_UNKNOWN_CLASSIFICATION_COLOR, (count, 1))
+        known = (classes >= 0) & (classes < _CLASSIFICATION_COLORS.shape[0])
+        colors[known] = _CLASSIFICATION_COLORS[classes[known]]
+        return colors
+
+    heights = np.asarray(xyz[:, 2], dtype=np.float64)
+    finite = np.isfinite(heights)
+    if not np.any(finite):
+        return np.full((count, 3), 128, dtype=np.uint8)
+    low = float(np.min(heights[finite]))
+    high = float(np.max(heights[finite]))
+    if high <= low + 1e-12:
+        return np.tile(_HEIGHT_COLOR_STOPS[1].astype(np.uint8), (count, 1))
+    scaled = np.clip((heights - low) / (high - low), 0.0, 1.0)
+    scaled[~finite] = 0.0
+    segment_position = scaled * (_HEIGHT_COLOR_STOPS.shape[0] - 1)
+    left = np.floor(segment_position).astype(np.int64)
+    right = np.minimum(left + 1, _HEIGHT_COLOR_STOPS.shape[0] - 1)
+    fraction = (segment_position - left)[:, None]
+    colors = (_HEIGHT_COLOR_STOPS[left] * (1.0 - fraction)) + (
+        _HEIGHT_COLOR_STOPS[right] * fraction
+    )
+    return np.asarray(np.rint(colors), dtype=np.uint8)
+
+
 def _sample_nearby_points(
     task: dict[str, Any],
     catalog: dict[str, Any],
@@ -447,6 +565,7 @@ def _sample_nearby_points(
     radius: float,
     dense_radius: float | None = None,
     dense_budget_fraction: float = POINT_PREVIEW_DENSE_BUDGET_FRACTION,
+    color_mode: PointPreviewColorMode = "rgb",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from mms_shp_detection.pointcloud import (
         match_nearest_pointcloud_files,
@@ -485,10 +604,13 @@ def _sample_nearby_points(
             dense_radius=dense_radius,
             maximum_radius=radius,
             dense_budget_fraction=dense_budget_fraction,
+            color_mode=color_mode,
         )
 
     xyz_parts: list[np.ndarray] = []
     rgb_parts: list[np.ndarray] = []
+    intensity_parts: list[np.ndarray] = []
+    classification_parts: list[np.ndarray] = []
     per_block_quota = max(1, math.ceil(budget / max(1, len(bounded_candidates))))
     remaining = budget
     for _distance, point_file, block in bounded_candidates:
@@ -505,7 +627,12 @@ def _sample_nearby_points(
                     )
                 ),
             }
-        xyz, rgb, _intensity = reader.read_block_points(safe_point_file, block)
+        xyz, rgb, intensity, classification = _read_preview_block(
+            reader,
+            safe_point_file,
+            block,
+            include_classification=color_mode == "classification",
+        )
         if xyz.size == 0:
             continue
         squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
@@ -524,11 +651,16 @@ def _sample_nearby_points(
             selected_rgb = np.full((selected_xyz.shape[0], 3), 210, dtype=np.uint8)
         xyz_parts.append(selected_xyz)
         rgb_parts.append(selected_rgb)
+        intensity_parts.append(np.asarray(intensity[selected]))
+        classification_parts.append(np.asarray(classification[selected]))
         remaining -= int(selected_xyz.shape[0])
 
     if xyz_parts:
         xyz = np.concatenate(xyz_parts, axis=0)
         rgb = np.concatenate(rgb_parts, axis=0)
+        intensity = np.concatenate(intensity_parts, axis=0)
+        classification = np.concatenate(classification_parts, axis=0)
+        rgb = _point_preview_colors(xyz, rgb, intensity, classification, color_mode)
     else:
         xyz = np.empty((0, 3), dtype=np.float64)
         rgb = np.empty((0, 3), dtype=np.uint8)
@@ -626,6 +758,7 @@ def _sample_distance_bands(
     dense_radius: float,
     maximum_radius: float,
     dense_budget_fraction: float,
+    color_mode: PointPreviewColorMode,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sample 0..dense_radius more heavily than the outer preview band."""
 
@@ -663,10 +796,17 @@ def _sample_distance_bands(
 
     xyz_parts: list[np.ndarray] = []
     rgb_parts: list[np.ndarray] = []
+    intensity_parts: list[np.ndarray] = []
+    classification_parts: list[np.ndarray] = []
     for index, (point_file, block) in enumerate(safe_candidates):
         if dense_by_block[index] <= 0 and sparse_by_block[index] <= 0:
             continue
-        xyz, rgb, _intensity = reader.read_block_points(point_file, block)
+        xyz, rgb, intensity, classification = _read_preview_block(
+            reader,
+            point_file,
+            block,
+            include_classification=color_mode == "classification",
+        )
         if xyz.size == 0:
             continue
         squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
@@ -695,6 +835,8 @@ def _sample_distance_bands(
             selected_rgb = np.full((selected_xyz.shape[0], 3), 210, dtype=np.uint8)
         xyz_parts.append(selected_xyz)
         rgb_parts.append(selected_rgb)
+        intensity_parts.append(np.asarray(intensity[selected]))
+        classification_parts.append(np.asarray(classification[selected]))
 
     if not xyz_parts:
         return (
@@ -702,7 +844,15 @@ def _sample_distance_bands(
             np.empty((0, 3), dtype=np.uint8),
             origin,
         )
-    return np.concatenate(xyz_parts), np.concatenate(rgb_parts), origin
+    xyz = np.concatenate(xyz_parts)
+    rgb = _point_preview_colors(
+        xyz,
+        np.concatenate(rgb_parts),
+        np.concatenate(intensity_parts),
+        np.concatenate(classification_parts),
+        color_mode,
+    )
+    return xyz, rgb, origin
 
 
 def _build_mmsp(
@@ -711,6 +861,7 @@ def _build_mmsp(
     reader: Any,
     *,
     budget: int,
+    color_mode: PointPreviewColorMode = "rgb",
 ) -> bytes:
     if budget < 1 or budget > POINT_PREVIEW_MAX_BUDGET:
         raise ValueError(
@@ -723,6 +874,7 @@ def _build_mmsp(
         budget=budget,
         radius=POINT_PREVIEW_MAX_RADIUS_M,
         dense_radius=POINT_PREVIEW_DENSE_RADIUS_M,
+        color_mode=color_mode,
     )
     if xyz.size:
         relative = np.asarray(xyz - origin[None, :], dtype="<f4")
@@ -1165,6 +1317,7 @@ async def points(
         ge=POINT_PREVIEW_MIN_BUDGET,
         le=POINT_PREVIEW_MAX_BUDGET,
     ),
+    color_mode: PointPreviewColorMode = "rgb",
 ) -> Response:
     dataset = require_ready_dataset(request, dataset_id)
     frame = request.app.state.store.get_frame(dataset_id, frame_id)
@@ -1200,7 +1353,7 @@ async def points(
         )
 
     fingerprint_payload = (
-        f"mmsp-v3\0{dataset_id}\0{frame_id}\0{budget}\0"
+        f"mmsp-v4\0{dataset_id}\0{frame_id}\0{budget}\0{color_mode}\0"
         f"{POINT_PREVIEW_DENSE_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
         f"{POINT_PREVIEW_DENSE_BUDGET_FRACTION:.4f}\0"
         f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
@@ -1214,13 +1367,15 @@ async def points(
         / f"{fingerprint}.mmsp"
     )
     if output_path.is_file():
-        return _etag_response(
+        response = _etag_response(
             request,
             output_path,
             etag_value=fingerprint,
             media_type="application/vnd.mmsp",
             cache_seconds=3_600,
         )
+        response.headers["X-MMSP-Color-Mode"] = color_mode
+        return response
     lock_key = f"points:{fingerprint}"
     lock = request.app.state.media_locks.setdefault(lock_key, asyncio.Lock())
 
@@ -1235,6 +1390,7 @@ async def points(
                             catalog,
                             request.app.state.point_reader,
                             budget=budget,
+                            color_mode=color_mode,
                         )
                         await asyncio.to_thread(_write_once, output_path, payload)
                         await asyncio.to_thread(
@@ -1261,13 +1417,15 @@ async def points(
         raise HTTPException(
             status_code=500, detail="Could not prepare point-cloud preview."
         ) from exc
-    return _etag_response(
+    response = _etag_response(
         request,
         output_path,
         etag_value=fingerprint,
         media_type="application/vnd.mmsp",
         cache_seconds=3_600,
     )
+    response.headers["X-MMSP-Color-Mode"] = color_mode
+    return response
 
 
 @router.get("/datasets/{dataset_id}/panorama-points/{frame_id}")

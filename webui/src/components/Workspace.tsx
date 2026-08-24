@@ -30,6 +30,10 @@ import type { DatasetSummary, Frame, FrameRange, RoutePoint, SurveySegment } fro
 import type { MapMode } from '../views/MapView'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
+import { ReviewQueue } from './ReviewQueue'
+import { ObjectTemplatePanel } from './ObjectTemplatePanel'
+import { ProposalInspector } from './ProposalInspector'
+import { QaIssuePanel } from './QaIssuePanel'
 
 export const OPEN_POINT_CLOUD_EVENT = 'mms-open-pointcloud'
 
@@ -749,6 +753,11 @@ export function Workspace({
             </DetachablePanel>
           </>
         )}
+
+        <ReviewQueue />
+        <ObjectTemplatePanel />
+        <ProposalInspector />
+        <QaIssuePanel />
 
         {dataset && frame && (
           <div className="frame-navigator">

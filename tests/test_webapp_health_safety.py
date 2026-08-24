@@ -64,6 +64,9 @@ class WebAppHealthSafetyTests(unittest.TestCase):
                 self.assertEqual(bootstrap.status_code, 200)
                 bootstrap_payload = bootstrap.json()
                 self.assertTrue(bootstrap_payload["capabilities"]["resumable_uploads"])
+                self.assertIs(
+                    bootstrap_payload["capabilities"]["review_workspace"], True
+                )
                 self.assertEqual(
                     bootstrap_payload["capabilities"]["max_point_budget"],
                     1_000_000,

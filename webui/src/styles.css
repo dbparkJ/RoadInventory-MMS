@@ -3229,6 +3229,134 @@ button:disabled {
   accent-color: var(--mint);
 }
 
+.pointcloud-tool-menu {
+  position: relative;
+}
+
+.pointcloud-tool-menu > summary {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  color: #8198a8;
+  list-style: none;
+  cursor: pointer;
+  border-radius: 5px;
+}
+
+.pointcloud-tool-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pointcloud-tool-menu[open] > summary,
+.pointcloud-tool-menu > summary:hover {
+  color: var(--mint);
+  background: rgba(57, 215, 174, 0.08);
+}
+
+.pointcloud-tool-menu > div {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 12;
+  display: grid;
+  width: 225px;
+  gap: 8px;
+  padding: 10px;
+  color: #8198a8;
+  background: rgba(6, 17, 29, 0.98);
+  border: 1px solid rgba(111, 147, 168, 0.24);
+  border-radius: 8px;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.4);
+}
+
+.pointcloud-tool-menu > div > label:not(.pointcloud-tool-check) {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 7px;
+}
+
+.pointcloud-tool-menu input[type='range'],
+.pointcloud-tool-menu select,
+.pointcloud-tool-menu input[type='number'] {
+  min-width: 0;
+  width: 100%;
+}
+
+.pointcloud-tool-menu input[type='range'],
+.pointcloud-tool-menu input[type='checkbox'] {
+  accent-color: var(--mint);
+}
+
+.pointcloud-tool-check {
+  justify-content: flex-start;
+}
+
+.pointcloud-z-range {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.pointcloud-z-range label {
+  display: grid;
+  gap: 3px;
+}
+
+.viewer-toolbar .pointcloud-tool-menu .button {
+  display: flex;
+  width: 100%;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.pointcloud-measure-card {
+  position: absolute;
+  bottom: 52px;
+  left: 14px;
+  z-index: 7;
+  display: grid;
+  min-width: 210px;
+  gap: 7px;
+  padding: 9px;
+  color: #8299a7;
+  font-size: 8px;
+  background: rgba(7, 17, 31, 0.92);
+  border: 1px solid rgba(145, 173, 193, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+}
+
+.pointcloud-measure-card > strong {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--mint);
+}
+
+.pointcloud-measure-card dl {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+}
+
+.pointcloud-measure-card dl > div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.pointcloud-measure-card dt,
+.pointcloud-measure-card dd {
+  margin: 0;
+}
+
+.manual-proposal-indicator {
+  color: #ffb44d !important;
+}
+
 .capture-pose-legend {
   position: absolute;
   top: 91px;

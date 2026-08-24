@@ -1,6 +1,204 @@
 # 현재 아키텍처
 
-이 문서는 `a34f267`의 1차 구조 개선과 2026-08-10 후속 안정화를 반영한 실제 실행 경로와 데이터 흐름을 기록한다. 목표 구조를 설명하는 문서가 아니라, 지금 코드가 어디에서 상태를 바꾸고 파일을 쓰며 어떤 테스트로 보호되는지 확인하기 위한 기준선이다.
+이 문서는 2026-08-24 기준 P0 작업자 지주 바닥점과 P1 미검출 검수 작업공간의 실제 실행 경로와 데이터 흐름을 기록한다. 목표 구조가 아니라 현재 코드가 어디에서 상태를 바꾸고 파일을 쓰며 어떤 복구 경계를 갖는지 확인하기 위한 운영 기준선이다.
+
+## P0 지주 보정과 P1 검수 작업공간
+
+P0 수동 지주 바닥점과 P1 검수 작업공간은 모두 활성 상태다. `/api/bootstrap`은
+`capabilities.pole_base_inference`, `capabilities.review_workspace`,
+`capabilities.active_learning_export`를 공개한다. 점군 reader가 없는 서버에서는 지주
+inference만 비활성화되고, 검수 session/task·QA·report 저장 계약은 그대로 유지된다.
+능동학습 export는 독립 서버 정책으로 끌 수 있으며 이때 endpoint도 403으로 거부한다.
+
+### 현재 기능
+
+| 영역 | 실제 동작 |
+|---|---|
+| 지주 신규 | `N`으로 Point 후보 생성 → 실제 점 선택 → `B`로 read-only 바닥점 proposal → 다시 `B`로 create 확정 |
+| 지주 수정 | 기존 Point 선택 → 이동할 실제 점 선택 → `B`로 proposal → 다시 `B`로 patch 확정 |
+| 미리보기 | 확정 전 바닥점과 수동 bbox PointZ를 파노라마·점군에 동시에 표시하며 지주 marker 색·크기는 로컬 설정으로 보존 |
+| 검수 범위 | dataset/run/layer/track/frame/class 범위를 session에 고정하고 마지막 task·필터를 복원 |
+| 작업 큐 | 수동 항목, 저신뢰도, 3D 실패, geometry/pole REVIEW, 간격 이상, 미검수 구간, 수동 flag를 mutation-safe cursor queue로 처리 |
+| 수동 객체 | `TRAFFIC_SIGN` 파노라마 seam-safe bbox와 `SIGN_SUPPORT_POLE` P0 adapter를 공통 template/proposal 흐름에서 사용 |
+| 품질·이력 | exact/near duplicate, required/domain/relation QA, provenance, revision CAS 기반 undo/redo를 제공 |
+| 납품 근거 | 범위·완료율·작업 결과·QA·작업시간·fingerprint report와 edited SHP/provenance/선택형 active-learning ZIP을 생성 |
+
+### 동결된 P0 public API
+
+```http
+POST /api/datasets/{dataset_id}/frames/{frame_id}/pole-base/infer
+Content-Type: application/json
+
+{
+  "coordinate_space": "dataset",
+  "seed_position": [123.0, 456.0, 10.0],
+  "profile": "balanced",
+  "debug": false
+}
+```
+
+응답은 `status`(`auto`, `review`, `failed`), `base_position`,
+`snapped_seed_position`, 품질 점수, `reason_codes`, `warnings`를 포함한다. 좌표는 항상
+dataset CRS이며 `failed`에는 저장 가능한 `base_position`이 없다. 이 endpoint는 원본
+점군과 overlay를 변경하지 않는다. 사용자가 확정할 때만 기존
+`POST /api/datasets/{dataset_id}/overlays/{layer_id}/features` 또는
+`PATCH /api/datasets/{dataset_id}/overlays/{layer_id}/features/{feature_id}`가 geometry와
+지원되는 바닥점 속성을 한 revision에 저장한다.
+
+축 return이 지면까지 이어지지 않는 경우에도 최하단 shaft point를 바닥점으로 복사하지
+않는다. 로컬 지면 후보에서 좁은 guardrail·식생 부유면을 제외하고, 분류 정보가 없을
+때는 직접 접촉한 작은 설치면을 제외하면 전체 ground cell의 과반을 설명하는 연속면을
+우선한 뒤 축과 교차시켜 새 PointZ를 만든다. 따라서 해당 XYZ에 원본 복셀 point가 없어도
+정상이며, 확정 시 geometry와 위 alias 속성에는 이 생성 좌표를 동일하게 기록한다.
+관측된 축 하단과 지면 교차점의 간격이 0.35m를 넘으면 `BOTTOM_EXTRAPOLATED` 검토 제안으로
+남기고, 과거 review 기준인 1.5m를 넘더라도 최대 6m까지는 작업자가 확정할 수 있다. 6m를
+넘는 교차는 다른 구조물을 지주로 고른 경우에 대비해 저장 불가능한 실패로 처리한다.
+
+### P1 런타임 계약
+
+`review_contracts.py`와 `webui/src/types.ts`가 다음 JSON 경계를 공유한다.
+
+- `ReviewSession`: dataset/run/layer/track/frame/class 범위, 작업자, 상태와 마지막 task
+- `ReviewTask`: 후보 종류, 우선순위, 근거 ID, 위치, claim과 resolution
+- `ManualObservation`: panorama bbox를 1~2개의 `u_intervals`로 보존해 seam 교차 지원
+- `GeometryProposal`: dataset PointZ, property patch, 품질, 사유와 evidence
+- `FeatureProvenance`: DBF가 아닌 내부 출처·도구·검수 메타데이터
+- `QaIssue`: rule, severity, 관련 feature와 처리 상태
+
+주요 API는 다음과 같다.
+
+```http
+POST /api/datasets/{dataset_id}/review-sessions
+GET  /api/datasets/{dataset_id}/review-sessions
+GET  /api/review-sessions/{session_id}
+PATCH /api/review-sessions/{session_id}
+POST /api/review-sessions/{session_id}/tasks/generate
+GET  /api/review-sessions/{session_id}/tasks
+GET  /api/review-tasks/{task_id}
+PATCH /api/review-tasks/{task_id}
+POST /api/review-tasks/{task_id}/resolve
+POST /api/review-tasks/{task_id}/reopen
+POST /api/datasets/{dataset_id}/frames/{frame_id}/manual-observations
+POST /api/datasets/{dataset_id}/frames/{frame_id}/manual-object-proposals
+GET  /api/manual-object-proposals/{proposal_id}
+DELETE /api/manual-object-proposals/{proposal_id}
+POST /api/manual-object-proposals/{proposal_id}/commit
+POST /api/datasets/{dataset_id}/manual-objects/duplicate-preflight
+POST /api/review-sessions/{session_id}/qa/run
+GET  /api/review-sessions/{session_id}/qa/issues
+PATCH /api/qa/issues/{issue_id}
+GET  /api/review-sessions/{session_id}/report?format=json|csv|markdown
+GET  /api/review-sessions/{session_id}/export
+GET  /api/review-sessions/{session_id}/active-learning-export
+GET  /api/datasets/{dataset_id}/overlays/{layer_id}/edit-history
+POST /api/datasets/{dataset_id}/overlays/{layer_id}/undo
+POST /api/datasets/{dataset_id}/overlays/{layer_id}/redo
+```
+
+session 범위는 draft이며 task가 없을 때만 바꿀 수 있다. task 생성·후보 생성·claim·해결·
+reopen과 task에 연결된 feature 저장은 active session에서만 허용된다. paused session은
+resume 전까지 작업 변경을 거부하고 completed/archived session과 그 task는 read-only다.
+task의 source run은 같은 dataset의 `completed` run이어야 하고 detection ID는 source run
+없이 저장할 수 없다. session에 명시한 run/layer와 task가 실제 참조한 run/layer의 합집합이
+QA·report·export의 유효 범위다. queue pagination은 작업 중 바뀔 수 있는 status/priority와
+분리된 생성 시점 `queue_priority DESC, created_at, id` keyset cursor를 사용하므로, 필터된
+첫 페이지 항목을 처리한 뒤에도 다음 페이지가 밀려 누락되지 않는다.
+`UNREVIEWED_INTERVAL`은 시작·끝 frame ordinal을 보존해 구간 전체를 검수 범위와 완료율에
+포함하며, 완료된 구간은 후보 재생성에서도 다시 나오지 않는다. task 상태 변경은 현재
+상태 CAS와 event append를 한 registry transaction으로 처리한다.
+
+session 완료 전에는 현재 유효 target layer revision 전체에 대해 QA를 한 번 실행해야 한다.
+QA 미실행, QA 이후 layer 수정, open error issue 또는 open task가 있으면 완료 전이를
+거부한다. report는 중간 진행 상황에서도 생성되지만 `completion_gate`에 같은 차단 사유를
+명시한다. error issue는 화면에서 임의 해제할 수 없고 원인 데이터를 고친 뒤 QA를 다시
+실행해 사라져야 한다. target layer가 없는 session도 빈 결과와 빈 revision map을 유효한
+최신 QA snapshot으로 저장한다.
+
+### 화면과 작업 context
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│ 검수 세션: dataset / run / track / class / 범위 / 작업자 / 진행률  │
+├──────────────┬──────────────────────────────────┬───────────────────┤
+│ 작업 큐      │ 지도 · 파노라마 · 점군            │ 객체 template     │
+│ 상태/유형    │ 현재 frame context 고정           │ 필수/자동 속성     │
+│ 이전/다음    │ AI bbox · 수동 bbox · proposal    │ QA · 확인 후 다음 │
+├──────────────┴──────────────────────────────────┴───────────────────┤
+│ 근거: run / model / frame / seed / bbox / quality / edit revision  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+기존 detachable 지도·파노라마·점군 창과 P0 단축키 relay는 유지하고, P1은 선택된
+review task의 frame context를 세 뷰와 객체 template·QA panel에 공유한다. `J/K`는
+이전·다음 task, `X`는 오검출, `F`는 나중에 확인, `M`은 수동 bbox, `Q`는 QA panel,
+`Shift+Enter`는 확인 후 다음이다. popup은 modifier를 보존해 canonical window handler로
+relay하며 입력 필드에서는 shortcut을 실행하지 않는다.
+
+점군 보조 도구는 local clip, Z slice, proposal isolate, 2점 거리/높이 측정과
+`rgb|intensity|classification|height` 색상 모드를 제공한다. 색상 모드는
+`GET /api/datasets/{dataset_id}/points/{frame_id}?color_mode=...`가 실제 intensity/LAS
+classification 또는 높이에서 RGB를 만든 MMSP v1 derivative를 반환한다. geometry layout을
+바꾸지 않고 mode를 cache fingerprint에 포함한다.
+
+### 지원 template
+
+첫 지원 조합은 `TRAFFIC_SIGN` + `SIGN_SUPPORT_POLE`이다. 전자는
+`panorama_bbox_point_v1`, 후자는 `manual_pole_base_v1`을 사용하고 둘 다 Point layer만
+허용한다. template registry가 fixed/default/domain/required semantics, 중복 반경,
+연속 추가, `support_id` 관계를 공개한다. 작업자 식별자는 현재 `operator-local` 단일 운영
+모드다. 두 template 모두 저장 직전 같은 overlay transaction에서 fixed/required/domain과
+exact/near duplicate를 다시 검사한다. exact duplicate는 차단하고 near duplicate는 3자
+이상의 작업자 사유가 있어야 허용하며, 기존 지주 이동은 자기 feature를 중복 후보에서
+제외한다. 연결된 review task의 run/detection ID는 DBF가 아닌 내부 provenance에 합쳐진다.
+
+### 저장·복구 경계
+
+기존 데이터는 additive·idempotent migration으로 보존한다.
+
+1. `registry.sqlite3`에 `review_sessions`, `review_tasks`, `review_task_events`,
+   `qa_issues`를 추가한다.
+2. overlay별 `features.sqlite3`에 `feature_provenance`, `manual_observations`,
+   `edit_transactions`, feature mutation 멱등성 기록, undo/redo request state와
+   `task_resolution_outbox`를 추가한다.
+3. feature geometry/properties/audit/provenance는 기존 layer revision CAS와 같은 overlay
+   write transaction에 저장한다.
+4. registry가 WAL이고 overlay DB가 rollback journal인 현재 구조에서는 두 파일을 하나의
+   원자적 SQLite transaction이라고 가정하지 않는다. 대신 feature·audit·provenance·요청
+   멱등성 결과와 task resolve/reopen intent를 같은 overlay transaction에 먼저 저장한다.
+   commit 직후 즉시 registry 반영을 시도하고, 실패한 intent는 서버 시작·session 조회·report·
+   완료 판정 시 bounded replay한다. pending/error 또는 scan 누락이 있으면 session 완료와 layer
+   unregister를 막으며, 이미 다른 terminal 결과가 된 task를 덮어쓰지 않는다. linked undo/redo와
+   session pause/completion은 단일-worker session fence를 공유한다. API는
+   `task_resolution_pending`과 멱등 replay 여부를 반환하므로 응답 유실 뒤 같은 key로 재시도해도
+   feature를 중복 생성하거나 revision을 다시 올리지 않는다.
+
+dataset unregister는 registry write transaction과 dataset별 process-local lock 아래에서 수행한다.
+active/paused session, 실제 범위나 task를 가진 draft session, 또는 해당 dataset overlay의
+미반영 task-resolution outbox가 있으면 삭제를 거부하고 frame/session/task를 그대로 둔다.
+아무 범위·task도 없는 빈 draft만 자동 정리할 수 있다.
+
+SHP/DBF에는 납품 schema가 정의한 업무 속성만 둔다. source run/frame/detection,
+manual observation, creation tool, proposal quality, review status, operator와 audit 시간은
+`feature_provenance`에 보존한다. edited SHP ZIP은 DBF schema를 임의 확장하지 않고 현재
+session에 귀속된 provenance만 sidecar JSON으로 함께 내보낸다.
+
+수동 bbox proposal은 메모리에서 15분 TTL과 최대 개수 제한을 가지므로 서버 재시작 후에는
+다시 inference해야 한다. inference는 overlay를 수정하지 않으며 commit 시 revision과
+duplicate를 다시 검사한다. 요청 취소 후에도 worker가 끝날 때까지 공용 semaphore ownership을
+유지해 reader와 cache를 조기에 닫지 않는다.
+
+report와 두 ZIP은 session/task/event/QA digest 및 유효 target layer의 실제 feature DB
+revision을 생성 전후 비교한다. 생성 중 registry나 layer가 바뀌면 임시 결과를 폐기하고
+409 재시도를 요구한다. task·QA·feature·출력 byte·영상 hash byte에는 상한이 있고 export는
+전용 semaphore로 직렬 제한된다. 비정상 종료가 남긴 export 임시 폴더는 이름·수명·개수와
+symlink/junction·resolved parent를 검사한 뒤 시작 시 제한적으로 정리한다. CSV는 선행 공백
+뒤 spreadsheet formula 문자를 neutralize하고 제어문자를 제거한다.
+
+active-learning ZIP은 현재 session 유효 범위에 연결된 수동 bbox, false positive, corrected
+class와 content-derived manifest만 포함한다. 영상은 서버 경로 대신 `{dataset_id, frame_id}`와
+제한된 content SHA로 식별하고 모델은 detection artifact에서 확인된 `model_sha256`만 version으로
+인정하며 unavailable/conflict를 명시한다. 작업자 식별자·작업 event 시각·checkpoint 경로·원본
+영상 byte를 내보내지 않으며 학습이나 배포를 자동 시작하지 않는다.
 
 ## 실행 진입점
 

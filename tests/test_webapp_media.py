@@ -53,16 +53,36 @@ class _Reader:
 
 
 class _StaticReader:
-    def __init__(self, xyz, rgb):
+    def __init__(self, xyz, rgb, intensity=None, classification=None):
         self.xyz = np.asarray(xyz, dtype=np.float64)
         self.rgb = np.asarray(rgb, dtype=np.uint8)
+        self.intensity = np.asarray(
+            np.zeros(self.xyz.shape[0], dtype=np.uint16)
+            if intensity is None
+            else intensity,
+            dtype=np.uint16,
+        )
+        self.classification = np.asarray(
+            np.full(self.xyz.shape[0], -1, dtype=np.int16)
+            if classification is None
+            else classification,
+            dtype=np.int16,
+        )
 
     def read_block_points(self, _point_file, _block):
         return (
             self.xyz.copy(),
             self.rgb.copy(),
-            np.zeros(self.xyz.shape[0], dtype=np.uint16),
+            self.intensity.copy(),
         )
+
+    def read_block_records(self, _point_file, _block):
+        return {
+            "xyz": self.xyz.copy(),
+            "rgb": self.rgb.copy(),
+            "intensity": self.intensity.copy(),
+            "classification": self.classification.copy(),
+        }
 
     def close(self):
         return None
@@ -375,6 +395,44 @@ class WebAppMediaTests(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(distances <= 15.0)), 10)
         self.assertEqual(int(np.count_nonzero(distances > 15.0)), 90)
 
+    def test_mmsp_color_derivatives_use_source_attributes_and_keep_v1_layout(self) -> None:
+        xyz = np.column_stack(
+            (np.linspace(1.0, 10.0, 20), np.zeros(20), np.linspace(0.0, 5.0, 20))
+        )
+        rgb = np.tile(np.asarray([[12, 34, 56]], dtype=np.uint8), (20, 1))
+        intensity = np.linspace(0, 4_000, 20, dtype=np.uint16)
+        classification = np.resize(np.asarray([2, 5, -1], dtype=np.int16), 20)
+        reader = _StaticReader(xyz, rgb, intensity, classification)
+        catalog = _static_catalog(xyz)
+
+        rendered: dict[str, np.ndarray] = {}
+        for mode in ("rgb", "intensity", "classification", "height"):
+            payload = _build_mmsp(
+                {
+                    "origin": [0.0, 0.0, 0.0],
+                    "job_name": "Job_A",
+                    "track_name": "TRACK01",
+                },
+                catalog,
+                reader,
+                budget=20,
+                color_mode=mode,
+            )
+            magic, version, _flags, count, *_bounds = MMSP_HEADER.unpack_from(payload)
+            self.assertEqual((magic, version, count), (b"MMSP", 1, 20))
+            self.assertEqual(len(payload), MMSP_HEADER.size + 20 * MMSP_RECORD_BYTES)
+            rendered[mode] = np.frombuffer(
+                payload,
+                dtype=np.dtype([("xyz", "<f4", (3,)), ("rgb", "u1", (3,))]),
+                offset=MMSP_HEADER.size,
+            )["rgb"]
+
+        np.testing.assert_array_equal(rendered["rgb"], rgb)
+        self.assertTrue(np.all(rendered["intensity"][:, 0] == rendered["intensity"][:, 1]))
+        self.assertGreater(int(rendered["intensity"][-1, 0]), int(rendered["intensity"][0, 0]))
+        self.assertGreater(len(np.unique(rendered["classification"], axis=0)), 2)
+        self.assertGreater(len(np.unique(rendered["height"], axis=0)), 4)
+
     def test_mmso_projects_world_points_to_normalized_panorama_uv(self) -> None:
         xyz = np.asarray(
             [
@@ -565,6 +623,7 @@ class WebAppMediaTests(unittest.TestCase):
                     params={"budget": POINT_PREVIEW_MAX_BUDGET},
                 )
                 self.assertEqual(point_response.status_code, 200, point_response.text)
+                self.assertEqual(point_response.headers["x-mmsp-color-mode"], "rgb")
                 self.assertTrue(
                     point_response.headers["content-type"].startswith(
                         "application/vnd.mmsp"
@@ -582,6 +641,14 @@ class WebAppMediaTests(unittest.TestCase):
                     params={"budget": POINT_PREVIEW_MIN_BUDGET - 1},
                 )
                 self.assertEqual(under_budget.status_code, 422, under_budget.text)
+                invalid_color = client.get(
+                    f"/api/datasets/{dataset_id}/points/{frame_id}",
+                    params={
+                        "budget": POINT_PREVIEW_MIN_BUDGET,
+                        "color_mode": "synthetic",
+                    },
+                )
+                self.assertEqual(invalid_color.status_code, 422, invalid_color.text)
 
                 projection = client.get(
                     f"/api/datasets/{dataset_id}/frames/{frame_id}/panorama-projection",

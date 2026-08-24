@@ -18,11 +18,22 @@ import type {
   OverlayFeatureCreateRequest,
   OverlayField,
   OverlayLayer,
+  ManualDuplicatePreflightResponse,
+  OverlayManualObjectValidation,
+  OverlayReviewMetadata,
   PoleBaseInferResponse,
 } from '../types'
+import { useOptionalReviewWorkspace } from './ReviewContext'
 
 const LAYER_COLORS = ['#2bcfa8', '#ffb84d', '#65a9ff', '#ff6f91', '#b38cff', '#f4e04d']
 const FEATURE_PAGE_SIZE = 3_000
+
+function featureMutationKey(prefix: string): string {
+  const random =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}_${Math.random().toString(16).slice(2)}`
+  return `${prefix}-${random}`
+}
 
 interface LayerFeatures {
   wgs84: OverlayFeatureCollection | null
@@ -67,6 +78,7 @@ type DirectPointPickTarget = Extract<OverlayPickTarget, { kind: 'move' | 'create
 interface StagedPointWorkflow {
   target: DirectPointPickTarget
   continuous: boolean
+  templateOptions?: PoleBaseTemplateOptions
 }
 
 interface StagedPointCloudCoordinate extends StagedPointWorkflow {
@@ -99,6 +111,21 @@ export type PoleBaseTarget =
   | { kind: 'pole-base-create'; layerId: string; continuous: boolean }
   | { kind: 'pole-base-move'; layerId: string; featureId: string | number }
 
+export interface PoleBaseTemplateOptions {
+  templateId: 'SIGN_SUPPORT_POLE'
+  properties: Record<string, unknown>
+  requiredFields: string[]
+  allowNearDuplicate: boolean
+  overrideReason: string
+}
+
+export interface PoleBaseTemplateValidation {
+  duplicate: ManualDuplicatePreflightResponse
+  missingRequiredFields: string[]
+  allowNearDuplicate: boolean
+  overrideReason: string
+}
+
 export type PoleBaseProposalState =
   | { status: 'idle' }
   | { status: 'picking'; target: PoleBaseTarget }
@@ -114,6 +141,8 @@ export type PoleBaseProposalState =
       frameId: string
       seed: [number, number, number]
       result: PoleBaseInferResponse
+      idempotencyKey: string
+      templateValidation?: PoleBaseTemplateValidation
     }
   | {
       status: 'error'
@@ -146,6 +175,9 @@ export const POLE_BASE_REASON_MESSAGES: Readonly<Record<string, string>> = {
   GROUND_PENETRATION: '검출된 지주가 추정 지면 아래로 지나치게 들어갑니다.',
   BOTTOM_EXTRAPOLATED: '관측된 지주 끝에서 바닥까지 외삽 거리가 깁니다.',
   BASE_OUTSIDE_LOCAL_WINDOW: '추정 바닥점이 분석 범위를 벗어났습니다.',
+  TASK_RESOLUTION_PENDING: '객체는 저장됐지만 검수 항목 동기화가 필요합니다.',
+  DUPLICATE_EXACT: '동일한 지주 객체가 이미 존재합니다.',
+  DUPLICATE_NEARBY: '가까운 지주 객체가 있어 저장 확인이 필요합니다.',
 }
 
 export function poleBaseReasonMessage(reasonCode: string): string {
@@ -275,6 +307,41 @@ export function buildPoleBasePropertyPatch(
   return patch
 }
 
+function hasPoleTemplatePropertyValue(value: unknown): boolean {
+  return value !== null && value !== undefined &&
+    (typeof value !== 'string' || value.trim().length > 0)
+}
+
+function buildPoleBaseTemplatePropertyPatch(
+  fields: OverlayField[],
+  currentProperties: Record<string, unknown>,
+  result: PoleBaseInferResponse,
+  frameId: string,
+  options?: PoleBaseTemplateOptions,
+): { properties: Record<string, unknown>; missingRequiredFields: string[] } {
+  const automatic = buildPoleBasePropertyPatch(fields, currentProperties, result, frameId)
+  const properties = options ? { ...options.properties, ...automatic } : automatic
+  const finalProperties = { ...currentProperties, ...properties }
+  return {
+    properties,
+    missingRequiredFields: options
+      ? options.requiredFields.filter((fieldName) =>
+          !hasPoleTemplatePropertyValue(finalProperties[fieldName]),
+        )
+      : [],
+  }
+}
+
+export function poleBaseTemplateValidationBlocksSave(
+  validation: PoleBaseTemplateValidation | undefined,
+): boolean {
+  if (!validation) return false
+  return validation.duplicate.exact_duplicate ||
+    validation.missingRequiredFields.length > 0 ||
+    (validation.duplicate.warning_count > 0 &&
+      (!validation.allowNearDuplicate || validation.overrideReason.trim().length < 3))
+}
+
 export interface OverlayContextValue {
   datasetId: string
   poleBaseInferenceEnabled: boolean
@@ -297,12 +364,20 @@ export interface OverlayContextValue {
   poleBaseProposal: PoleBaseProposalState
   setPickMode: (enabled: boolean) => void
   beginCreatePoint: (layerId: string) => void
-  beginStagedPointCreate: (layerId: string, continuous?: boolean) => void
+  beginStagedPointCreate: (
+    layerId: string,
+    continuous?: boolean,
+    templateOptions?: PoleBaseTemplateOptions,
+  ) => void
   beginStagedSelectedPointMove: () => void
+  updateStagedPoleBaseTemplateOptions: (
+    layerId: string,
+    templateOptions: PoleBaseTemplateOptions,
+  ) => void
   beginCreatePoleBase: (layerId: string, continuous?: boolean) => void
   beginRecomputeSelectedPoleBase: () => void
   applyPoleSeed: (frameId: string, coordinates: [number, number, number]) => Promise<void>
-  confirmPoleBaseProposal: () => Promise<void>
+  confirmPoleBaseProposal: () => Promise<boolean>
   retryPoleBasePick: () => void
   cancelPoleBaseProposal: () => void
   handlePoleBaseFrameChange: (frameId: string) => void
@@ -321,6 +396,8 @@ export interface OverlayContextValue {
     geometry?: { type: 'Point'; coordinates: [number, number, number?] }
     coordinate_space?: OverlayCoordinateSpace
     properties?: Record<string, unknown>
+    review_metadata?: OverlayReviewMetadata
+    manual_object_validation?: OverlayManualObjectValidation
   }) => Promise<void>
   applyPickedCoordinate: (
     coordinates: [number, number, number?],
@@ -389,6 +466,7 @@ export function OverlayProvider({
   notify?: (entry: { tone: 'success' | 'error' | 'info'; title: string; message?: string }) => void
   children: ReactNode
 }) {
+  const review = useOptionalReviewWorkspace()
   const [layers, setLayers] = useState<OverlayLayer[]>([])
   const [features, setFeatures] = useState<Record<string, LayerFeatures>>({})
   const [visibleLayerIds, setVisibleLayerIds] = useState<Set<string>>(new Set())
@@ -416,6 +494,8 @@ export function OverlayProvider({
   const poleBaseRequestIdRef = useRef(0)
   const poleBaseSaveIdRef = useRef(0)
   const poleBaseConfirmingRef = useRef(false)
+  const featureTaskResolutionPendingRef = useRef<boolean | null>(null)
+  const savedFeatureIdRef = useRef<string | number | null>(null)
   const stagedPointWorkflowRef = useRef<StagedPointWorkflow | null>(null)
   const stagedPointCloudCoordinateRef = useRef<StagedPointCloudCoordinate | null>(null)
   const directActualPointPickRef = useRef(false)
@@ -534,7 +614,11 @@ export function OverlayProvider({
   )
 
   const beginStagedPointCreate = useCallback(
-    (layerId: string, continuous = false) => {
+    (
+      layerId: string,
+      continuous = false,
+      templateOptions?: PoleBaseTemplateOptions,
+    ) => {
       const layer = layers.find((candidate) => candidate.id === layerId)
       beginCreatePoint(layerId)
       if (!layer || layer.geometry_type !== 'Point' || demoMode) return
@@ -542,6 +626,7 @@ export function OverlayProvider({
       stagedPointWorkflowRef.current = {
         target: { kind: 'create', layerId },
         continuous,
+        templateOptions,
       }
     },
     [beginCreatePoint, demoMode, layers],
@@ -560,6 +645,73 @@ export function OverlayProvider({
       continuous: false,
     }
   }, [selected, setPickMode])
+
+  const updateStagedPoleBaseTemplateOptions = useCallback(
+    (layerId: string, templateOptions: PoleBaseTemplateOptions) => {
+      const workflow = stagedPointWorkflowRef.current
+      if (!workflow || workflow.target.layerId !== layerId) return
+      const nextWorkflow = { ...workflow, templateOptions }
+      stagedPointWorkflowRef.current = nextWorkflow
+      const staged = stagedPointCloudCoordinateRef.current
+      if (staged && directPointTargetsMatch(staged.target, workflow.target)) {
+        stagedPointCloudCoordinateRef.current = { ...staged, templateOptions }
+      }
+      const proposal = poleBaseProposalRef.current
+      if (
+        proposal.status !== 'ready' ||
+        !proposal.templateValidation ||
+        !stagedWorkflowMatchesPoleTarget(nextWorkflow, proposal.target)
+      ) return
+      const layer = layers.find((candidate) => candidate.id === layerId)
+      if (!layer) return
+      const fields =
+        layer.fields ??
+        features[layerId]?.dataset?.fields ??
+        features[layerId]?.wgs84?.fields ??
+        []
+      const moveFeatureId =
+        proposal.target.kind === 'pole-base-move'
+          ? String(proposal.target.featureId)
+          : null
+      const currentProperties =
+        moveFeatureId !== null
+          ? (
+              features[layerId]?.dataset?.features.find(
+                (feature) => String(feature.id) === moveFeatureId,
+              )?.properties ??
+              selectedDatasetDetail?.feature.properties ??
+              features[layerId]?.wgs84?.features.find(
+                (feature) => String(feature.id) === moveFeatureId,
+              )?.properties ??
+              selectedWgs84Detail?.feature.properties ??
+              {}
+            )
+          : {}
+      const propertyResult = buildPoleBaseTemplatePropertyPatch(
+        fields,
+        currentProperties,
+        proposal.result,
+        proposal.frameId,
+        templateOptions,
+      )
+      commitPoleBaseProposal({
+        ...proposal,
+        templateValidation: {
+          ...proposal.templateValidation,
+          missingRequiredFields: propertyResult.missingRequiredFields,
+          allowNearDuplicate: templateOptions.allowNearDuplicate,
+          overrideReason: templateOptions.overrideReason,
+        },
+      })
+    },
+    [
+      commitPoleBaseProposal,
+      features,
+      layers,
+      selectedDatasetDetail,
+      selectedWgs84Detail,
+    ],
+  )
 
   const beginCreatePoleBase = useCallback(
     (layerId: string, continuous = true) => {
@@ -671,6 +823,13 @@ export function OverlayProvider({
   const retryPoleBasePick = useCallback(() => {
     const proposal = poleBaseProposalRef.current
     if (proposal.status === 'idle') return
+    // The feature has already been persisted in this state. Starting another
+    // pick would allow a second create/patch while only task reconciliation is
+    // pending, so the operator may only dismiss the notice and reload the task.
+    if (
+      proposal.status === 'error' &&
+      proposal.reasonCodes.includes('TASK_RESOLUTION_PENDING')
+    ) return
     const workflow = stagedPointWorkflowRef.current
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
@@ -1286,6 +1445,8 @@ export function OverlayProvider({
           ...payload,
           expected_revision: currentRevision,
         })
+        featureTaskResolutionPendingRef.current = response.task_resolution_pending ?? false
+        savedFeatureIdRef.current = response.feature.id
         const nextSelection = { layerId, featureId: response.feature.id }
         selectFeature(nextSelection, selectionOptions)
         const detail: SelectedFeatureDetailCache = {
@@ -1322,6 +1483,9 @@ export function OverlayProvider({
       geometry?: { type: 'Point'; coordinates: [number, number, number?] }
       coordinate_space?: OverlayCoordinateSpace
       properties?: Record<string, unknown>
+      review_metadata?: OverlayReviewMetadata
+      manual_object_validation?: OverlayManualObjectValidation
+      idempotency_key?: string
     }) => {
       if (!datasetId || !selected || !selectedLayer || demoMode) return
       const currentRevision =
@@ -1331,6 +1495,8 @@ export function OverlayProvider({
           ...patch,
           expected_revision: currentRevision,
         })
+        featureTaskResolutionPendingRef.current = response.task_resolution_pending ?? false
+        savedFeatureIdRef.current = response.feature.id
         const detail: SelectedFeatureDetailCache = {
           datasetId,
           ...selected,
@@ -1406,7 +1572,74 @@ export function OverlayProvider({
         ) {
           return
         }
-        commitPoleBaseProposal({ status: 'ready', target, frameId, seed: coordinates, result })
+        let templateValidation: PoleBaseTemplateValidation | undefined
+        const workflow = stagedPointWorkflowRef.current
+        const templateOptions =
+          workflow && stagedWorkflowMatchesPoleTarget(workflow, target)
+            ? workflow.templateOptions
+            : undefined
+        if (
+          templateOptions &&
+          result.status !== 'failed' &&
+          result.base_position
+        ) {
+          const duplicate = await api.duplicateManualObjectPreflight(
+            requestDatasetId,
+            {
+              target_layer_id: target.layerId,
+              template_id: templateOptions.templateId,
+              position: result.base_position,
+              ...(target.kind === 'pole-base-move'
+                ? { exclude_feature_id: String(target.featureId) }
+                : {}),
+            },
+            controller.signal,
+          )
+          if (
+            controller.signal.aborted ||
+            poleBaseRequestIdRef.current !== requestId ||
+            activeDatasetIdRef.current !== requestDatasetId
+          ) {
+            return
+          }
+          const latestWorkflow = stagedPointWorkflowRef.current
+          const latestTemplateOptions =
+            latestWorkflow && stagedWorkflowMatchesPoleTarget(latestWorkflow, target)
+              ? (latestWorkflow.templateOptions ?? templateOptions)
+              : templateOptions
+          const layer = layers.find((candidate) => candidate.id === target.layerId)
+          const fields =
+            layer?.fields ??
+            features[target.layerId]?.dataset?.fields ??
+            features[target.layerId]?.wgs84?.fields ??
+            []
+          const currentProperties =
+            target.kind === 'pole-base-move'
+              ? (selectedDatasetFeature?.properties ?? selectedFeature?.properties ?? {})
+              : {}
+          const propertyResult = buildPoleBaseTemplatePropertyPatch(
+            fields,
+            currentProperties,
+            result,
+            frameId,
+            latestTemplateOptions,
+          )
+          templateValidation = {
+            duplicate,
+            missingRequiredFields: propertyResult.missingRequiredFields,
+            allowNearDuplicate: latestTemplateOptions.allowNearDuplicate,
+            overrideReason: latestTemplateOptions.overrideReason,
+          }
+        }
+        commitPoleBaseProposal({
+          status: 'ready',
+          target,
+          frameId,
+          seed: coordinates,
+          result,
+          idempotencyKey: featureMutationKey('pole-base'),
+          ...(templateValidation ? { templateValidation } : {}),
+        })
         const reasonMessage = poleBaseReasonMessages(result.reason_codes).join(' · ')
         if (result.status === 'failed') {
           notify?.({
@@ -1448,7 +1681,16 @@ export function OverlayProvider({
         }
       }
     },
-    [abortPoleBaseRequest, commitPoleBaseProposal, datasetId, notify],
+    [
+      abortPoleBaseRequest,
+      commitPoleBaseProposal,
+      datasetId,
+      features,
+      layers,
+      notify,
+      selectedDatasetFeature,
+      selectedFeature,
+    ],
   )
 
   const confirmPoleBaseProposal = useCallback(async () => {
@@ -1459,10 +1701,10 @@ export function OverlayProvider({
       !proposal.result.base_position ||
       poleBaseConfirmingRef.current
     ) {
-      return
+      return false
     }
     const layer = layers.find((candidate) => candidate.id === proposal.target.layerId)
-    if (!layer || !datasetId || demoMode) return
+    if (!layer || !datasetId || demoMode) return false
     const target = proposal.target
     const stagedWorkflow = stagedPointWorkflowRef.current
     const matchingStagedWorkflow =
@@ -1476,7 +1718,7 @@ export function OverlayProvider({
         String(selected.featureId) !== String(target.featureId))
     ) {
       notify?.({ tone: 'info', title: '재산출을 시작한 SHP 피처를 다시 선택해 주세요.' })
-      return
+      return false
     }
 
     const fields =
@@ -1488,36 +1730,147 @@ export function OverlayProvider({
       target.kind === 'pole-base-move'
         ? (selectedDatasetFeature?.properties ?? selectedFeature?.properties ?? {})
         : {}
-    const properties = buildPoleBasePropertyPatch(
+    const templateOptions = matchingStagedWorkflow?.templateOptions
+    const propertyResult = buildPoleBaseTemplatePropertyPatch(
       fields,
       currentProperties,
       proposal.result,
       proposal.frameId,
+      templateOptions,
     )
+    const properties = propertyResult.properties
+    if (templateOptions) {
+      const duplicate = proposal.templateValidation?.duplicate
+      if (!duplicate) {
+        notify?.({ tone: 'info', title: '중복 검사가 끝난 뒤 저장해 주세요.' })
+        return false
+      }
+      if (propertyResult.missingRequiredFields.length > 0) {
+        notify?.({
+          tone: 'info',
+          title: '필수 속성을 입력해 주세요.',
+          message: propertyResult.missingRequiredFields.join(', '),
+        })
+        return false
+      }
+      if (duplicate.exact_duplicate) {
+        notify?.({ tone: 'error', title: poleBaseReasonMessage('DUPLICATE_EXACT') })
+        return false
+      }
+      if (
+        duplicate.warning_count > 0 &&
+        (!templateOptions.allowNearDuplicate || templateOptions.overrideReason.trim().length < 3)
+      ) {
+        notify?.({ tone: 'info', title: '근접 중복 저장 사유를 3자 이상 입력해 주세요.' })
+        return false
+      }
+    }
     const propertyPayload = Object.keys(properties).length > 0 ? { properties } : {}
+    const manualObjectValidation: OverlayManualObjectValidation | undefined = templateOptions
+      ? {
+          template_id: templateOptions.templateId,
+          allow_near_duplicate: templateOptions.allowNearDuplicate,
+          ...(templateOptions.allowNearDuplicate
+            ? { override_reason: templateOptions.overrideReason.trim() }
+            : {}),
+        }
+      : undefined
+    const reviewMetadata: OverlayReviewMetadata = {
+      source_frame_ids: [proposal.frameId],
+      source_detection_ids: [],
+      manual_observation_ids: [],
+      creation_tool: 'manual_pole_base_v1',
+      proposal_quality: proposal.result.quality.score,
+      created_by: 'operator-local',
+      ...(review?.currentTask?.dataset_id === datasetId &&
+      review.currentTask.status === 'in_progress' &&
+      (review.currentTask.target_layer_id === null ||
+        review.currentTask.target_layer_id === target.layerId)
+        ? { task_id: review.currentTask.id }
+        : {}),
+    }
     const saveId = poleBaseSaveIdRef.current + 1
     poleBaseSaveIdRef.current = saveId
     poleBaseConfirmingRef.current = true
+    featureTaskResolutionPendingRef.current = null
+    savedFeatureIdRef.current = null
     try {
       if (target.kind === 'pole-base-create') {
         await createFeature(target.layerId, {
           geometry: { type: 'Point', coordinates: proposal.result.base_position },
           coordinate_space: 'dataset',
+          idempotency_key: proposal.idempotencyKey,
           ...propertyPayload,
+          review_metadata: reviewMetadata,
+          ...(manualObjectValidation
+            ? { manual_object_validation: manualObjectValidation }
+            : {}),
         }, { navigate: false })
       } else {
         await updateSelected({
           geometry: { type: 'Point', coordinates: proposal.result.base_position },
           coordinate_space: 'dataset',
+          idempotency_key: proposal.idempotencyKey,
           ...propertyPayload,
+          review_metadata: reviewMetadata,
+          ...(manualObjectValidation
+            ? { manual_object_validation: manualObjectValidation }
+            : {}),
         })
       }
+      if (
+        featureTaskResolutionPendingRef.current &&
+        reviewMetadata.task_id &&
+        savedFeatureIdRef.current !== null
+      ) {
+        try {
+          const resolution = target.kind === 'pole-base-create' ? 'manual_added' : 'corrected'
+          const savedFeatureId = String(savedFeatureIdRef.current)
+          const reconciled = await api.resolveReviewTask(reviewMetadata.task_id, {
+            resolution,
+            resolved_feature_ids: [String(savedFeatureIdRef.current)],
+          })
+          if (
+            reconciled.task.status === resolution &&
+            reconciled.task.resolved_feature_ids.some(
+              (featureId) => String(featureId) === savedFeatureId,
+            )
+          ) {
+            featureTaskResolutionPendingRef.current = false
+          }
+        } catch {
+          // The feature transaction already committed. Keep the blocking
+          // reconciliation state below instead of allowing a duplicate save.
+        }
+      }
+      review?.reload()
       if (
         poleBaseSaveIdRef.current !== saveId ||
         activeDatasetIdRef.current !== datasetId ||
         poleBaseProposalRef.current !== proposal
       ) {
-        return
+        return false
+      }
+      if (featureTaskResolutionPendingRef.current) {
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
+        setPickTarget(null)
+        const message = poleBaseReasonMessage('TASK_RESOLUTION_PENDING')
+        commitPoleBaseProposal({
+          status: 'error',
+          target,
+          frameId: proposal.frameId,
+          seed: proposal.seed,
+          message,
+          reasonCodes: ['TASK_RESOLUTION_PENDING'],
+        })
+        notify?.({
+          tone: 'error',
+          title: message,
+          message: '현재 task를 유지하고 목록을 새로고침했습니다. 동기화 상태를 확인해 주세요.',
+        })
+        return false
       }
       if (
         matchingStagedWorkflow?.target.kind === 'create' &&
@@ -1541,11 +1894,41 @@ export function OverlayProvider({
         setPickTarget((current) => (current === target ? null : current))
         commitPoleBaseProposal({ status: 'idle' })
       }
+      return true
     } catch (reason) {
       // The existing create/update helpers show the actionable server error.
       // Keep the ready proposal so a revision conflict can be refreshed and retried.
       if (reason instanceof ApiError && reason.status === 409) {
         await refresh()
+        if (
+          (reason.code === 'DUPLICATE_EXACT' || reason.code === 'DUPLICATE_NEARBY') &&
+          proposal.templateValidation &&
+          poleBaseProposalRef.current === proposal
+        ) {
+          const exact = reason.code === 'DUPLICATE_EXACT'
+          commitPoleBaseProposal({
+            ...proposal,
+            templateValidation: {
+              ...proposal.templateValidation,
+              duplicate: {
+                ...proposal.templateValidation.duplicate,
+                exact_duplicate: exact,
+                blocked: exact,
+                warning_count: exact
+                  ? proposal.templateValidation.duplicate.warning_count
+                  : Math.max(1, proposal.templateValidation.duplicate.warning_count),
+              },
+            },
+          })
+          notify?.({
+            tone: exact ? 'error' : 'info',
+            title: poleBaseReasonMessage(reason.code),
+            message: exact
+              ? '다른 위치를 선택해 주세요.'
+              : '방금 추가된 근접 객체를 확인하고 저장 사유를 입력해 주세요.',
+          })
+          return false
+        }
         if (poleBaseProposalRef.current === proposal) {
           notify?.({
             tone: 'info',
@@ -1554,6 +1937,7 @@ export function OverlayProvider({
           })
         }
       }
+      return false
     } finally {
       if (poleBaseSaveIdRef.current === saveId) poleBaseConfirmingRef.current = false
     }
@@ -1566,6 +1950,11 @@ export function OverlayProvider({
     layers,
     notify,
     refresh,
+    review?.currentTask?.dataset_id,
+    review?.currentTask?.id,
+    review?.currentTask?.status,
+    review?.currentTask?.target_layer_id,
+    review?.reload,
     restoreStagedPointWorkflow,
     selected,
     selectedDatasetFeature,
@@ -1759,9 +2148,9 @@ export function OverlayProvider({
 
   const shortcutStateRef = useRef({
     activeLayerId,
-    beginCreatePoint,
     beginCreatePoleBase,
     beginDirectActualPointPick,
+    beginStagedPointCreate,
     cancelPoleBaseProposal,
     confirmStagedActualPoint,
     confirmPoleBaseProposal,
@@ -1775,9 +2164,9 @@ export function OverlayProvider({
   })
   shortcutStateRef.current = {
     activeLayerId,
-    beginCreatePoint,
     beginCreatePoleBase,
     beginDirectActualPointPick,
+    beginStagedPointCreate,
     cancelPoleBaseProposal,
     confirmStagedActualPoint,
     confirmPoleBaseProposal,
@@ -1842,7 +2231,7 @@ export function OverlayProvider({
         ) {
           shortcut.setPickMode(false)
         } else {
-          shortcut.beginCreatePoint(shortcut.activeLayerId)
+          shortcut.beginStagedPointCreate(shortcut.activeLayerId, false)
         }
       } else if (event.code === 'KeyP') {
         if (stagedPointCloudCoordinateRef.current) {
@@ -2033,6 +2422,7 @@ export function OverlayProvider({
       beginCreatePoint,
       beginStagedPointCreate,
       beginStagedSelectedPointMove,
+      updateStagedPoleBaseTemplateOptions,
       beginCreatePoleBase,
       beginRecomputeSelectedPoleBase,
       applyPoleSeed,
@@ -2064,6 +2454,7 @@ export function OverlayProvider({
       beginCreatePoint,
       beginStagedPointCreate,
       beginStagedSelectedPointMove,
+      updateStagedPoleBaseTemplateOptions,
       beginCreatePoleBase,
       beginRecomputeSelectedPoleBase,
       cancelPoleBaseProposal,

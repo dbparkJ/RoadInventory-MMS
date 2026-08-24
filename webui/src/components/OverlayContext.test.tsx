@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api, ApiError } from '../lib/api'
 import type {
   OverlayCoordinateSpace,
@@ -8,10 +8,20 @@ import type {
   OverlayLayer,
   PoleBaseInferResponse,
 } from '../types'
+
+const reviewContextMocks = vi.hoisted(() => ({
+  useOptionalReviewWorkspace: vi.fn(),
+}))
+
+vi.mock('./ReviewContext', () => ({
+  useOptionalReviewWorkspace: reviewContextMocks.useOptionalReviewWorkspace,
+}))
+
 import {
   buildPoleBasePropertyPatch,
   OverlayProvider,
   poleBaseReasonMessage,
+  type PoleBaseTemplateOptions,
   useOverlayWorkspace,
 } from './OverlayContext'
 
@@ -37,6 +47,28 @@ const POLE_LAYER: OverlayLayer = {
     { name: 'SRC_FRAME', type: 'C' },
     { name: 'X', type: 'N', decimal: 3 },
   ],
+}
+
+const MANUAL_POLE_LAYER: OverlayLayer = {
+  ...POLE_LAYER,
+  fields: [
+    ...(POLE_LAYER.fields ?? []),
+    { name: 'CLASS_NM', type: 'C', required: true },
+    { name: 'NOTE', type: 'C', required: true },
+  ],
+}
+
+const COMPLETE_POLE_TEMPLATE_OPTIONS: PoleBaseTemplateOptions = {
+  templateId: 'SIGN_SUPPORT_POLE',
+  properties: { CLASS_NM: 'SIGN_SUPPORT_POLE', NOTE: 'manual pole' },
+  requiredFields: ['CLASS_NM', 'NOTE'],
+  allowNearDuplicate: false,
+  overrideReason: '',
+}
+
+const MISSING_POLE_TEMPLATE_OPTIONS: PoleBaseTemplateOptions = {
+  ...COMPLETE_POLE_TEMPLATE_OPTIONS,
+  properties: { CLASS_NM: 'SIGN_SUPPORT_POLE' },
 }
 
 const AUTO_POLE_BASE_RESULT: PoleBaseInferResponse = {
@@ -145,6 +177,21 @@ function WorkspaceProbe() {
           ? overlay.poleBaseProposal.result.status
           : 'none'}
       </output>
+      <output data-testid="pole-reason-codes">
+        {overlay.poleBaseProposal.status === 'error'
+          ? overlay.poleBaseProposal.reasonCodes.join(',')
+          : 'none'}
+      </output>
+      <output data-testid="pole-template-missing">
+        {overlay.poleBaseProposal.status === 'ready'
+          ? overlay.poleBaseProposal.templateValidation?.missingRequiredFields.join(',') || 'none'
+          : 'none'}
+      </output>
+      <output data-testid="pole-template-duplicate">
+        {overlay.poleBaseProposal.status === 'ready' && overlay.poleBaseProposal.templateValidation
+          ? `${overlay.poleBaseProposal.templateValidation.duplicate.exact_duplicate ? 'exact' : 'not-exact'}:${overlay.poleBaseProposal.templateValidation.duplicate.warning_count}`
+          : 'none'}
+      </output>
       <output data-testid="active-layer">{overlay.activeLayerId || 'none'}</output>
       <output data-testid="layer-name">{overlay.layers[0]?.name ?? 'none'}</output>
       <output data-testid="layer-color">{overlay.layerColor(LAYER.id)}</output>
@@ -183,6 +230,34 @@ function WorkspaceProbe() {
       </button>
       <button type="button" onClick={() => overlay.beginStagedPointCreate(LAYER.id, true)}>
         begin staged continuous create
+      </button>
+      <button
+        type="button"
+        onClick={() => overlay.beginStagedPointCreate(LAYER.id, false, COMPLETE_POLE_TEMPLATE_OPTIONS)}
+      >
+        begin template pole create
+      </button>
+      <button
+        type="button"
+        onClick={() => overlay.beginStagedPointCreate(LAYER.id, false, MISSING_POLE_TEMPLATE_OPTIONS)}
+      >
+        begin missing template pole create
+      </button>
+      <button
+        type="button"
+        onClick={() => overlay.updateStagedPoleBaseTemplateOptions(LAYER.id, COMPLETE_POLE_TEMPLATE_OPTIONS)}
+      >
+        apply complete pole template
+      </button>
+      <button
+        type="button"
+        onClick={() => overlay.updateStagedPoleBaseTemplateOptions(LAYER.id, {
+          ...COMPLETE_POLE_TEMPLATE_OPTIONS,
+          allowNearDuplicate: true,
+          overrideReason: 'separate pole',
+        })}
+      >
+        allow near pole duplicate
       </button>
       <button type="button" onClick={() => overlay.beginStagedSelectedPointMove()}>
         begin staged move
@@ -312,6 +387,11 @@ function mockOutsideFeature() {
     }),
   )
 }
+
+beforeEach(() => {
+  reviewContextMocks.useOptionalReviewWorkspace.mockReset()
+  reviewContextMocks.useOptionalReviewWorkspace.mockReturnValue(null)
+})
 
 afterEach(() => {
   cleanup()
@@ -980,6 +1060,7 @@ describe('manual pole-base proposals', () => {
     expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
       geometry: { type: 'Point', coordinates: [10.1, 20.2, 30.3] },
       coordinate_space: 'dataset',
+      idempotency_key: expect.stringMatching(/^pole-base-/),
       properties: {
         base_x: 10.1,
         'BAS Y': '20.2',
@@ -988,6 +1069,14 @@ describe('manual pole-base proposals', () => {
         BASE_Q: 91,
         QA_STATUS: 'AUTO',
         SRC_FRAME: 'frame-1',
+      },
+      review_metadata: {
+        source_frame_ids: ['frame-1'],
+        source_detection_ids: [],
+        manual_observation_ids: [],
+        creation_tool: 'manual_pole_base_v1',
+        proposal_quality: 0.91,
+        created_by: 'operator-local',
       },
       expected_revision: LAYER.revision,
     })
@@ -1028,12 +1117,21 @@ describe('manual pole-base proposals', () => {
     expect(patchOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, 'outside-42', {
       geometry: { type: 'Point', coordinates: [10.1, 20.2, 30.3] },
       coordinate_space: 'dataset',
+      idempotency_key: expect.stringMatching(/^pole-base-/),
       properties: expect.objectContaining({
         QA_STATUS: 'REVIEW',
         BASE_MTH: 'MAN_SEED',
         BASE_Q: 91,
         SRC_FRAME: 'frame-1',
       }),
+      review_metadata: {
+        source_frame_ids: ['frame-1'],
+        source_detection_ids: [],
+        manual_observation_ids: [],
+        creation_tool: 'manual_pole_base_v1',
+        proposal_quality: 0.91,
+        created_by: 'operator-local',
+      },
       expected_revision: LAYER.revision,
     })
     await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle'))
@@ -1087,7 +1185,7 @@ describe('manual pole-base proposals', () => {
     expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
   })
 
-  it('keeps N as one-key direct raw-XYZ creation in PointCloud', async () => {
+  it('stages N PointCloud clicks, infers on the first B, and creates on the second B', async () => {
     mockFeaturePages()
     const created = feature('raw-n-point', 10, '')
     const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
@@ -1104,20 +1202,42 @@ describe('manual pole-base proposals', () => {
       crs: 'EPSG:4326',
       fields: [{ name: 'label', type: 'C' }],
     })
-    const inferPoleBase = vi.spyOn(api, 'inferPoleBase')
+    const inferPoleBase = vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
     renderWorkspace('frame-1')
     await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
 
     fireEvent.keyDown(window, { key: 'n', code: 'KeyN' })
     fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
 
-    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
-    expect(createOverlayFeature).toHaveBeenCalledWith('dataset-1', LAYER.id, {
-      geometry: { type: 'Point', coordinates: [10, 20, 35] },
-      coordinate_space: 'dataset',
-      expected_revision: LAYER.revision,
-    })
+    expect(createOverlayFeature).not.toHaveBeenCalled()
     expect(inferPoleBase).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    expect(inferPoleBase).toHaveBeenCalledWith(
+      'dataset-1',
+      'frame-1',
+      {
+        coordinate_space: 'dataset',
+        seed_position: [10, 20, 35],
+        profile: 'balanced',
+        debug: false,
+      },
+      expect.any(AbortSignal),
+    )
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith(
+      'dataset-1',
+      LAYER.id,
+      expect.objectContaining({
+        geometry: { type: 'Point', coordinates: AUTO_POLE_BASE_RESULT.base_position },
+        coordinate_space: 'dataset',
+        expected_revision: LAYER.revision,
+      }),
+    )
   })
 
   it('aborts and ignores an old inference when the frame or dataset changes', async () => {
@@ -1189,6 +1309,245 @@ describe('manual pole-base proposals', () => {
 
     await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('picking'))
     expect(screen.getByTestId('pick-target')).toHaveTextContent('pole-base-create')
+  })
+
+  it('applies filtered pole template properties and blocks save until required fields are present', async () => {
+    mockFeaturePages(MANUAL_POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const duplicatePreflight = vi.spyOn(api, 'duplicateManualObjectPreflight').mockResolvedValue({
+      exact_duplicate: false,
+      blocked: false,
+      candidates: [],
+      warning_count: 0,
+      radius_m: 0.5,
+    })
+    const created = feature('manual-template-pole', 10.1, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: MANUAL_POLE_LAYER.fields ?? [],
+    })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin missing template pole create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+
+    expect(duplicatePreflight).toHaveBeenCalledWith(
+      'dataset-1',
+      {
+        target_layer_id: LAYER.id,
+        template_id: 'SIGN_SUPPORT_POLE',
+        position: AUTO_POLE_BASE_RESULT.base_position,
+      },
+      expect.any(AbortSignal),
+    )
+    expect(screen.getByTestId('pole-template-missing')).toHaveTextContent('NOTE')
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'apply complete pole template' }))
+    expect(screen.getByTestId('pole-template-missing')).toHaveTextContent('none')
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature).toHaveBeenCalledWith(
+      'dataset-1',
+      LAYER.id,
+      expect.objectContaining({
+        properties: expect.objectContaining({
+          CLASS_NM: 'SIGN_SUPPORT_POLE',
+          NOTE: 'manual pole',
+          base_x: 10.1,
+        }),
+        manual_object_validation: {
+          template_id: 'SIGN_SUPPORT_POLE',
+          allow_near_duplicate: false,
+        },
+      }),
+    )
+  })
+
+  it('excludes the moved pole itself from duplicate preflight and blocks an exact other pole', async () => {
+    mockFeaturePages(MANUAL_POLE_LAYER)
+    mockOutsideFeature()
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const duplicatePreflight = vi.spyOn(api, 'duplicateManualObjectPreflight').mockResolvedValue({
+      exact_duplicate: true,
+      blocked: true,
+      candidates: [{
+        feature_id: 'other-pole',
+        xy_distance_m: 0.01,
+        z_difference_m: 0.02,
+        match: 'exact',
+        reason_codes: ['DUPLICATE_EXACT'],
+      }],
+      warning_count: 0,
+      radius_m: 0.5,
+    })
+    const patchOverlayFeature = vi.spyOn(api, 'patchOverlayFeature')
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('wgs-ids')).toHaveTextContent('wgs-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'select outside' }))
+    await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('outside-42'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin staged move' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply complete pole template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+
+    expect(duplicatePreflight).toHaveBeenCalledWith(
+      'dataset-1',
+      expect.objectContaining({ exclude_feature_id: 'outside-42' }),
+      expect.any(AbortSignal),
+    )
+    expect(screen.getByTestId('pole-template-duplicate')).toHaveTextContent('exact:0')
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    expect(patchOverlayFeature).not.toHaveBeenCalled()
+  })
+
+  it('turns a transaction-time near-duplicate race into an override gate before retrying', async () => {
+    mockFeaturePages(MANUAL_POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    vi.spyOn(api, 'duplicateManualObjectPreflight').mockResolvedValue({
+      exact_duplicate: false,
+      blocked: false,
+      candidates: [],
+      warning_count: 0,
+      radius_m: 0.5,
+    })
+    const created = feature('manual-pole-after-race', 10.1, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature')
+      .mockRejectedValueOnce(new ApiError('near duplicate', 409, 'DUPLICATE_NEARBY'))
+      .mockResolvedValue({
+        feature: created,
+        revision: 5,
+        coordinate_space: 'dataset',
+        crs: 'EPSG:5186',
+        fields: MANUAL_POLE_LAYER.fields ?? [],
+      })
+    renderWorkspace('frame-1')
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin template pole create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pointcloud coordinate' }))
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('pole-template-duplicate')).toHaveTextContent('not-exact:1'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    expect(createOverlayFeature).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'allow near pole duplicate' }))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledTimes(2))
+    expect(createOverlayFeature.mock.calls[1][2]).toMatchObject({
+      manual_object_validation: {
+        template_id: 'SIGN_SUPPORT_POLE',
+        allow_near_duplicate: true,
+        override_reason: 'separate pole',
+      },
+    })
+  })
+
+  it('blocks task advance and a duplicate retry when feature save reports task reconciliation pending', async () => {
+    mockFeaturePages(POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const created = feature('pole-pending-task', 10.1, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+      task_resolution_pending: true,
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin pole continuous' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('error'))
+    expect(screen.getByTestId('pole-reason-codes')).toHaveTextContent('TASK_RESOLUTION_PENDING')
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+    expect(createOverlayFeature).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByRole('button', { name: 'retry pole' }))
+    fireEvent.keyDown(window, { key: 'r', code: 'KeyR' })
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('error')
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+    expect(createOverlayFeature).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByRole('button', { name: 'cancel pole' }))
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+  })
+
+  it('retries a pending linked-task resolution once before leaving pole save blocked', async () => {
+    mockFeaturePages(POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const created = feature('pole-reconciled-task', 10.1, '')
+    vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+      task_resolution_pending: true,
+    })
+    vi.spyOn(api, 'overlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'wgs84',
+      crs: 'EPSG:4326',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    const resolveReviewTask = vi.spyOn(api, 'resolveReviewTask').mockResolvedValue({
+      task: {
+        status: 'manual_added',
+        resolved_feature_ids: ['pole-reconciled-task'],
+      } as never,
+    })
+    const reload = vi.fn()
+    reviewContextMocks.useOptionalReviewWorkspace.mockReturnValue({
+      currentTask: {
+        id: 'task-pole-1',
+        dataset_id: 'dataset-1',
+        target_layer_id: POLE_LAYER.id,
+        status: 'in_progress',
+      },
+      reload,
+    })
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin pole continuous' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+
+    await waitFor(() => expect(resolveReviewTask).toHaveBeenCalledWith('task-pole-1', {
+      resolution: 'manual_added',
+      resolved_feature_ids: ['pole-reconciled-task'],
+    }))
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('picking'))
+    expect(screen.getByTestId('pole-reason-codes')).toHaveTextContent('none')
+    expect(reload).toHaveBeenCalled()
   })
 
   it('refreshes a 409 revision conflict and keeps the ready proposal retryable', async () => {

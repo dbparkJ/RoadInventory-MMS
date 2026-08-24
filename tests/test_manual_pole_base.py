@@ -99,6 +99,50 @@ def _vertical_panel(
     )
 
 
+def _ground_with_center_occluded(
+    base: tuple[float, float, float],
+    *,
+    inner_radius_m: float = 0.75,
+) -> np.ndarray:
+    ground = _ground(base)
+    base_xy = np.asarray(base[:2], dtype=np.float64)
+    return ground[
+        np.linalg.norm(ground[:, :2] - base_xy[None, :], axis=1) >= inner_radius_m
+    ]
+
+
+def _floating_guardrail(base: tuple[float, float, float]) -> np.ndarray:
+    base_array = np.asarray(base, dtype=np.float64)
+    x_grid, y_grid = np.meshgrid(
+        np.arange(base_array[0] - 0.70, base_array[0] + 0.701, 0.06),
+        np.arange(base_array[1] - 0.14, base_array[1] + 0.141, 0.05),
+    )
+    points = np.column_stack(
+        (x_grid.ravel(), y_grid.ravel(), np.full(x_grid.size, base_array[2] + 0.84))
+    )
+    return points[
+        np.linalg.norm(points[:, :2] - base_array[None, :2], axis=1) >= 0.24
+    ]
+
+
+def _floating_vegetation(base: tuple[float, float, float]) -> np.ndarray:
+    base_array = np.asarray(base, dtype=np.float64)
+    x_grid, y_grid = np.meshgrid(
+        np.arange(base_array[0] - 0.62, base_array[0] + 0.621, 0.07),
+        np.arange(base_array[1] - 0.62, base_array[1] + 0.621, 0.07),
+    )
+    radial = np.hypot(x_grid - base_array[0], y_grid - base_array[1])
+    mask = (radial >= 0.24) & (radial <= 0.62)
+    z_grid = (
+        base_array[2]
+        + 0.78
+        + (0.08 * np.sin(8.0 * x_grid))
+        + (0.056 * np.cos(7.0 * y_grid))
+        + (0.024 * np.sin(6.0 * (x_grid + y_grid)))
+    )
+    return np.column_stack((x_grid[mask], y_grid[mask], z_grid[mask]))
+
+
 def _scene(
     shafts: list[np.ndarray],
     ground: np.ndarray | None,
@@ -184,6 +228,160 @@ class ManualPoleBaseTests(unittest.TestCase):
             if case["reason"] is not None:
                 self.assertIn(case["reason"], result.reason_codes)
 
+    def test_occluded_shaft_uses_real_ground_below_floating_clutter(self) -> None:
+        base = (0.0, 0.0, 0.0)
+        cases = (
+            {
+                "name": "unclassified_guardrail_ribbon",
+                "clutter": _floating_guardrail(base),
+                "clutter_class": 0,
+                "expects_hypothesis_conflict": False,
+            },
+            {
+                "name": "classified_vegetation_cloud",
+                "clutter": _floating_vegetation(base),
+                "clutter_class": 5,
+                "expects_hypothesis_conflict": False,
+            },
+            {
+                "name": "class_zero_rough_vegetation_cloud",
+                "clutter": _floating_vegetation(base),
+                "clutter_class": 0,
+                "expects_hypothesis_conflict": False,
+            },
+            {
+                "name": "class_one_rough_vegetation_cloud",
+                "clutter": _floating_vegetation(base),
+                "clutter_class": 1,
+                "expects_hypothesis_conflict": False,
+            },
+            {
+                "name": "all_zero_classifications",
+                "clutter": _floating_vegetation(base),
+                "clutter_class": 0,
+                "classification_mode": "all_zero",
+                "expects_hypothesis_conflict": False,
+                "expected_ground_method": "geometry",
+            },
+            {
+                "name": "missing_classifications",
+                "clutter": _floating_vegetation(base),
+                "clutter_class": 0,
+                "classification_mode": "none",
+                "expects_hypothesis_conflict": False,
+                "expected_ground_method": "geometry",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                shaft = _shaft(base, bottom_gap_m=0.92)
+                ground = _ground_with_center_occluded(base)
+                clutter = case["clutter"]
+                assert isinstance(clutter, np.ndarray)
+                points = np.vstack((shaft, ground, clutter))
+                classification_mode = case.get("classification_mode", "per_group")
+                if classification_mode == "none":
+                    classes = None
+                elif classification_mode == "all_zero":
+                    classes = np.zeros(points.shape[0], dtype=np.int16)
+                else:
+                    classes = np.concatenate(
+                        (
+                            np.zeros(shaft.shape[0], dtype=np.int16),
+                            np.full(ground.shape[0], 2, dtype=np.int16),
+                            np.full(
+                                clutter.shape[0],
+                                int(case["clutter_class"]),
+                                dtype=np.int16,
+                            ),
+                        )
+                    )
+
+                result = infer_pole_base_from_seed(
+                    points,
+                    shaft[shaft.shape[0] // 2],
+                    classifications=classes,
+                )
+
+                self.assertEqual(result.status, "review")
+                self.assertIsNotNone(result.base_position)
+                assert result.base_position is not None
+                self.assertLessEqual(
+                    float(np.linalg.norm(result.base_position - np.asarray(base))),
+                    0.10,
+                )
+                self.assertIn("BOTTOM_EXTRAPOLATED", result.reason_codes)
+                if bool(case["expects_hypothesis_conflict"]):
+                    self.assertIn("GROUND_HYPOTHESES_CONFLICT", result.reason_codes)
+                    self.assertIsNotNone(result.ground)
+                    assert result.ground is not None
+                    self.assertTrue(result.ground.method.startswith("classified"))
+                expected_ground_method = case.get("expected_ground_method")
+                if expected_ground_method is not None:
+                    self.assertIsNotNone(result.ground)
+                    assert result.ground is not None
+                    self.assertTrue(
+                        result.ground.method.startswith(str(expected_ground_method))
+                    )
+                self.assertGreater(
+                    float(np.min(np.linalg.norm(points - result.base_position, axis=1))),
+                    0.20,
+                )
+
+    def test_long_missing_lower_shaft_keeps_synthetic_ground_intersection(self) -> None:
+        base = (0.0, 0.0, 0.0)
+        shaft = _shaft(base, bottom_gap_m=2.40)
+        ground = _ground_with_center_occluded(base)
+        points = np.vstack((shaft, ground))
+        classes = np.concatenate(
+            (
+                np.zeros(shaft.shape[0], dtype=np.int16),
+                np.full(ground.shape[0], 2, dtype=np.int16),
+            )
+        )
+
+        result = infer_pole_base_from_seed(
+            points,
+            shaft[shaft.shape[0] // 2],
+            classifications=classes,
+        )
+
+        self.assertEqual(result.status, "review")
+        self.assertIsNotNone(result.base_position)
+        assert result.base_position is not None
+        self.assertLessEqual(
+            float(np.linalg.norm(result.base_position - np.asarray(base))),
+            0.10,
+        )
+        self.assertGreater(result.quality.bottom_gap_m, 1.50)
+        self.assertIn("BOTTOM_EXTRAPOLATED", result.reason_codes)
+        self.assertGreater(
+            float(np.min(np.linalg.norm(points - result.base_position, axis=1))),
+            0.20,
+        )
+
+    def test_implausibly_remote_ground_intersection_still_fails_safely(self) -> None:
+        base = (0.0, 0.0, 0.0)
+        shaft = _shaft(base, height_m=9.0, bottom_gap_m=6.40)
+        ground = _ground_with_center_occluded(base)
+        points = np.vstack((shaft, ground))
+        classes = np.concatenate(
+            (
+                np.zeros(shaft.shape[0], dtype=np.int16),
+                np.full(ground.shape[0], 2, dtype=np.int16),
+            )
+        )
+
+        result = infer_pole_base_from_seed(
+            points,
+            shaft[shaft.shape[0] // 2],
+            classifications=classes,
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.base_position)
+        self.assertIn("BOTTOM_EXTRAPOLATED", result.reason_codes)
+
     def test_fifteen_degree_top_click_expands_over_full_two_metre_crop(self) -> None:
         base = (0.0, 0.0, 5.0)
         shaft = _shaft(
@@ -229,6 +427,24 @@ class ManualPoleBaseTests(unittest.TestCase):
         self.assertIsNotNone(curb_result.base_position)
         assert curb_result.base_position is not None
         self.assertAlmostEqual(float(curb_result.base_position[2]), 1.0, delta=0.05)
+
+        mixed_classes = np.where(
+            curb_points[:, 0] < curb_base[0] + 0.45,
+            1,
+            curb_classes,
+        ).astype(np.int16)
+        mixed_result = infer_pole_base_from_seed(
+            curb_points,
+            curb_shaft[curb_shaft.shape[0] // 2],
+            classifications=mixed_classes,
+        )
+        self.assertIsNotNone(mixed_result.base_position)
+        assert mixed_result.base_position is not None
+        self.assertAlmostEqual(float(mixed_result.base_position[2]), 1.0, delta=0.05)
+        self.assertIsNotNone(mixed_result.ground)
+        assert mixed_result.ground is not None
+        self.assertTrue(mixed_result.ground.method.startswith("geometry"))
+        self.assertNotIn("GROUND_HYPOTHESES_CONFLICT", mixed_result.reason_codes)
 
         left = _shaft((-0.30, 0.0, 0.0))
         right = _shaft((0.30, 0.0, 0.0))

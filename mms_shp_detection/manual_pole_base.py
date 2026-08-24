@@ -95,6 +95,7 @@ class ManualPoleBaseParameters:
     max_ground_penetration_m: float = 0.10
     max_bottom_gap_auto_m: float = 0.35
     max_bottom_gap_review_m: float = 1.50
+    max_bottom_gap_hard_m: float = 6.00
     max_base_seed_xy_distance_m: float = 1.0
 
     ground_class_ids: tuple[int, ...] = (2, 11)
@@ -122,6 +123,7 @@ class ManualPoleBaseParameters:
             self.max_ground_support_distance_review_m,
             self.max_bottom_gap_auto_m,
             self.max_bottom_gap_review_m,
+            self.max_bottom_gap_hard_m,
             self.max_base_seed_xy_distance_m,
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in positive):
@@ -134,6 +136,8 @@ class ManualPoleBaseParameters:
             raise ValueError("automatic ground distance cannot exceed review distance")
         if self.max_bottom_gap_auto_m > self.max_bottom_gap_review_m:
             raise ValueError("automatic bottom gap cannot exceed review gap")
+        if self.max_bottom_gap_review_m > self.max_bottom_gap_hard_m:
+            raise ValueError("review bottom gap cannot exceed the hard safety gap")
         if self.min_axis_points < 3 or self.min_vertical_bins < 2:
             raise ValueError("Manual pole-base point/bin limits are too small")
         if self.min_consecutive_vertical_bins < 2:
@@ -880,6 +884,27 @@ def _fit_ground_component(
             break
         keep = next_keep
     selected = samples[keep]
+    support_vectors = selected[:, :2] - reference_xy[None, :]
+    support_angles = np.mod(
+        np.arctan2(support_vectors[:, 1], support_vectors[:, 0]),
+        2.0 * math.pi,
+    )
+    occupied_sector_count = int(
+        np.unique(np.floor(support_angles / (2.0 * math.pi / 8.0)).astype(np.int64)).size
+    )
+    centered_xy = selected[:, :2] - np.mean(selected[:, :2], axis=0, keepdims=True)
+    covariance = (centered_xy.T @ centered_xy) / float(selected.shape[0])
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    minor_spread_m = math.sqrt(max(0.0, float(eigenvalues[0])))
+    # A ground plane needs support in at least three azimuth sectors and enough
+    # absolute width to constrain both slopes.  Absolute minor-axis spread, unlike
+    # an eigenvalue ratio, keeps broad but elongated one-sided road/sidewalk
+    # observations while rejecting a narrow guardrail ribbon.
+    if (
+        occupied_sector_count < 3
+        or minor_spread_m < (0.5 * parameters.ground_cell_size_m)
+    ):
+        return None
     design = np.column_stack(
         (
             selected[:, 0] - reference_xy[0],
@@ -934,6 +959,14 @@ def _ground_hypothesis(
         if classes is None or not parameters.ground_class_ids:
             return None
         mask &= np.isin(classes, parameters.ground_class_ids)
+    elif classes is not None:
+        non_ground_class_ids = tuple(
+            class_id
+            for class_id in parameters.excluded_axis_class_ids
+            if class_id not in parameters.ground_class_ids
+        )
+        if non_ground_class_ids:
+            mask &= ~np.isin(classes, non_ground_class_ids)
     samples, cells = _cell_representatives(
         points,
         mask,
@@ -962,7 +995,33 @@ def _ground_hypothesis(
             item.estimate.z,
         )
     )
-    return candidates[0]
+    nearest = candidates[0]
+    nearest_bottom_gap = fit.observed_z_min - nearest.estimate.z
+    dominant = [
+        item
+        for item in candidates
+        if item.estimate.cell_count
+        >= (0.50 * max(1, item.estimate.candidate_cell_count))
+    ]
+    # Geometry fallback can contain a compact floating canopy plus a much broader
+    # outer ground surface.  Prefer the component that explains most ground cells
+    # unless the nearest surface is in direct contact with the observed shaft
+    # bottom; that contact exception preserves small upper installation surfaces.
+    if dominant and not (
+        -parameters.max_ground_penetration_m
+        <= nearest_bottom_gap
+        <= parameters.max_ground_penetration_m
+    ):
+        dominant.sort(
+            key=lambda item: (
+                item.nearest_support_distance_m,
+                item.estimate.rmse_m,
+                -item.estimate.cell_count,
+                item.estimate.z,
+            )
+        )
+        return dominant[0]
+    return nearest
 
 
 def _select_ground(
@@ -1017,18 +1076,30 @@ def _select_ground(
     support_difference = (
         classified.nearest_support_distance_m - geometry.nearest_support_distance_m
     )
-    if abs(support_difference) >= 0.12:
-        return (classified if support_difference < 0.0 else geometry), False
-    selected = min(
-        (classified, geometry),
-        key=lambda item: (
-            abs(fit.observed_z_min - item.estimate.z),
-            item.nearest_support_distance_m,
-            item.estimate.rmse_m,
-            0 if item.estimate.method.startswith("classified") else 1,
-        ),
+    geometry_component_share = geometry.estimate.cell_count / max(
+        1,
+        geometry.estimate.candidate_cell_count,
     )
-    return selected, True
+    geometry_is_confident_contact_surface = (
+        geometry_component_share >= 0.50
+        and -parameters.max_ground_penetration_m
+        <= geometry_gap
+        <= parameters.max_ground_penetration_m
+        and geometry.estimate.rmse_m
+        <= max(0.04, classified.estimate.rmse_m + 0.03)
+    )
+    if support_difference <= -0.12:
+        return classified, False
+    if support_difference >= 0.12:
+        if geometry_is_confident_contact_surface:
+            return geometry, False
+        return classified, True
+    if (
+        geometry.nearest_support_distance_m < classified.nearest_support_distance_m
+        and geometry_is_confident_contact_surface
+    ):
+        return geometry, True
+    return classified, True
 
 
 def _public_ground(
@@ -1218,7 +1289,11 @@ def infer_pole_base_from_seed(
         hard_failure = True
     if bottom_gap > parameters.max_bottom_gap_auto_m:
         reasons.append("BOTTOM_EXTRAPOLATED")
-    if bottom_gap > parameters.max_bottom_gap_review_m:
+    # A missing lower shaft is the reason this operator tool exists.  Keep a
+    # trustworthy axis/ground intersection as a REVIEW proposal even when no
+    # source return exists for several metres below the observed shaft.  The
+    # separate hard cap still rejects implausibly remote intersections.
+    if bottom_gap > parameters.max_bottom_gap_hard_m:
         hard_failure = True
     if bottom_gap < -parameters.max_ground_penetration_m:
         reasons.append("GROUND_PENETRATION")

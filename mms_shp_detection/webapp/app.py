@@ -25,16 +25,23 @@ from starlette.responses import Response
 from .datasets import public_dataset, utc_now
 from .datasets import router as datasets_router
 from .detections import router as detections_router
+from .manual_objects import router as manual_objects_router
 from .media import POINT_PREVIEW_MAX_BUDGET, VWORLD_DEVELOPMENT_KEY
 from .media import router as media_router
 from .optimizer import router as optimizer_router
 from .overlays import router as overlays_router
 from .pole_tools import router as pole_tools_router
+from .qa import router as qa_router
+from .review_edits import router as review_edits_router
+from .review_reports import cleanup_stale_review_exports
+from .review_reports import router as review_reports_router
+from .review_tasks import router as review_tasks_router
 from .runs import RunManager, public_run
 from .runs import router as runs_router
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
 from .store import WebStore
 from .surveys import router as surveys_router
+from .task_resolution_outbox import reconcile_all_task_resolutions
 from .uploads import router as uploads_router
 
 API_VERSION = "1"
@@ -103,6 +110,14 @@ class WebAppConfig:
     max_overlay_total_bytes: int = 1024**3
     max_overlay_features: int = 500_000
     max_overlay_response_features: int = 10_000
+    max_review_export_tasks: int = 100_000
+    max_review_export_features: int = 500_000
+    max_review_export_bytes: int = 2 * 1024**3
+    max_review_export_image_hash_bytes: int = 256 * 1024**2
+    max_review_exports: int = 1
+    max_review_export_cleanup_entries: int = 512
+    review_export_stale_seconds: int = 24 * 60 * 60
+    enable_active_learning_export: bool = True
     enable_run_worker: bool = True
     static_dir: Path | None = None
     auth_username: str | None = None
@@ -159,6 +174,13 @@ class WebAppConfig:
                 self.max_overlay_total_bytes,
                 self.max_overlay_features,
                 self.max_overlay_response_features,
+                self.max_review_export_tasks,
+                self.max_review_export_features,
+                self.max_review_export_bytes,
+                self.max_review_export_image_hash_bytes,
+                self.max_review_exports,
+                self.max_review_export_cleanup_entries,
+                self.review_export_stale_seconds,
             )
             <= 0
         ):
@@ -467,6 +489,33 @@ def create_app(
     async def lifespan(app: FastAPI):
         worker_lock_acquired = False
         try:
+            await asyncio.to_thread(cleanup_stale_review_exports, app)
+            try:
+                reconciliation = await asyncio.to_thread(
+                    reconcile_all_task_resolutions, app
+                )
+            except Exception:
+                # Recovery is fail-closed at session/report/completion read
+                # boundaries. An unexpected adapter failure must not make the
+                # entire API unavailable at process start.
+                logger.exception("Review task outbox startup recovery failed.")
+                reconciliation = {
+                    "attempted": 0,
+                    "reconciled": 0,
+                    "pending": 0,
+                    "error": 0,
+                    "truncated": 1,
+                }
+            if reconciliation["attempted"] or reconciliation["truncated"]:
+                logger.info(
+                    "Review task outbox recovery attempted=%d reconciled=%d "
+                    "pending=%d errors=%d truncated=%d.",
+                    reconciliation["attempted"],
+                    reconciliation["reconciled"],
+                    reconciliation["pending"],
+                    reconciliation["error"],
+                    reconciliation["truncated"],
+                )
             if config.enable_run_worker:
                 app.state.worker_process_lock.acquire()
                 worker_lock_acquired = True
@@ -534,6 +583,8 @@ def create_app(
     # long-running server does not retain one lock per preview or upload chunk.
     app.state.media_locks = weakref.WeakValueDictionary()
     app.state.overlay_locks = weakref.WeakValueDictionary()
+    app.state.review_dataset_locks = weakref.WeakValueDictionary()
+    app.state.review_session_locks = weakref.WeakValueDictionary()
     app.state.upload_locks = weakref.WeakValueDictionary()
     app.state.upload_coordinators = weakref.WeakValueDictionary()
     app.state.upload_owner_tasks = set()
@@ -543,6 +594,7 @@ def create_app(
     app.state.point_preview_semaphore = asyncio.Semaphore(config.max_point_previews)
     app.state.pole_tool_semaphore = asyncio.Semaphore(2)
     app.state.run_archive_semaphore = asyncio.Semaphore(2)
+    app.state.review_export_semaphore = asyncio.Semaphore(config.max_review_exports)
     app.state.address_semaphore = asyncio.Semaphore(2)
     app.state.address_failure_cache = {}
     app.state.address_inflight = {}
@@ -576,7 +628,12 @@ def create_app(
     app.include_router(detections_router)
     app.include_router(media_router)
     app.include_router(overlays_router)
+    app.include_router(manual_objects_router)
     app.include_router(pole_tools_router)
+    app.include_router(qa_router)
+    app.include_router(review_edits_router)
+    app.include_router(review_reports_router)
+    app.include_router(review_tasks_router)
     app.include_router(optimizer_router)
     app.include_router(uploads_router)
     app.include_router(runs_router)
@@ -649,6 +706,8 @@ def create_app(
                 "panorama": True,
                 "point_cloud": app.state.point_preview_available,
                 "pole_base_inference": app.state.point_preview_available,
+                "review_workspace": True,
+                "active_learning_export": config.enable_active_learning_export,
                 "auto_optimize": True,
                 "folder_browser": True,
                 "resumable_uploads": True,

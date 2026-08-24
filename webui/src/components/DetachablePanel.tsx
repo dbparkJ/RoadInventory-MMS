@@ -112,30 +112,45 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
     root.appendChild(panelHost)
 
     // React portals keep their event tree, but native keyboard events do not cross
-    // Window boundaries. Relay frame-navigation and global overlay-edit keys
+    // Window boundaries. Relay frame-navigation and global workspace-edit keys
     // through the opener chain so one canonical handler serves every popup.
     const relayFrameNavigation = (event: KeyboardEvent) => {
-      const globalOverlayKey =
+      const globalWorkspaceKey =
         !event.altKey &&
         !event.ctrlKey &&
         !event.metaKey &&
-        !event.shiftKey &&
         !isTextEntryTarget(event.target) &&
         (
-          event.code === 'KeyP' ||
-          event.code === 'KeyN' ||
-          event.code === 'KeyB' ||
-          event.code === 'KeyR' ||
-          event.key === 'Enter' ||
-          event.key === 'Escape'
+          (
+            !event.shiftKey &&
+            (
+              event.code === 'KeyP' ||
+              event.code === 'KeyN' ||
+              event.code === 'KeyB' ||
+              event.code === 'KeyR' ||
+              event.code === 'KeyJ' ||
+              event.code === 'KeyK' ||
+              event.code === 'KeyM' ||
+              event.code === 'KeyQ' ||
+              event.code === 'KeyX' ||
+              event.code === 'KeyF' ||
+              event.key === 'Enter' ||
+              event.key === 'Escape'
+            )
+          ) ||
+          (event.shiftKey && event.key === 'Enter')
         )
-      if (!frameNavigationDirection(event) && !globalOverlayKey) return
+      if (!frameNavigationDirection(event) && !globalWorkspaceKey) return
       event.preventDefault()
       sourceWindow.dispatchEvent(
         new sourceWindow.KeyboardEvent('keydown', {
           key: event.key,
           code: event.code,
           repeat: event.repeat,
+          altKey: event.altKey,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          shiftKey: event.shiftKey,
           bubbles: true,
           cancelable: true,
         }),

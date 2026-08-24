@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { api, errorMessageFromPayload } from './api'
+import { api, ApiError, errorMessageFromPayload } from './api'
 
 describe('errorMessageFromPayload', () => {
   it('renders FastAPI validation arrays as actionable field messages', () => {
@@ -100,6 +100,208 @@ describe('overlay layer metadata', () => {
         name: '현장 지주',
         color: '#123456',
         expected_metadata_revision: 2,
+      })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('review workspace API contracts', () => {
+  it('uses the P1 session/task URIs and explicit resolution payload', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ items: [], total: 0, offset: 0, limit: 20, next_offset: null }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            task: {
+              id: 'task/1',
+              session_id: 'session-1',
+              dataset_id: 'dataset/a',
+              task_type: 'MANUAL_SCAN',
+              status: 'skipped',
+              priority: 1,
+              frame_id: null,
+              track_id: null,
+              source_run_id: null,
+              source_detection_id: null,
+              target_layer_id: null,
+              class_hint: null,
+              reason_codes: [],
+              location_hint: null,
+              claimed_by: null,
+              resolved_feature_ids: [],
+              resolution: 'skipped',
+              created_at: '2026-08-24T00:00:00Z',
+              updated_at: '2026-08-24T00:00:00Z',
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            frame: {
+              id: 'frame 1',
+              index: 1,
+              track_id: 'Track01',
+              timestamp: '2026-08-24T00:00:00Z',
+              coordinate: null,
+              has_panorama: true,
+              has_points: true,
+            },
+            page_offset: 20,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+
+    await api.reviewSessions('dataset/a', 10, 20)
+    await api.resolveReviewTask('task/1', { resolution: 'skipped' })
+    await api.reviewTaskFrame('dataset/a', 'frame 1')
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/datasets/dataset%2Fa/review-sessions?offset=10&limit=20',
+    )
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/review-tasks/task%2F1/resolve')
+    expect(fetchMock.mock.calls[1][1]?.method).toBe('POST')
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      resolution: 'skipped',
+    })
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      '/api/datasets/dataset%2Fa/frames/frame%201',
+    )
+  })
+
+  it('encodes task filters and exposes the five report/export download URLs', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({ items: [], total: 0, offset: 200, limit: 200, next_offset: null }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.reviewTasks('session/a', 200, 200, undefined, {
+        status: 'corrected',
+        task_type: 'POLE_BASE_REVIEW',
+      })
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/review-sessions/session%2Fa/tasks?offset=200&limit=200&status=corrected&task_type=POLE_BASE_REVIEW',
+      )
+      expect(api.reviewReportUrl('session/a', 'json')).toBe(
+        '/api/review-sessions/session%2Fa/report?format=json',
+      )
+      expect(api.reviewReportUrl('session/a', 'csv')).toBe(
+        '/api/review-sessions/session%2Fa/report?format=csv',
+      )
+      expect(api.reviewReportUrl('session/a', 'markdown')).toBe(
+        '/api/review-sessions/session%2Fa/report?format=markdown',
+      )
+      expect(api.reviewExportUrl('session/a')).toBe(
+        '/api/review-sessions/session%2Fa/export',
+      )
+      expect(api.reviewActiveLearningExportUrl('session/a')).toBe(
+        '/api/review-sessions/session%2Fa/active-learning-export',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('uses bounded QA paging and the exact issue override contract', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        items: [], total: 401, offset: 200, limit: 200, next_offset: 400,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ issue: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+
+    try {
+      await api.qaIssues('session/a', { offset: 200, limit: 200, status: 'open', severity: 'error' })
+      await api.patchQaIssue('issue/a', { status: 'resolved' })
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/review-sessions/session%2Fa/qa/issues?offset=200&limit=200&status=open&severity=error',
+      )
+      expect(fetchMock.mock.calls[1][0]).toBe('/api/qa/issues/issue%2Fa')
+      expect(fetchMock.mock.calls[1][1]?.method).toBe('PATCH')
+      expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({ status: 'resolved' })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('preserves nested duplicate reason codes from transactional conflicts', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail: {
+            message: 'A nearby manual pole requires confirmation.',
+            reason_code: 'DUPLICATE_NEARBY',
+          },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      let caught: unknown
+      try {
+        await api.createOverlayFeature('dataset-a', 'layer-a', {
+          geometry: { type: 'Point', coordinates: [1, 2, 3] },
+          coordinate_space: 'dataset',
+          expected_revision: 1,
+        })
+      } catch (reason) {
+        caught = reason
+      }
+      expect(caught).toBeInstanceOf(ApiError)
+      expect(caught).toMatchObject({
+        status: 409,
+        code: 'DUPLICATE_NEARBY',
+      })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
+describe('manual object duplicate preflight', () => {
+  it('passes the edited feature exclusion through the advisory request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          exact_duplicate: false,
+          blocked: false,
+          candidates: [],
+          warning_count: 0,
+          radius_m: 0.5,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.duplicateManualObjectPreflight('dataset/a', {
+        target_layer_id: 'layer 1',
+        template_id: 'SIGN_SUPPORT_POLE',
+        position: [1, 2, 3],
+        exclude_feature_id: 'feature/7',
+      })
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/manual-objects/duplicate-preflight',
+      )
+      expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({
+        exclude_feature_id: 'feature/7',
       })
     } finally {
       fetchMock.mockRestore()
@@ -325,7 +527,7 @@ describe('frame detections API', () => {
 })
 
 describe('point preview API', () => {
-  it('requests only a budget because the server owns the 15m/25m distance bands', async () => {
+  it('requests a budget and an explicit server-derived color mode', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(new ArrayBuffer(40), {
         status: 200,
@@ -334,9 +536,9 @@ describe('point preview API', () => {
     )
 
     try {
-      await api.points('dataset/a', 'frame 1', 120_000)
+      await api.points('dataset/a', 'frame 1', 120_000, undefined, 'classification')
       expect(fetchMock.mock.calls[0][0]).toBe(
-        '/api/datasets/dataset%2Fa/points/frame%201?budget=120000',
+        '/api/datasets/dataset%2Fa/points/frame%201?budget=120000&color_mode=classification',
       )
     } finally {
       fetchMock.mockRestore()

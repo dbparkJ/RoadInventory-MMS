@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import json
 import math
 import os
@@ -30,9 +31,11 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pyproj.exceptions import ProjError
 from starlette.background import BackgroundTask
+
+from mms_shp_detection.manual_object_tools import MANUAL_OBJECT_TEMPLATES
 
 from .datasets import require_ready_dataset, utc_now
 from .security import (
@@ -41,6 +44,11 @@ from .security import (
     normalize_relative_path,
     opaque_id,
     resolve_under_root,
+)
+from .task_resolution_outbox import (
+    enqueue_task_resolution_intent,
+    reconcile_task_resolution_intent,
+    review_dataset_lock,
 )
 
 router = APIRouter(prefix="/api", tags=["overlays"])
@@ -91,6 +99,78 @@ class OverlayTooLarge(ValueError):
     pass
 
 
+class FeatureMutationReplay(Exception):
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("feature mutation replay")
+        self.result = result
+
+
+ReviewEvidenceId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    ),
+]
+FeatureMutationKey = Annotated[
+    str,
+    Field(
+        min_length=8,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    ),
+]
+
+
+class ReviewEditMetadata(BaseModel):
+    """Optional P1 evidence stored beside, never inside, DBF properties."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    source_frame_ids: list[ReviewEvidenceId] = Field(
+        default_factory=list, max_length=20
+    )
+    source_detection_ids: list[ReviewEvidenceId] = Field(
+        default_factory=list, max_length=100
+    )
+    manual_observation_ids: list[ReviewEvidenceId] = Field(
+        default_factory=list, max_length=100
+    )
+    creation_tool: ReviewEvidenceId
+    proposal_quality: float | None = Field(None, ge=0.0, le=1.0, allow_inf_nan=False)
+    created_by: str = Field(default="operator-local", min_length=1, max_length=160)
+    task_id: ReviewEvidenceId | None = None
+
+    @model_validator(mode="after")
+    def _unique_evidence_ids(self) -> ReviewEditMetadata:
+        for field_name in (
+            "source_frame_ids",
+            "source_detection_ids",
+            "manual_observation_ids",
+        ):
+            values = getattr(self, field_name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} must not contain duplicate IDs.")
+        return self
+
+
+class ManualObjectEditValidation(BaseModel):
+    """Transactional validation requested by the manual pole template adapter."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    template_id: Literal["SIGN_SUPPORT_POLE"]
+    allow_near_duplicate: bool = False
+    override_reason: str | None = Field(None, min_length=3, max_length=500)
+
+    @model_validator(mode="after")
+    def _override_requires_reason(self) -> ManualObjectEditValidation:
+        if self.allow_near_duplicate and not self.override_reason:
+            raise ValueError("A near-duplicate override requires a reason.")
+        return self
+
+
 class FeaturePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -98,6 +178,19 @@ class FeaturePatch(BaseModel):
     coordinate_space: Literal["dataset", "wgs84"] = "dataset"
     properties: dict[str, Any] | None = None
     expected_revision: int | None = Field(None, ge=1)
+    idempotency_key: FeatureMutationKey | None = None
+    review_metadata: ReviewEditMetadata | None = None
+    manual_object_validation: ManualObjectEditValidation | None = None
+
+    @model_validator(mode="after")
+    def _linked_edit_requires_idempotency(self) -> FeaturePatch:
+        if (
+            self.review_metadata is not None
+            and self.review_metadata.task_id is not None
+            and self.idempotency_key is None
+        ):
+            raise ValueError("A linked review feature edit requires idempotency_key.")
+        return self
 
 
 class FeatureCreate(BaseModel):
@@ -107,7 +200,20 @@ class FeatureCreate(BaseModel):
     coordinate_space: Literal["dataset", "wgs84"] = "dataset"
     copy_geometry_from: str | None = Field(None, min_length=1, max_length=160)
     expected_revision: int | None = Field(None, ge=1)
+    idempotency_key: FeatureMutationKey | None = None
     properties: dict[str, Any] | None = None
+    review_metadata: ReviewEditMetadata | None = None
+    manual_object_validation: ManualObjectEditValidation | None = None
+
+    @model_validator(mode="after")
+    def _linked_edit_requires_idempotency(self) -> FeatureCreate:
+        if (
+            self.review_metadata is not None
+            and self.review_metadata.task_id is not None
+            and self.idempotency_key is None
+        ):
+            raise ValueError("A linked review feature edit requires idempotency_key.")
+        return self
 
 
 class OverlayLayerPatch(BaseModel):
@@ -209,6 +315,89 @@ def _json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _feature_mutation_fingerprint(
+    dataset_id: str,
+    layer_id: str,
+    operation: Literal["create", "patch"],
+    feature_id: str | None,
+    payload: FeatureCreate | FeaturePatch,
+) -> str:
+    body = payload.model_dump(mode="json", exclude={"idempotency_key"})
+    return hashlib.sha256(
+        _json_bytes([dataset_id, layer_id, operation, feature_id, body])
+    ).hexdigest()
+
+
+def _ensure_feature_mutation_requests(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feature_mutation_requests (
+            idempotency_key TEXT PRIMARY KEY,
+            operation TEXT NOT NULL CHECK(operation IN ('create','patch')),
+            request_fingerprint TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _feature_mutation_replay(
+    connection: sqlite3.Connection,
+    *,
+    idempotency_key: str | None,
+    operation: Literal["create", "patch"],
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    if idempotency_key is None:
+        return None
+    _ensure_feature_mutation_requests(connection)
+    row = connection.execute(
+        "SELECT operation,request_fingerprint,result_json "
+        "FROM feature_mutation_requests WHERE idempotency_key=?",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if (
+        str(row["operation"]) != operation
+        or str(row["request_fingerprint"]) != request_fingerprint
+    ):
+        raise ValueError("The idempotency key belongs to another feature mutation.")
+    result = json.loads(str(row["result_json"]))
+    if not isinstance(result, dict):
+        raise TypeError("The feature mutation replay record is invalid.")
+    return result
+
+
+def _record_feature_mutation(
+    connection: sqlite3.Connection,
+    *,
+    idempotency_key: str | None,
+    operation: Literal["create", "patch"],
+    request_fingerprint: str,
+    result: dict[str, Any],
+    now: str,
+) -> None:
+    if idempotency_key is None:
+        return
+    _ensure_feature_mutation_requests(connection)
+    connection.execute(
+        """
+        INSERT INTO feature_mutation_requests(
+            idempotency_key,operation,request_fingerprint,result_json,created_at
+        ) VALUES(?,?,?,?,?)
+        """,
+        (
+            idempotency_key,
+            operation,
+            request_fingerprint,
+            _json_bytes(result).decode("utf-8"),
+            now,
+        ),
+    )
+
+
 def _read_manifest(
     layer_dir: Path,
     *,
@@ -297,16 +486,16 @@ def _raw_detection_boxes_for_frame(
     ):
         return []
     image_name = str(frame_task.get("image_name") or "").strip()
-    image_stem = str(frame_task.get("image_stem") or "").strip() or Path(image_name).stem
+    image_stem = (
+        str(frame_task.get("image_stem") or "").strip() or Path(image_name).stem
+    )
     record_name = str(frame_task.get("record_name") or "").strip()
     if not image_name or not image_stem or not record_name:
         return []
     model_root = source_path.parent.parent
     # Stable for repeated imports of the same run/model output, but opaque so
     # no server path or user-supplied run identifier is exposed to the client.
-    detection_source_id = opaque_id(
-        "det-src", run_id, model_root.as_posix(), length=32
-    )
+    detection_source_id = opaque_id("det-src", run_id, model_root.as_posix(), length=32)
     relative_parts = [*model_root.parts, "txt", record_name, f"{image_stem}.txt"]
     try:
         result_relative = normalize_relative_path(
@@ -340,7 +529,9 @@ def _raw_detection_boxes_for_frame(
         ValueError,
     ):
         return []
-    if not isinstance(payload, dict) or _image_stem(payload.get("image_name")) != _image_stem(image_name):
+    if not isinstance(payload, dict) or _image_stem(
+        payload.get("image_name")
+    ) != _image_stem(image_name):
         return []
     detections = payload.get("detections")
     if not isinstance(detections, list):
@@ -448,6 +639,373 @@ def _db_revision(connection: sqlite3.Connection) -> int:
 def _active_count(connection: sqlite3.Connection) -> int:
     row = connection.execute("SELECT COUNT(*) FROM features WHERE deleted=0").fetchone()
     return int(row[0]) if row is not None else 0
+
+
+_MANUAL_CLASS_FIELD_ALIASES = {
+    "CLASS",
+    "CLASS_NM",
+    "CLASSNAME",
+    "CLASS_NAME",
+    "OBJ_TYPE",
+    "TYPE",
+}
+
+
+class ManualDuplicateConflict(ValueError):
+    def __init__(self, reason_code: str, candidates: list[dict[str, Any]]) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.candidates = candidates
+
+
+def _manual_field_name(value: str) -> str:
+    return value.strip().upper().replace(" ", "_")
+
+
+def _apply_manual_template_constraints(
+    manifest: dict[str, Any],
+    properties: dict[str, Any],
+    validation: ManualObjectEditValidation,
+) -> None:
+    template = MANUAL_OBJECT_TEMPLATES[validation.template_id]
+    fields = list(manifest.get("fields") or [])
+    encoding = str(manifest.get("source_encoding", "utf-8"))
+    for field in fields:
+        field_name = str(field["name"])
+        if _manual_field_name(field_name) in _MANUAL_CLASS_FIELD_ALIASES:
+            properties[field_name] = _coerce_property(
+                template.class_name,
+                field,
+                encoding=encoding,
+            )
+    for field in fields:
+        field_name = str(field["name"])
+        value = properties.get(field_name)
+        if bool(field.get("required")) and value in (None, ""):
+            raise ValueError(f"{field_name} is required by the target layer schema.")
+        domain = field.get("domain") or field.get("allowed_values") or field.get("values")
+        if isinstance(domain, dict):
+            domain = domain.get("values")
+        if domain and value is not None and value not in domain:
+            raise ValueError(f"{field_name} is outside the target layer domain.")
+
+
+def _manual_duplicate_candidates(
+    connection: sqlite3.Connection,
+    *,
+    position: tuple[float, float, float],
+    radius_m: float,
+    class_name: str,
+    exclude_feature_id: str | None = None,
+) -> list[dict[str, Any]]:
+    x, y, z = position
+    if not all(math.isfinite(value) for value in position):
+        raise ValueError("Manual object position must contain three finite coordinates.")
+    rows = connection.execute(
+        """
+        SELECT id,point_x,point_y,point_z,properties_json FROM features
+        WHERE deleted=0 AND point_x BETWEEN ? AND ? AND point_y BETWEEN ? AND ?
+        ORDER BY ((point_x-?)*(point_x-?))+((point_y-?)*(point_y-?)), id
+        LIMIT 100
+        """,
+        (x - radius_m, x + radius_m, y - radius_m, y + radius_m, x, x, y, y),
+    ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        feature_id = str(row["id"])
+        if exclude_feature_id is not None and feature_id == exclude_feature_id:
+            continue
+        try:
+            decoded = json.loads(str(row["properties_json"]))
+            properties = decoded if isinstance(decoded, dict) else {}
+        except (TypeError, json.JSONDecodeError):
+            properties = {}
+        existing_classes = {
+            str(value).strip().upper()
+            for key, value in properties.items()
+            if _manual_field_name(str(key)) in _MANUAL_CLASS_FIELD_ALIASES
+            and value not in (None, "")
+        }
+        if existing_classes and class_name.upper() not in existing_classes:
+            continue
+        xy_distance = math.hypot(float(row["point_x"]) - x, float(row["point_y"]) - y)
+        if xy_distance > radius_m:
+            continue
+        row_z = row["point_z"]
+        z_difference = None if row_z is None else abs(float(row_z) - z)
+        if z_difference is not None and z_difference > 2.0:
+            continue
+        exact = xy_distance <= 0.05 and (z_difference is None or z_difference <= 0.10)
+        candidates.append(
+            {
+                "feature_id": feature_id,
+                "xy_distance_m": xy_distance,
+                "z_difference_m": z_difference,
+                "match": "exact" if exact else "near",
+                "reason_codes": ["DUPLICATE_EXACT" if exact else "DUPLICATE_NEARBY"],
+            }
+        )
+    return candidates
+
+
+def _validate_manual_duplicate_transaction(
+    connection: sqlite3.Connection,
+    *,
+    geometry: dict[str, Any] | None,
+    validation: ManualObjectEditValidation,
+    exclude_feature_id: str | None = None,
+) -> list[dict[str, Any]]:
+    if geometry is None or geometry.get("type") != "Point":
+        raise ValueError("Manual object validation requires Point geometry.")
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) < 3:
+        raise ValueError("Manual pole validation requires PointZ geometry.")
+    position = (float(coordinates[0]), float(coordinates[1]), float(coordinates[2]))
+    template = MANUAL_OBJECT_TEMPLATES[validation.template_id]
+    candidates = _manual_duplicate_candidates(
+        connection,
+        position=position,
+        radius_m=template.duplicate_radius_m,
+        class_name=template.class_name,
+        exclude_feature_id=exclude_feature_id,
+    )
+    exact = [candidate for candidate in candidates if candidate["match"] == "exact"]
+    near = [candidate for candidate in candidates if candidate["match"] == "near"]
+    if exact:
+        raise ManualDuplicateConflict("DUPLICATE_EXACT", exact)
+    if near and not validation.allow_near_duplicate:
+        raise ManualDuplicateConflict("DUPLICATE_NEARBY", near)
+    return near
+
+
+def _ensure_feature_review_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feature_provenance (
+            feature_id TEXT PRIMARY KEY,
+            provenance_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edit_transactions (
+            id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            action TEXT NOT NULL,
+            feature_id TEXT,
+            task_id TEXT,
+            revision INTEGER,
+            before_json TEXT,
+            after_json TEXT,
+            status TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(edit_transactions)")
+    }
+    if "revision" not in columns:
+        connection.execute("ALTER TABLE edit_transactions ADD COLUMN revision INTEGER")
+    if "override_reason" not in columns:
+        connection.execute(
+            "ALTER TABLE edit_transactions ADD COLUMN override_reason TEXT"
+        )
+
+
+def _write_feature_review_metadata(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: str,
+    layer_id: str,
+    feature_id: str,
+    metadata: ReviewEditMetadata,
+    action: Literal["create", "update"],
+    revision: int,
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+    now: str,
+    override_reason: str | None = None,
+    review_task: dict[str, Any] | None = None,
+) -> str | None:
+    _ensure_feature_review_tables(connection)
+    previous_row = connection.execute(
+        "SELECT provenance_json FROM feature_provenance WHERE feature_id=?",
+        (feature_id,),
+    ).fetchone()
+    previous: dict[str, Any] = {}
+    if previous_row is not None:
+        try:
+            decoded = json.loads(str(previous_row[0]))
+            if isinstance(decoded, dict):
+                previous = decoded
+        except json.JSONDecodeError:
+            previous = {}
+    values = metadata.model_dump(mode="json")
+    task_detection_id = (
+        str(review_task["source_detection_id"])
+        if review_task is not None and review_task.get("source_detection_id")
+        else None
+    )
+    source_detection_ids = list(
+        dict.fromkeys(
+            [
+                *values["source_detection_ids"],
+                *(
+                    [task_detection_id]
+                    if task_detection_id is not None
+                    else []
+                ),
+                *list(previous.get("source_detection_ids", [])),
+            ]
+        )
+    )
+    provenance = {
+        "layer_id": layer_id,
+        "feature_id": feature_id,
+        "origin": "MANUAL" if action == "create" else "CORRECTED",
+        "source_run_id": (
+            review_task.get("source_run_id")
+            if review_task is not None and review_task.get("source_run_id")
+            else previous.get("source_run_id")
+        ),
+        "source_frame_ids": values["source_frame_ids"]
+        or previous.get("source_frame_ids", []),
+        "source_detection_ids": source_detection_ids,
+        "manual_observation_ids": values["manual_observation_ids"]
+        or previous.get("manual_observation_ids", []),
+        "creation_tool": values["creation_tool"],
+        "proposal_quality": values["proposal_quality"],
+        "review_status": "manual_added" if action == "create" else "corrected",
+        "created_by": previous.get("created_by", values["created_by"]),
+        "created_at": previous.get("created_at", now),
+        "updated_at": now,
+    }
+    edit_transaction_id = f"edt_{uuid.uuid4().hex}"
+    connection.execute(
+        """
+        INSERT INTO feature_provenance(feature_id,provenance_json,updated_at)
+        VALUES(?,?,?)
+        ON CONFLICT(feature_id) DO UPDATE SET
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (feature_id, _json_bytes(provenance).decode("utf-8"), now),
+    )
+    connection.execute(
+        """
+        INSERT INTO edit_transactions(
+            id,idempotency_key,action,feature_id,task_id,revision,before_json,
+            after_json,status,created_by,created_at,override_reason
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            edit_transaction_id,
+            f"overlay-edit:{uuid.uuid4().hex}",
+            f"review_{action}",
+            feature_id,
+            values["task_id"],
+            revision,
+            None if before is None else _json_bytes(before).decode("utf-8"),
+            _json_bytes(after).decode("utf-8"),
+            "committed",
+            values["created_by"],
+            now,
+            override_reason,
+        ),
+    )
+    return enqueue_task_resolution_intent(
+        connection,
+        source_key=f"overlay-edit:{edit_transaction_id}",
+        task_id=values["task_id"],
+        feature_id=feature_id,
+        transition_kind="resolve",
+        resolution="manual_added" if action == "create" else "corrected",
+        expected_status=None,
+        allow_claim=False,
+        actor=values["created_by"],
+        now=now,
+        session_id=(
+            str(review_task["session_id"])
+            if review_task is not None and review_task.get("session_id")
+            else None
+        ),
+        dataset_id=dataset_id,
+        layer_id=layer_id,
+    )
+
+
+def _validate_review_task_scope(
+    request: Request,
+    dataset_id: str,
+    layer_id: str,
+    metadata: ReviewEditMetadata | None,
+) -> dict[str, Any] | None:
+    if metadata is None:
+        return None
+    if any(
+        request.app.state.store.get_frame(dataset_id, frame_id) is None
+        for frame_id in metadata.source_frame_ids
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Review evidence contains a frame outside this dataset.",
+        )
+    if metadata.task_id is None:
+        return None
+    task = request.app.state.store.get_review_task(metadata.task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Review task not found.")
+    session = request.app.state.store.get_review_session(str(task["session_id"]))
+    if (
+        str(task["dataset_id"]) != dataset_id
+        or session is None
+        or str(session["dataset_id"]) != dataset_id
+        or (
+            task.get("target_layer_id") is not None
+            and str(task["target_layer_id"]) != layer_id
+        )
+        or (
+            session.get("target_layer_ids")
+            and layer_id not in set(session["target_layer_ids"])
+        )
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Review task is outside this feature edit scope.",
+        )
+    if str(session["status"]) != "active":
+        raise HTTPException(
+            status_code=409,
+            detail="Review task feature edits require an active review session.",
+        )
+    if str(task["status"]) != "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="Review task must be in progress before a feature edit.",
+        )
+    if (
+        task.get("claimed_by") is not None
+        and str(task["claimed_by"]) != metadata.created_by
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Review task is claimed by another operator.",
+        )
+    if (
+        task.get("frame_id") is not None
+        and metadata.source_frame_ids
+        and str(task["frame_id"]) not in set(metadata.source_frame_ids)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Review evidence does not include the review task frame.",
+        )
+    return task
 
 
 def _public_layer(layer_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1186,7 +1744,9 @@ def _deletable_overlay_field(
         or bool(field.get("required"))
         or bool(field.get("internal"))
     ):
-        raise PermissionError("The ID, required, and internal SHP fields cannot be deleted.")
+        raise PermissionError(
+            "The ID, required, and internal SHP fields cannot be deleted."
+        )
     if len(fields) <= 1:
         raise ValueError("The final SHP attribute field cannot be deleted.")
     return field
@@ -1595,13 +2155,15 @@ async def patch_overlay(
             _validated_layer_name(payload.name) if "name" in supplied_fields else None
         )
         next_color = (
-            _validated_layer_color(payload.color) if "color" in supplied_fields else None
+            _validated_layer_color(payload.color)
+            if "color" in supplied_fields
+            else None
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     lock = _layer_lock(request.app, dataset_id, layer_id)
-    async with lock:
+    async with review_dataset_lock(request.app, dataset_id), lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
         except (
@@ -1680,7 +2242,7 @@ async def unregister_overlay(
 
     require_ready_dataset(request, dataset_id)
     lock = _layer_lock(request.app, dataset_id, layer_id)
-    async with lock:
+    async with review_dataset_lock(request.app, dataset_id), lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
             archive_root = _overlay_archive_root(request.app, dataset_id)
@@ -1691,18 +2253,40 @@ async def unregister_overlay(
             # SQLite lock used by metadata PATCH prevents a concurrent worker
             # from updating a manifest that is about to be archived.  The DB
             # handle is closed before moving the directory for Windows.
-            with _feature_db(layer_dir, write=True):
+            with _feature_db(layer_dir, write=True) as connection:
                 manifest = _read_manifest(layer_dir, include_unregistered=True)
                 if (
                     manifest.get("dataset_id") != dataset_id
                     or manifest.get("registered", True) is False
                 ):
                     raise FileNotFoundError("Overlay layer not found.")
+                outbox_exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='task_resolution_outbox'"
+                ).fetchone()
+                if outbox_exists is not None:
+                    rows = connection.execute(
+                        """
+                        SELECT status,COUNT(*) AS count
+                        FROM task_resolution_outbox
+                        WHERE status IN ('pending','error') GROUP BY status
+                        """
+                    ).fetchall()
+                    blockers = {str(row["status"]): int(row["count"]) for row in rows}
+                    if blockers:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "message": (
+                                    "Overlay has unresolved review task transitions."
+                                ),
+                                "pending_task_resolutions": blockers.get("pending", 0),
+                                "task_resolution_errors": blockers.get("error", 0),
+                            },
+                        )
                 manifest["registered"] = False
                 manifest["removed_at"] = utc_now()
-                atomic_replace_bytes(
-                    layer_dir / "manifest.json", _json_bytes(manifest)
-                )
+                atomic_replace_bytes(layer_dir / "manifest.json", _json_bytes(manifest))
             layer_dir.replace(archived)
         except (
             FileNotFoundError,
@@ -1916,7 +2500,12 @@ async def delete_overlay_field(
     async with lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
-            manifest, canonical_name, revision, remaining_fields = await asyncio.to_thread(
+            (
+                manifest,
+                canonical_name,
+                revision,
+                remaining_fields,
+            ) = await asyncio.to_thread(
                 _delete_overlay_field_from_store,
                 layer_dir,
                 dataset_id,
@@ -1965,18 +2554,39 @@ async def create_overlay_feature(
     request: Request,
 ) -> dict[str, Any]:
     require_ready_dataset(request, dataset_id)
+    review_task: dict[str, Any] | None = None
+    task_resolution_intent_id: str | None = None
+    idempotent_replay = False
+    request_fingerprint = _feature_mutation_fingerprint(
+        dataset_id, layer_id, "create", None, payload
+    )
     if (payload.geometry is None) == (payload.copy_geometry_from is None):
         raise HTTPException(
             status_code=422,
             detail="Supply exactly one of geometry or copy_geometry_from.",
         )
+    manual_duplicate_warnings: list[dict[str, Any]] = []
     lock = _layer_lock(request.app, dataset_id, layer_id)
-    async with lock:
+    async with review_dataset_lock(request.app, dataset_id), lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
             manifest = _read_manifest(layer_dir)
             with _feature_db(layer_dir, write=True) as connection:
-                if _active_count(connection) >= request.app.state.config.max_overlay_features:
+                replay = _feature_mutation_replay(
+                    connection,
+                    idempotency_key=payload.idempotency_key,
+                    operation="create",
+                    request_fingerprint=request_fingerprint,
+                )
+                if replay is not None:
+                    raise FeatureMutationReplay(replay)
+                review_task = _validate_review_task_scope(
+                    request, dataset_id, layer_id, payload.review_metadata
+                )
+                if (
+                    _active_count(connection)
+                    >= request.app.state.config.max_overlay_features
+                ):
                     raise OverlayTooLarge(
                         "SHP feature count exceeds the configured overlay limit."
                     )
@@ -1999,8 +2609,12 @@ async def create_overlay_feature(
                     geometry = _normalize_point_geometry(payload.geometry or {})
                     if payload.coordinate_space == "wgs84":
                         longitude, latitude = geometry["coordinates"][:2]
-                        if not (-180.0 <= longitude <= 180.0 and -90.0 <= latitude <= 90.0):
-                            raise ValueError("WGS84 Point coordinates are outside valid bounds.")
+                        if not (
+                            -180.0 <= longitude <= 180.0 and -90.0 <= latitude <= 90.0
+                        ):
+                            raise ValueError(
+                                "WGS84 Point coordinates are outside valid bounds."
+                            )
                         geometry = _transform_geometry(
                             geometry,
                             _from_wgs84_transformer(manifest["dataset_crs"]),
@@ -2019,6 +2633,17 @@ async def create_overlay_feature(
                             field_map[key],
                             encoding=str(manifest.get("source_encoding", "utf-8")),
                         )
+                if payload.manual_object_validation is not None:
+                    _apply_manual_template_constraints(
+                        manifest,
+                        properties,
+                        payload.manual_object_validation,
+                    )
+                    manual_duplicate_warnings = _validate_manual_duplicate_transaction(
+                        connection,
+                        geometry=geometry,
+                        validation=payload.manual_object_validation,
+                    )
                 feature_id, ordinal = _next_feature_identity(connection)
                 x, y, z = _point_columns(geometry)
                 now = utc_now()
@@ -2046,6 +2671,25 @@ async def create_overlay_feature(
                         now,
                     ),
                 )
+                if payload.review_metadata is not None:
+                    task_resolution_intent_id = _write_feature_review_metadata(
+                        connection,
+                        dataset_id=dataset_id,
+                        layer_id=layer_id,
+                        feature_id=feature_id,
+                        metadata=payload.review_metadata,
+                        action="create",
+                        revision=revision,
+                        before=None,
+                        after=after,
+                        now=now,
+                        override_reason=(
+                            payload.manual_object_validation.override_reason
+                            if payload.manual_object_validation is not None
+                            else None
+                        ),
+                        review_task=review_task,
+                    )
                 connection.execute(
                     "UPDATE metadata SET value=? WHERE key='revision'", (str(revision),)
                 )
@@ -2063,6 +2707,42 @@ async def create_overlay_feature(
                         now,
                     ),
                 )
+                _record_feature_mutation(
+                    connection,
+                    idempotency_key=payload.idempotency_key,
+                    operation="create",
+                    request_fingerprint=request_fingerprint,
+                    result={
+                        "feature": after,
+                        "revision": revision,
+                        "task_resolution_intent_id": task_resolution_intent_id,
+                        "duplicate_warnings": manual_duplicate_warnings,
+                    },
+                    now=now,
+                )
+        except FeatureMutationReplay as exc:
+            after = exc.result["feature"]
+            revision = int(exc.result["revision"])
+            task_resolution_intent_id = exc.result.get(
+                "task_resolution_intent_id"
+            )
+            manual_duplicate_warnings = list(
+                exc.result.get("duplicate_warnings", [])
+            )
+            idempotent_replay = True
+        except ManualDuplicateConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "An exact duplicate manual pole already exists."
+                        if exc.reason_code == "DUPLICATE_EXACT"
+                        else "A nearby manual pole requires operator confirmation."
+                    ),
+                    "reason_code": exc.reason_code,
+                    "candidates": exc.candidates,
+                },
+            ) from exc
         except RuntimeError as exc:
             if str(exc).startswith("revision:"):
                 raise HTTPException(
@@ -2090,6 +2770,9 @@ async def create_overlay_feature(
         if payload.coordinate_space == "wgs84"
         else None,
     )
+    task_resolution_pending = not reconcile_task_resolution_intent(
+        request.app, dataset_id, layer_id, task_resolution_intent_id
+    )
     return {
         "feature": public_feature,
         "revision": revision,
@@ -2098,6 +2781,9 @@ async def create_overlay_feature(
         if payload.coordinate_space == "wgs84"
         else manifest["dataset_crs"],
         "fields": manifest["fields"],
+        "task_resolution_pending": task_resolution_pending,
+        "duplicate_warnings": manual_duplicate_warnings,
+        "idempotent_replay": idempotent_replay,
     }
 
 
@@ -2110,16 +2796,34 @@ async def update_overlay_feature(
     request: Request,
 ) -> dict[str, Any]:
     require_ready_dataset(request, dataset_id)
+    review_task: dict[str, Any] | None = None
+    task_resolution_intent_id: str | None = None
+    idempotent_replay = False
+    request_fingerprint = _feature_mutation_fingerprint(
+        dataset_id, layer_id, "patch", feature_id, payload
+    )
     if payload.geometry is None and payload.properties is None:
         raise HTTPException(
             status_code=422, detail="Geometry or properties must be supplied."
         )
+    manual_duplicate_warnings: list[dict[str, Any]] = []
     lock = _layer_lock(request.app, dataset_id, layer_id)
-    async with lock:
+    async with review_dataset_lock(request.app, dataset_id), lock:
         try:
             layer_dir = _layer_directory(request.app, dataset_id, layer_id)
             manifest = _read_manifest(layer_dir)
             with _feature_db(layer_dir, write=True) as connection:
+                replay = _feature_mutation_replay(
+                    connection,
+                    idempotency_key=payload.idempotency_key,
+                    operation="patch",
+                    request_fingerprint=request_fingerprint,
+                )
+                if replay is not None:
+                    raise FeatureMutationReplay(replay)
+                review_task = _validate_review_task_scope(
+                    request, dataset_id, layer_id, payload.review_metadata
+                )
                 row = connection.execute(
                     "SELECT * FROM features WHERE id=? AND deleted=0", (feature_id,)
                 ).fetchone()
@@ -2152,6 +2856,18 @@ async def update_overlay_feature(
                             field_map[key],
                             encoding=str(manifest.get("source_encoding", "utf-8")),
                         )
+                if payload.manual_object_validation is not None:
+                    _apply_manual_template_constraints(
+                        manifest,
+                        properties,
+                        payload.manual_object_validation,
+                    )
+                    manual_duplicate_warnings = _validate_manual_duplicate_transaction(
+                        connection,
+                        geometry=geometry,
+                        validation=payload.manual_object_validation,
+                        exclude_feature_id=feature_id,
+                    )
                 revision = _updated_revision(connection, payload.expected_revision)
                 x, y, z = _point_columns(geometry)
                 after = {
@@ -2178,6 +2894,25 @@ async def update_overlay_feature(
                         feature_id,
                     ),
                 )
+                if payload.review_metadata is not None:
+                    task_resolution_intent_id = _write_feature_review_metadata(
+                        connection,
+                        dataset_id=dataset_id,
+                        layer_id=layer_id,
+                        feature_id=feature_id,
+                        metadata=payload.review_metadata,
+                        action="update",
+                        revision=revision,
+                        before=before,
+                        after=after,
+                        now=now,
+                        override_reason=(
+                            payload.manual_object_validation.override_reason
+                            if payload.manual_object_validation is not None
+                            else None
+                        ),
+                        review_task=review_task,
+                    )
                 connection.execute(
                     "UPDATE metadata SET value=? WHERE key='revision'", (str(revision),)
                 )
@@ -2195,6 +2930,42 @@ async def update_overlay_feature(
                         now,
                     ),
                 )
+                _record_feature_mutation(
+                    connection,
+                    idempotency_key=payload.idempotency_key,
+                    operation="patch",
+                    request_fingerprint=request_fingerprint,
+                    result={
+                        "feature": after,
+                        "revision": revision,
+                        "task_resolution_intent_id": task_resolution_intent_id,
+                        "duplicate_warnings": manual_duplicate_warnings,
+                    },
+                    now=now,
+                )
+        except FeatureMutationReplay as exc:
+            after = exc.result["feature"]
+            revision = int(exc.result["revision"])
+            task_resolution_intent_id = exc.result.get(
+                "task_resolution_intent_id"
+            )
+            manual_duplicate_warnings = list(
+                exc.result.get("duplicate_warnings", [])
+            )
+            idempotent_replay = True
+        except ManualDuplicateConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "An exact duplicate manual pole already exists."
+                        if exc.reason_code == "DUPLICATE_EXACT"
+                        else "A nearby manual pole requires operator confirmation."
+                    ),
+                    "reason_code": exc.reason_code,
+                    "candidates": exc.candidates,
+                },
+            ) from exc
         except RuntimeError as exc:
             if str(exc).startswith("revision:"):
                 raise HTTPException(
@@ -2221,10 +2992,16 @@ async def update_overlay_feature(
         if payload.coordinate_space == "wgs84"
         else None,
     )
+    task_resolution_pending = not reconcile_task_resolution_intent(
+        request.app, dataset_id, layer_id, task_resolution_intent_id
+    )
     return {
         "feature": public_feature,
         "revision": revision,
         "coordinate_space": payload.coordinate_space,
+        "task_resolution_pending": task_resolution_pending,
+        "duplicate_warnings": manual_duplicate_warnings,
+        "idempotent_replay": idempotent_replay,
     }
 
 

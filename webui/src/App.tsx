@@ -18,11 +18,14 @@ import { DatasetPanel } from './components/DatasetPanel'
 import { DetachablePanel, type DetachablePanelHandle } from './components/DetachablePanel'
 import { GeneralSettingsPanel } from './components/GeneralSettingsPanel'
 import { LatestRunResults } from './components/LatestRunResults'
+import { ManualObjectProvider } from './components/ManualObjectContext'
 import { OVERLAY_DETAILS_EVENT } from './components/OverlayHoverTooltip'
 import { OverlayProvider } from './components/OverlayContext'
 import { OverlayAttributePanel, OverlayPanel } from './components/OverlayPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
+import { ReviewProvider } from './components/ReviewContext'
+import { ReviewSessionBar } from './components/ReviewSessionBar'
 import { StorageDialog } from './components/StorageDialog'
 import { ToastRegion, type Toast } from './components/ToastRegion'
 import { Workspace } from './components/Workspace'
@@ -107,6 +110,15 @@ function App() {
   )
   const detectionRevisionKey = useMemo(
     () => completedDetectionRevision(runs, datasetId),
+    [datasetId, runs],
+  )
+  const reviewSourceRuns = useMemo(
+    () => runs
+      .filter((run) => run.dataset_id === datasetId && run.status === 'completed')
+      .map((run) => ({
+        id: run.id,
+        label: `${run.name?.trim() || run.id}${run.finished_at ? ` · ${new Date(run.finished_at).toLocaleString('ko-KR')}` : ''}`,
+      })),
     [datasetId, runs],
   )
 
@@ -423,6 +435,22 @@ function App() {
     [frameNextOffset, frames, loadMoreFrames, selectedFrame],
   )
 
+  const focusReviewFrame = useCallback(
+    (frame: Frame, pageOffset: number) => {
+      if (!datasetId) return
+      pendingFrameFocusRef.current = {
+        datasetId,
+        frame,
+        offset: pageOffset,
+      }
+      setFrameRange(null)
+      setTrackId(frame.track_id)
+      setSelectedFrame(frame)
+      setFrameFocusToken((value) => value + 1)
+    },
+    [datasetId],
+  )
+
   useEffect(() => {
     if (!datasetId || selectedDataset?.status !== 'ready') {
       setRoute([])
@@ -659,13 +687,28 @@ function App() {
   if (booting) return <BootScreen />
 
   return (
-    <OverlayProvider
+    <ReviewProvider
+      enabled={Boolean(boot?.capabilities?.review_workspace) && !demoMode}
       datasetId={datasetId}
-      activeFrameId={selectedFrame?.id ?? null}
-      poleBaseInferenceEnabled={Boolean(boot?.capabilities?.pole_base_inference)}
-      demoMode={demoMode}
+      activeFrame={selectedFrame}
+      frameRange={frameRange}
+      sourceRuns={reviewSourceRuns}
+      onNavigateFrame={focusReviewFrame}
       notify={toast}
     >
+      <OverlayProvider
+        datasetId={datasetId}
+        activeFrameId={selectedFrame?.id ?? null}
+        poleBaseInferenceEnabled={Boolean(boot?.capabilities?.pole_base_inference)}
+        demoMode={demoMode}
+        notify={toast}
+      >
+        <ManualObjectProvider
+          enabled={Boolean(boot?.capabilities?.review_workspace) && !demoMode}
+          datasetId={datasetId}
+          frame={selectedFrame}
+          notify={toast}
+        >
       <div className={`app-shell ${dataPanelCollapsed ? 'data-collapsed' : ''}`}>
       <header className="topbar">
         <div className="topbar-left">
@@ -756,6 +799,10 @@ function App() {
           <BrandLogo />
         </div>
       </header>
+
+      <ReviewSessionBar
+        activeLearningExportEnabled={Boolean(boot?.capabilities?.active_learning_export)}
+      />
 
       {connectionIssue && (
         <div className="offline-banner">
@@ -1063,7 +1110,9 @@ function App() {
       />
       <ToastRegion toasts={toasts} dismiss={dismissToast} />
       </div>
-    </OverlayProvider>
+        </ManualObjectProvider>
+      </OverlayProvider>
+    </ReviewProvider>
   )
 }
 

@@ -20,6 +20,10 @@ import {
   type OverlayHoverState,
 } from '../components/OverlayHoverTooltip'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
+import {
+  seamSafeBboxFromUvSamples,
+  useOptionalManualObjectWorkspace,
+} from '../components/ManualObjectContext'
 import { api, ApiError } from '../lib/api'
 import { createDemoPanoramaPoints, parseMmso } from '../lib/mmso'
 import {
@@ -946,6 +950,7 @@ export default function PanoramaView({
   onPanoramaOpacityChange?: (opacity: number) => void
 }) {
   const overlay = useOptionalOverlayWorkspace()
+  const manualObject = useOptionalManualObjectWorkspace()
   const stageRef = useRef<HTMLDivElement>(null)
   const linkedPointMarkerRef = useRef<HTMLDivElement>(null)
   const linkedHoverPointRef = useRef(linkedHoverPoint)
@@ -994,6 +999,20 @@ export default function PanoramaView({
   const [sceneNavigationFeedback, setSceneNavigationFeedback] = useState<string | null>(null)
   const [frameAddress, setFrameAddress] = useState<string | null>(null)
   const [addressLoading, setAddressLoading] = useState(false)
+  const [panoramaDimensions, setPanoramaDimensions] = useState({ width: 4096, height: 2048 })
+  const [manualBboxDrag, setManualBboxDrag] = useState<{
+    pointerId: number
+    startX: number
+    startY: number
+    currentX: number
+    currentY: number
+  } | null>(null)
+  const [manualBboxRect, setManualBboxRect] = useState<{
+    left: number
+    top: number
+    width: number
+    height: number
+  } | null>(null)
   const [poleBaseProjectionMetadata, setPoleBaseProjectionMetadata] = useState<{
     datasetId: string
     metadata: PanoramaProjectionMetadata
@@ -1023,6 +1042,11 @@ export default function PanoramaView({
     && poleBaseProposal.result.status !== 'failed'
       ? poleBaseProposal.result.base_position
       : null
+  const manualProposalFrameId =
+    manualObject?.proposalState.status === 'ready' || manualObject?.proposalState.status === 'committing'
+      ? manualObject.proposalState.data.frameId
+      : null
+  const proposalProjectionFrameId = manualProposalFrameId ?? readyPoleBaseFrameId
   const activePoleBaseMetadata = poleBaseProjectionMetadata?.datasetId === datasetId
     ? poleBaseProjectionMetadata.metadata
     : null
@@ -1044,6 +1068,18 @@ export default function PanoramaView({
       readyPoleBasePosition,
     ],
   )
+  const manualObjectPreview = useMemo(
+    () => panoramaPoleBasePreviewProjection({
+      datasetPosition: manualObject?.proposalPosition ?? null,
+      proposalFrameId: manualProposalFrameId,
+      currentFrameId: frame?.id,
+      metadata: activePoleBaseMetadata,
+      color: '#ffb84d',
+      sizeM: poleBaseMarkerSizeM,
+    }),
+    [activePoleBaseMetadata, frame?.id, manualObject?.proposalPosition, manualProposalFrameId, poleBaseMarkerSizeM],
+  )
+  const activeProposalPreview = manualObjectPreview ?? poleBasePreview
   const pointPayloadRequired = pointOverlayEnabled || Boolean(overlay?.pickMode)
   const visibleDetectionBoxes = useMemo(
     () => detectionBoxes.filter((box) => {
@@ -1055,7 +1091,7 @@ export default function PanoramaView({
   const hasVisualOverlay = pointOverlayEnabled
     || overlayProjection.length > 0
     || visibleDetectionBoxes.length > 0
-    || Boolean(poleBasePreview)
+    || Boolean(activeProposalPreview)
   // SHP markers are already composited with a transparent texture. Only the
   // dense point-cloud overlay may dim the camera image at the user's request.
   const effectivePanoramaOpacity = pointOverlayEnabled ? panoramaOpacity : 1
@@ -1111,10 +1147,18 @@ export default function PanoramaView({
     pendingHoverRef.current = null
     setOverlayHover(null)
     setPinnedOverlayHover(null)
+    setManualBboxDrag(null)
+    setManualBboxRect(null)
     setIsDragging(false)
     dragExceededThresholdRef.current = false
     setError(null)
   }, [frame?.id])
+
+  useEffect(() => {
+    if (!manualObject?.bboxMode || manualObject.proposalState.status === 'drawing') {
+      setManualBboxRect(null)
+    }
+  }, [manualObject?.bboxMode, manualObject?.proposalState.status])
 
   useEffect(() => {
     setFov(72)
@@ -1148,7 +1192,7 @@ export default function PanoramaView({
 
   useEffect(() => {
     setPoleBaseProjectionMetadata(null)
-    if (!frame || demoMode || readyPoleBaseFrameId !== frame.id) return
+    if (!frame || demoMode || proposalProjectionFrameId !== frame.id) return
     const controller = new AbortController()
     const expectedFrameId = frame.id
     void api.panoramaProjectionMetadata(datasetId, expectedFrameId, controller.signal)
@@ -1161,7 +1205,7 @@ export default function PanoramaView({
         // calibration metadata is unavailable; no approximate projection is drawn.
       })
     return () => controller.abort()
-  }, [datasetId, demoMode, frame?.id, readyPoleBaseFrameId])
+  }, [datasetId, demoMode, frame?.id, proposalProjectionFrameId])
 
   useEffect(() => {
     if (!frame?.coordinate || demoMode) {
@@ -1443,6 +1487,12 @@ export default function PanoramaView({
         }
         readyTexture.colorSpace = THREE.SRGBColorSpace
         readyTexture.needsUpdate = true
+        const image = readyTexture.image as
+          | { naturalWidth?: number; naturalHeight?: number; width?: number; height?: number }
+          | undefined
+        const width = image?.naturalWidth ?? image?.width
+        const height = image?.naturalHeight ?? image?.height
+        if (width && height) setPanoramaDimensions({ width, height })
         const previousTexture = panoramaTextureRef.current
         panoramaTextureRef.current = readyTexture
         renderedFrameKeyRef.current = sourceFrameKey
@@ -1636,7 +1686,7 @@ export default function PanoramaView({
     if (
       !runtime
       || !host
-      || (!renderedOverlayProjection.length && !renderedDetectionBoxes.length && !poleBasePreview)
+      || (!renderedOverlayProjection.length && !renderedDetectionBoxes.length && !activeProposalPreview)
     ) return
     const geometry = new THREE.SphereGeometry(9.92, 64, 40)
     geometry.scale(-1, 1, 1)
@@ -1644,7 +1694,7 @@ export default function PanoramaView({
       host.ownerDocument,
       renderedOverlayProjection,
       renderedDetectionBoxes,
-      poleBasePreview,
+      activeProposalPreview,
     )
     const material = new THREE.MeshBasicMaterial({
       map: texture,
@@ -1663,7 +1713,7 @@ export default function PanoramaView({
       material.dispose()
       texture.dispose()
     }
-  }, [poleBasePreview, renderedDetectionBoxes, renderedOverlayProjection])
+  }, [activeProposalPreview, renderedDetectionBoxes, renderedOverlayProjection])
 
   useEffect(() => {
     if (!frame || !pointPayloadRequired) {
@@ -1856,6 +1906,52 @@ export default function PanoramaView({
     }
   }
 
+  const manualBboxInteractive = Boolean(
+    manualObject?.bboxMode &&
+    (
+      manualObject.proposalState.status === 'drawing' ||
+      manualObject.proposalState.status === 'adjusting' ||
+      manualObject.proposalState.status === 'error'
+    ),
+  )
+
+  const finishManualBbox = (drag: NonNullable<typeof manualBboxDrag>) => {
+    const left = Math.min(drag.startX, drag.currentX)
+    const right = Math.max(drag.startX, drag.currentX)
+    const top = Math.min(drag.startY, drag.currentY)
+    const bottom = Math.max(drag.startY, drag.currentY)
+    const first = panoramaUvAtPointer(left, top)
+    if (!first || right - left < 5 || bottom - top < 5) {
+      setPickFeedback('객체를 포함하도록 조금 더 큰 bbox를 그려 주세요.')
+      return
+    }
+    const samples = [0, 0.5, 1].flatMap((xRatio) =>
+      [0, 0.5, 1].map((yRatio) =>
+        panoramaUvAtPointer(
+          left + (right - left) * xRatio,
+          top + (bottom - top) * yRatio,
+        ),
+      ),
+    ).filter((sample): sample is NonNullable<ReturnType<typeof panoramaUvAtPointer>> => Boolean(sample))
+    const geometry = seamSafeBboxFromUvSamples(
+      samples,
+      panoramaDimensions.width,
+      panoramaDimensions.height,
+    )
+    if (!geometry) {
+      setPickFeedback('현재 시야에서 bbox 좌표를 만들지 못했습니다. 다시 그려 주세요.')
+      return
+    }
+    setManualBboxRect({
+      left: left - first.bounds.left,
+      top: top - first.bounds.top,
+      width: right - left,
+      height: bottom - top,
+    })
+    setPickFeedback(null)
+    manualObject?.stageBbox(geometry)
+  }
+
   const clearOverlayHover = () => {
     const ownerWindow = stageRef.current?.ownerDocument.defaultView
     if (hoverFrameRef.current && ownerWindow) ownerWindow.cancelAnimationFrame(hoverFrameRef.current)
@@ -1999,6 +2095,7 @@ export default function PanoramaView({
       className={[
         'panorama-view',
         isDragging ? 'dragging' : '',
+        manualObject?.bboxMode ? 'manual-bbox-mode' : '',
       ].filter(Boolean).join(' ')}
       tabIndex={0}
       role="region"
@@ -2015,8 +2112,10 @@ export default function PanoramaView({
       data-yolo-box-count={renderedDetectionBoxes.length}
       data-panorama-opacity={effectivePanoramaOpacity}
       data-pole-base-preview={String(Boolean(poleBasePreview))}
+      data-manual-proposal-preview={String(Boolean(manualObjectPreview))}
       data-pole-base-marker-color={poleBaseMarkerColor}
       data-pole-base-marker-size-m={poleBaseMarkerSizeM}
+      data-manual-bbox-mode={String(Boolean(manualObject?.bboxMode))}
       onPointerDown={(event) => {
         if (
           !source
@@ -2029,11 +2128,34 @@ export default function PanoramaView({
         clearOverlayHover()
         event.currentTarget.focus({ preventScroll: true })
         event.currentTarget.setPointerCapture?.(event.pointerId)
+        if (manualObject?.bboxMode) {
+          if (!manualBboxInteractive) return
+          setManualBboxDrag({
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            currentX: event.clientX,
+            currentY: event.clientY,
+          })
+          setManualBboxRect(null)
+          setIsDragging(false)
+          setDragStart(null)
+          return
+        }
         setIsDragging(false)
         dragExceededThresholdRef.current = false
         setDragStart({ pointerId: event.pointerId, x: event.clientX, y: event.clientY, yaw, pitch })
       }}
       onPointerMove={(event) => {
+        if (manualBboxDrag) {
+          if (event.pointerId !== manualBboxDrag.pointerId) return
+          setManualBboxDrag((current) => current ? {
+            ...current,
+            currentX: event.clientX,
+            currentY: event.clientY,
+          } : null)
+          return
+        }
         if (dragStart) {
           if (event.pointerId !== dragStart.pointerId) return
           if (isPanoramaSceneClick(dragStart, { x: event.clientX, y: event.clientY })) return
@@ -2048,6 +2170,17 @@ export default function PanoramaView({
         }
       }}
       onPointerUp={(event) => {
+        if (manualBboxDrag) {
+          if (event.pointerId !== manualBboxDrag.pointerId) return
+          const completed = {
+            ...manualBboxDrag,
+            currentX: event.clientX,
+            currentY: event.clientY,
+          }
+          setManualBboxDrag(null)
+          finishManualBbox(completed)
+          return
+        }
         if (dragStart && event.pointerId !== dragStart.pointerId) return
         const clicked = Boolean(dragStart && !dragExceededThresholdRef.current && isPanoramaSceneClick(
           dragStart,
@@ -2059,6 +2192,7 @@ export default function PanoramaView({
         if (clicked) void selectAtPointer(event.clientX, event.clientY)
       }}
       onPointerCancel={() => {
+        setManualBboxDrag(null)
         dragExceededThresholdRef.current = false
         setDragStart(null)
         setIsDragging(false)
@@ -2066,6 +2200,25 @@ export default function PanoramaView({
       }}
       onPointerLeave={clearOverlayHover}
     >
+      {(manualBboxDrag || manualBboxRect) && (
+        <div
+          className="panorama-manual-bbox"
+          style={manualBboxDrag ? (() => {
+            const bounds = runtimeRef.current?.renderer.domElement.getBoundingClientRect()
+            const left = Math.min(manualBboxDrag.startX, manualBboxDrag.currentX) - (bounds?.left ?? 0)
+            const top = Math.min(manualBboxDrag.startY, manualBboxDrag.currentY) - (bounds?.top ?? 0)
+            return {
+              left,
+              top,
+              width: Math.abs(manualBboxDrag.currentX - manualBboxDrag.startX),
+              height: Math.abs(manualBboxDrag.currentY - manualBboxDrag.startY),
+            }
+          })() : manualBboxRect ?? undefined}
+          aria-hidden="true"
+        >
+          <i /><i /><i /><i />
+        </div>
+      )}
       <div
         ref={linkedPointMarkerRef}
         className="panorama-linked-point"
@@ -2264,6 +2417,11 @@ export default function PanoramaView({
             <MapPin size={14} /> 임시 바닥점
           </span>
         )}
+        {manualObjectPreview && (
+          <span title="확정 전 수동 객체 위치">
+            <MapPin size={14} /> 수동 제안
+          </span>
+        )}
         {detectionModels.length > 0 && (
           <span title="현재 파노라마의 원본 YOLO 검출 박스">
             <ScanLine size={14} /> YOLO {renderedDetectionBoxes.length.toLocaleString('ko-KR')}
@@ -2272,6 +2430,11 @@ export default function PanoramaView({
         {overlay?.pickMode && (
           <strong className="viewer-pick-indicator">
             <Crosshair size={14} /> 포인트를 클릭해 좌표 적용
+          </strong>
+        )}
+        {manualObject?.bboxMode && (
+          <strong className="viewer-pick-indicator manual-bbox-indicator">
+            <Crosshair size={14} /> bbox 드래그 · Esc 취소
           </strong>
         )}
         <button type="button" onClick={() => changeZoom(6)} aria-label="축소">

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -9,6 +11,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from mms_shp_detection.webapp import create_app
+from mms_shp_detection.webapp import review_tasks as review_tasks_module
 from mms_shp_detection.webapp.datasets import detect_dataset_crs
 from mms_shp_detection.webapp.store import WebStore
 
@@ -182,6 +185,213 @@ class WebAppDatasetRegistryTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 409)
                 self.assertIn("run-queued", response.json()["detail"])
                 self.assertEqual(client.get("/api/datasets/dataset-a").status_code, 200)
+
+    def test_delete_api_preserves_frames_and_nonterminal_review_work(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            (root / "delivery").mkdir()
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            with TestClient(app) as client:
+                root_id = client.get("/api/storage").json()["roots"][0]["id"]
+                seed_ready_dataset(
+                    app.state.store,
+                    dataset_id="dataset-a",
+                    root_id=root_id,
+                )
+                created = client.post(
+                    "/api/datasets/dataset-a/review-sessions",
+                    json={"target_layer_ids": [], "status": "active"},
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                session_id = created.json()["session"]["id"]
+
+                response = client.delete("/api/datasets/dataset-a")
+
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertIsNotNone(
+                    app.state.store.get_frame("dataset-a", "frame-1")
+                )
+                self.assertIsNotNone(
+                    app.state.store.get_review_session(session_id)
+                )
+                self.assertEqual(
+                    client.get("/api/datasets/dataset-a").status_code,
+                    200,
+                )
+
+    def test_delete_api_discards_only_a_truly_empty_draft_session(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            (root / "delivery").mkdir()
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            with TestClient(app) as client:
+                root_id = client.get("/api/storage").json()["roots"][0]["id"]
+                seed_ready_dataset(
+                    app.state.store,
+                    dataset_id="dataset-a",
+                    root_id=root_id,
+                )
+                created = client.post(
+                    "/api/datasets/dataset-a/review-sessions",
+                    json={"status": "draft"},
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                session_id = created.json()["session"]["id"]
+
+                response = client.delete("/api/datasets/dataset-a")
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertIsNone(app.state.store.get_review_session(session_id))
+                self.assertIsNone(app.state.store.get_frame("dataset-a", "frame-1"))
+
+    def test_delete_api_fails_closed_when_outbox_scan_is_truncated(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            (root / "delivery").mkdir()
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            with TestClient(app) as client:
+                root_id = client.get("/api/storage").json()["roots"][0]["id"]
+                seed_ready_dataset(
+                    app.state.store,
+                    dataset_id="dataset-a",
+                    root_id=root_id,
+                )
+                with mock.patch(
+                    "mms_shp_detection.webapp.task_resolution_outbox."
+                    "reconcile_dataset_task_resolutions",
+                    return_value={
+                        "pending": 0,
+                        "error": 0,
+                        "reconciled": 0,
+                        "attempted": 0,
+                        "truncated": 1,
+                    },
+                ):
+                    response = client.delete("/api/datasets/dataset-a")
+
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(
+                    response.json()["detail"]["task_resolution_scan_truncated"],
+                    1,
+                )
+                self.assertIsNotNone(
+                    app.state.store.get_frame("dataset-a", "frame-1")
+                )
+
+    def test_delete_api_preserves_a_draft_with_a_qa_snapshot(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            (root / "delivery").mkdir()
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            with TestClient(app) as client:
+                root_id = client.get("/api/storage").json()["roots"][0]["id"]
+                seed_ready_dataset(
+                    app.state.store,
+                    dataset_id="dataset-a",
+                    root_id=root_id,
+                )
+                created = client.post(
+                    "/api/datasets/dataset-a/review-sessions",
+                    json={"status": "draft"},
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                session_id = created.json()["session"]["id"]
+                qa_run = client.post(f"/api/review-sessions/{session_id}/qa/run")
+                self.assertEqual(qa_run.status_code, 200, qa_run.text)
+
+                response = client.delete("/api/datasets/dataset-a")
+
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertIsNotNone(app.state.store.get_review_session(session_id))
+                self.assertIsNotNone(
+                    app.state.store.get_frame("dataset-a", "frame-1")
+                )
+
+    def test_session_creation_fences_concurrent_dataset_delete(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            root = Path(root_text)
+            (root / "delivery").mkdir()
+            app = create_app(
+                allowed_roots=[root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            original_create = review_tasks_module._create_review_session_locked
+
+            def blocked_create(*args, **kwargs):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("dataset fence test timed out")
+                return original_create(*args, **kwargs)
+
+            with TestClient(app) as client:
+                root_id = client.get("/api/storage").json()["roots"][0]["id"]
+                seed_ready_dataset(
+                    app.state.store,
+                    dataset_id="dataset-a",
+                    root_id=root_id,
+                )
+                with (
+                    mock.patch.object(
+                        review_tasks_module,
+                        "_create_review_session_locked",
+                        side_effect=blocked_create,
+                    ),
+                    ThreadPoolExecutor(max_workers=2) as executor,
+                ):
+                    create_future = executor.submit(
+                        client.post,
+                        "/api/datasets/dataset-a/review-sessions",
+                        json={"status": "active"},
+                    )
+                    self.assertTrue(entered.wait(timeout=5))
+                    delete_future = executor.submit(
+                        client.delete, "/api/datasets/dataset-a"
+                    )
+                    release.set()
+                    created = create_future.result(timeout=5)
+                    deleted = delete_future.result(timeout=5)
+
+                self.assertEqual(created.status_code, 201, created.text)
+                self.assertEqual(deleted.status_code, 409, deleted.text)
+                session_id = created.json()["session"]["id"]
+                self.assertIsNotNone(app.state.store.get_review_session(session_id))
+                self.assertIsNotNone(
+                    app.state.store.get_frame("dataset-a", "frame-1")
+                )
 
     def test_malformed_leica_utm_wkt_beats_unrelated_wgs84_prj(self) -> None:
         try:

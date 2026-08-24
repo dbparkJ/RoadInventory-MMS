@@ -6,7 +6,16 @@ import type {
   FrameAddressResponse,
   FrameLocateResponse,
   FramePage,
+  ManualDuplicatePreflightResponse,
+  ManualObjectProposalCreateRequest,
+  ManualObjectProposalResponse,
+  ManualObjectTemplate,
+  ManualObservationCreateRequest,
+  ManualObservationCreateResponse,
+  ManualProposalCommitRequest,
+  ManualProposalCommitResponse,
   OverlayCoordinateSpace,
+  OverlayEditHistoryItem,
   OverlayEncoding,
   OverlayFeature,
   OverlayFeatureCollection,
@@ -14,12 +23,35 @@ import type {
   OverlayFeatureDetail,
   OverlayFieldDeleteResponse,
   OverlayLayer,
+  OverlayManualObjectValidation,
+  OverlayHistoryMutationRequest,
+  OverlayHistoryMutationResponse,
+  OverlayReviewMetadata,
   PanoramaOverlayFeature,
   PanoramaDetectionBoxObservation,
   PanoramaProjectionMetadata,
   PoleBaseInferRequest,
   PoleBaseInferResponse,
+  QaIssue,
+  QaIssuePage,
+  QaIssuePatch,
+  QaIssueSeverity,
+  QaIssueStatus,
+  QaRunResponse,
   RouteResponse,
+  ReviewSession,
+  ReviewSessionCreateRequest,
+  ReviewSessionPage,
+  ReviewSessionPatch,
+  ReviewTask,
+  ReviewTaskFrameResponse,
+  ReviewTaskGenerateRequest,
+  ReviewTaskGenerateResponse,
+  ReviewTaskPage,
+  ReviewTaskPatch,
+  ReviewTaskResolveRequest,
+  ReviewTaskStatus,
+  ReviewTaskType,
   RunEvent,
   RunRecord,
   RunRequest,
@@ -123,10 +155,20 @@ async function parseError(response: Response): Promise<ApiError> {
   const fallback = `요청을 처리하지 못했습니다. (${response.status})`
   try {
     const payload = (await response.json()) as unknown
+    const detail =
+      payload && typeof payload === 'object' &&
+      (payload as Record<string, unknown>).detail &&
+      typeof (payload as Record<string, unknown>).detail === 'object'
+        ? ((payload as Record<string, unknown>).detail as Record<string, unknown>)
+        : undefined
     const code =
       payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).code === 'string'
         ? ((payload as Record<string, unknown>).code as string)
-        : undefined
+        : typeof detail?.code === 'string'
+          ? detail.code
+          : typeof detail?.reason_code === 'string'
+            ? detail.reason_code
+            : undefined
     return new ApiError(errorMessageFromPayload(payload, fallback), response.status, code, payload)
   } catch {
     return new ApiError(fallback, response.status)
@@ -255,6 +297,293 @@ export const api = {
     )
   },
 
+  reviewSessions(
+    datasetId: string,
+    offset = 0,
+    limit = 100,
+    signal?: AbortSignal,
+  ) {
+    return json<ReviewSessionPage>(
+      buildApiUrl(`/api/datasets/${encodeURIComponent(datasetId)}/review-sessions`, {
+        offset,
+        limit,
+      }),
+      { signal },
+    )
+  },
+
+  reviewSession(sessionId: string, signal?: AbortSignal) {
+    return json<{ session: ReviewSession }>(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}`,
+      { signal },
+    )
+  },
+
+  createReviewSession(
+    datasetId: string,
+    payload: ReviewSessionCreateRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<{ session: ReviewSession }>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/review-sessions`,
+      { method: 'POST', ...jsonBody(payload), signal },
+    )
+  },
+
+  patchReviewSession(
+    sessionId: string,
+    payload: ReviewSessionPatch,
+    signal?: AbortSignal,
+  ) {
+    return json<{ session: ReviewSession }>(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}`,
+      { method: 'PATCH', ...jsonBody(payload), signal },
+    )
+  },
+
+  reviewTasks(
+    sessionId: string,
+    offset = 0,
+    limit = 200,
+    signal?: AbortSignal,
+    filters: {
+      status?: ReviewTaskStatus
+      task_type?: ReviewTaskType
+      cursor?: string
+    } = {},
+  ) {
+    return json<ReviewTaskPage>(
+      buildApiUrl(`/api/review-sessions/${encodeURIComponent(sessionId)}/tasks`, {
+        offset,
+        limit,
+        status: filters.status,
+        task_type: filters.task_type,
+        cursor: filters.cursor,
+      }),
+      { signal },
+    )
+  },
+
+  generateReviewTasks(
+    sessionId: string,
+    payload: ReviewTaskGenerateRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<ReviewTaskGenerateResponse>(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}/tasks/generate`,
+      { method: 'POST', ...jsonBody(payload), signal, timeout: 120_000 },
+    )
+  },
+
+  reviewTask(taskId: string, signal?: AbortSignal) {
+    return json<{ task: ReviewTask }>(`/api/review-tasks/${encodeURIComponent(taskId)}`, {
+      signal,
+    })
+  },
+
+  patchReviewTask(taskId: string, payload: ReviewTaskPatch, signal?: AbortSignal) {
+    return json<{ task: ReviewTask }>(`/api/review-tasks/${encodeURIComponent(taskId)}`, {
+      method: 'PATCH',
+      ...jsonBody(payload),
+      signal,
+    })
+  },
+
+  resolveReviewTask(
+    taskId: string,
+    payload: ReviewTaskResolveRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<{ task: ReviewTask }>(
+      `/api/review-tasks/${encodeURIComponent(taskId)}/resolve`,
+      { method: 'POST', ...jsonBody(payload), signal },
+    )
+  },
+
+  reopenReviewTask(taskId: string, signal?: AbortSignal) {
+    return json<{ task: ReviewTask }>(
+      `/api/review-tasks/${encodeURIComponent(taskId)}/reopen`,
+      { method: 'POST', signal },
+    )
+  },
+
+  reviewTaskFrame(datasetId: string, frameId: string, signal?: AbortSignal) {
+    return json<ReviewTaskFrameResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}`,
+      { signal },
+    )
+  },
+
+  reviewReportUrl(sessionId: string, format: 'json' | 'csv' | 'markdown') {
+    return buildApiUrl(`/api/review-sessions/${encodeURIComponent(sessionId)}/report`, {
+      format,
+    })
+  },
+
+  reviewExportUrl(sessionId: string) {
+    return buildApiUrl(`/api/review-sessions/${encodeURIComponent(sessionId)}/export`)
+  },
+
+  reviewActiveLearningExportUrl(sessionId: string) {
+    return buildApiUrl(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}/active-learning-export`,
+    )
+  },
+
+  manualObjectTemplates(signal?: AbortSignal) {
+    return json<{ items: ManualObjectTemplate[] }>('/api/manual-object-templates', { signal })
+  },
+
+  createManualObservation(
+    datasetId: string,
+    frameId: string,
+    payload: ManualObservationCreateRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<ManualObservationCreateResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/manual-observations`,
+      { method: 'POST', ...jsonBody(payload), signal, timeout: 30_000 },
+    )
+  },
+
+  async createManualObjectProposal(
+    datasetId: string,
+    frameId: string,
+    payload: ManualObjectProposalCreateRequest,
+    signal?: AbortSignal,
+  ) {
+    const response = await request(
+      `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/manual-object-proposals`,
+      {
+        method: 'POST',
+        ...jsonBody(payload),
+        signal,
+        timeout: 30_000,
+        retries: 0,
+      },
+    )
+    if (response.status === 202) {
+      let payload: unknown
+      try {
+        payload = await response.json()
+      } catch {
+        payload = undefined
+      }
+      throw new ApiError(
+        errorMessageFromPayload(payload, '원본 점군을 준비하고 있습니다. 잠시 후 다시 시도해 주세요.'),
+        202,
+        'CATALOG_PREPARING',
+        payload,
+      )
+    }
+    return response.json() as Promise<ManualObjectProposalResponse>
+  },
+
+  manualObjectProposal(proposalId: string, signal?: AbortSignal) {
+    return json<ManualObjectProposalResponse>(
+      `/api/manual-object-proposals/${encodeURIComponent(proposalId)}`,
+      { signal },
+    )
+  },
+
+  deleteManualObjectProposal(proposalId: string, signal?: AbortSignal) {
+    return json<{ proposal_id: string; deleted: true }>(
+      `/api/manual-object-proposals/${encodeURIComponent(proposalId)}`,
+      { method: 'DELETE', signal },
+    )
+  },
+
+  duplicateManualObjectPreflight(
+    datasetId: string,
+    payload: {
+      target_layer_id: string
+      template_id: 'TRAFFIC_SIGN' | 'SIGN_SUPPORT_POLE'
+      position: [number, number, number]
+      observation_id?: string
+      exclude_feature_id?: string
+    },
+    signal?: AbortSignal,
+  ) {
+    return json<ManualDuplicatePreflightResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/manual-objects/duplicate-preflight`,
+      { method: 'POST', ...jsonBody(payload), signal, timeout: 30_000 },
+    )
+  },
+
+  commitManualObjectProposal(
+    proposalId: string,
+    payload: ManualProposalCommitRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<ManualProposalCommitResponse>(
+      `/api/manual-object-proposals/${encodeURIComponent(proposalId)}/commit`,
+      { method: 'POST', ...jsonBody(payload), signal, timeout: 30_000 },
+    )
+  },
+
+  runQa(sessionId: string, signal?: AbortSignal) {
+    return json<QaRunResponse>(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}/qa/run`,
+      { method: 'POST', signal, timeout: 30_000 },
+    )
+  },
+
+  qaIssues(
+    sessionId: string,
+    options: {
+      offset?: number
+      limit?: number
+      status?: QaIssueStatus
+      severity?: QaIssueSeverity
+      rule_id?: string
+      layer_id?: string
+    } = {},
+    signal?: AbortSignal,
+  ) {
+    return json<QaIssuePage>(
+      buildApiUrl(`/api/review-sessions/${encodeURIComponent(sessionId)}/qa/issues`, {
+        offset: options.offset ?? 0,
+        limit: options.limit ?? 100,
+        status: options.status,
+        severity: options.severity,
+        rule_id: options.rule_id,
+        layer_id: options.layer_id,
+      }),
+      { signal },
+    )
+  },
+
+  patchQaIssue(issueId: string, payload: QaIssuePatch, signal?: AbortSignal) {
+    return json<{ issue: QaIssue }>(`/api/qa/issues/${encodeURIComponent(issueId)}`, {
+      method: 'PATCH',
+      ...jsonBody(payload),
+      signal,
+    })
+  },
+
+  overlayEditHistory(datasetId: string, layerId: string, limit = 20, signal?: AbortSignal) {
+    return json<{ items: OverlayEditHistoryItem[] }>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/edit-history`,
+        { limit },
+      ),
+      { signal },
+    )
+  },
+
+  mutateOverlayHistory(
+    operation: 'undo' | 'redo',
+    datasetId: string,
+    layerId: string,
+    payload: OverlayHistoryMutationRequest,
+    signal?: AbortSignal,
+  ) {
+    return json<OverlayHistoryMutationResponse>(
+      `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/${operation}`,
+      { method: 'POST', ...jsonBody(payload), signal },
+    )
+  },
+
   locateFrame(
     id: string,
     payload: { image_name?: string; dataset_position?: [number, number] },
@@ -370,10 +699,18 @@ export const api = {
       geometry?: { type: 'Point'; coordinates: [number, number, number?] }
       coordinate_space?: OverlayCoordinateSpace
       properties?: Record<string, unknown>
+      review_metadata?: OverlayReviewMetadata
+      manual_object_validation?: OverlayManualObjectValidation
       expected_revision?: number
+      idempotency_key?: string
     },
   ) {
-    return json<{ feature: OverlayFeature; revision: number; coordinate_space: OverlayCoordinateSpace }>(
+    return json<{
+      feature: OverlayFeature
+      revision: number
+      coordinate_space: OverlayCoordinateSpace
+      task_resolution_pending?: boolean
+    }>(
       `/api/datasets/${encodeURIComponent(datasetId)}/overlays/${encodeURIComponent(layerId)}/features/${encodeURIComponent(String(featureId))}`,
       { method: 'PATCH', ...jsonBody(payload), timeout: 30_000 },
     )
@@ -563,10 +900,12 @@ export const api = {
     frameId: string,
     budget: number,
     signal?: AbortSignal,
+    colorMode: 'rgb' | 'intensity' | 'classification' | 'height' = 'rgb',
   ) {
     const response = await request(
       buildApiUrl(`/api/datasets/${encodeURIComponent(id)}/points/${encodeURIComponent(frameId)}`, {
         budget,
+        color_mode: colorMode,
       }),
       {
         signal,
