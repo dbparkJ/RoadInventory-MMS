@@ -28,11 +28,13 @@ from mms_shp_detection.geometry import (
 from mms_shp_detection.infrastructure.manifest_writer import (
     PUBLISHED_SHAPEFILE_COMPONENT_SUFFIXES,
 )
+from mms_shp_detection.object_crops.contracts import ObjectCropConfig
 from mms_shp_detection.pipeline import (
     POINT_CROP_SEMANTICS,
     POLE_CROP_SEMANTICS,
     MultiModelCoordinator,
     PersistentCudaOutOfMemoryError,
+    _build_object_crop_source_inventory,
     _scoped_pointcloud_catalog_path,
     apply_model_filter,
     build_arg_parser,
@@ -1357,6 +1359,22 @@ class DatasetFingerprintTests(unittest.TestCase):
                 dataset_signature,
             )
             self.assertEqual(first_fingerprint, second_fingerprint)
+
+            disabled_object_crops = argparse.Namespace(**vars(first_slice))
+            disabled_object_crops.object_crops = {
+                "enabled": False,
+                "schema_version": "1.0.0",
+                "source_scope": {"strict": True, "jobs": []},
+            }
+            self.assertEqual(
+                build_run_fingerprint(
+                    disabled_object_crops,
+                    pointcloud_catalog,
+                    calibration_bundle,
+                    dataset_signature,
+                ),
+                first_fingerprint,
+            )
 
             changed_dataset = dict(dataset_signature, sha256="e" * 64)
             self.assertNotEqual(
@@ -2949,6 +2967,67 @@ class MultiModelExecutionTests(unittest.TestCase):
 
 
 class PipelineInputScopeTests(unittest.TestCase):
+    def test_run_level_object_crop_inventory_is_persisted_and_cached_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_root = root / "data"
+            data_root.mkdir()
+            source_path = data_root / "Job_A_Track01.las"
+            source_path.write_bytes(b"record-preserving-source")
+            args = argparse.Namespace(
+                data_root=data_root,
+                output_dir=root / "outputs" / "model-a",
+                _object_crop_output_root=root / "outputs",
+                _object_crop_inventory_cache={},
+            )
+            config = ObjectCropConfig.from_value(
+                {
+                    "enabled": True,
+                    "source_scope": {
+                        "strict": True,
+                        "jobs": [
+                            {"job_id": "Job_A", "tracks": ["Track01"]}
+                        ],
+                    },
+                }
+            )
+            catalog = {
+                "files": [
+                    {
+                        "path": str(source_path),
+                        "source_type": "las",
+                        "job_name": "Job_A",
+                        "track_name": "Track01",
+                    }
+                ]
+            }
+
+            first = _build_object_crop_source_inventory(args, catalog, config)
+            second = _build_object_crop_source_inventory(args, catalog, config)
+
+            self.assertIs(second, first)
+            self.assertEqual(first["source_inventory"]["source_count"], 1)
+            inventory_path = (
+                root
+                / "outputs"
+                / "object_crops_v1"
+                / "source_inventory"
+                / "source_inventory.json"
+            )
+            self.assertEqual(first["source_inventory_path"], inventory_path)
+            self.assertTrue(inventory_path.is_file())
+            self.assertEqual(
+                len(first["source_inventory_sha256"]),
+                64,
+            )
+
+            source_path.write_bytes(b"record-preserving-source-replaced")
+            with self.assertRaisesRegex(
+                ValueError,
+                "source catalog changed.*inventory was frozen",
+            ):
+                _build_object_crop_source_inventory(args, catalog, config)
+
     def test_scoped_catalog_path_is_stable_and_seeded_from_full_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2980,6 +3059,47 @@ class PipelineInputScopeTests(unittest.TestCase):
             self.assertEqual(repeated_jobs, jobs)
             self.assertEqual(scoped.read_bytes(), base_payload)
             self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_object_crop_catalog_cache_identity_includes_exact_track_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_path = root / "pointcloud_catalog.json"
+            tasks = [
+                {
+                    "pose_format": "leica-sphere",
+                    "job_name": "Job_A",
+                    "track_name": "Track01",
+                },
+                {
+                    "pose_format": "leica-sphere",
+                    "job_name": "Job_A",
+                    "track_name": "Track02",
+                },
+            ]
+            track01, jobs01 = _scoped_pointcloud_catalog_path(
+                base_path,
+                all_image_tasks=tasks,
+                selected_image_tasks=tasks,
+                include_scope={
+                    "strict": True,
+                    "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+                },
+            )
+            track02, jobs02 = _scoped_pointcloud_catalog_path(
+                base_path,
+                all_image_tasks=tasks,
+                selected_image_tasks=tasks,
+                include_scope={
+                    "strict": True,
+                    "jobs": [{"job_id": "job_a", "tracks": ["track02"]}],
+                },
+            )
+
+            self.assertNotEqual(track01, base_path)
+            self.assertNotEqual(track01, track02)
+            self.assertIn(".scope-", track01.name)
+            self.assertEqual(jobs01, ("Job_A",))
+            self.assertEqual(jobs02, ("job_a",))
 
     def test_stable_work_scope_filters_precede_shared_inputs_and_las_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3111,6 +3231,9 @@ class PipelineInputScopeTests(unittest.TestCase):
                     "mms_shp_detection.pipeline.run_panorama_alignment_qa",
                     return_value={"status": "disabled"},
                 ),
+                mock.patch(
+                    "mms_shp_detection.pipeline._build_object_crop_source_inventory",
+                ) as object_inventory_mock,
             ):
                 context = prepare_shared_pipeline_context(
                     args,
@@ -3128,9 +3251,274 @@ class PipelineInputScopeTests(unittest.TestCase):
                 catalog_mock.call_args.kwargs["include_jobs"],
                 ("Job_A", "Job_B"),
             )
+            self.assertNotIn("include_scope", catalog_mock.call_args.kwargs)
+            object_inventory_mock.assert_not_called()
             self.assertIs(context["image_tasks"], selected_tasks)
             self.assertIs(context["calibration_bundle"], calibration_bundle)
             logger.info.assert_called()
+
+    def test_enabled_object_crops_pass_exact_scope_and_build_inventory_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            object_crop_config = {
+                "enabled": True,
+                "source_scope": {
+                    "strict": True,
+                    "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+                },
+            }
+            args = build_arg_parser().parse_args(
+                [
+                    "--data-root",
+                    str(root),
+                    "--output-dir",
+                    str(root / "outputs"),
+                    "--pointcloud-cache-path",
+                    str(root / "catalog.json"),
+                    "--object-crops",
+                    json.dumps(object_crop_config),
+                ]
+            )
+            tasks = [
+                {
+                    "timestamp_iso": "2025-03-11T00:00:01+00:00",
+                    "image_path": str(root / "frame1.jpg"),
+                    "image_name": "frame1.jpg",
+                    "image_stem": "frame1",
+                    "record_name": "Record_A",
+                    "job_name": "Job_A",
+                    "track_name": "Track01",
+                    "pose_format": "leica-sphere",
+                },
+                {
+                    "timestamp_iso": "2025-03-11T00:00:02+00:00",
+                    "image_path": str(root / "frame2.jpg"),
+                    "image_name": "frame2.jpg",
+                    "image_stem": "frame2",
+                    "record_name": "Record_A",
+                    "job_name": "Job_A",
+                    "track_name": "Track02",
+                    "pose_format": "leica-sphere",
+                },
+            ]
+            dataset_signature = {"sha256": "a" * 64}
+            legacy_catalog = {
+                "selected_source_type": "mixed",
+                "signature": {"source_files": ["legacy-all-tracks"]},
+                "files": [
+                    {"job_name": "Job_A", "track_name": "Track01"},
+                    {"job_name": "Job_A", "track_name": "Track02"},
+                ],
+            }
+            object_catalog = {
+                "selected_source_type": "las",
+                "signature": {"source_files": ["object-track01"]},
+                "files": [{"job_name": "Job_A", "track_name": "Track01"}],
+            }
+            inventory_context = {
+                "status": "ready",
+                "config": args.object_crops,
+                "source_inventory": {
+                    "scope_id": "SCOPE_fixture",
+                    "source_count": 1,
+                    "sources": [{}],
+                },
+                "source_inventory_path": (
+                    root
+                    / "outputs"
+                    / "object_crops_v1"
+                    / "source_inventory"
+                    / "source_inventory.json"
+                ),
+                "source_inventory_sha256": "b" * 64,
+            }
+            with (
+                mock.patch(
+                    "mms_shp_detection.pipeline.scan_image_tasks",
+                    return_value=tasks,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.attach_calibration_metadata",
+                    return_value={"sha256": "c" * 64},
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.build_dataset_signature",
+                    return_value=dataset_signature,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.build_pointcloud_catalog",
+                    side_effect=[legacy_catalog, object_catalog],
+                ) as catalog_mock,
+                mock.patch(
+                    "mms_shp_detection.pipeline._build_object_crop_source_inventory",
+                    return_value=inventory_context,
+                ) as inventory_mock,
+                mock.patch(
+                    "mms_shp_detection.pipeline.resolve_matched_crs_wkt",
+                    return_value='PROJCS["fixture"]',
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.validate_pose_pointcloud_proximity",
+                    return_value=0.0,
+                ),
+                mock.patch(
+                    "mms_shp_detection.pipeline.run_panorama_alignment_qa",
+                    return_value={"status": "disabled"},
+                ),
+            ):
+                context = prepare_shared_pipeline_context(
+                    args,
+                    alignment_report_path=root / "alignment.json",
+                    logger=mock.Mock(),
+                )
+
+            self.assertEqual(catalog_mock.call_count, 2)
+            legacy_call, object_call = catalog_mock.call_args_list
+            self.assertNotIn("include_scope", legacy_call.kwargs)
+            self.assertEqual(legacy_call.kwargs["source"], "auto")
+            self.assertEqual(legacy_call.kwargs["include_jobs"], ("Job_A",))
+            self.assertEqual(
+                object_call.kwargs["include_scope"],
+                {
+                    "strict": True,
+                    "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+                },
+            )
+            self.assertEqual(object_call.kwargs["source"], "las")
+            self.assertNotEqual(legacy_call.args[1], object_call.args[1])
+            inventory_mock.assert_called_once()
+            self.assertIs(inventory_mock.call_args.args[1], object_catalog)
+            self.assertIs(context["pointcloud_catalog"], legacy_catalog)
+            self.assertEqual(
+                [item["track_name"] for item in context["pointcloud_catalog"]["files"]],
+                ["Track01", "Track02"],
+            )
+            self.assertIs(context["object_crops"], inventory_context)
+
+    def test_object_crop_catalog_failure_obeys_fail_pipeline_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tasks = [
+                {
+                    "timestamp_iso": "2025-03-11T00:00:01+00:00",
+                    "image_path": str(root / "frame1.jpg"),
+                    "image_name": "frame1.jpg",
+                    "image_stem": "frame1",
+                    "record_name": "Record_A",
+                    "job_name": "Job_A",
+                    "track_name": "Track01",
+                    "pose_format": "leica-sphere",
+                }
+            ]
+            legacy_catalog = {
+                "selected_source_type": "pcdb",
+                "signature": {"source_files": ["legacy-pcdb"]},
+                "files": [{"source_type": "pcdb"}],
+            }
+
+            def prepare(
+                *,
+                fail_pipeline_on_error: bool,
+                point_source: str = "auto",
+            ):
+                config = {
+                    "enabled": True,
+                    "fail_pipeline_on_error": fail_pipeline_on_error,
+                    "source_scope": {
+                        "strict": True,
+                        "jobs": [
+                            {"job_id": "Job_A", "tracks": ["Track01"]}
+                        ],
+                    },
+                }
+                args = build_arg_parser().parse_args(
+                    [
+                        "--data-root",
+                        str(root),
+                        "--output-dir",
+                        str(root / "outputs"),
+                        "--pointcloud-cache-path",
+                        str(root / "catalog.json"),
+                        "--point-source",
+                        point_source,
+                        "--object-crops",
+                        json.dumps(config),
+                    ]
+                )
+                logger = mock.Mock()
+                inventory_mock = mock.Mock()
+                with (
+                    mock.patch(
+                        "mms_shp_detection.pipeline.scan_image_tasks",
+                        return_value=tasks,
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.attach_calibration_metadata",
+                        return_value={"sha256": "c" * 64},
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.build_dataset_signature",
+                        return_value={"sha256": "a" * 64},
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.build_pointcloud_catalog",
+                        side_effect=[
+                            legacy_catalog,
+                            FileNotFoundError("no authoritative LAS in object scope"),
+                        ],
+                    ) as catalog_mock,
+                    mock.patch(
+                        "mms_shp_detection.pipeline._build_object_crop_source_inventory",
+                        inventory_mock,
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.resolve_matched_crs_wkt",
+                        return_value=None,
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.validate_pose_pointcloud_proximity",
+                        return_value=0.0,
+                    ),
+                    mock.patch(
+                        "mms_shp_detection.pipeline.run_panorama_alignment_qa",
+                        return_value={"status": "disabled"},
+                    ),
+                ):
+                    context = prepare_shared_pipeline_context(
+                        args,
+                        alignment_report_path=root / "alignment.json",
+                        logger=logger,
+                    )
+                return context, catalog_mock, inventory_mock, logger
+
+            context, catalog_mock, inventory_mock, logger = prepare(
+                fail_pipeline_on_error=False
+            )
+            self.assertIs(context["pointcloud_catalog"], legacy_catalog)
+            self.assertEqual(context["object_crops"]["status"], "failed")
+            self.assertEqual(
+                context["object_crops"]["error"]["type"],
+                "FileNotFoundError",
+            )
+            self.assertEqual(catalog_mock.call_args_list[1].kwargs["source"], "las")
+            inventory_mock.assert_not_called()
+            logger.warning.assert_called()
+
+            pcdb_context, pcdb_catalog_mock, _, _ = prepare(
+                fail_pipeline_on_error=False,
+                point_source="pcdb",
+            )
+            self.assertEqual(
+                pcdb_catalog_mock.call_args_list[1].kwargs["source"],
+                "pcdb",
+            )
+            self.assertEqual(pcdb_context["object_crops"]["status"], "failed")
+
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                "no authoritative LAS",
+            ):
+                prepare(fail_pipeline_on_error=True)
 
     def test_empty_work_scope_fails_before_calibration_or_catalog(self) -> None:
         args = build_arg_parser().parse_args(

@@ -61,7 +61,7 @@ from .config import (
 )
 from .dataset import scan_image_tasks
 from .domain.calibration import CalibrationResolver
-from .domain.models import JobStatus, StageResult
+from .domain.models import JobStatus, PipelineWarning, StageResult
 from .geometry import (
     angular_radius_from_bbox,
     apply_panorama_angular_offsets,
@@ -528,6 +528,19 @@ def public_pole_classification_policy(policy: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in policy.items() if not key.startswith("_")}
 
 
+def _parse_object_crop_config(value: Any) -> dict[str, Any]:
+    """Lazily validate the optional versioned object-crop mapping.
+
+    Keeping the import local prevents the legacy pipeline module from acquiring
+    an import cycle while the isolated ``object_crops`` package remains free to
+    depend on low-level point-cloud contracts.
+    """
+
+    from .object_crops.contracts import parse_object_crop_config
+
+    return parse_object_crop_config(value)
+
+
 def pole_classifications_for_policy(
     classifications: np.ndarray,
     policy: dict[str, Any],
@@ -667,6 +680,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default={},
         help=(
             "Per-model filter mapping. YAML mappings are preferred; the CLI accepts JSON."
+        ),
+    )
+    parser.add_argument(
+        "--object-crops",
+        type=_parse_object_crop_config,
+        default=_parse_object_crop_config(None),
+        metavar="JSON",
+        help=(
+            "Versioned record-preserving object-crop configuration. YAML accepts "
+            "a nested mapping; the CLI accepts one JSON object. Disabled by default."
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
@@ -1939,6 +1962,10 @@ def build_run_fingerprint(
         "model_dir",
         "model_names",
         "model_filters",
+        # Object crops are a parallel, opt-in artifact family. Their own
+        # source inventory carries its scope/hash identity; they must not
+        # invalidate otherwise identical legacy SHP/TXT results.
+        "object_crops",
         "pointcloud_cache_path",
         "skip_existing",
         "num_workers",
@@ -7734,31 +7761,182 @@ def _leica_catalog_job_names(
     return tuple(names_by_key[key] for key in sorted(names_by_key))
 
 
+def _object_crop_contract(
+    args: argparse.Namespace,
+) -> tuple[Any, dict[str, Any]]:
+    """Return the typed and canonical object-crop configuration."""
+
+    from .object_crops.contracts import ObjectCropConfig
+
+    config = ObjectCropConfig.from_value(getattr(args, "object_crops", None))
+    return config, config.to_dict()
+
+
+def _object_crop_run_root(args: argparse.Namespace) -> Path:
+    """Resolve the run-wide output root, including multi-model executions."""
+
+    configured_root = getattr(args, "_object_crop_output_root", None)
+    if configured_root is not None:
+        return Path(configured_root).resolve(strict=False)
+    manifest_path = getattr(args, "_run_manifest_path", None)
+    if manifest_path:
+        return Path(manifest_path).resolve(strict=False).parent
+    return Path(args.output_dir).resolve(strict=False)
+
+
+def _build_object_crop_source_inventory(
+    args: argparse.Namespace,
+    pointcloud_catalog: dict[str, Any],
+    object_crop_config: Any,
+) -> dict[str, Any]:
+    """Build and persist the one run-level source inventory for P0-A."""
+
+    from .object_crops.source_inventory import (
+        SourceMutationError,
+        build_source_inventory,
+        write_source_inventory,
+    )
+
+    identity_files: list[dict[str, Any]] = []
+    for item in pointcloud_catalog.get("files", []):
+        source_path = Path(str(item.get("path") or ""))
+        try:
+            source_stat = source_path.stat()
+        except OSError:
+            file_size = None
+            mtime_ns = None
+        else:
+            file_size = int(source_stat.st_size)
+            mtime_ns = int(source_stat.st_mtime_ns)
+        identity_files.append(
+            {
+                "path": str(source_path.resolve(strict=False)),
+                "file_size": file_size,
+                "mtime_ns": mtime_ns,
+                "source_type": item.get("source_type"),
+                "job_name": item.get("job_name", item.get("job_id")),
+                "track_name": item.get("track_name", item.get("track_id")),
+            }
+        )
+    cache_identity_payload = {
+        "schema_version": object_crop_config.schema_version,
+        "scope": object_crop_config.source_scope.to_dict(),
+        "output_root": str(_object_crop_run_root(args)),
+        "output_directory_name": object_crop_config.output.directory_name,
+        "catalog_signature": pointcloud_catalog.get("signature"),
+        "files": sorted(identity_files, key=lambda item: item["path"].casefold()),
+    }
+    cache_identity = hashlib.sha256(
+        json.dumps(
+            cache_identity_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    run_cache = getattr(args, "_object_crop_inventory_cache", None)
+    cached_identity = run_cache.get("identity") if isinstance(run_cache, dict) else None
+    if cached_identity is not None and cached_identity != cache_identity:
+        raise SourceMutationError(
+            "object-crop source catalog changed after the run inventory was frozen"
+        )
+    if isinstance(run_cache, dict) and cached_identity == cache_identity:
+        cached_context = run_cache.get("context")
+        if isinstance(cached_context, dict):
+            cached_path = Path(cached_context.get("source_inventory_path", ""))
+            cached_sha256 = str(
+                cached_context.get("source_inventory_sha256") or ""
+            )
+            if (
+                cached_path.is_file()
+                and len(cached_sha256) == 64
+                and _sha256_file(cached_path) == cached_sha256
+            ):
+                return cached_context
+        raise SourceMutationError(
+            "cached object-crop source inventory is missing or its hash changed"
+        )
+
+    inventory = build_source_inventory(
+        pointcloud_catalog,
+        Path(args.data_root),
+        object_crop_config.source_scope,
+    )
+    output_path = (
+        _object_crop_run_root(args)
+        / object_crop_config.output.directory_name
+        / "source_inventory"
+        / "source_inventory.json"
+    )
+    published_inventory = write_source_inventory(inventory, output_path)
+    context = {
+        "status": "ready",
+        "config": object_crop_config.to_dict(),
+        "source_inventory": inventory,
+        "source_inventory_path": output_path,
+        "source_inventory_sha256": str(published_inventory["sha256"]),
+    }
+    if isinstance(run_cache, dict):
+        run_cache["identity"] = cache_identity
+        run_cache["context"] = context
+    return context
+
+
 def _scoped_pointcloud_catalog_path(
     base_path: Path,
     *,
     all_image_tasks: list[dict[str, Any]],
     selected_image_tasks: list[dict[str, Any]],
+    include_scope: Any | None = None,
     logger=None,
 ) -> tuple[Path, tuple[str, ...]]:
-    """Keep different selected Leica job sets in stable, reusable cache files.
+    """Keep selected Leica source scopes in stable, reusable cache files.
 
     The unfiltered path remains unchanged for backward compatibility.  A new
     scoped cache is seeded from that full cache when available: the catalog
     builder can then reuse unchanged per-file block indexes instead of reading
-    the selected LAS files again.
+    the selected LAS files again. Object-crop scopes always use a dedicated
+    cache identity because Track01 and Track02 in one job must never collide.
     """
 
     all_jobs = _leica_catalog_job_names(all_image_tasks)
     selected_jobs = _leica_catalog_job_names(selected_image_tasks)
-    if {name.casefold() for name in selected_jobs} == {
-        name.casefold() for name in all_jobs
-    }:
-        return base_path, selected_jobs
+    scope_label = "jobs"
+    if include_scope is None:
+        if {name.casefold() for name in selected_jobs} == {
+            name.casefold() for name in all_jobs
+        }:
+            return base_path, selected_jobs
+        scope_identity: Any = sorted(name.casefold() for name in selected_jobs)
+    else:
+        from .object_crops.contracts import SourceScope
+
+        source_scope = SourceScope.from_value(include_scope)
+        normalized_scope = source_scope.to_dict()
+        scoped_jobs = {
+            str(item["job_id"]).casefold(): str(item["job_id"])
+            for item in normalized_scope["jobs"]
+        }
+        if scoped_jobs:
+            selected_jobs = tuple(scoped_jobs[key] for key in sorted(scoped_jobs))
+        scope_identity = {
+            "strict": bool(normalized_scope["strict"]),
+            "pairs": sorted(
+                (
+                    str(item["job_id"]).casefold(),
+                    str(track).casefold(),
+                )
+                for item in normalized_scope["jobs"]
+                for track in item["tracks"]
+            ),
+        }
+        scope_label = "scope"
 
     canonical = json.dumps(
-        sorted(name.casefold() for name in selected_jobs),
+        scope_identity,
         ensure_ascii=False,
+        sort_keys=True,
         separators=(",", ":"),
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -7766,7 +7944,7 @@ def _scoped_pointcloud_catalog_path(
     stem = (
         base_path.name[: -len(base_path.suffix)] if base_path.suffix else base_path.name
     )
-    scoped_path = base_path.with_name(f"{stem}.jobs-{digest}{suffix}")
+    scoped_path = base_path.with_name(f"{stem}.{scope_label}-{digest}{suffix}")
 
     if not scoped_path.exists() and base_path.is_file():
         temporary_path = scoped_path.with_name(
@@ -7808,6 +7986,11 @@ def prepare_shared_pipeline_context(
     """Prepare immutable dataset/catalog inputs once for every model."""
 
     run_manifest = _run_manifest_store(args)
+    object_crop_config, object_crop_config_payload = _object_crop_contract(args)
+    object_crops_enabled = bool(object_crop_config_payload["enabled"])
+    object_crop_scope = (
+        object_crop_config.source_scope.to_dict() if object_crops_enabled else None
+    )
     with _tracked_stage_for_args(args, "discover_inputs") as stage:
         all_image_tasks = scan_image_tasks(
             args.data_root,
@@ -7882,9 +8065,10 @@ def prepare_shared_pipeline_context(
             track=tracks[0] if len(tracks) == 1 else "multiple",
         )
 
+    base_catalog_path = Path(args.pointcloud_cache_path)
     with _tracked_stage_for_args(args, "load_or_build_spatial_index") as stage:
         catalog_path, included_leica_jobs = _scoped_pointcloud_catalog_path(
-            Path(args.pointcloud_cache_path),
+            base_catalog_path,
             all_image_tasks=all_image_tasks,
             selected_image_tasks=image_tasks,
             logger=logger,
@@ -7904,6 +8088,119 @@ def prepare_shared_pipeline_context(
         stage.metrics["source_type"] = str(
             pointcloud_catalog.get("selected_source_type") or "unknown"
         )
+
+    object_crop_context: dict[str, Any] = {}
+    if object_crops_enabled:
+        with _tracked_stage_for_args(
+            args,
+            "build_object_crop_source_inventory",
+        ) as stage:
+            stage.input_count = len(image_tasks)
+            try:
+                object_catalog_path, _object_jobs = _scoped_pointcloud_catalog_path(
+                    base_catalog_path,
+                    all_image_tasks=all_image_tasks,
+                    selected_image_tasks=image_tasks,
+                    include_scope=object_crop_scope,
+                    logger=logger,
+                )
+                # Auto/mixed discovery uses authoritative LAS for object crops.
+                # An explicit source choice remains authoritative: explicit
+                # PCDB is allowed to fail its provenance/scope checks under the
+                # configured object-crop failure policy rather than silently
+                # switching to a hidden LAS source.
+                object_source = (
+                    "las" if str(args.point_source).casefold() == "auto" else args.point_source
+                )
+                object_pointcloud_catalog = build_pointcloud_catalog(
+                    args.data_root,
+                    object_catalog_path,
+                    logger,
+                    source=object_source,
+                    las_chunk_size=max(10_000, args.las_index_chunk_points),
+                    include_scope=object_crop_scope,
+                )
+                object_crop_context = _build_object_crop_source_inventory(
+                    args,
+                    object_pointcloud_catalog,
+                    object_crop_config,
+                )
+                object_crop_context["source_catalog_path"] = object_catalog_path
+                object_crop_context["source_catalog"] = object_pointcloud_catalog
+                source_inventory = object_crop_context["source_inventory"]
+                source_count = int(source_inventory.get("source_count", 0))
+                stage.input_count = len(object_pointcloud_catalog.get("files", []))
+                stage.output_count = source_count
+                stage.metrics["status"] = "ready"
+                stage.metrics["source_count"] = source_count
+                stage.metrics["scope_id"] = str(source_inventory["scope_id"])
+            except Exception as exc:
+                error_payload = {
+                    "type": type(exc).__name__,
+                    "message": str(exc) or type(exc).__name__,
+                }
+                stage.output_count = 0
+                stage.rejected_count = 1
+                stage.metrics["status"] = "failed"
+                stage.metrics["scope_id"] = str(
+                    object_crop_config.source_scope.scope_id
+                )
+                stage.warnings.append(
+                    PipelineWarning(
+                        code="OBJECT_CROP_SOURCE_INVENTORY_FAILED",
+                        message=error_payload["message"],
+                        context={"cause_type": error_payload["type"]},
+                    )
+                )
+                logger.warning(
+                    "Object-crop source inventory failed; legacy pipeline %s: %s",
+                    (
+                        "will fail because fail_pipeline_on_error=true"
+                        if object_crop_config.fail_pipeline_on_error
+                        else "will continue"
+                    ),
+                    error_payload["message"],
+                    exc_info=True,
+                )
+                if object_crop_config.fail_pipeline_on_error:
+                    raise
+                object_crop_context = {
+                    "status": "failed",
+                    "config": object_crop_config.to_dict(),
+                    "scope_id": object_crop_config.source_scope.scope_id,
+                    "error": error_payload,
+                }
+        if run_manifest is not None:
+            if object_crop_context["status"] == "ready":
+                source_inventory = object_crop_context["source_inventory"]
+                source_count = int(source_inventory.get("source_count", 0))
+                inventory_fingerprint = {
+                    "status": "ready",
+                    "sha256": object_crop_context["source_inventory_sha256"],
+                    "scope_id": source_inventory["scope_id"],
+                    "source_count": source_count,
+                }
+            else:
+                inventory_fingerprint = {
+                    "status": "failed",
+                    "scope_id": object_crop_context["scope_id"],
+                    "error_type": object_crop_context["error"]["type"],
+                }
+            run_manifest.set_input(
+                fingerprints={
+                    "object_crop_source_inventory": inventory_fingerprint,
+                }
+            )
+        if object_crop_context["status"] == "ready":
+            source_inventory = object_crop_context["source_inventory"]
+            source_count = int(source_inventory.get("source_count", 0))
+            logger.info(
+                "Object-crop source inventory: sources=%d scope=%s path=%s sha256=%s",
+                source_count,
+                source_inventory["scope_id"],
+                object_crop_context["source_inventory_path"],
+                object_crop_context["source_inventory_sha256"][:12],
+            )
 
     with _tracked_stage_for_args(args, "validate_inputs") as stage:
         crs_wkt = (
@@ -7965,7 +8262,7 @@ def prepare_shared_pipeline_context(
             manifest=run_manifest,
         )
 
-    return {
+    shared_context = {
         "pipeline_context": application_context,
         "image_tasks": image_tasks,
         "calibration_bundle": calibration_bundle,
@@ -7977,6 +8274,9 @@ def prepare_shared_pipeline_context(
         "maximum_pose_separation": maximum_pose_separation,
         "alignment_report": alignment_report,
     }
+    if object_crops_enabled:
+        shared_context["object_crops"] = object_crop_context
+    return shared_context
 
 
 def finalize_prepared_model_run(
@@ -9667,6 +9967,10 @@ def _run_pipeline_impl(args: argparse.Namespace) -> dict[str, Any]:
     base_output_dir = Path(args.output_dir).resolve()
 
     prepared: list[tuple[Path, argparse.Namespace, str, str, str]] = []
+    # Effective model namespaces share this private cache. Sequential
+    # multi-model runs therefore hash/write one run-level source inventory just
+    # as the parallel shared-context path does.
+    object_crop_inventory_cache: dict[str, Any] = {}
     for model_path in model_paths:
         effective, profile_name, object_type = apply_model_filter(
             args,
@@ -9684,6 +9988,8 @@ def _run_pipeline_impl(args: argparse.Namespace) -> dict[str, Any]:
         effective.output_dir = (
             base_output_dir / model_key if multi_model else base_output_dir
         )
+        effective._object_crop_output_root = base_output_dir
+        effective._object_crop_inventory_cache = object_crop_inventory_cache
         prepared.append((model_path, effective, model_key, profile_name, object_type))
 
     if not multi_model:
