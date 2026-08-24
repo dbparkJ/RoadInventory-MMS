@@ -12,7 +12,7 @@ describe('GeneralSettingsPanel', () => {
 
     render(
       <GeneralSettingsPanel
-        settings={{ ...DEFAULT_USER_SETTINGS, panoramaPointOverlayEnabled: true }}
+        settings={DEFAULT_USER_SETTINGS}
         onChange={onChange}
         onReset={onReset}
       />,
@@ -21,9 +21,8 @@ describe('GeneralSettingsPanel', () => {
     fireEvent.change(screen.getByRole('spinbutton', { name: '파노라마 정면 보정각' }), {
       target: { value: '7.5' },
     })
-    fireEvent.click(screen.getByRole('checkbox', { name: '파노라마 포인트 오버레이 표시' }))
-    fireEvent.change(screen.getByRole('slider', { name: '파노라마 영상 투명도' }), {
-      target: { value: '0.35' },
+    fireEvent.change(screen.getByRole('slider', { name: '파노라마 검출 표시 거리' }), {
+      target: { value: '80' },
     })
     fireEvent.change(screen.getByRole('combobox', { name: '파노라마 기본 화질' }), {
       target: { value: 'ultra' },
@@ -35,30 +34,29 @@ describe('GeneralSettingsPanel', () => {
     fireEvent.change(screen.getByRole('slider', { name: '지주 바닥점 마커 크기' }), {
       target: { value: '0.12' },
     })
-    fireEvent.click(screen.getByRole('checkbox', { name: '지도에 모든 트랙 표시' }))
     fireEvent.click(screen.getByRole('button', { name: '기본 설정으로 복원' }))
 
     expect(onChange).toHaveBeenNthCalledWith(1, { panoramaForwardOffsetDeg: 7.5 })
-    expect(onChange).toHaveBeenNthCalledWith(2, { panoramaPointOverlayEnabled: false })
-    expect(onChange).toHaveBeenNthCalledWith(3, { panoramaImageOpacity: 0.35 })
-    expect(onChange).toHaveBeenNthCalledWith(4, { panoramaDefaultQuality: 'ultra' })
-    expect(onChange).toHaveBeenNthCalledWith(5, { poleBaseMarkerColor: '#ff00aa' })
-    expect(onChange).toHaveBeenNthCalledWith(6, { poleBaseMarkerSizeM: 0.12 })
-    expect(onChange).toHaveBeenNthCalledWith(7, { showAllMapTracks: true })
+    expect(onChange).toHaveBeenNthCalledWith(2, { detectionVisibilityDistanceM: 80 })
+    expect(onChange).toHaveBeenNthCalledWith(3, { panoramaDefaultQuality: 'ultra' })
+    expect(onChange).toHaveBeenNthCalledWith(4, { poleBaseMarkerColor: '#ff00aa' })
+    expect(onChange).toHaveBeenNthCalledWith(5, { poleBaseMarkerSizeM: 0.12 })
+    expect(onChange).toHaveBeenCalledTimes(5)
     expect(onReset).toHaveBeenCalledTimes(1)
   })
 
-  it('disables opacity while the point overlay is hidden', () => {
+  it('does not expose the removed panorama point overlay controls', () => {
     render(
       <GeneralSettingsPanel
-        settings={{ ...DEFAULT_USER_SETTINGS, panoramaPointOverlayEnabled: false }}
+        settings={DEFAULT_USER_SETTINGS}
         onChange={vi.fn()}
         onReset={vi.fn()}
       />,
     )
 
-    expect(screen.getByRole('slider', { name: '파노라마 영상 투명도' })).toBeDisabled()
-    expect(screen.getByText('포인트는 선명하게 유지하고 배경 영상만 흐리게 조절합니다.')).toBeInTheDocument()
-    expect(screen.getByText('활성 트랙만 색상으로 표시합니다.')).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: '파노라마 포인트 오버레이 표시' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('slider', { name: '파노라마 영상 투명도' })).not.toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: '파노라마 검출 표시 거리' })).toBeEnabled()
+    expect(screen.queryByRole('checkbox', { name: '지도에 모든 트랙 표시' })).not.toBeInTheDocument()
   })
 })

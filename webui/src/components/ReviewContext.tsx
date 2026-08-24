@@ -9,11 +9,13 @@ import {
   type ReactNode,
 } from 'react'
 import { api } from '../lib/api'
-import { isTextEntryTarget } from '../lib/frameNavigation'
+import { hasOpenModalDialog, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 import type {
   Frame,
   FrameRange,
+  QaRunResponse,
   ReviewCandidateSources,
+  ReviewCompletionStatus,
   ReviewSession,
   ReviewSessionStatus,
   ReviewTask,
@@ -54,8 +56,38 @@ const REVIEW_TASK_TYPES: readonly ReviewTask['task_type'][] = [
   'MANUAL_FLAG',
 ]
 
+interface ReviewSessionScopeToken {
+  datasetId: string
+  sessionId: string
+  generation: number
+}
+
 export function isReviewTaskComplete(task: ReviewTask): boolean {
   return TERMINAL_TASK_STATUSES.has(task.status)
+}
+
+export function reviewCompletionBlockerMessages(blockers: Record<string, number>): string[] {
+  return Object.entries(blockers).flatMap(([name, count]) => {
+    if (!count) return []
+    switch (name) {
+      case 'open_tasks':
+        return [`미처리 검수 항목 ${count.toLocaleString('ko-KR')}개`]
+      case 'open_error_qa_issues':
+        return [`미해결 QA 오류 ${count.toLocaleString('ko-KR')}개`]
+      case 'qa_not_run':
+        return ['QA 검사를 아직 실행하지 않음']
+      case 'stale_qa_target_layers':
+        return [`QA 이후 변경된 레이어 ${count.toLocaleString('ko-KR')}개`]
+      case 'pending_task_resolutions':
+        return [`저장 동기화 대기 ${count.toLocaleString('ko-KR')}건`]
+      case 'task_resolution_errors':
+        return [`저장 동기화 오류 ${count.toLocaleString('ko-KR')}건`]
+      case 'task_resolution_scan_truncated':
+        return ['저장 동기화 상태를 모두 확인하지 못함']
+      default:
+        return [`${name} ${count.toLocaleString('ko-KR')}건`]
+    }
+  })
 }
 
 export function reviewSessionStorageKey(datasetId: string): string {
@@ -153,6 +185,12 @@ interface ReviewContextValue {
   creatingSession: boolean
   updatingSession: boolean
   generatingCandidates: boolean
+  completionStatus: ReviewCompletionStatus | null
+  checkingCompletion: boolean
+  startGuideOpen: boolean
+  setStartGuideOpen: (open: boolean) => void
+  candidateGuideOpen: boolean
+  setCandidateGuideOpen: (open: boolean) => void
   sourceRuns: Array<{ id: string; label: string }>
   setQueueOpen: (open: boolean) => void
   reload: () => void
@@ -161,9 +199,16 @@ interface ReviewContextValue {
   navigateFrame: (frameId: string) => Promise<void>
   moveTask: (direction: -1 | 1) => void
   createDefaultSession: (targetLayerId: string, sourceRunIds: string[]) => Promise<void>
-  generateCandidates: (sources: ReviewCandidateSources) => Promise<void>
+  startReviewWork: (
+    targetLayerId: string,
+    sourceRunIds: string[],
+    sources: ReviewCandidateSources,
+  ) => Promise<boolean>
+  generateCandidates: (sources: ReviewCandidateSources) => Promise<boolean>
   flagCurrentFrame: (targetLayerId?: string) => Promise<void>
   reopenCurrent: () => Promise<void>
+  refreshCompletionStatus: () => Promise<ReviewCompletionStatus | null>
+  recordQaRun: (result: QaRunResponse, sessionId?: string) => Promise<void>
   completeSession: () => Promise<void>
   setSessionStatus: (status: 'active' | 'paused') => Promise<void>
   resolveCurrent: (
@@ -212,6 +257,10 @@ export function ReviewProvider({
   const [creatingSession, setCreatingSession] = useState(false)
   const [updatingSession, setUpdatingSession] = useState(false)
   const [generatingCandidates, setGeneratingCandidates] = useState(false)
+  const [completionStatus, setCompletionStatus] = useState<ReviewCompletionStatus | null>(null)
+  const [checkingCompletion, setCheckingCompletion] = useState(false)
+  const [startGuideOpen, setStartGuideOpen] = useState(false)
+  const [candidateGuideOpen, setCandidateGuideOpen] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
   const preferredSessionRef = useRef<{ datasetId: string; sessionId: string } | null>(null)
   const loadRequestRef = useRef(0)
@@ -220,9 +269,48 @@ export function ReviewProvider({
   const navigationControllerRef = useRef<AbortController | null>(null)
   const taskPageLoadingRef = useRef(false)
   const taskQueryGenerationRef = useRef(0)
+  const completionRequestRef = useRef(0)
+  const completionControllerRef = useRef<AbortController | null>(null)
+  const startWorkBusyRef = useRef(false)
+  const startWorkRequestRef = useRef(0)
+  const startWorkControllerRef = useRef<AbortController | null>(null)
+  const reopenRequestRef = useRef(0)
+  const reopenControllerRef = useRef<AbortController | null>(null)
+  const taskSelectionSequenceRef = useRef(0)
+  const latestTaskSelectionRef = useRef(new Map<string, { datasetId: string; taskId: string; sequence: number }>())
+  const taskSelectionWriteChainRef = useRef<Promise<void>>(Promise.resolve())
   const activeDatasetIdRef = useRef(datasetId)
   activeDatasetIdRef.current = datasetId
+  const activeCurrentTaskIdRef = useRef(currentTaskId)
+  activeCurrentTaskIdRef.current = currentTaskId
+  const selectedSessionScopeRef = useRef({ datasetId, sessionId: '' })
+  const sessionScopeGenerationRef = useRef(0)
+  if (selectedSessionScopeRef.current.datasetId !== datasetId) {
+    sessionScopeGenerationRef.current += 1
+    selectedSessionScopeRef.current = { datasetId, sessionId: '' }
+  }
   const filterDatasetIdRef = useRef(datasetId)
+
+  const selectSessionScope = useCallback((nextDatasetId: string, nextSessionId: string, force = false) => {
+    const current = selectedSessionScopeRef.current
+    if (force || current.datasetId !== nextDatasetId || current.sessionId !== nextSessionId) {
+      sessionScopeGenerationRef.current += 1
+    }
+    selectedSessionScopeRef.current = { datasetId: nextDatasetId, sessionId: nextSessionId }
+  }, [])
+
+  const captureSessionScope = useCallback((scopeDatasetId: string, scopeSessionId: string): ReviewSessionScopeToken => ({
+    datasetId: scopeDatasetId,
+    sessionId: scopeSessionId,
+    generation: sessionScopeGenerationRef.current,
+  }), [])
+
+  const isCurrentSessionScope = useCallback((scope: ReviewSessionScopeToken) => (
+    sessionScopeGenerationRef.current === scope.generation &&
+    activeDatasetIdRef.current === scope.datasetId &&
+    selectedSessionScopeRef.current.datasetId === scope.datasetId &&
+    selectedSessionScopeRef.current.sessionId === scope.sessionId
+  ), [])
 
   useEffect(() => {
     if (filterDatasetIdRef.current === datasetId) return
@@ -234,7 +322,19 @@ export function ReviewProvider({
     setCurrentTaskId('')
     setTasks([])
     setTaskNextCursor(null)
+    setCompletionStatus(null)
+    setStartGuideOpen(false)
+    setCandidateGuideOpen(false)
   }, [datasetId])
+
+  useEffect(() => {
+    startWorkRequestRef.current += 1
+    startWorkControllerRef.current?.abort()
+    startWorkControllerRef.current = null
+    startWorkBusyRef.current = false
+    setCreatingSession(false)
+    setGeneratingCandidates(false)
+  }, [datasetId, enabled])
 
   const navigateFrame = useCallback(
     async (frameId: string) => {
@@ -276,17 +376,32 @@ export function ReviewProvider({
   )
 
   const claimTask = useCallback(
-    (task: ReviewTask, sessionStatus: ReviewSessionStatus) => {
-      if (sessionStatus !== 'active' || task.status !== 'todo') return
+    (task: ReviewTask, sessionStatus: ReviewSessionStatus, sessionId: string) => {
+      if (
+        sessionStatus !== 'active' ||
+        task.status !== 'todo' ||
+        startWorkBusyRef.current
+      ) return
+      const scope = captureSessionScope(datasetId, sessionId)
+      const queryGeneration = taskQueryGenerationRef.current
+      const isCurrentRequest = () => (
+        isCurrentSessionScope(scope) && taskQueryGenerationRef.current === queryGeneration
+      )
       setUpdatingTaskId(task.id)
       setTasks((current) =>
         current.map((candidate) =>
           candidate.id === task.id ? { ...candidate, status: 'in_progress' } : candidate,
         ),
       )
+      setStatusCounts((current) => ({
+        ...current,
+        todo: Math.max(0, (current.todo ?? 0) - 1),
+        in_progress: (current.in_progress ?? 0) + 1,
+      }))
       void api
         .patchReviewTask(task.id, { status: 'in_progress', claimed_by: 'operator-local' })
         .then((response) => {
+          if (!isCurrentRequest()) return
           setTasks((current) =>
             current.map((candidate) =>
               candidate.id === response.task.id ? response.task : candidate,
@@ -294,9 +409,15 @@ export function ReviewProvider({
           )
         })
         .catch((reason: unknown) => {
+          if (!isCurrentRequest()) return
           setTasks((current) =>
             current.map((candidate) => (candidate.id === task.id ? task : candidate)),
           )
+          setStatusCounts((current) => ({
+            ...current,
+            todo: (current.todo ?? 0) + 1,
+            in_progress: Math.max(0, (current.in_progress ?? 0) - 1),
+          }))
           notify?.({
             tone: 'error',
             title: '검수 항목을 시작하지 못했습니다',
@@ -304,14 +425,25 @@ export function ReviewProvider({
           })
         })
         .finally(() => {
-          setUpdatingTaskId((current) => (current === task.id ? '' : current))
+          if (isCurrentRequest()) {
+            setUpdatingTaskId((current) => (current === task.id ? '' : current))
+          }
         })
     },
-    [notify],
+    [captureSessionScope, datasetId, isCurrentSessionScope, notify],
   )
 
   useEffect(() => {
     taskQueryGenerationRef.current += 1
+    completionRequestRef.current += 1
+    completionControllerRef.current?.abort()
+    completionControllerRef.current = null
+    reopenRequestRef.current += 1
+    reopenControllerRef.current?.abort()
+    reopenControllerRef.current = null
+    setUpdatingTaskId('')
+    setUpdatingSession(false)
+    setGeneratingCandidates(false)
     loadRequestRef.current += 1
     const requestId = loadRequestRef.current
     loadControllerRef.current?.abort()
@@ -330,12 +462,17 @@ export function ReviewProvider({
       setLoading(false)
       setUpdatingTaskId('')
       setError(null)
+      setCompletionStatus(null)
+      setCheckingCompletion(false)
+      selectSessionScope(datasetId, '')
       return
     }
 
     const controller = new AbortController()
     loadControllerRef.current = controller
     setLoading(true)
+    setCompletionStatus(null)
+    setCheckingCompletion(false)
     setError(null)
     void (async () => {
       try {
@@ -347,14 +484,17 @@ export function ReviewProvider({
           requested?.datasetId === datasetId ? requested.sessionId : storedSessionId(datasetId)
         const selectedSession = preferredSession(sessionPage.items, rememberedId)
         if (!selectedSession) {
+          selectSessionScope(datasetId, '')
           setSession(null)
           setTasks([])
           setTaskNextCursor(null)
           setTaskTotal(0)
           setStatusCounts({})
           setCurrentTaskId('')
+          setCompletionStatus(null)
           return
         }
+        selectSessionScope(datasetId, selectedSession.id)
         const [sessionResponse, taskPage] = await Promise.all([
           api.reviewSession(selectedSession.id, controller.signal),
           api.reviewTasks(
@@ -399,6 +539,7 @@ export function ReviewProvider({
           loadedTasks.find((task) => !isReviewTaskComplete(task)) ??
           loadedTasks[0] ??
           null
+        selectSessionScope(datasetId, restoredSession.id)
         setSession(restoredSession)
         setTasks(loadedTasks)
         setTaskNextCursor(taskPage.next_cursor ?? null)
@@ -407,7 +548,7 @@ export function ReviewProvider({
         setCurrentTaskId(restoredTask?.id ?? '')
         rememberSession(datasetId, restoredSession.id)
         if (restoredTask) {
-          claimTask(restoredTask, restoredSession.status)
+          claimTask(restoredTask, restoredSession.status, restoredSession.id)
           void navigateToTask(restoredTask)
         }
       } catch (reason) {
@@ -420,6 +561,7 @@ export function ReviewProvider({
         setTaskTotal(0)
         setStatusCounts({})
         setCurrentTaskId('')
+        selectSessionScope(datasetId, '')
         setError(message)
         notify?.({ tone: 'error', title: '검수 작업을 불러오지 못했습니다', message })
       } finally {
@@ -429,12 +571,15 @@ export function ReviewProvider({
     })()
 
     return () => controller.abort()
-  }, [claimTask, datasetId, enabled, navigateToTask, notify, reloadToken, taskStatusFilter, taskTypeFilter])
+  }, [claimTask, datasetId, enabled, navigateToTask, notify, reloadToken, selectSessionScope, taskStatusFilter, taskTypeFilter])
 
   useEffect(
     () => () => {
       loadControllerRef.current?.abort()
       navigationControllerRef.current?.abort()
+      completionControllerRef.current?.abort()
+      startWorkControllerRef.current?.abort()
+      reopenControllerRef.current?.abort()
     },
     [],
   )
@@ -450,40 +595,149 @@ export function ReviewProvider({
   const totalCount = aggregateTotal > 0 ? aggregateTotal : taskTotal
   const progress = totalCount > 0 ? completedCount / totalCount : 0
 
+  const refreshCompletionStatus = useCallback(async (): Promise<ReviewCompletionStatus | null> => {
+    if (!session) {
+      setCompletionStatus(null)
+      return null
+    }
+    const requestDatasetId = datasetId
+    const sessionId = session.id
+    const scope = captureSessionScope(requestDatasetId, sessionId)
+    if (!isCurrentSessionScope(scope)) return null
+    const requestId = completionRequestRef.current + 1
+    completionRequestRef.current = requestId
+    completionControllerRef.current?.abort()
+    const controller = new AbortController()
+    completionControllerRef.current = controller
+    setCheckingCompletion(true)
+    try {
+      const result = await api.reviewCompletionStatus(sessionId, controller.signal)
+      if (
+        controller.signal.aborted ||
+        completionRequestRef.current !== requestId ||
+        !isCurrentSessionScope(scope)
+      ) return null
+      setCompletionStatus(result)
+      return result
+    } catch (reason) {
+      if (
+        controller.signal.aborted ||
+        completionRequestRef.current !== requestId ||
+        !isCurrentSessionScope(scope)
+      ) return null
+      const message = reason instanceof Error
+        ? reason.message
+        : '검수 작업의 완료 조건을 확인하지 못했습니다.'
+      setCompletionStatus(null)
+      setError(message)
+      return null
+    } finally {
+      if (
+        completionRequestRef.current === requestId &&
+        isCurrentSessionScope(scope)
+      ) setCheckingCompletion(false)
+      if (completionControllerRef.current === controller) completionControllerRef.current = null
+    }
+  }, [captureSessionScope, datasetId, isCurrentSessionScope, session])
+
+  useEffect(() => {
+    if (
+      !session ||
+      !['active', 'paused'].includes(session.status) ||
+      completedCount < totalCount
+    ) {
+      setCompletionStatus(null)
+      return
+    }
+    void refreshCompletionStatus()
+  }, [completedCount, refreshCompletionStatus, session, totalCount])
+
+  const recordQaRun = useCallback(async (result: QaRunResponse, expectedSessionId?: string) => {
+    if (!session) return
+    const requestDatasetId = datasetId
+    const sessionId = expectedSessionId ?? session.id
+    const scope = captureSessionScope(requestDatasetId, sessionId)
+    if (session.id !== sessionId || !isCurrentSessionScope(scope)) return
+    const qaPatch = {
+      qa_ran_at: result.ran_at,
+      qa_layer_revisions: result.layer_revisions,
+    }
+    setSession((current) => current?.id === sessionId ? { ...current, ...qaPatch } : current)
+    setSessions((current) => current.map((candidate) =>
+      candidate.id === sessionId ? { ...candidate, ...qaPatch } : candidate,
+    ))
+    if (!isCurrentSessionScope(scope)) return
+    await refreshCompletionStatus()
+  }, [captureSessionScope, datasetId, isCurrentSessionScope, refreshCompletionStatus, session])
+
   const persistTaskSelection = useCallback(
     (selectedSession: ReviewSession, task: ReviewTask) => {
+      const scope = captureSessionScope(datasetId, selectedSession.id)
+      const selection = {
+        datasetId,
+        taskId: task.id,
+        sequence: taskSelectionSequenceRef.current + 1,
+      }
+      taskSelectionSequenceRef.current = selection.sequence
+      latestTaskSelectionRef.current.set(selectedSession.id, selection)
       setSession((current) =>
         current?.id === selectedSession.id ? { ...current, last_task_id: task.id } : current,
       )
-      void api
-        .patchReviewSession(selectedSession.id, { last_task_id: task.id })
-        .then((response) => {
+      // Serialize selection writes so a slow A request can never reach the
+      // server after a newer B request and restore the wrong resume position.
+      // Coalescing is deliberately avoided: every session retains its own
+      // latest selection even when the operator switches sessions mid-write.
+      taskSelectionWriteChainRef.current = taskSelectionWriteChainRef.current.then(async () => {
+        try {
+          await api.patchReviewSession(selectedSession.id, { last_task_id: task.id })
+          const latest = latestTaskSelectionRef.current.get(selectedSession.id)
+          if (
+            !latest ||
+            latest.datasetId !== selection.datasetId ||
+            latest.taskId !== selection.taskId ||
+            latest.sequence !== selection.sequence ||
+            activeCurrentTaskIdRef.current !== task.id ||
+            !isCurrentSessionScope(scope)
+          ) return
+          // A session response may have been captured before a concurrent QA
+          // or status update. Merge only the field owned by this mutation.
           setSession((current) =>
-            current?.id === response.session.id ? response.session : current,
+            current?.id === selectedSession.id ? { ...current, last_task_id: task.id } : current,
           )
-        })
-        .catch((reason: unknown) => {
+          setSessions((current) => current.map((candidate) =>
+            candidate.id === selectedSession.id ? { ...candidate, last_task_id: task.id } : candidate,
+          ))
+        } catch (reason) {
+          const latest = latestTaskSelectionRef.current.get(selectedSession.id)
+          if (
+            !latest ||
+            latest.datasetId !== selection.datasetId ||
+            latest.taskId !== selection.taskId ||
+            latest.sequence !== selection.sequence ||
+            !isCurrentSessionScope(scope)
+          ) return
           notify?.({
             tone: 'error',
             title: '마지막 검수 위치를 저장하지 못했습니다',
             message: reason instanceof Error ? reason.message : undefined,
           })
-        })
+        }
+      })
     },
-    [notify],
+    [captureSessionScope, datasetId, isCurrentSessionScope, notify],
   )
 
   const activateTask = useCallback(
     (task: ReviewTask) => {
-      if (!session) return
+      if (!session || startWorkBusyRef.current || creatingSession || generatingCandidates) return
       setCurrentTaskId(task.id)
       setError(null)
       rememberSession(datasetId, session.id)
       persistTaskSelection(session, task)
       void navigateToTask(task)
-      claimTask(task, session.status)
+      claimTask(task, session.status, session.id)
     },
-    [claimTask, datasetId, navigateToTask, persistTaskSelection, session],
+    [claimTask, creatingSession, datasetId, generatingCandidates, navigateToTask, persistTaskSelection, session],
   )
 
   const selectTask = useCallback(
@@ -497,6 +751,7 @@ export function ReviewProvider({
   const loadMoreTasks = useCallback(async (): Promise<ReviewTask[]> => {
     if (!session || taskNextCursor === null || taskPageLoadingRef.current) return []
     const queryGeneration = taskQueryGenerationRef.current
+    const scope = captureSessionScope(datasetId, session.id)
     taskPageLoadingRef.current = true
     try {
       const page = await api.reviewTasks(
@@ -510,7 +765,7 @@ export function ReviewProvider({
           cursor: taskNextCursor,
         },
       )
-      if (taskQueryGenerationRef.current !== queryGeneration) return []
+      if (taskQueryGenerationRef.current !== queryGeneration || !isCurrentSessionScope(scope)) return []
       setTasks((current) => {
         const known = new Set(current.map((task) => task.id))
         return [...current, ...page.items.filter((task) => !known.has(task.id))]
@@ -520,13 +775,14 @@ export function ReviewProvider({
       if (page.status_counts) setStatusCounts(page.status_counts)
       return page.items
     } catch (reason) {
+      if (taskQueryGenerationRef.current !== queryGeneration || !isCurrentSessionScope(scope)) return []
       const message = reason instanceof Error ? reason.message : '다음 검수 작업을 불러오지 못했습니다.'
       setError(message)
       return []
     } finally {
       taskPageLoadingRef.current = false
     }
-  }, [session, taskNextCursor, taskStatusFilter, taskTypeFilter])
+  }, [captureSessionScope, datasetId, isCurrentSessionScope, session, taskNextCursor, taskStatusFilter, taskTypeFilter])
 
   const setTaskStatusFilter = useCallback((status: ReviewTaskStatus | '') => {
     taskQueryGenerationRef.current += 1
@@ -548,7 +804,13 @@ export function ReviewProvider({
 
   const moveTask = useCallback(
     (direction: -1 | 1) => {
-      if (!tasks.length || updatingTaskId) return
+      if (
+        !tasks.length ||
+        updatingTaskId ||
+        startWorkBusyRef.current ||
+        creatingSession ||
+        generatingCandidates
+      ) return
       const index = currentTaskIndex < 0 ? (direction === 1 ? -1 : tasks.length) : currentTaskIndex
       const next = tasks[index + direction]
       if (next) {
@@ -560,19 +822,33 @@ export function ReviewProvider({
         })
       }
     },
-    [activateTask, currentTaskIndex, loadMoreTasks, taskNextCursor, tasks, updatingTaskId],
+    [activateTask, creatingSession, currentTaskIndex, generatingCandidates, loadMoreTasks, taskNextCursor, tasks, updatingTaskId],
   )
 
   const resolveCurrent = useCallback(
     async (
       resolution: Extract<ReviewTaskResolution, 'confirmed' | 'false_positive' | 'skipped' | 'field_survey'>,
     ) => {
-      if (!currentTask || !session || session.status !== 'active' || updatingTaskId) return
+      if (
+        !currentTask ||
+        !session ||
+        session.status !== 'active' ||
+        updatingTaskId ||
+        startWorkBusyRef.current ||
+        creatingSession ||
+        generatingCandidates
+      ) return
       const task = currentTask
+      const scope = captureSessionScope(datasetId, session.id)
+      const queryGeneration = taskQueryGenerationRef.current
+      const isCurrentRequest = () => (
+        isCurrentSessionScope(scope) && taskQueryGenerationRef.current === queryGeneration
+      )
       setUpdatingTaskId(task.id)
       setError(null)
       try {
         const response = await api.resolveReviewTask(task.id, { resolution })
+        if (!isCurrentRequest()) return
         const resolvedTask = response.task
         setStatusCounts((current) => ({
           ...current,
@@ -591,10 +867,11 @@ export function ReviewProvider({
         if (nextTask && session) {
           setCurrentTaskId(nextTask.id)
           persistTaskSelection(session, nextTask)
-          claimTask(nextTask, session.status)
+          claimTask(nextTask, session.status, session.id)
           void navigateToTask(nextTask)
         } else if (taskNextCursor !== null) {
           const loaded = await loadMoreTasks()
+          if (!isCurrentRequest()) return
           const nextLoaded = loaded.find((candidate) => !isReviewTaskComplete(candidate))
           if (nextLoaded) activateTask(nextLoaded)
           else setCurrentTaskId(resolvedTask.id)
@@ -613,17 +890,25 @@ export function ReviewProvider({
                 : '현장조사 필요 항목으로 분류했습니다',
         })
       } catch (reason) {
+        if (!isCurrentRequest()) return
         const message = reason instanceof Error ? reason.message : '검수 상태를 저장하지 못했습니다.'
         setError(message)
         notify?.({ tone: 'error', title: '검수 상태를 저장하지 못했습니다', message })
       } finally {
-        setUpdatingTaskId((current) => (current === task.id ? '' : current))
+        if (isCurrentRequest()) {
+          setUpdatingTaskId((current) => (current === task.id ? '' : current))
+        }
       }
     },
     [
       currentTask,
       activateTask,
+      captureSessionScope,
       claimTask,
+      creatingSession,
+      datasetId,
+      generatingCandidates,
+      isCurrentSessionScope,
       loadMoreTasks,
       navigateToTask,
       notify,
@@ -644,10 +929,21 @@ export function ReviewProvider({
       sourceRunIds.length === 0 ||
       creatingSession
     ) return
+    const requestDatasetId = datasetId
+    const requestId = startWorkRequestRef.current + 1
+    startWorkRequestRef.current = requestId
+    startWorkControllerRef.current?.abort()
+    const controller = new AbortController()
+    startWorkControllerRef.current = controller
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      startWorkRequestRef.current === requestId &&
+      activeDatasetIdRef.current === requestDatasetId
+    )
     setCreatingSession(true)
     setError(null)
     try {
-      const response = await api.createReviewSession(datasetId, {
+      const response = await api.createReviewSession(requestDatasetId, {
         source_run_ids: sourceRunIds,
         target_layer_ids: [targetLayerId],
         track_ids: [activeFrame.track_id],
@@ -655,22 +951,180 @@ export function ReviewProvider({
         class_filters: ['TRAFFIC_SIGN', 'SIGN_SUPPORT_POLE'],
         status: 'active',
         created_by: 'operator-local',
-      })
-      preferredSessionRef.current = { datasetId, sessionId: response.session.id }
-      rememberSession(datasetId, response.session.id)
+      }, controller.signal)
+      if (!isCurrentRequest()) return
+      preferredSessionRef.current = { datasetId: requestDatasetId, sessionId: response.session.id }
+      selectSessionScope(requestDatasetId, response.session.id)
+      rememberSession(requestDatasetId, response.session.id)
       setReloadToken((value) => value + 1)
-      notify?.({ tone: 'success', title: '현재 작업 범위로 검수 세션을 만들었습니다.' })
+      notify?.({ tone: 'success', title: '현재 범위로 검수 작업을 만들었습니다.' })
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : '검수 세션을 만들지 못했습니다.'
+      if (!isCurrentRequest()) return
+      const message = reason instanceof Error ? reason.message : '검수 작업을 만들지 못했습니다.'
       setError(message)
-      notify?.({ tone: 'error', title: '검수 세션을 만들지 못했습니다', message })
+      notify?.({ tone: 'error', title: '검수 작업을 만들지 못했습니다', message })
     } finally {
-      setCreatingSession(false)
+      if (startWorkRequestRef.current === requestId) setCreatingSession(false)
+      if (startWorkControllerRef.current === controller) startWorkControllerRef.current = null
     }
-  }, [activeFrame, creatingSession, datasetId, enabled, frameRange, notify])
+  }, [activeFrame, creatingSession, datasetId, enabled, frameRange, notify, selectSessionScope])
 
-  const generateCandidates = useCallback(async (sources: ReviewCandidateSources) => {
-    if (!session || session.status !== 'active' || generatingCandidates) return
+  const startReviewWork = useCallback(async (
+    targetLayerId: string,
+    sourceRunIds: string[],
+    sources: ReviewCandidateSources,
+  ): Promise<boolean> => {
+    if (
+      !enabled ||
+      !datasetId ||
+      !activeFrame ||
+      !targetLayerId ||
+      sourceRunIds.length === 0 ||
+      !Object.values(sources).some(Boolean) ||
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
+    ) return false
+    const requestDatasetId = datasetId
+    const requestId = startWorkRequestRef.current + 1
+    startWorkRequestRef.current = requestId
+    startWorkControllerRef.current?.abort()
+    const controller = new AbortController()
+    startWorkControllerRef.current = controller
+    let createdScope: ReviewSessionScopeToken | null = null
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      startWorkRequestRef.current === requestId &&
+      activeDatasetIdRef.current === requestDatasetId &&
+      (createdScope === null || isCurrentSessionScope(createdScope))
+    )
+    startWorkBusyRef.current = true
+    setCreatingSession(true)
+    setGeneratingCandidates(true)
+    setError(null)
+    let createdSession: ReviewSession | null = null
+    try {
+      const created = await api.createReviewSession(requestDatasetId, {
+        source_run_ids: sourceRunIds,
+        target_layer_ids: [targetLayerId],
+        track_ids: [activeFrame.track_id],
+        frame_range: frameRange ?? [activeFrame.index, activeFrame.index],
+        class_filters: ['TRAFFIC_SIGN', 'SIGN_SUPPORT_POLE'],
+        status: 'active',
+        created_by: 'operator-local',
+      }, controller.signal)
+      if (!isCurrentRequest()) return false
+      createdSession = created.session
+      preferredSessionRef.current = { datasetId: requestDatasetId, sessionId: created.session.id }
+      selectSessionScope(requestDatasetId, created.session.id)
+      createdScope = captureSessionScope(requestDatasetId, created.session.id)
+      taskQueryGenerationRef.current += 1
+      loadRequestRef.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
+      navigationRequestRef.current += 1
+      navigationControllerRef.current?.abort()
+      navigationControllerRef.current = null
+      completionRequestRef.current += 1
+      completionControllerRef.current?.abort()
+      completionControllerRef.current = null
+      reopenRequestRef.current += 1
+      reopenControllerRef.current?.abort()
+      reopenControllerRef.current = null
+      setCompletionStatus(null)
+      setCheckingCompletion(false)
+      setUpdatingTaskId('')
+      setLoading(false)
+      rememberSession(requestDatasetId, created.session.id)
+      setSessions((current) => [
+        created.session,
+        ...current.filter((candidate) => candidate.id !== created.session.id),
+      ])
+      setSession(created.session)
+      setTasks([])
+      setCurrentTaskId('')
+      setTaskNextCursor(null)
+      setTaskTotal(0)
+      setStatusCounts({})
+      setQueueOpen(true)
+      const generated = await api.generateReviewTasks(created.session.id, {
+        sources,
+        low_confidence_threshold: 0.5,
+        unreviewed_interval_frames: 50,
+      }, controller.signal)
+      if (!isCurrentRequest()) return false
+      setStartGuideOpen(false)
+      setQueueOpen(true)
+      setReloadToken((value) => value + 1)
+      notify?.({
+        tone: 'success',
+        title: `검수 작업을 시작하고 후보 ${generated.created.toLocaleString('ko-KR')}개를 준비했습니다`,
+        message: generated.existing
+          ? `기존 후보 ${generated.existing.toLocaleString('ko-KR')}개는 유지했습니다.`
+          : undefined,
+      })
+      return true
+    } catch (reason) {
+      if (!isCurrentRequest()) return false
+      if (createdSession) {
+        const recoveredSession = createdSession
+        preferredSessionRef.current = { datasetId: requestDatasetId, sessionId: recoveredSession.id }
+        selectSessionScope(requestDatasetId, recoveredSession.id)
+        rememberSession(requestDatasetId, recoveredSession.id)
+        setSessions((current) => [
+          recoveredSession,
+          ...current.filter((candidate) => candidate.id !== recoveredSession.id),
+        ])
+        setSession(recoveredSession)
+        setTasks([])
+        setCurrentTaskId('')
+        setTaskNextCursor(null)
+        setTaskTotal(0)
+        setStatusCounts({})
+        setQueueOpen(true)
+        setStartGuideOpen(false)
+        setCandidateGuideOpen(true)
+      }
+      const message = reason instanceof Error ? reason.message : '검수 작업을 시작하지 못했습니다.'
+      setError(message)
+      notify?.({
+        tone: 'error',
+        title: createdSession
+          ? '검수 작업은 만들었지만 후보를 준비하지 못했습니다'
+          : '검수 작업을 시작하지 못했습니다',
+        message,
+      })
+      return false
+    } finally {
+      if (startWorkRequestRef.current === requestId) {
+        startWorkBusyRef.current = false
+        setCreatingSession(false)
+        setGeneratingCandidates(false)
+      }
+      if (startWorkControllerRef.current === controller) startWorkControllerRef.current = null
+    }
+  }, [
+    activeFrame,
+    captureSessionScope,
+    creatingSession,
+    datasetId,
+    enabled,
+    frameRange,
+    generatingCandidates,
+    isCurrentSessionScope,
+    notify,
+    selectSessionScope,
+  ])
+
+  const generateCandidates = useCallback(async (sources: ReviewCandidateSources): Promise<boolean> => {
+    if (
+      !session ||
+      session.status !== 'active' ||
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
+    ) return false
+    const scope = captureSessionScope(datasetId, session.id)
     setGeneratingCandidates(true)
     setError(null)
     try {
@@ -679,28 +1133,35 @@ export function ReviewProvider({
         low_confidence_threshold: 0.5,
         unreviewed_interval_frames: 50,
       })
+      if (!isCurrentSessionScope(scope)) return false
       setReloadToken((value) => value + 1)
       notify?.({
         tone: 'success',
         title: `검수 후보 ${response.created.toLocaleString('ko-KR')}개를 추가했습니다`,
         message: response.existing ? `기존 후보 ${response.existing.toLocaleString('ko-KR')}개는 유지했습니다.` : undefined,
       })
+      return true
     } catch (reason) {
+      if (!isCurrentSessionScope(scope)) return false
       const message = reason instanceof Error ? reason.message : '검수 후보를 생성하지 못했습니다.'
       setError(message)
       notify?.({ tone: 'error', title: '검수 후보를 생성하지 못했습니다', message })
+      return false
     } finally {
-      setGeneratingCandidates(false)
+      if (isCurrentSessionScope(scope)) setGeneratingCandidates(false)
     }
-  }, [generatingCandidates, notify, session])
+  }, [captureSessionScope, creatingSession, datasetId, generatingCandidates, isCurrentSessionScope, notify, session])
 
   const flagCurrentFrame = useCallback(async (targetLayerId?: string) => {
     if (
       !session ||
       session.status !== 'active' ||
       !activeFrame ||
-      generatingCandidates
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
     ) return
+    const scope = captureSessionScope(datasetId, session.id)
     setGeneratingCandidates(true)
     setError(null)
     try {
@@ -715,16 +1176,18 @@ export function ReviewProvider({
           reason_codes: ['OPERATOR_FLAGGED'],
         }],
       })
+      if (!isCurrentSessionScope(scope)) return
       setReloadToken((value) => value + 1)
       notify?.({ tone: 'success', title: '현재 프레임을 나중에 확인할 항목으로 추가했습니다.' })
     } catch (reason) {
+      if (!isCurrentSessionScope(scope)) return
       const message = reason instanceof Error ? reason.message : '현재 프레임을 표시하지 못했습니다.'
       setError(message)
       notify?.({ tone: 'error', title: '나중에 확인 항목을 만들지 못했습니다', message })
     } finally {
-      setGeneratingCandidates(false)
+      if (isCurrentSessionScope(scope)) setGeneratingCandidates(false)
     }
-  }, [activeFrame, generatingCandidates, notify, session])
+  }, [activeFrame, captureSessionScope, creatingSession, datasetId, generatingCandidates, isCurrentSessionScope, notify, session])
 
   const reopenCurrent = useCallback(async () => {
     if (
@@ -732,79 +1195,154 @@ export function ReviewProvider({
       session.status !== 'active' ||
       !currentTask ||
       !isReviewTaskComplete(currentTask) ||
-      updatingTaskId
+      updatingTaskId ||
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
     ) return
-    setUpdatingTaskId(currentTask.id)
+    const requestDatasetId = datasetId
+    const sessionId = session.id
+    const task = currentTask
+    const scope = captureSessionScope(requestDatasetId, sessionId)
+    const requestId = reopenRequestRef.current + 1
+    reopenRequestRef.current = requestId
+    reopenControllerRef.current?.abort()
+    const controller = new AbortController()
+    reopenControllerRef.current = controller
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      reopenRequestRef.current === requestId &&
+      isCurrentSessionScope(scope) &&
+      activeCurrentTaskIdRef.current === task.id
+    )
+    setUpdatingTaskId(task.id)
     setError(null)
     try {
-      const response = await api.reopenReviewTask(currentTask.id)
-      setTasks((current) => current.map((task) => task.id === response.task.id ? response.task : task))
+      const reopened = await api.reopenReviewTask(task.id, controller.signal)
+      if (!isCurrentRequest()) return
+      let activeTask = reopened.task
+      try {
+        const claimed = await api.patchReviewTask(reopened.task.id, {
+          status: 'in_progress',
+          claimed_by: 'operator-local',
+        }, controller.signal)
+        if (!isCurrentRequest()) return
+        activeTask = claimed.task
+      } catch (reason) {
+        if (!isCurrentRequest()) return
+        const message = reason instanceof Error
+          ? reason.message
+          : '다시 연 항목을 즉시 시작하지 못했습니다.'
+        setError(`${message} 항목을 다시 선택하면 검수를 시작할 수 있습니다.`)
+      }
+      if (!isCurrentRequest()) return
+      setTasks((current) => current.map((task) => task.id === activeTask.id ? activeTask : task))
       setStatusCounts((current) => ({
         ...current,
-        [currentTask.status]: Math.max(0, (current[currentTask.status] ?? 0) - 1),
-        todo: (current.todo ?? 0) + 1,
+        [task.status]: Math.max(0, (current[task.status] ?? 0) - 1),
+        [activeTask.status]: (current[activeTask.status] ?? 0) + 1,
       }))
+      if (activeTask.status === 'in_progress') {
+        notify?.({ tone: 'success', title: '이 항목을 다시 검수할 수 있습니다.' })
+      }
     } catch (reason) {
+      if (!isCurrentRequest()) return
       const message = reason instanceof Error ? reason.message : '검수 항목을 다시 열지 못했습니다.'
       setError(message)
     } finally {
-      setUpdatingTaskId((current) => current === currentTask.id ? '' : current)
+      if (reopenRequestRef.current === requestId) {
+        setUpdatingTaskId((current) => current === task.id ? '' : current)
+      }
+      if (reopenControllerRef.current === controller) reopenControllerRef.current = null
     }
-  }, [currentTask, session, updatingTaskId])
+  }, [captureSessionScope, creatingSession, currentTask, datasetId, generatingCandidates, isCurrentSessionScope, notify, session, updatingTaskId])
 
   const completeSession = useCallback(async () => {
-    if (!session || updatingSession) return
+    if (
+      !session ||
+      updatingSession ||
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
+    ) return
+    const scope = captureSessionScope(datasetId, session.id)
     setUpdatingSession(true)
     setError(null)
     try {
+      const completion = await refreshCompletionStatus()
+      if (!isCurrentSessionScope(scope)) return
+      if (!completion) return
+      if (!completion.can_complete) {
+        const message = reviewCompletionBlockerMessages(completion.blockers).join(' · ')
+        setError(message)
+        notify?.({
+          tone: 'info',
+          title: '검수 작업을 완료하려면 남은 조건을 처리해 주세요',
+          message,
+        })
+        return
+      }
       const response = await api.patchReviewSession(session.id, { status: 'completed' })
+      if (!isCurrentSessionScope(scope)) return
       setSession(response.session)
       setSessions((current) => current.map((candidate) => candidate.id === response.session.id ? response.session : candidate))
-      notify?.({ tone: 'success', title: '검수 세션을 완료했습니다.' })
+      notify?.({ tone: 'success', title: '검수 작업을 완료했습니다.' })
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : '검수 세션을 완료하지 못했습니다.'
+      if (!isCurrentSessionScope(scope)) return
+      const message = reason instanceof Error ? reason.message : '검수 작업을 완료하지 못했습니다.'
       setError(message)
-      notify?.({ tone: 'error', title: '세션 완료 조건을 확인해 주세요', message })
+      notify?.({ tone: 'error', title: '검수 작업 완료 조건을 확인해 주세요', message })
     } finally {
-      setUpdatingSession(false)
+      if (isCurrentSessionScope(scope)) setUpdatingSession(false)
     }
-  }, [notify, session, updatingSession])
+  }, [captureSessionScope, creatingSession, datasetId, generatingCandidates, isCurrentSessionScope, notify, refreshCompletionStatus, session, updatingSession])
 
   const setSessionStatus = useCallback(async (status: 'active' | 'paused') => {
-    if (!session || updatingSession || session.status === status) return
+    if (
+      !session ||
+      updatingSession ||
+      session.status === status ||
+      creatingSession ||
+      generatingCandidates ||
+      startWorkBusyRef.current
+    ) return
+    const scope = captureSessionScope(datasetId, session.id)
     setUpdatingSession(true)
     setError(null)
     try {
       const response = await api.patchReviewSession(session.id, { status })
+      if (!isCurrentSessionScope(scope)) return
       setSession(response.session)
       setSessions((current) => current.map((candidate) =>
         candidate.id === response.session.id ? response.session : candidate,
       ))
       notify?.({
         tone: 'success',
-        title: status === 'paused' ? '검수 세션을 일시 정지했습니다.' : '검수 세션을 재개했습니다.',
+        title: status === 'paused' ? '검수 작업을 일시 정지했습니다.' : '검수 작업을 재개했습니다.',
       })
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : '검수 세션 상태를 바꾸지 못했습니다.'
+      if (!isCurrentSessionScope(scope)) return
+      const message = reason instanceof Error ? reason.message : '검수 작업 상태를 바꾸지 못했습니다.'
       setError(message)
-      notify?.({ tone: 'error', title: '검수 세션 상태를 바꾸지 못했습니다', message })
+      notify?.({ tone: 'error', title: '검수 작업 상태를 바꾸지 못했습니다', message })
     } finally {
-      setUpdatingSession(false)
+      if (isCurrentSessionScope(scope)) setUpdatingSession(false)
     }
-  }, [notify, session, updatingSession])
+  }, [captureSessionScope, creatingSession, datasetId, generatingCandidates, isCurrentSessionScope, notify, session, updatingSession])
 
   const shortcutStateRef = useRef({ enabled, moveTask, resolveCurrent, flagCurrentFrame, currentTask })
   shortcutStateRef.current = { enabled, moveTask, resolveCurrent, flagCurrentFrame, currentTask }
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
+        hasOpenModalDialog() ||
         event.defaultPrevented ||
         event.repeat ||
         event.altKey ||
         event.ctrlKey ||
         event.metaKey ||
         event.shiftKey ||
-        isTextEntryTarget(event.target) ||
+        isWorkspaceShortcutBlockedTarget(event.target) ||
         !shortcutStateRef.current.enabled
       ) {
         return
@@ -854,6 +1392,12 @@ export function ReviewProvider({
       creatingSession,
       updatingSession,
       generatingCandidates,
+      completionStatus,
+      checkingCompletion,
+      startGuideOpen,
+      setStartGuideOpen,
+      candidateGuideOpen,
+      setCandidateGuideOpen,
       sourceRuns,
       setQueueOpen,
       reload: () => {
@@ -862,6 +1406,27 @@ export function ReviewProvider({
       },
       selectSession: (sessionId: string) => {
         taskQueryGenerationRef.current += 1
+        startWorkRequestRef.current += 1
+        startWorkControllerRef.current?.abort()
+        startWorkControllerRef.current = null
+        startWorkBusyRef.current = false
+        completionRequestRef.current += 1
+        completionControllerRef.current?.abort()
+        completionControllerRef.current = null
+        reopenRequestRef.current += 1
+        reopenControllerRef.current?.abort()
+        reopenControllerRef.current = null
+        navigationRequestRef.current += 1
+        navigationControllerRef.current?.abort()
+        navigationControllerRef.current = null
+        taskPageLoadingRef.current = false
+        selectSessionScope(datasetId, sessionId, true)
+        setCompletionStatus(null)
+        setCheckingCompletion(false)
+        setUpdatingTaskId('')
+        setUpdatingSession(false)
+        setCreatingSession(false)
+        setGeneratingCandidates(false)
         preferredSessionRef.current = { datasetId, sessionId }
         rememberSession(datasetId, sessionId)
         setReloadToken((value) => value + 1)
@@ -870,18 +1435,23 @@ export function ReviewProvider({
       navigateFrame,
       moveTask,
       createDefaultSession,
+      startReviewWork,
       generateCandidates,
       flagCurrentFrame,
       reopenCurrent,
+      refreshCompletionStatus,
+      recordQaRun,
       completeSession,
       setSessionStatus,
       resolveCurrent,
     }),
     [
       completedCount,
+      completionStatus,
       completeSession,
       createDefaultSession,
       creatingSession,
+      checkingCompletion,
       currentTask,
       currentTaskIndex,
       datasetId,
@@ -899,6 +1469,9 @@ export function ReviewProvider({
       navigateFrame,
       progress,
       queueOpen,
+      candidateGuideOpen,
+      recordQaRun,
+      refreshCompletionStatus,
       reopenCurrent,
       resolveCurrent,
       selectTask,
@@ -906,12 +1479,15 @@ export function ReviewProvider({
       setTaskTypeFilter,
       session,
       sessions,
+      startGuideOpen,
+      startReviewWork,
       tasks,
       taskNextCursor,
       taskStatusFilter,
       taskTypeFilter,
       totalCount,
       setSessionStatus,
+      selectSessionScope,
       updatingSession,
       updatingTaskId,
     ],

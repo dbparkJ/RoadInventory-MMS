@@ -16,6 +16,41 @@ from mms_shp_detection.webapp import create_app
 
 
 class WebAppUploadTests(unittest.TestCase):
+    def test_upload_can_target_a_configured_external_storage_root(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as default_text,
+            tempfile.TemporaryDirectory() as external_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            default_root = Path(default_text)
+            external_root = Path(external_text)
+            app = create_app(
+                allowed_roots=[default_root, external_root],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            external_root_id = app.state.storage_roots[1].id
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/uploads",
+                    json={
+                        "name": "external-delivery",
+                        "root_id": external_root_id,
+                        "files": [{"path": "delivery/empty.txt", "size": 0}],
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                completed = client.post(
+                    f"/api/uploads/{created.json()['id']}/complete"
+                )
+                self.assertEqual(completed.status_code, 200, completed.text)
+            relative_path = completed.json()["relative_path"]
+            self.assertEqual(completed.json()["root_id"], external_root_id)
+            self.assertTrue(
+                (external_root / relative_path / "delivery/empty.txt").is_file()
+            )
+            self.assertFalse((default_root / relative_path).exists())
+
     def test_cancelled_chunk_waits_for_fsync_before_releasing_owner(self) -> None:
         with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
             root = Path(root_text)

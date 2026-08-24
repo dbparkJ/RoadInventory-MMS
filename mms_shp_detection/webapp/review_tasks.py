@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 from mms_shp_detection.review_candidates import (
     CandidateSourceSettings,
@@ -640,11 +640,18 @@ def _resolution_blockers(summary: dict[str, int]) -> dict[str, int]:
     }
 
 
-def _require_session(request: Request, session_id: str) -> dict[str, Any]:
+def _require_session(
+    request: Request,
+    session_id: str,
+    *,
+    reconciliation_out: dict[str, int] | None = None,
+) -> dict[str, Any]:
     session = request.app.state.store.get_review_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Review session not found.")
-    _reconcile_session(request, session)
+    reconciliation = _reconcile_session(request, session)
+    if reconciliation_out is not None:
+        reconciliation_out.update(reconciliation)
     return session
 
 
@@ -892,6 +899,60 @@ def list_review_sessions(
 @router.get("/review-sessions/{session_id}")
 def get_review_session(session_id: str, request: Request) -> dict[str, Any]:
     return {"session": _public_session(_require_session(request, session_id))}
+
+
+def _completion_status(
+    request: Request,
+    session: dict[str, Any],
+    *,
+    reconciliation: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Return the same fail-closed gate used by the completion mutation."""
+
+    blockers = request.app.state.store.review_session_completion_blockers(
+        str(session["id"]),
+        current_layer_revisions=_current_target_layer_revisions(request, session),
+    )
+    if reconciliation is None:
+        reconciliation = _reconcile_session(request, session)
+    blockers.update(_resolution_blockers(reconciliation))
+    normalized = {name: int(value) for name, value in blockers.items()}
+    session_status = str(session["status"])
+    requirements_met = not any(normalized.values())
+    return {
+        "session_status": session_status,
+        "requirements_met": requirements_met,
+        "can_complete": requirements_met
+        and session_status
+        in {
+            ReviewSessionStatus.ACTIVE.value,
+            ReviewSessionStatus.PAUSED.value,
+        },
+        "blockers": normalized,
+        "checked_at": utc_now(),
+    }
+
+
+@router.get("/review-sessions/{session_id}/completion-status")
+async def get_review_session_completion_status(
+    session_id: str,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    async with review_session_lock(request.app, session_id):
+        reconciliation: dict[str, int] = {}
+        session = _require_session(
+            request,
+            session_id,
+            reconciliation_out=reconciliation,
+        )
+        require_ready_dataset(request, str(session["dataset_id"]))
+        response.headers["Cache-Control"] = "no-store"
+        return _completion_status(
+            request,
+            session,
+            reconciliation=reconciliation,
+        )
 
 
 def _patch_review_session_locked(

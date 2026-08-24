@@ -5,6 +5,7 @@ import {
   Check,
   CircleGauge,
   Crosshair,
+  Layers3,
   LoaderCircle,
   MapPin,
   Palette,
@@ -31,7 +32,11 @@ import {
   type PoleBaseProposalState,
 } from '../components/OverlayContext'
 import { useOptionalManualObjectWorkspace } from '../components/ManualObjectContext'
-import { api, ApiError } from '../lib/api'
+import { api, ApiError, type PointPreviewFocus } from '../lib/api'
+import {
+  POINT_CLOUD_DETECTION_FOCUS_EVENT,
+  type PointCloudDetectionFocusEventDetail,
+} from '../lib/detectionFocus'
 import { createDemoPointCloud } from '../lib/demo'
 import { formatCount } from '../lib/format'
 import { parseMmsp } from '../lib/mmsp'
@@ -43,6 +48,7 @@ import {
 import type {
   Frame,
   OverlayFeature,
+  OverlaySupportFeatureResponse,
   PanoramaDetectionBoxObservation,
   PanoramaProjectionMetadata,
   PoleBaseInferResponse,
@@ -290,6 +296,27 @@ export interface RenderPointCloudDetection {
   properties: Record<string, unknown>
 }
 
+export type PointCloudFocusAnchor = RenderOverlayPoint | RenderPointCloudDetection
+
+export interface PointCloudSelectionFocus {
+  selected: PointCloudFocusAnchor | null
+  related: PointCloudFocusAnchor[]
+  focalPositions: Array<[number, number, number]>
+  supportPositions: Array<[number, number, number]>
+  guideSegments: Array<[
+    [number, number, number],
+    [number, number, number],
+  ]>
+  supportId: string | null
+  mode: 'selection' | 'infrastructure-layer'
+}
+
+export interface PointCloudSelectionDisplay {
+  payload: PointCloudPayload
+  focusPointCount: number
+  backgroundPointCount: number
+}
+
 type PointCloudHoverEntry = RenderOverlayPoint | RenderPointCloudDetection
 
 export function pointCloudHoverState(
@@ -298,6 +325,9 @@ export function pointCloudHoverState(
 ): OverlayHoverState {
   const observationId = 'observationId' in entry ? entry.observationId : ''
   return {
+    identityKey: observationId
+      ? pointCloudDetectionFocusKey(entry as RenderPointCloudDetection)
+      : `${entry.layerId}\u0000${String(entry.featureId)}`,
     layerId: entry.layerId,
     layerName: entry.layerName,
     featureId: entry.featureId ?? observationId,
@@ -307,11 +337,24 @@ export function pointCloudHoverState(
   }
 }
 
-interface NearbyOverlayFeature {
+export interface NearbyOverlayFeature {
   layerId: string
   layerName: string
   color: string
+  visible: boolean
   feature: OverlayFeature
+}
+
+export function mergeNearbyOverlayFeatures(
+  ...groups: readonly (readonly NearbyOverlayFeature[])[]
+): NearbyOverlayFeature[] {
+  const merged = new Map<string, NearbyOverlayFeature>()
+  groups.forEach((group) => {
+    group.forEach((entry) => {
+      merged.set(`${entry.layerId}\u0000${String(entry.feature.id)}`, entry)
+    })
+  })
+  return [...merged.values()]
 }
 
 export function pointCloudOverlayPointSize(selected: boolean): number {
@@ -389,6 +432,457 @@ function compatibleDetectionProperty(
   return !leftValue || !rightValue || leftValue === rightValue
 }
 
+export function isAiDetectedOverlayProperties(
+  properties: Record<string, unknown>,
+): boolean {
+  return Boolean(
+    normalizedDetectionProperty(properties, 'det_id', 'detection_id') ||
+    normalizedDetectionProperty(properties, 'model_nm', 'model_name') ||
+    normalizedDetectionProperty(properties, 'run_id', 'run_fingerprint') ||
+    normalizedDetectionProperty(properties, 'conf', 'confidence'),
+  )
+}
+
+function overlaySupportId(properties: Record<string, unknown>): string | null {
+  return normalizedDetectionProperty(properties, 'support_id', 'supportid', 'pole_id') || null
+}
+
+function isSupportPolePoint(point: PointCloudFocusAnchor): boolean {
+  if (normalizedDetectionProperty(
+    point.properties,
+    'pole_type',
+    'pole_status',
+    'base_st',
+    'bas_st',
+  )) return true
+  const objectClass = normalizedDetectionProperty(
+    point.properties,
+    'class_nm',
+    'class_name',
+    'class',
+    'obj_type',
+    'template_id',
+  )
+  if (['sign_support_pole', 'support_pole', 'pole', '지주'].includes(objectClass)) return true
+  const creationTool = normalizedDetectionProperty(
+    point.properties,
+    'creation_tool',
+    'tool_id',
+    'method',
+  )
+  if (creationTool.includes('pole')) return true
+  return /(?:지주|support[ _-]?pole|\bpole\b)/iu.test(point.layerName)
+}
+
+function isSupportPoleOverlayPoint(point: RenderOverlayPoint): boolean {
+  return isSupportPolePoint(point)
+}
+
+export function isSelectableInfrastructurePoint(point: PointCloudFocusAnchor): boolean {
+  if (isSupportPolePoint(point)) return true
+  const objectClass = normalizedDetectionProperty(
+    point.properties,
+    'class_nm',
+    'class_name',
+    'class',
+    'obj_type',
+    'template_id',
+  )
+  const modelName = normalizedDetectionProperty(
+    point.properties,
+    'model_nm',
+    'model_name',
+    'obj_type',
+  )
+  const identity = `${objectClass} ${modelName} ${point.layerName}`
+  if (
+    /(?:traffic[ _-]?)?(?:sign|signal|light)s?\b|(?:표지|신호등|신호기)/iu.test(identity)
+  ) return true
+  // AI metadata alone is not enough: a mixed result layer can also contain
+  // road markings or unrelated review objects.
+  return false
+}
+
+function sameLocalPosition(
+  left: [number, number, number],
+  right: [number, number, number],
+): boolean {
+  return left.every((coordinate, index) => Math.abs(coordinate - right[index]) <= 1e-6)
+}
+
+function uniqueLocalPositions(
+  positions: Array<[number, number, number]>,
+): Array<[number, number, number]> {
+  return positions.filter((position, index) => (
+    positions.findIndex((candidate) => sameLocalPosition(candidate, position)) === index
+  ))
+}
+
+function uniqueSupportPositions(
+  points: PointCloudFocusAnchor[],
+): Array<[number, number, number]> {
+  const positions: Array<[number, number, number]> = []
+  points.filter(isSupportPolePoint).forEach(({ position }) => {
+    const existingIndex = positions.findIndex((candidate) => (
+      Math.hypot(candidate[0] - position[0], candidate[1] - position[1]) <= 1e-4
+    ))
+    if (existingIndex < 0) {
+      positions.push(position)
+    } else if (position[2] < positions[existingIndex][2]) {
+      // Pole layers can contain one row per attached detection. Keep the
+      // lowest coincident point as the physical shaft/base anchor.
+      positions[existingIndex] = position
+    }
+  })
+  return positions
+}
+
+function pointCloudStructureSegments(
+  objectPosition: [number, number, number],
+  supportPosition: [number, number, number],
+): PointCloudSelectionFocus['guideSegments'] {
+  const attachment: [number, number, number] = [
+    supportPosition[0],
+    supportPosition[1],
+    objectPosition[2],
+  ]
+  return [
+    [objectPosition, attachment],
+    [attachment, supportPosition],
+  ].filter(([start, end]) => !sameLocalPosition(start, end)) as PointCloudSelectionFocus['guideSegments']
+}
+
+function uniqueGuideSegments(
+  segments: PointCloudSelectionFocus['guideSegments'],
+): PointCloudSelectionFocus['guideSegments'] {
+  const keys = new Set<string>()
+  return segments.filter(([start, end]) => {
+    const key = [...start, ...end].map((value) => value.toFixed(6)).join(',')
+    if (keys.has(key)) return false
+    keys.add(key)
+    return true
+  })
+}
+
+export function pointCloudSelectionFocus(
+  points: RenderOverlayPoint[],
+  selectedOverride?: PointCloudFocusAnchor | null,
+): PointCloudSelectionFocus | null {
+  const selected = selectedOverride ?? points.find((point) => point.selected)
+  if (!selected || !isSelectableInfrastructurePoint(selected)) return null
+  const supportId = overlaySupportId(selected.properties)
+  const selectedIsSupport = isSupportPolePoint(selected)
+  const related = supportId
+    ? points.filter((point) => (
+        point !== selected &&
+        !point.selected &&
+        overlaySupportId(point.properties) === supportId &&
+        (selectedIsSupport
+          ? isSelectableInfrastructurePoint(point) && !isSupportPolePoint(point)
+          : isSupportPoleOverlayPoint(point))
+      ))
+    : []
+  const focalPositions = uniqueLocalPositions(
+    [selected, ...related].map((point) => point.position),
+  )
+  const supportPositions = uniqueSupportPositions(
+    selectedIsSupport ? [selected] : related,
+  )
+  const objectPositions = (selectedIsSupport ? related : [selected])
+    .filter((point) => !isSupportPolePoint(point))
+    .map((point) => point.position)
+  const guideSegments = uniqueGuideSegments(objectPositions.flatMap((objectPosition) => (
+    supportPositions.flatMap((supportPosition) => (
+      pointCloudStructureSegments(objectPosition, supportPosition)
+    ))
+  )))
+
+  return {
+    selected,
+    related,
+    focalPositions,
+    supportPositions,
+    guideSegments,
+    supportId,
+    mode: 'selection',
+  }
+}
+
+export function pointCloudInfrastructureLayerFocus(
+  points: PointCloudFocusAnchor[],
+  maximumAnchors = 64,
+): PointCloudSelectionFocus | null {
+  const safeMaximum = Number.isFinite(maximumAnchors)
+    ? Math.max(1, Math.min(128, Math.floor(maximumAnchors)))
+    : 64
+  const eligible = points.filter(isSelectableInfrastructurePoint).slice(0, safeMaximum)
+  if (eligible.length === 0) return null
+  const supports = eligible.filter(isSupportPolePoint)
+  const objects = eligible.filter((point) => !isSupportPolePoint(point))
+  const supportPositions = uniqueSupportPositions(supports)
+  const guideSegments = uniqueGuideSegments(objects.flatMap((object) => {
+    const supportId = overlaySupportId(object.properties)
+    if (!supportId) return []
+    return uniqueSupportPositions(supports.filter(
+      (support) => overlaySupportId(support.properties) === supportId,
+    )).flatMap((supportPosition) => (
+      pointCloudStructureSegments(object.position, supportPosition)
+    ))
+  }))
+  return {
+    selected: null,
+    related: eligible,
+    focalPositions: uniqueLocalPositions(eligible.map((point) => point.position)),
+    supportPositions,
+    guideSegments,
+    supportId: null,
+    mode: 'infrastructure-layer',
+  }
+}
+
+export function pointCloudDetectionFocus(
+  detection: RenderPointCloudDetection,
+  overlayPoints: RenderOverlayPoint[],
+): PointCloudSelectionFocus | null {
+  return pointCloudSelectionFocus(overlayPoints, detection)
+}
+
+export function pointCloudDetectionFocusKey(
+  detection: Pick<RenderPointCloudDetection, 'sourceId' | 'observationId' | 'position'>,
+): string {
+  return [detection.sourceId, detection.observationId, ...detection.position]
+    .map((value) => String(value))
+    .join('\u0000')
+}
+
+type PointCloudActiveFocusTarget =
+  | { kind: 'overlay'; key: string }
+  | { kind: 'detection'; key: string }
+
+interface PointCloudClickCycle {
+  kind: 'detection' | 'overlay'
+  signature: string
+  x: number
+  y: number
+  index: number
+}
+
+function pointCloudOverlayFocusKey(
+  selection: { layerId: string; featureId: string | number },
+): string {
+  return `${selection.layerId}\u0000${String(selection.featureId)}`
+}
+
+export type PointCloudExactSupportFocusState = 'ready' | 'pending' | 'failed'
+
+export function pointCloudExactSupportFocusState(
+  supportId: string | null,
+  loadedKey: string,
+  failedKey: string,
+  requestKey: string,
+): PointCloudExactSupportFocusState {
+  if (!supportId || loadedKey === requestKey) return 'ready'
+  if (failedKey === requestKey) return 'failed'
+  return 'pending'
+}
+
+/**
+ * Focus the selected AI object immediately, then enrich it with exact support
+ * matches when that lookup completes. A slow or failed lookup must never make
+ * the user's selection disappear.
+ */
+export function pointCloudSelectionFocusForState(
+  points: RenderOverlayPoint[],
+  state: PointCloudExactSupportFocusState,
+): PointCloudSelectionFocus | null {
+  return pointCloudSelectionFocus(
+    state === 'ready' ? points : points.filter((point) => point.selected),
+  )
+}
+
+export const POINT_CLOUD_FOCUS_TRANSITION_MS = 260
+
+export function pointCloudFocusTransitionProgress(
+  elapsedMs: number,
+  durationMs = POINT_CLOUD_FOCUS_TRANSITION_MS,
+): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0
+  if (!Number.isFinite(durationMs) || durationMs <= 0 || elapsedMs >= durationMs) return 1
+  const linear = elapsedMs / durationMs
+  return 1 - (1 - linear) ** 3
+}
+
+/** Convert frame-local selection anchors to stable dataset-CRS XY focus cylinders. */
+export function pointCloudPreviewFocuses(
+  focus: PointCloudSelectionFocus | null,
+  frameOrigin: readonly [number, number, number] | undefined,
+  maximumCount = 4,
+): PointPreviewFocus[] {
+  if (
+    !focus ||
+    focus.mode !== 'selection' ||
+    !frameOrigin ||
+    !Number.isFinite(frameOrigin[0]) ||
+    !Number.isFinite(frameOrigin[1])
+  ) return []
+
+  const result: PointPreviewFocus[] = []
+  const safeMaximumCount = Number.isFinite(maximumCount)
+    ? Math.max(1, Math.min(4, Math.floor(maximumCount)))
+    : 4
+  for (const position of focus.focalPositions) {
+    if (
+      !position.every(Number.isFinite) ||
+      Math.hypot(position[0], position[1]) > POINT_PREVIEW_MAX_RADIUS_M
+    ) continue
+    const candidate: readonly [number, number] = [
+      frameOrigin[0] + position[0],
+      frameOrigin[1] + position[1],
+    ]
+    if (result.some((existing) => (
+      Math.abs(existing[0] - candidate[0]) <= 1e-6 &&
+      Math.abs(existing[1] - candidate[1]) <= 1e-6
+    ))) continue
+    result.push(candidate)
+    if (result.length >= safeMaximumCount) break
+  }
+  return result
+}
+
+function squaredDistanceToSegment(
+  point: [number, number, number],
+  start: [number, number, number],
+  end: [number, number, number],
+): number {
+  const segment = [end[0] - start[0], end[1] - start[1], end[2] - start[2]]
+  const lengthSquared = segment[0] ** 2 + segment[1] ** 2 + segment[2] ** 2
+  if (lengthSquared <= Number.EPSILON) {
+    return point.reduce((sum, coordinate, index) => sum + (coordinate - start[index]) ** 2, 0)
+  }
+  const projection = Math.max(0, Math.min(1, (
+    (point[0] - start[0]) * segment[0] +
+    (point[1] - start[1]) * segment[1] +
+    (point[2] - start[2]) * segment[2]
+  ) / lengthSquared))
+  return point.reduce((sum, coordinate, index) => {
+    const closest = start[index] + segment[index] * projection
+    return sum + (coordinate - closest) ** 2
+  }, 0)
+}
+
+function pointCloudSparseHash(
+  point: [number, number, number],
+  index: number,
+): number {
+  const x = Math.round(point[0] * 20)
+  const y = Math.round(point[1] * 20)
+  const z = Math.round(point[2] * 20)
+  return (
+    Math.imul(x, 73_856_093) ^
+    Math.imul(y, 19_349_663) ^
+    Math.imul(z, 83_492_791) ^
+    Math.imul(index + 1, 2_654_435_761)
+  ) >>> 0
+}
+
+export function buildPointCloudSelectionDisplay(
+  payload: PointCloudPayload,
+  focus: PointCloudSelectionFocus | null,
+  {
+    focusRadiusM = 1.8,
+    corridorRadiusM = 0.38,
+    backgroundStride = 7,
+  }: {
+    focusRadiusM?: number
+    corridorRadiusM?: number
+    backgroundStride?: number
+  } = {},
+): PointCloudSelectionDisplay {
+  if (!focus || payload.pointCount === 0) {
+    return {
+      payload,
+      focusPointCount: 0,
+      backgroundPointCount: payload.pointCount,
+    }
+  }
+
+  const safeStride = Math.max(2, Math.floor(backgroundStride))
+  const focusRadiusSquared = focusRadiusM ** 2
+  const corridorRadiusSquared = corridorRadiusM ** 2
+  const focusIndices: number[] = []
+  const backgroundIndices: number[] = []
+  for (let index = 0; index < payload.pointCount; index += 1) {
+    const offset = index * 3
+    const point: [number, number, number] = [
+      payload.positions[offset],
+      payload.positions[offset + 1],
+      payload.positions[offset + 2],
+    ]
+    const nearFocus = focus.focalPositions.some((position) => (
+      point.reduce(
+        (sum, coordinate, axis) => sum + (coordinate - position[axis]) ** 2,
+        0,
+      ) <= focusRadiusSquared
+    ))
+    // A support feature records one representative/base point, but the actual
+    // pole occupies the vertical column above that XY. Keep that column dense
+    // even when the sign head is horizontally offset and the guide is diagonal.
+    const nearSupportAxis = !nearFocus && focus.supportPositions.some((position) => (
+      ((point[0] - position[0]) ** 2) + ((point[1] - position[1]) ** 2)
+        <= corridorRadiusSquared
+    ))
+    const nearGuide = !nearFocus && !nearSupportAxis && focus.guideSegments.some(([start, end]) => (
+      squaredDistanceToSegment(point, start, end) <= corridorRadiusSquared
+    ))
+    if (nearFocus || nearSupportAxis || nearGuide) {
+      focusIndices.push(index)
+    } else if (pointCloudSparseHash(point, index) % safeStride === 0) {
+      backgroundIndices.push(index)
+    }
+  }
+  if (backgroundIndices.length === 0 && focusIndices.length < payload.pointCount) {
+    const focusSet = new Set(focusIndices)
+    const firstBackground = Array.from(
+      { length: payload.pointCount },
+      (_, index) => index,
+    ).find((index) => !focusSet.has(index))
+    if (firstBackground !== undefined) backgroundIndices.push(firstBackground)
+  }
+
+  const indices = [...focusIndices, ...backgroundIndices]
+  const positions = new Float32Array(indices.length * 3)
+  const colors = payload.colors ? new Uint8Array(indices.length * 3) : null
+  const bounds = {
+    min: [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY] as [number, number, number],
+    max: [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY] as [number, number, number],
+  }
+  indices.forEach((sourceIndex, targetIndex) => {
+    const sourceOffset = sourceIndex * 3
+    const targetOffset = targetIndex * 3
+    for (let axis = 0; axis < 3; axis += 1) {
+      const coordinate = payload.positions[sourceOffset + axis]
+      positions[targetOffset + axis] = coordinate
+      bounds.min[axis] = Math.min(bounds.min[axis], coordinate)
+      bounds.max[axis] = Math.max(bounds.max[axis], coordinate)
+      if (colors && payload.colors) colors[targetOffset + axis] = payload.colors[sourceOffset + axis]
+    }
+  })
+  if (indices.length === 0) {
+    bounds.min = [0, 0, 0]
+    bounds.max = [0, 0, 0]
+  }
+  return {
+    payload: {
+      positions,
+      colors,
+      bounds,
+      pointCount: indices.length,
+    },
+    focusPointCount: focusIndices.length,
+    backgroundPointCount: backgroundIndices.length,
+  }
+}
+
 export function pointCloudDetectionsFromObservations(
   observations: PanoramaDetectionBoxObservation[],
   frameOrigin: [number, number, number] | undefined,
@@ -401,14 +895,23 @@ export function pointCloudDetectionsFromObservations(
     const position = datasetPointToFrameLocal(observation.dataset_position, frameOrigin)
     if (
       !position
-      || position[0] ** 2 + position[1] ** 2 + position[2] ** 2 > maximumDistanceSquared
+      // The point preview and overlay spatial APIs use an XY cylinder. Keep
+      // high-mounted signals inside the same advertised 25 m radius.
+      || position[0] ** 2 + position[1] ** 2 > maximumDistanceSquared
     ) return []
     const detectionId = normalizedDetectionProperty(
       observation.properties,
       'det_id',
       'detection_id',
     )
-    const representative = overlayPoints.find((point) => {
+    const serverRepresentative = observation.layer_id && observation.feature_id !== undefined
+      ? overlayPoints.find((point) => (
+          point.layerId === observation.layer_id &&
+          String(point.featureId) === String(observation.feature_id)
+        ))
+      : undefined
+    const legacyRepresentative = observation.overlay_resolution === undefined
+      ? overlayPoints.find((point) => {
       const pointDetectionId = normalizedDetectionProperty(
         point.properties,
         'det_id',
@@ -429,14 +932,18 @@ export function pointCloudDetectionsFromObservations(
         0,
       )
       return deltaSquared <= 0.5 ** 2
-    })
+      })
+      : undefined
+    const representative = serverRepresentative ?? legacyRepresentative
+    const resolvedLayerId = observation.layer_id ?? representative?.layerId
+    const resolvedFeatureId = observation.feature_id ?? representative?.featureId
     return [{
       sourceId: observation.source_id,
       observationId: observation.observation_id,
-      layerId: representative?.layerId,
+      layerId: resolvedLayerId,
       layerName: representative?.layerName
         ?? (observation.source_name ? `YOLO · ${observation.source_name}` : 'YOLO 검출'),
-      featureId: representative?.featureId,
+      featureId: resolvedFeatureId,
       color: pointCloudDetectionColor(observation.model_id ?? observation.source_id),
       tooltipColor: representative?.color,
       position,
@@ -636,6 +1143,24 @@ export function closestPointHitIndex(
   viewportHeight: number,
   maximumPixelDistance = 7,
 ): number | null {
+  return pointHitIndices(
+    candidates,
+    pointerNdc,
+    camera,
+    viewportWidth,
+    viewportHeight,
+    maximumPixelDistance,
+  )[0] ?? null
+}
+
+export function pointHitIndices(
+  candidates: readonly PointHitCandidate[],
+  pointerNdc: { x: number; y: number },
+  camera: THREE.Camera,
+  viewportWidth: number,
+  viewportHeight: number,
+  maximumPixelDistance = 7,
+): number[] {
   if (
     !Number.isFinite(pointerNdc.x) ||
     !Number.isFinite(pointerNdc.y) ||
@@ -646,14 +1171,17 @@ export function closestPointHitIndex(
     viewportHeight <= 0 ||
     maximumPixelDistance <= 0
   ) {
-    return null
+    return []
   }
   const projected = new THREE.Vector3()
   const maximumSquared = maximumPixelDistance * maximumPixelDistance
-  let selectedIndex: number | null = null
-  let selectedScreenDistance = maximumSquared
-  let selectedDepth = Number.POSITIVE_INFINITY
-  candidates.forEach((candidate) => {
+  const ranked: Array<{
+    index: number
+    screenDistance: number
+    depth: number
+    ordinal: number
+  }> = []
+  candidates.forEach((candidate, ordinal) => {
     if (candidate.index === undefined) return
     actualPointHitPosition(candidate, projected).project(camera)
     if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y) || projected.z < -1 || projected.z > 1) {
@@ -662,18 +1190,32 @@ export function closestPointHitIndex(
     const deltaX = ((projected.x - pointerNdc.x) * viewportWidth) / 2
     const deltaY = ((projected.y - pointerNdc.y) * viewportHeight) / 2
     const screenDistance = deltaX * deltaX + deltaY * deltaY
-    const closerOnScreen = screenDistance < selectedScreenDistance - 1e-9
-    const sameScreenDistance = Math.abs(screenDistance - selectedScreenDistance) <= 1e-9
-    if (
-      screenDistance <= maximumSquared &&
-      (closerOnScreen || (sameScreenDistance && candidate.distance < selectedDepth))
-    ) {
-      selectedIndex = candidate.index
-      selectedScreenDistance = screenDistance
-      selectedDepth = candidate.distance
-    }
+    if (screenDistance <= maximumSquared) ranked.push({
+      index: candidate.index,
+      screenDistance,
+      depth: candidate.distance,
+      ordinal,
+    })
   })
-  return selectedIndex
+  ranked.sort((left, right) => (
+    left.screenDistance - right.screenDistance ||
+    left.depth - right.depth ||
+    left.ordinal - right.ordinal
+  ))
+  return ranked
+    .filter((candidate, index, all) => (
+      all.findIndex((other) => other.index === candidate.index) === index
+    ))
+    .map((candidate) => candidate.index)
+}
+
+export function nextCycledPointHit(
+  indices: readonly number[],
+  previousIndex: number | null,
+): number | null {
+  if (indices.length === 0) return null
+  const previousOffset = previousIndex === null ? -1 : indices.indexOf(previousIndex)
+  return indices[(previousOffset + 1) % indices.length]
 }
 
 export default function PointCloudView({
@@ -699,6 +1241,7 @@ export default function PointCloudView({
   const manualObject = useOptionalManualObjectWorkspace()
   const hostRef = useRef<HTMLDivElement>(null)
   const pointMaterialRef = useRef<THREE.PointsMaterial | null>(null)
+  const focusedPointMaterialRef = useRef<THREE.PointsMaterial | null>(null)
   const renderSceneRef = useRef<THREE.Scene | null>(null)
   const wakeRenderSceneRef = useRef<(() => void) | null>(null)
   const viewStateRef = useRef<PointCloudViewState | null>(null)
@@ -721,6 +1264,20 @@ export default function PointCloudView({
   const [indexing, setIndexing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  const payloadFrameKeyRef = useRef('')
+  const basePayloadCacheRef = useRef<{
+    key: string
+    reloadKey: number
+    payload: PointCloudPayload
+  } | null>(null)
+  const supportFeatureCacheRef = useRef<{
+    key: string
+    response: OverlaySupportFeatureResponse
+  } | null>(null)
+  const supportFeatureRequestRef = useRef<{
+    key: string
+    promise: Promise<OverlaySupportFeatureResponse>
+  } | null>(null)
   const [nearbyOverlayFeatures, setNearbyOverlayFeatures] = useState<NearbyOverlayFeature[]>([])
   const [detectionObservations, setDetectionObservations] = useState<PanoramaDetectionBoxObservation[]>([])
   const [detectionLoading, setDetectionLoading] = useState(false)
@@ -728,6 +1285,8 @@ export default function PointCloudView({
   const [nearbyOverlayTotal, setNearbyOverlayTotal] = useState(0)
   const [overlayLoading, setOverlayLoading] = useState(false)
   const [overlayError, setOverlayError] = useState<string | null>(null)
+  const [nearbyOverlayLoadedKey, setNearbyOverlayLoadedKey] = useState('')
+  const [nearbyOverlayFailedKey, setNearbyOverlayFailedKey] = useState('')
   const [overlayHover, setOverlayHover] = useState<OverlayHoverState | null>(null)
   const [pinnedOverlayHover, setPinnedOverlayHover] = useState<OverlayHoverState | null>(null)
   const [colorMode, setColorMode] = useState<PointCloudColorMode>('rgb')
@@ -742,6 +1301,20 @@ export default function PointCloudView({
   const [isolateProposal, setIsolateProposal] = useState(false)
   const [measureMode, setMeasureMode] = useState(false)
   const [measurementPoints, setMeasurementPoints] = useState<Array<[number, number, number]>>([])
+  const [infrastructureLayerEnabled, setInfrastructureLayerEnabled] = useState(false)
+  const [activeFocusTarget, setActiveFocusTarget] =
+    useState<PointCloudActiveFocusTarget | null>(null)
+  const [externalDetectionFocus, setExternalDetectionFocus] =
+    useState<PointCloudDetectionFocusEventDetail | null>(null)
+  const focusContextRef = useRef<{
+    frameId: string | null
+    selectionKey: string | null
+  } | null>(null)
+  const linkedDetectionSelectionRef = useRef<string | null>(null)
+  // Keep overlap cycling across the render rebuild caused by selecting the
+  // first same-position detection. A render-local variable resets too early
+  // and makes the second object effectively unreachable.
+  const clickCycleRef = useRef<PointCloudClickCycle | null>(null)
   const [renderSceneGeneration, setRenderSceneGeneration] = useState(0)
   const [toolSettingsDatasetId, setToolSettingsDatasetId] = useState('')
   const measureModeRef = useRef(measureMode)
@@ -787,11 +1360,20 @@ export default function PointCloudView({
     setIsolateProposal(false)
     setMeasureMode(false)
     setMeasurementPoints([])
+    setInfrastructureLayerEnabled(false)
+    setActiveFocusTarget(null)
+    setExternalDetectionFocus(null)
+    focusContextRef.current = null
+    clickCycleRef.current = null
+    basePayloadCacheRef.current = null
     setToolSettingsDatasetId(datasetId)
   }, [datasetId])
   useEffect(() => {
     setMeasureMode(false)
     setMeasurementPoints([])
+    setPinnedOverlayHover(null)
+    clickCycleRef.current = null
+    setExternalDetectionFocus(null)
   }, [frame?.id])
   useEffect(() => {
     if (toolSettingsDatasetId !== datasetId) return
@@ -819,7 +1401,46 @@ export default function PointCloudView({
   }, [payload, zSliceEnabled])
   const overlayHoverRef = useRef<OverlayHoverState | null>(null)
   const selectedOverlay = overlay?.selected
+  const selectedOverlayKey = selectedOverlay
+    ? pointCloudOverlayFocusKey(selectedOverlay)
+    : null
   const poleBaseProposal = overlay?.poleBaseProposal
+  useEffect(() => {
+    const current = {
+      frameId: frame?.id ?? null,
+      selectionKey: selectedOverlayKey,
+    }
+    const previous = focusContextRef.current
+    focusContextRef.current = current
+    if (!previous) {
+      setActiveFocusTarget(
+        selectedOverlayKey ? { kind: 'overlay', key: selectedOverlayKey } : null,
+      )
+      return
+    }
+    const selectionChanged = previous.selectionKey !== current.selectionKey
+    const frameChanged = previous.frameId !== current.frameId
+    if (selectionChanged) {
+      if (
+        selectedOverlayKey &&
+        linkedDetectionSelectionRef.current === selectedOverlayKey
+      ) {
+        // A linked raw detection remains the visual anchor even when its
+        // editable SHP feature (often the support row) becomes selected.
+        linkedDetectionSelectionRef.current = null
+      } else {
+        linkedDetectionSelectionRef.current = null
+        setActiveFocusTarget(
+          selectedOverlayKey ? { kind: 'overlay', key: selectedOverlayKey } : null,
+        )
+      }
+    } else if (frameChanged) {
+      linkedDetectionSelectionRef.current = null
+      // Advancing the frame restores the ordinary point map, while a new
+      // selection that also navigates to a frame still receives focus.
+      setActiveFocusTarget(null)
+    }
+  }, [frame?.id, selectedOverlayKey])
   const manualProposalLocalPosition = useMemo(
     () => datasetPointToFrameLocal(
       manualObject?.proposalPosition ?? null,
@@ -845,7 +1466,7 @@ export default function PointCloudView({
     [clipEnabled, clipRadiusM, isolateProposal, manualProposalLocalPosition, selectedOverlayLocalPosition, zMaximum, zMinimum, zSliceEnabled],
   )
   const deferredDisplayOptions = useDeferredValue(displayOptions)
-  const displayPayload = useMemo(
+  const filteredDisplayPayload = useMemo(
     () => payload ? buildPointCloudDisplayPayload(payload, deferredDisplayOptions) : null,
     [deferredDisplayOptions, payload],
   )
@@ -864,9 +1485,40 @@ export default function PointCloudView({
     () => (overlay?.layers ?? []).filter((layer) => overlay?.visibleLayerIds.has(layer.id)),
     [overlay?.layers, overlay?.visibleLayerIds],
   )
-  const visibleOverlayLayerKey = visibleOverlayLayers
+  const selectedSupportId = overlay?.selectedDatasetFeature
+    ? overlaySupportId(overlay.selectedDatasetFeature.properties)
+    : null
+  const nearbyOverlayLayers = visibleOverlayLayers
+  const nearbyOverlayLayerKey = nearbyOverlayLayers
     .map((layer) => `${layer.id}:${layer.revision}`)
     .join('|')
+  const overlayDetectionRevisionKey = (overlay?.layers ?? [])
+    .map((layer) => `${layer.id}:${layer.revision}`)
+    .join('|')
+  const supportOverlayLayerKey = selectedSupportId
+    ? (overlay?.layers ?? [])
+      .filter((layer) => layer.geometry_type === 'Point')
+      .map((layer) => [
+        layer.id,
+        layer.revision,
+        layer.metadata_revision ?? 0,
+        layer.name,
+        layer.color ?? '',
+      ].join(':'))
+      .join('|')
+    : ''
+  const exactSupportRequestKey = [
+    datasetId,
+    selectedSupportId ?? '',
+    supportOverlayLayerKey,
+  ].join(':')
+  const nearbyOverlayRequestKey = [
+    datasetId,
+    frame?.id ?? '',
+    frame?.dataset_position?.join(',') ?? '',
+    nearbyOverlayLayerKey,
+    exactSupportRequestKey,
+  ].join(':')
   const overlayLayerColor = overlay?.layerColor
   const overlayActionsRef = useRef({
     pickTarget: null as OverlayPickTarget | null,
@@ -935,9 +1587,11 @@ export default function PointCloudView({
 
   useEffect(() => {
     const origin = frame?.dataset_position
-    if (!origin || demoMode || !visibleOverlayLayers.length) {
+    if (!origin || demoMode || (!nearbyOverlayLayers.length && !selectedSupportId)) {
       setNearbyOverlayFeatures([])
       setNearbyOverlayTotal(0)
+      setNearbyOverlayLoadedKey('')
+      setNearbyOverlayFailedKey('')
       setOverlayLoading(false)
       setOverlayError(null)
       return
@@ -945,18 +1599,23 @@ export default function PointCloudView({
     const controller = new AbortController()
     setNearbyOverlayFeatures([])
     setNearbyOverlayTotal(0)
+    setNearbyOverlayLoadedKey('')
+    setNearbyOverlayFailedKey('')
     setOverlayLoading(true)
     setOverlayError(null)
+    let exactSupportLookupSucceeded = !selectedSupportId
     const loadNearby = async () => {
       const groups: NearbyOverlayFeature[][] = []
       const totals: number[] = []
       const errors: unknown[] = []
+      let exactSupportFeatures: NearbyOverlayFeature[] = []
+      let exactSupportCount = 0
       let nextIndex = 0
       const worker = async () => {
         while (!controller.signal.aborted) {
           const index = nextIndex
           nextIndex += 1
-          const layer = visibleOverlayLayers[index]
+          const layer = nearbyOverlayLayers[index]
           if (!layer) return
           try {
             const page = await api.overlaySpatialFeatures(
@@ -973,6 +1632,7 @@ export default function PointCloudView({
               layerId: layer.id,
               layerName: layer.name,
               color,
+              visible: Boolean(overlay?.visibleLayerIds.has(layer.id)),
               feature,
             }))
           } catch (reason) {
@@ -982,24 +1642,99 @@ export default function PointCloudView({
           }
         }
       }
-      await Promise.all(
-        Array.from({ length: Math.min(4, visibleOverlayLayers.length) }, () => worker()),
-      )
+      const supportLookup = async () => {
+        if (!selectedSupportId) return
+        try {
+          const cached = supportFeatureCacheRef.current
+          let response: OverlaySupportFeatureResponse
+          if (cached?.key === exactSupportRequestKey) {
+            response = cached.response
+          } else {
+            let request = supportFeatureRequestRef.current
+            if (request?.key !== exactSupportRequestKey) {
+              const promise = api.overlaySupportFeatures(
+                datasetId,
+                selectedSupportId,
+              ).then((result) => {
+                if (result.status !== 'unavailable' && result.scan_complete) {
+                  supportFeatureCacheRef.current = {
+                    key: exactSupportRequestKey,
+                    response: result,
+                  }
+                }
+                return result
+              })
+              request = { key: exactSupportRequestKey, promise }
+              supportFeatureRequestRef.current = request
+              void promise.finally(() => {
+                if (supportFeatureRequestRef.current?.promise === promise) {
+                  supportFeatureRequestRef.current = null
+                }
+              }).catch(() => {
+                // The awaiting effect reports the request failure.
+              })
+            }
+            response = await request.promise
+          }
+          if (controller.signal.aborted) return
+          if (response.status === 'unavailable' || !response.scan_complete) {
+            errors.push(new Error('연결된 지주 포인트를 정확히 조회하지 못했습니다.'))
+            return
+          }
+          exactSupportLookupSucceeded = true
+          exactSupportCount = response.count
+          exactSupportFeatures = response.items.map((item) => ({
+            layerId: item.layer_id,
+            layerName: item.layer_name,
+            color: item.layer_color || overlayLayerColor?.(item.layer_id) || '#ffb84d',
+            visible: Boolean(overlay?.visibleLayerIds.has(item.layer_id)),
+            feature: item.feature,
+          }))
+        } catch (reason) {
+          if (!controller.signal.aborted) errors.push(reason)
+        }
+      }
+      await Promise.all([
+        Promise.all(
+          Array.from({ length: Math.min(4, nearbyOverlayLayers.length) }, () => worker()),
+        ),
+        supportLookup(),
+      ])
       if (controller.signal.aborted) return
-      setNearbyOverlayFeatures(groups.flat())
-      setNearbyOverlayTotal(totals.reduce((sum, value) => sum + (value ?? 0), 0))
+      const spatialFeatures = groups.flat()
+      const mergedFeatures = mergeNearbyOverlayFeatures(spatialFeatures, exactSupportFeatures)
+      const spatialKeys = new Set(
+        spatialFeatures.map((entry) => `${entry.layerId}\u0000${String(entry.feature.id)}`),
+      )
+      const extraSupportCount = exactSupportFeatures.filter(
+        (entry) => !spatialKeys.has(`${entry.layerId}\u0000${String(entry.feature.id)}`),
+      ).length
+      setNearbyOverlayFeatures(mergedFeatures)
+      setNearbyOverlayTotal(Math.max(
+        mergedFeatures.length,
+        totals.reduce((sum, value) => sum + (value ?? 0), 0)
+          + Math.min(extraSupportCount, exactSupportCount),
+      ))
       if (errors.length) {
+        const requestCount = nearbyOverlayLayers.length + (selectedSupportId ? 1 : 0)
         setOverlayError(
-          errors.length === visibleOverlayLayers.length
+          errors.length === requestCount
             ? errors[0] instanceof Error
               ? errors[0].message
               : '주변 SHP 포인트를 불러오지 못했습니다.'
-            : `일부 SHP 레이어(${errors.length}개)를 불러오지 못했습니다.`,
+            : `일부 SHP 조회(${errors.length}개)를 완료하지 못했습니다.`,
         )
       }
     }
     void loadNearby().finally(() => {
-      if (!controller.signal.aborted) setOverlayLoading(false)
+      if (!controller.signal.aborted) {
+        setOverlayLoading(false)
+        if (exactSupportLookupSucceeded) {
+          setNearbyOverlayLoadedKey(nearbyOverlayRequestKey)
+        } else {
+          setNearbyOverlayFailedKey(nearbyOverlayRequestKey)
+        }
+      }
     })
     return () => controller.abort()
   }, [
@@ -1007,17 +1742,26 @@ export default function PointCloudView({
     demoMode,
     frame?.dataset_position,
     frame?.id,
+    exactSupportRequestKey,
+    nearbyOverlayLayerKey,
+    nearbyOverlayLayers,
+    nearbyOverlayRequestKey,
     overlayLayerColor,
-    visibleOverlayLayerKey,
-    visibleOverlayLayers,
+    overlay?.visibleLayerIds,
+    selectedSupportId,
+    supportOverlayLayerKey,
   ])
 
   const overlayPoints = useMemo<RenderOverlayPoint[]>(() => {
     const origin = frame?.dataset_position
     if (!origin) return []
     const maximumDistanceSquared = POINT_PREVIEW_MAX_RADIUS_M ** 2
-    return nearbyOverlayFeatures.flatMap(({ layerId, layerName, color, feature }) => {
+    return nearbyOverlayFeatures.flatMap(({ layerId, layerName, color, visible, feature }) => {
       if (feature.geometry?.type !== 'Point') return []
+      if (
+        !visible &&
+        !(selectedSupportId && overlaySupportId(feature.properties) === selectedSupportId)
+      ) return []
       const position = datasetPointToFrameLocal(feature.geometry.coordinates, origin)
       if (!position || position[0] ** 2 + position[1] ** 2 > maximumDistanceSquared) return []
       return [{
@@ -1032,7 +1776,37 @@ export default function PointCloudView({
           String(selectedOverlay.featureId) === String(feature.id),
       }]
     })
-  }, [frame?.dataset_position, nearbyOverlayFeatures, selectedOverlay])
+  }, [frame?.dataset_position, nearbyOverlayFeatures, selectedOverlay, selectedSupportId])
+
+  const focusOverlayPoints = useMemo(() => {
+    if (
+      overlayPoints.some((point) => point.selected) ||
+      !selectedOverlay ||
+      !selectedOverlayLocalPosition ||
+      !overlay?.selectedDatasetFeature ||
+      Math.hypot(selectedOverlayLocalPosition[0], selectedOverlayLocalPosition[1]) >
+        POINT_PREVIEW_MAX_RADIUS_M
+    ) return overlayPoints
+    const layer = overlay.layers.find((candidate) => candidate.id === selectedOverlay.layerId)
+    return [
+      ...overlayPoints,
+      {
+        layerId: selectedOverlay.layerId,
+        layerName: layer?.name ?? '선택 객체',
+        featureId: selectedOverlay.featureId,
+        color: overlay.layerColor(selectedOverlay.layerId),
+        position: selectedOverlayLocalPosition,
+        properties: overlay.selectedDatasetFeature.properties,
+        selected: true,
+      },
+    ]
+  }, [overlay, overlayPoints, selectedOverlay, selectedOverlayLocalPosition])
+  const exactSupportFocusState = pointCloudExactSupportFocusState(
+    selectedSupportId,
+    nearbyOverlayLoadedKey,
+    nearbyOverlayFailedKey,
+    nearbyOverlayRequestKey,
+  )
 
   useEffect(() => {
     if (!frame || demoMode) {
@@ -1060,26 +1834,177 @@ export default function PointCloudView({
         if (!controller.signal.aborted) setDetectionLoading(false)
       })
     return () => controller.abort()
-  }, [datasetId, demoMode, detectionRevisionKey, frame])
+  }, [datasetId, demoMode, detectionRevisionKey, frame, overlayDetectionRevisionKey])
 
   const detectionPoints = useMemo(
     () => pointCloudDetectionsFromObservations(
       detectionObservations,
       frame?.dataset_position,
-      overlayPoints,
+      focusOverlayPoints,
     ),
-    [detectionObservations, frame?.dataset_position, overlayPoints],
+    [detectionObservations, focusOverlayPoints, frame?.dataset_position],
   )
+  useEffect(() => {
+    const receiveDetectionFocus = (event: Event) => {
+      const detail = (
+        event as CustomEvent<PointCloudDetectionFocusEventDetail>
+      ).detail
+      if (
+        !detail
+        || detail.datasetId !== datasetId
+        || detail.frameId !== frame?.id
+        || !detail.sourceId
+        || !detail.observationId
+      ) return
+      setInfrastructureLayerEnabled(false)
+      setExternalDetectionFocus(detail)
+    }
+    window.addEventListener(
+      POINT_CLOUD_DETECTION_FOCUS_EVENT,
+      receiveDetectionFocus,
+    )
+    return () => window.removeEventListener(
+      POINT_CLOUD_DETECTION_FOCUS_EVENT,
+      receiveDetectionFocus,
+    )
+  }, [datasetId, frame?.id])
+  useEffect(() => {
+    if (!externalDetectionFocus) return
+    const detection = detectionPoints.find((candidate) => (
+      candidate.sourceId === externalDetectionFocus.sourceId
+      && candidate.observationId === externalDetectionFocus.observationId
+    ))
+    if (!detection) return
+    if (detection.layerId && detection.featureId !== undefined) {
+      linkedDetectionSelectionRef.current = pointCloudOverlayFocusKey({
+        layerId: detection.layerId,
+        featureId: detection.featureId,
+      })
+    }
+    setActiveFocusTarget({
+      kind: 'detection',
+      key: pointCloudDetectionFocusKey(detection),
+    })
+    setExternalDetectionFocus(null)
+  }, [detectionPoints, externalDetectionFocus])
+  const renderOverlayPoints = useMemo(
+    () => infrastructureLayerEnabled
+      ? overlayPoints.filter(isSelectableInfrastructurePoint)
+      : overlayPoints,
+    [infrastructureLayerEnabled, overlayPoints],
+  )
+  const renderDetectionPoints = useMemo(
+    () => infrastructureLayerEnabled
+      ? detectionPoints.filter(isSelectableInfrastructurePoint)
+      : detectionPoints,
+    [detectionPoints, infrastructureLayerEnabled],
+  )
+
+  const selectedDetection = activeFocusTarget?.kind === 'detection'
+    ? detectionPoints.find(
+        (detection) => pointCloudDetectionFocusKey(detection) === activeFocusTarget.key,
+      ) ?? null
+    : null
+  const activeOverlayFocusPoints = useMemo(
+    () => focusOverlayPoints.map((point) => ({
+      ...point,
+      selected: activeFocusTarget?.kind === 'overlay'
+        && pointCloudOverlayFocusKey(point) === activeFocusTarget.key,
+    })),
+    [activeFocusTarget, focusOverlayPoints],
+  )
+  const selectedFocus = useMemo(() => {
+    if (selectedDetection) {
+      return pointCloudDetectionFocus(selectedDetection, focusOverlayPoints)
+    }
+    if (activeFocusTarget?.kind !== 'overlay') return null
+    return pointCloudSelectionFocusForState(
+      activeOverlayFocusPoints,
+      exactSupportFocusState,
+    )
+  }, [
+    activeFocusTarget?.kind,
+    activeOverlayFocusPoints,
+    exactSupportFocusState,
+    focusOverlayPoints,
+    selectedDetection,
+  ])
+  const infrastructureLayerFocus = useMemo(
+    () => infrastructureLayerEnabled
+      ? pointCloudInfrastructureLayerFocus([
+          ...focusOverlayPoints,
+          ...detectionPoints.filter((detection) => (
+            detection.layerId === undefined || detection.featureId === undefined
+          )),
+        ])
+      : null,
+    [detectionPoints, focusOverlayPoints, infrastructureLayerEnabled],
+  )
+  const selectionFocus = selectedFocus ?? infrastructureLayerFocus
+  const selectionDisplay = useMemo(
+    () => filteredDisplayPayload
+      ? buildPointCloudSelectionDisplay(
+          filteredDisplayPayload,
+          selectionFocus,
+          selectionFocus?.mode === 'infrastructure-layer'
+            ? { backgroundStride: 10 }
+            : undefined,
+        )
+      : null,
+    [filteredDisplayPayload, selectionFocus],
+  )
+  const displayPayload = selectionDisplay?.payload ?? null
+  const pointPreviewFocuses = useMemo(
+    () => pointCloudPreviewFocuses(selectedFocus, frame?.dataset_position),
+    [frame?.dataset_position, selectedFocus],
+  )
+  const pointPreviewFocusKey = pointPreviewFocuses
+    .map((focus) => focus.join(','))
+    .join('|')
+  const pointPreviewFocusPending = Boolean(
+    activeFocusTarget?.kind === 'overlay' &&
+    selectedSupportId &&
+    exactSupportFocusState === 'pending'
+  )
+  const pointPreviewFocusRef = useRef<readonly PointPreviewFocus[]>(pointPreviewFocuses)
+  pointPreviewFocusRef.current = pointPreviewFocuses
 
   useEffect(() => {
     if (!frame) {
       setPayload(null)
+      payloadFrameKeyRef.current = ''
+      return
+    }
+    const payloadFrameKey = `${demoMode}:${datasetId}:${frame.id}`
+    const basePayloadKey = [payloadFrameKey, budget, colorMode].join(':')
+    if (pointPreviewFocusPending) {
+      if (payloadFrameKeyRef.current !== payloadFrameKey) setPayload(null)
+      setLoading(false)
+      setIndexing(false)
+      setError(null)
+      return
+    }
+    const requestFocuses = [...pointPreviewFocusRef.current]
+    const cachedBase = basePayloadCacheRef.current
+    if (
+      requestFocuses.length === 0 &&
+      cachedBase?.key === basePayloadKey &&
+      cachedBase.reloadKey === reloadKey
+    ) {
+      // Selection clear must feel immediate. The ordinary sample is retained
+      // while a denser focused sample is active, so no network round trip is
+      // needed to restore the original map.
+      setPayload(cachedBase.payload)
+      payloadFrameKeyRef.current = payloadFrameKey
+      setLoading(false)
+      setIndexing(false)
+      setError(null)
       return
     }
     const controller = new AbortController()
     let retryTimer: number | undefined
     let attempts = 0
-    setPayload(null)
+    if (payloadFrameKeyRef.current !== payloadFrameKey) setPayload(null)
     setLoading(true)
     setIndexing(false)
     setError(null)
@@ -1088,9 +2013,24 @@ export default function PointCloudView({
       try {
         const data = demoMode
           ? createDemoPointCloud(budget)
-          : parseMmsp(await api.points(datasetId, frame.id, budget, controller.signal, colorMode))
+          : parseMmsp(await api.points(
+              datasetId,
+              frame.id,
+              budget,
+              controller.signal,
+              colorMode,
+              requestFocuses.length ? requestFocuses : undefined,
+            ))
         if (!controller.signal.aborted) {
+          if (requestFocuses.length === 0) {
+            basePayloadCacheRef.current = {
+              key: basePayloadKey,
+              reloadKey,
+              payload: data,
+            }
+          }
           setPayload(data)
+          payloadFrameKeyRef.current = payloadFrameKey
           setLoading(false)
           setIndexing(false)
         }
@@ -1111,7 +2051,16 @@ export default function PointCloudView({
       controller.abort()
       if (retryTimer) window.clearTimeout(retryTimer)
     }
-  }, [budget, colorMode, datasetId, demoMode, frame, reloadKey])
+  }, [
+    budget,
+    colorMode,
+    datasetId,
+    demoMode,
+    frame,
+    pointPreviewFocusKey,
+    pointPreviewFocusPending,
+    reloadKey,
+  ])
 
   useEffect(() => {
     const host = hostRef.current
@@ -1151,6 +2100,14 @@ export default function PointCloudView({
     renderer.outputColorSpace = THREE.SRGBColorSpace
     host.appendChild(renderer.domElement)
 
+    const reduceFocusMotion = Boolean(
+      selectionFocus
+      && typeof ownerWindow.matchMedia === 'function'
+      && ownerWindow.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    )
+    const animateSelectionFocus = Boolean(selectionFocus && !reduceFocusMotion)
+    let selectionTransitionFrame = 0
+
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.dampingFactor = 0.07
@@ -1180,11 +2137,41 @@ export default function PointCloudView({
       vertexColors: Boolean(displayPayload.colors),
       color: displayPayload.colors ? 0xffffff : 0x69e0be,
       transparent: true,
-      opacity: 0.94,
+      opacity: animateSelectionFocus ? 0.94 : selectionFocus ? 0.38 : 0.94,
     })
     pointMaterialRef.current = material
     const points = new THREE.Points(geometry, material)
     scene.add(points)
+
+    let focusedPointGeometry: THREE.BufferGeometry | null = null
+    let focusedPointMaterial: THREE.PointsMaterial | null = null
+    if (selectionFocus && selectionDisplay && selectionDisplay.focusPointCount > 0) {
+      const focusValueCount = selectionDisplay.focusPointCount * 3
+      focusedPointGeometry = new THREE.BufferGeometry()
+      focusedPointGeometry.setAttribute(
+        'position',
+        new THREE.BufferAttribute(displayPayload.positions.slice(0, focusValueCount), 3),
+      )
+      if (displayPayload.colors) {
+        focusedPointGeometry.setAttribute(
+          'color',
+          new THREE.Uint8BufferAttribute(displayPayload.colors.slice(0, focusValueCount), 3, true),
+        )
+      }
+      focusedPointMaterial = new THREE.PointsMaterial({
+        size: pointSizeRef.current * 0.058,
+        sizeAttenuation: true,
+        vertexColors: Boolean(displayPayload.colors),
+        color: displayPayload.colors ? 0xffffff : 0x8bffe0,
+        transparent: true,
+        opacity: animateSelectionFocus ? 0 : 1,
+      })
+      focusedPointMaterialRef.current = focusedPointMaterial
+      const focusedPoints = new THREE.Points(focusedPointGeometry, focusedPointMaterial)
+      focusedPoints.name = 'selected-object-dense-points'
+      focusedPoints.renderOrder = 2
+      scene.add(focusedPoints)
+    }
 
     // MMSP coordinates are frame-local, so the origin is the physical capture
     // position. Show both that origin and the GNSS heading to make the current
@@ -1237,6 +2224,124 @@ export default function PointCloudView({
     capturePose.add(arrow)
     scene.add(capturePose)
 
+    let selectionFocusGroup: THREE.Group | null = null
+    if (selectionFocus) {
+      selectionFocusGroup = new THREE.Group()
+      selectionFocusGroup.name = selectionFocus.mode === 'selection'
+        ? 'selected-object-focus-guide'
+        : 'detected-infrastructure-focus-guide'
+      if (selectionFocus.selected) {
+        const selectedPosition = new THREE.Vector3(...selectionFocus.selected.position)
+        const selectionMarker = new THREE.Mesh(
+          new THREE.SphereGeometry(0.2, 18, 12),
+          new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            depthTest: false,
+            transparent: true,
+            opacity: 0.98,
+          }),
+        )
+        selectionMarker.position.copy(selectedPosition)
+        selectionMarker.renderOrder = 31
+        selectionFocusGroup.add(selectionMarker)
+        const selectionRing = new THREE.Mesh(
+          new THREE.TorusGeometry(0.42, 0.035, 8, 32),
+          new THREE.MeshBasicMaterial({
+            color: 0xffd166,
+            depthTest: false,
+            transparent: true,
+            opacity: 0.95,
+          }),
+        )
+        selectionRing.position.copy(selectedPosition)
+        selectionRing.renderOrder = 30
+        selectionFocusGroup.add(selectionRing)
+      }
+
+      if (selectionFocus.guideSegments.length > 0) {
+        const relationGeometry = new THREE.BufferGeometry().setFromPoints(
+          selectionFocus.guideSegments.flatMap(([start, end]) => [
+            new THREE.Vector3(...start),
+            new THREE.Vector3(...end),
+          ]),
+        )
+        const relationLines = new THREE.LineSegments(
+          relationGeometry,
+          new THREE.LineDashedMaterial({
+            color: 0x5fffd7,
+            dashSize: 0.28,
+            gapSize: 0.18,
+            depthTest: false,
+            transparent: true,
+            opacity: 0.92,
+          }),
+        )
+        relationLines.computeLineDistances()
+        relationLines.renderOrder = 29
+        selectionFocusGroup.add(relationLines)
+      }
+      const relatedMarkers = selectionFocus.mode === 'selection'
+        ? selectionFocus.related.slice(0, 16)
+        : []
+      relatedMarkers.forEach((related) => {
+        const marker = new THREE.Mesh(
+          new THREE.SphereGeometry(0.13, 14, 10),
+          new THREE.MeshBasicMaterial({
+            color: 0x5fffd7,
+            depthTest: false,
+            transparent: true,
+            opacity: 0.95,
+          }),
+        )
+        marker.position.fromArray(related.position)
+        marker.renderOrder = 30
+        selectionFocusGroup!.add(marker)
+      })
+      scene.add(selectionFocusGroup)
+    }
+
+    if (animateSelectionFocus && focusedPointMaterial) {
+      const guideMaterials: Array<{
+        material: THREE.Material & { opacity: number }
+        targetOpacity: number
+      }> = []
+      selectionFocusGroup?.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          material?: THREE.Material | THREE.Material[]
+        }
+        const materials = Array.isArray(renderable.material)
+          ? renderable.material
+          : renderable.material
+            ? [renderable.material]
+            : []
+        materials.forEach((candidate) => {
+          const opacityMaterial = candidate as THREE.Material & { opacity?: number }
+          if (typeof opacityMaterial.opacity !== 'number') return
+          guideMaterials.push({
+            material: opacityMaterial as THREE.Material & { opacity: number },
+            targetOpacity: opacityMaterial.opacity,
+          })
+          opacityMaterial.opacity = 0
+        })
+      })
+      let transitionStartedAt: number | null = null
+      const advanceSelectionTransition = (timestamp: number) => {
+        transitionStartedAt ??= timestamp
+        const progress = pointCloudFocusTransitionProgress(timestamp - transitionStartedAt)
+        material.opacity = THREE.MathUtils.lerp(0.94, 0.38, progress)
+        focusedPointMaterial.opacity = progress
+        guideMaterials.forEach(({ material: guideMaterial, targetOpacity }) => {
+          guideMaterial.opacity = targetOpacity * progress
+        })
+        if (progress < 1) {
+          selectionTransitionFrame = ownerWindow.requestAnimationFrame(advanceSelectionTransition)
+        } else {
+          selectionTransitionFrame = 0
+        }
+      }
+      selectionTransitionFrame = ownerWindow.requestAnimationFrame(advanceSelectionTransition)
+    }
+
     let overlayGeometry: THREE.BufferGeometry | null = null
     let overlayMaterial: THREE.PointsMaterial | null = null
     let overlayObject: THREE.Points | null = null
@@ -1248,10 +2353,10 @@ export default function PointCloudView({
     let detectionBoxGeometry: THREE.BufferGeometry | null = null
     let detectionBoxMaterial: THREE.LineBasicMaterial | null = null
     let detectionBoxObject: THREE.LineSegments | null = null
-    if (overlayPoints.length) {
-      const positions = new Float32Array(overlayPoints.length * 3)
-      const colors = new Float32Array(overlayPoints.length * 3)
-      overlayPoints.forEach((entry, index) => {
+    if (renderOverlayPoints.length) {
+      const positions = new Float32Array(renderOverlayPoints.length * 3)
+      const colors = new Float32Array(renderOverlayPoints.length * 3)
+      renderOverlayPoints.forEach((entry, index) => {
         positions.set(entry.position, index * 3)
         const color = new THREE.Color(entry.color)
         colors.set([color.r, color.g, color.b], index * 3)
@@ -1269,7 +2374,7 @@ export default function PointCloudView({
       overlayObject.renderOrder = 4
       scene.add(overlayObject)
 
-      const selectedEntry = overlayPoints.find((entry) => entry.selected)
+      const selectedEntry = renderOverlayPoints.find((entry) => entry.selected)
       if (selectedEntry) {
         selectedGeometry = new THREE.BufferGeometry()
         selectedGeometry.setAttribute(
@@ -1288,13 +2393,13 @@ export default function PointCloudView({
       }
     }
 
-    if (detectionPoints.length) {
-      const positions = new Float32Array(detectionPoints.length * 3)
-      const colors = new Float32Array(detectionPoints.length * 3)
+    if (renderDetectionPoints.length) {
+      const positions = new Float32Array(renderDetectionPoints.length * 3)
+      const colors = new Float32Array(renderDetectionPoints.length * 3)
       const boxColors = new Float32Array(
-        detectionPoints.length * DETECTION_BOX_EDGE_INDICES.length * 3,
+        renderDetectionPoints.length * DETECTION_BOX_EDGE_INDICES.length * 3,
       )
-      detectionPoints.forEach((entry, index) => {
+      renderDetectionPoints.forEach((entry, index) => {
         positions.set(entry.position, index * 3)
         const color = new THREE.Color(entry.selected ? '#ffffff' : entry.color)
         colors.set([color.r, color.g, color.b], index * 3)
@@ -1308,7 +2413,7 @@ export default function PointCloudView({
       detectionBoxGeometry = new THREE.BufferGeometry()
       detectionBoxGeometry.setAttribute(
         'position',
-        new THREE.BufferAttribute(pointCloudDetectionWireframePositions(detectionPoints), 3),
+        new THREE.BufferAttribute(pointCloudDetectionWireframePositions(renderDetectionPoints), 3),
       )
       detectionBoxGeometry.setAttribute('color', new THREE.BufferAttribute(boxColors, 3))
       detectionBoxMaterial = new THREE.LineBasicMaterial({
@@ -1518,6 +2623,29 @@ export default function PointCloudView({
     let pendingHover: { x: number; y: number } | null = null
     let lastHoveredPointIndex: number | null = null
     let lastHoverRaycastAt = Number.NEGATIVE_INFINITY
+    const cycledHitIndex = (
+      kind: 'detection' | 'overlay',
+      indices: number[],
+      signature: string,
+      clientX: number,
+      clientY: number,
+    ) => {
+      const previousCycle = clickCycleRef.current
+      const repeated = Boolean(
+        previousCycle &&
+        previousCycle.kind === kind &&
+        previousCycle.signature === signature &&
+        Math.hypot(clientX - previousCycle.x, clientY - previousCycle.y) <= 6,
+      )
+      const index = nextCycledPointHit(
+        indices,
+        repeated && previousCycle ? previousCycle.index : null,
+      )
+      if (index !== null) {
+        clickCycleRef.current = { kind, signature, x: clientX, y: clientY, index }
+      }
+      return index
+    }
 
     const clearHover = () => {
       pendingHover = null
@@ -1566,7 +2694,7 @@ export default function PointCloudView({
         : null
       const detectionEntry = detectionIndex === null
         ? undefined
-        : detectionPoints[detectionIndex]
+        : renderDetectionPoints[detectionIndex]
       const overlayIndex = !detectionEntry && overlayObject
         ? closestPointHitIndex(
             overlayRaycaster.intersectObject(overlayObject, false),
@@ -1579,7 +2707,7 @@ export default function PointCloudView({
         : null
       const overlayEntry = overlayIndex === null
         ? undefined
-        : overlayPoints[overlayIndex]
+        : renderOverlayPoints[overlayIndex]
       const hoverEntry = detectionEntry ?? overlayEntry
       setOverlayHover(hoverEntry ? pointCloudHoverState(hoverEntry, {
         x: pending.x - bounds.left,
@@ -1650,6 +2778,7 @@ export default function PointCloudView({
         poleBaseProposal?.status ?? 'idle',
       )
       if (target && targetAcceptsPoint && frame?.dataset_position) {
+        clickCycleRef.current = null
         const pointIndex = closestPointHitIndex(
           pointRaycaster.intersectObject(points, false),
           pointer,
@@ -1670,6 +2799,7 @@ export default function PointCloudView({
         return
       }
       if (measureModeRef.current) {
+        clickCycleRef.current = null
         const pointIndex = closestPointHitIndex(
           pointRaycaster.intersectObject(points, false),
           pointer,
@@ -1690,7 +2820,7 @@ export default function PointCloudView({
         return
       }
       if (detectionObject) {
-        const detectionIndex = closestPointHitIndex(
+        const detectionIndices = pointHitIndices(
           detectionRaycaster.intersectObject(detectionObject, false),
           pointer,
           camera,
@@ -1698,13 +2828,35 @@ export default function PointCloudView({
           bounds.height,
           POINT_CLOUD_YOLO_HIT_RADIUS_PX,
         )
-        const entry = detectionIndex === null ? undefined : detectionPoints[detectionIndex]
+        const detectionIndex = cycledHitIndex(
+          'detection',
+          detectionIndices,
+          detectionIndices.map((index) => (
+            pointCloudDetectionFocusKey(renderDetectionPoints[index])
+          )).join('|'),
+          event.clientX,
+          event.clientY,
+        )
+        const entry = detectionIndex === null ? undefined : renderDetectionPoints[detectionIndex]
         if (entry) {
+          setActiveFocusTarget({
+            kind: 'detection',
+            key: pointCloudDetectionFocusKey(entry),
+          })
+          if (entry.layerId && entry.featureId !== undefined) {
+            linkedDetectionSelectionRef.current = pointCloudOverlayFocusKey({
+              layerId: entry.layerId,
+              featureId: entry.featureId,
+            })
+            actions.selectFeature(
+              { layerId: entry.layerId, featureId: entry.featureId },
+              { navigate: false },
+            )
+          }
           const transient = overlayHoverRef.current
           setPinnedOverlayHover(
             transient
-              && transient.layerId === entry.layerId
-              && String(transient.featureId) === String(entry.featureId ?? entry.observationId)
+              && transient.identityKey === pointCloudDetectionFocusKey(entry)
               ? transient
               : pointCloudHoverState(entry, {
                   x: event.clientX - bounds.left,
@@ -1717,7 +2869,7 @@ export default function PointCloudView({
         }
       }
       if (overlayObject) {
-        const overlayIndex = closestPointHitIndex(
+        const overlayIndices = pointHitIndices(
           overlayRaycaster.intersectObject(overlayObject, false),
           pointer,
           camera,
@@ -1725,8 +2877,26 @@ export default function PointCloudView({
           bounds.height,
           12,
         )
-        const entry = overlayIndex === null ? undefined : overlayPoints[overlayIndex]
+        const overlayIndex = cycledHitIndex(
+          'overlay',
+          overlayIndices,
+          overlayIndices.map((index) => (
+            pointCloudOverlayFocusKey(renderOverlayPoints[index])
+          )).join('|'),
+          event.clientX,
+          event.clientY,
+        )
+        const entry = overlayIndex === null ? undefined : renderOverlayPoints[overlayIndex]
         if (entry) {
+          linkedDetectionSelectionRef.current = null
+          setActiveFocusTarget({
+            kind: 'overlay',
+            key: pointCloudOverlayFocusKey(entry),
+          })
+          actions.selectFeature(
+            { layerId: entry.layerId, featureId: entry.featureId },
+            { navigate: false },
+          )
           const transient = overlayHoverRef.current
           setPinnedOverlayHover(
             transient?.layerId === entry.layerId &&
@@ -1739,8 +2909,13 @@ export default function PointCloudView({
                   viewportHeight: bounds.height,
                 }),
           )
+          return
         }
       }
+      clickCycleRef.current = null
+      linkedDetectionSelectionRef.current = null
+      setActiveFocusTarget(null)
+      actions.selectFeature(null, { navigate: false })
     }
     renderer.domElement.addEventListener('pointerdown', onPointerDown)
     renderer.domElement.addEventListener('pointermove', onPointerMove)
@@ -1749,6 +2924,9 @@ export default function PointCloudView({
 
     return () => {
       rendererDisposed = true
+      if (selectionTransitionFrame) {
+        ownerWindow.cancelAnimationFrame(selectionTransitionFrame)
+      }
       renderLoop.dispose()
       resizeObserver.disconnect()
       ownerWindow.removeEventListener('resize', wakeRenderer)
@@ -1774,6 +2952,8 @@ export default function PointCloudView({
       controls.dispose()
       geometry.dispose()
       material.dispose()
+      focusedPointGeometry?.dispose()
+      focusedPointMaterial?.dispose()
       overlayGeometry?.dispose()
       overlayMaterial?.dispose()
       selectedGeometry?.dispose()
@@ -1820,23 +3000,40 @@ export default function PointCloudView({
           renderable.material?.dispose()
         }
       })
+      selectionFocusGroup?.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          geometry?: THREE.BufferGeometry
+          material?: THREE.Material | THREE.Material[]
+        }
+        renderable.geometry?.dispose()
+        if (Array.isArray(renderable.material)) {
+          renderable.material.forEach((entry) => entry.dispose())
+        } else {
+          renderable.material?.dispose()
+        }
+      })
       if (pointMaterialRef.current === material) pointMaterialRef.current = null
+      if (focusedPointMaterialRef.current === focusedPointMaterial) {
+        focusedPointMaterialRef.current = null
+      }
       if (renderSceneRef.current === scene) renderSceneRef.current = null
       if (wakeRenderSceneRef.current === wakeRenderer) wakeRenderSceneRef.current = null
       renderer.dispose()
       renderer.domElement.remove()
     }
   }, [
-    detectionPoints,
+    renderDetectionPoints,
     frame?.dataset_position,
     frame?.heading,
     frame?.id,
-    overlayPoints,
+    renderOverlayPoints,
     displayPayload,
     manualProposalLocalPosition,
     poleBaseMarkerColor,
     poleBaseMarkerSizeM,
     poleBaseProposal,
+    selectionDisplay,
+    selectionFocus,
   ])
 
   useEffect(() => {
@@ -1890,6 +3087,9 @@ export default function PointCloudView({
     const material = pointMaterialRef.current
     if (!material) return
     material.size = pointSize * 0.045
+    if (focusedPointMaterialRef.current) {
+      focusedPointMaterialRef.current.size = pointSize * 0.058
+    }
   }, [pointSize])
 
   const readyPoleBaseResult = poleBaseProposal?.status === 'ready'
@@ -1927,6 +3127,9 @@ export default function PointCloudView({
       data-pole-base-status={poleBaseProposal?.status ?? 'idle'}
       data-manual-proposal-preview={String(Boolean(manualProposalLocalPosition))}
       data-visible-point-count={displayPayload?.pointCount ?? 0}
+      data-selection-focus={String(Boolean(selectionFocus))}
+      data-infrastructure-layer={String(infrastructureLayerEnabled)}
+      data-selection-focus-point-count={selectionDisplay?.focusPointCount ?? 0}
     >
       <div ref={hostRef} className="pointcloud-canvas" />
       <OverlayHoverTooltip
@@ -2033,6 +3236,24 @@ export default function PointCloudView({
             <small>{formatCount(displayPayload?.pointCount ?? 0)} / {formatCount(payload?.pointCount ?? 0)} 표시</small>
           </div>
         </details>
+        <button
+          type="button"
+          className={`pointcloud-infrastructure-toggle ${infrastructureLayerEnabled ? 'active' : ''}`}
+          aria-label="검출 표지·신호등·지주 강조"
+          aria-pressed={infrastructureLayerEnabled}
+          title="검출된 표지·신호등과 수직·수평 지주 포인트만 강조"
+          onClick={() => setInfrastructureLayerEnabled((value) => {
+            const next = !value
+            if (next) {
+              linkedDetectionSelectionRef.current = null
+              clickCycleRef.current = null
+              setActiveFocusTarget(null)
+            }
+            return next
+          })}
+        >
+          <Layers3 size={14} />
+        </button>
         {overlayPoints.length > 0 && (
           <span title="현재 프레임 주변에 표시된 SHP 포인트">
             <MapPin size={14} /> SHP {overlayPoints.length.toLocaleString('ko-KR')}
@@ -2048,6 +3269,17 @@ export default function PointCloudView({
         {detectionError && <span className="viewer-overlay-error" title={detectionError}>YOLO 3D 일부 오류</span>}
         {overlayLoading && <LoaderCircle size={14} className="spin" aria-label="SHP 포인트 불러오는 중" />}
         {overlayError && <span className="viewer-overlay-error" title={overlayError}>SHP 일부 오류</span>}
+        {selectionFocus && (
+          <strong
+            className="viewer-pick-indicator"
+            title="선택한 표지·신호등·지주 주변 점은 유지하고, 나머지 주변 점은 낮은 밀도로 표시합니다."
+          >
+            <Scan size={14} />
+            {selectionFocus.mode === 'selection'
+              ? '선택 객체·지주 고밀도 · 주변 저밀도'
+              : '검출 표지·신호등·지주 강조'}
+          </strong>
+        )}
         {poleBasePicking && (
           <strong className="viewer-pick-indicator pole-base-pick-indicator">
             <Crosshair size={14} /> 지주 몸체의 실제 포인트를 클릭해 하단 산출 (B)
@@ -2166,6 +3398,11 @@ export default function PointCloudView({
                     <AlertTriangle size={13} /> 필수 속성: {poleBaseProposal.templateValidation.missingRequiredFields.join(', ')}
                   </p>
                 )}
+              {overlay?.poleBaseReviewTaskChanged && (
+                <p className="pole-base-result-warning" role="alert">
+                  <AlertTriangle size={13} /> 검수 항목이 바뀌었습니다. 현재 항목에서 바닥점을 다시 선택해 주세요.
+                </p>
+              )}
             </>
           )}
 
@@ -2177,6 +3414,7 @@ export default function PointCloudView({
                 disabled={
                   readyPoleBaseResult.status === 'failed' ||
                   !readyPoleBaseResult.base_position ||
+                  Boolean(overlay?.poleBaseReviewTaskChanged) ||
                   (poleBaseProposal.status === 'ready' &&
                     poleBaseTemplateValidationBlocksSave(poleBaseProposal.templateValidation))
                 }
@@ -2238,9 +3476,21 @@ export default function PointCloudView({
       )}
       {payload && !loading && (
         <div className="viewer-data-card">
-          <span>LIVE SAMPLE · MMSP</span>
+          <span>
+            {selectionFocus?.mode === 'selection'
+              ? 'SELECTION FOCUS · MMSP'
+              : selectionFocus
+                ? 'INFRASTRUCTURE LAYER · MMSP'
+                : 'LIVE SAMPLE · MMSP'}
+          </span>
           <strong>{formatCount(displayPayload?.pointCount ?? payload.pointCount)} points</strong>
-          <small>{displayPayload && displayPayload.pointCount !== payload.pointCount ? `경량 샘플 ${formatCount(payload.pointCount)}개에서 로컬 필터` : '원본 LAS 대신 프레임 주변 경량 바이너리'}</small>
+          <small>
+            {selectionFocus && selectionDisplay
+              ? `${selectionFocus.mode === 'selection' ? '객체·지주' : '검출 인프라'} ${formatCount(selectionDisplay.focusPointCount)}개 유지 · 주변 ${formatCount(selectionDisplay.backgroundPointCount)}개 표시`
+              : displayPayload && displayPayload.pointCount !== payload.pointCount
+                ? `경량 샘플 ${formatCount(payload.pointCount)}개에서 로컬 필터`
+                : '원본 LAS 대신 프레임 주변 경량 바이너리'}
+          </small>
         </div>
       )}
     </div>

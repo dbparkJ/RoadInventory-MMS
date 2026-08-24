@@ -331,6 +331,14 @@ export interface ReviewSession {
   qa_ran_at: string | null
 }
 
+export interface ReviewCompletionStatus {
+  session_status: ReviewSessionStatus
+  requirements_met: boolean
+  can_complete: boolean
+  blockers: Record<string, number>
+  checked_at: string
+}
+
 export type ReviewTaskType =
   | 'MANUAL_SCAN'
   | 'LOW_CONFIDENCE'
@@ -753,6 +761,24 @@ export interface OverlayFeature {
   provenance?: FeatureProvenance
 }
 
+export interface OverlaySupportFeatureItem {
+  layer_id: string
+  layer_name: string
+  layer_color?: string | null
+  revision: number
+  feature: OverlayFeature
+}
+
+export interface OverlaySupportFeatureResponse {
+  dataset_id: string
+  support_id: string
+  status: 'matched' | 'not_found' | 'unavailable'
+  items: OverlaySupportFeatureItem[]
+  count: number
+  candidate_count: number
+  scan_complete: boolean
+}
+
 export interface OverlayReviewMetadata {
   source_frame_ids?: string[]
   source_detection_ids?: string[]
@@ -884,9 +910,44 @@ export interface PanoramaDetectionBoxObservation {
   model_id?: string
   source_name?: string
   observation_id: string
+  layer_id?: string
   feature_id?: string | number
+  overlay_revision?: number
+  overlay_resolution?: DetectionOverlayResolutionStatus
+  overlay_candidate_count?: number
   dataset_position?: [number, number, number]
   properties: Record<string, unknown>
+}
+
+export type DetectionOverlayResolutionStatus =
+  | 'matched'
+  | 'not_found'
+  | 'ambiguous'
+  | 'unavailable'
+  | 'deleted'
+
+export interface DetectionOverlayMatch {
+  layer_id: string
+  feature_id: string | number
+  revision: number
+  evidence: Array<'property' | 'provenance'>
+}
+
+export interface DetectionOverlayResolution {
+  source_id: string
+  observation_id: string
+  status: DetectionOverlayResolutionStatus
+  match: DetectionOverlayMatch | null
+  candidates: DetectionOverlayMatch[]
+  candidate_count: number
+  tombstones?: Array<{
+    layer_id: string
+    feature_id: string | number
+    evidence: Array<'property' | 'provenance'>
+    deleted_at: string
+  }>
+  tombstone_count?: number
+  scan_complete: boolean
 }
 
 export interface PanoramaDetectionModel {
@@ -905,6 +966,8 @@ export interface FrameDetectionResponse {
   /** Present on current servers; clients also derive this from items for compatibility. */
   models?: PanoramaDetectionModel[]
   count: number
+  /** Raw observations intentionally hidden after their linked feature was deleted. */
+  suppressed_count?: number
   model_count: number
   truncated: boolean
 }

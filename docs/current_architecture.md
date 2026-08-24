@@ -4,7 +4,9 @@
 
 ## P0 지주 보정과 P1 검수 작업공간
 
-P0 수동 지주 바닥점과 P1 검수 작업공간은 모두 활성 상태다. `/api/bootstrap`은
+P0 수동 지주 바닥점과 수동 객체 편집은 활성 상태다. P1 검수 작업공간의 서버 API와
+프런트 컴포넌트는 보존하지만 현재 배포 UI에서는 `REVIEW_WORKSPACE_UI_ENABLED = false`로
+session 상태·단축키까지 비활성화하고 작업 바·큐·QA panel을 렌더링하지 않는다. `/api/bootstrap`은
 `capabilities.pole_base_inference`, `capabilities.review_workspace`,
 `capabilities.active_learning_export`를 공개한다. 점군 reader가 없는 서버에서는 지주
 inference만 비활성화되고, 검수 session/task·QA·report 저장 계약은 그대로 유지된다.
@@ -17,9 +19,9 @@ inference만 비활성화되고, 검수 session/task·QA·report 저장 계약�
 | 지주 신규 | `N`으로 Point 후보 생성 → 실제 점 선택 → `B`로 read-only 바닥점 proposal → 다시 `B`로 create 확정 |
 | 지주 수정 | 기존 Point 선택 → 이동할 실제 점 선택 → `B`로 proposal → 다시 `B`로 patch 확정 |
 | 미리보기 | 확정 전 바닥점과 수동 bbox PointZ를 파노라마·점군에 동시에 표시하며 지주 marker 색·크기는 로컬 설정으로 보존 |
-| 검수 범위 | dataset/run/layer/track/frame/class 범위를 session에 고정하고 마지막 task·필터를 복원 |
-| 작업 큐 | 수동 항목, 저신뢰도, 3D 실패, geometry/pole REVIEW, 간격 이상, 미검수 구간, 수동 flag를 mutation-safe cursor queue로 처리 |
-| 수동 객체 | `TRAFFIC_SIGN` 파노라마 seam-safe bbox와 `SIGN_SUPPORT_POLE` P0 adapter를 공통 template/proposal 흐름에서 사용 |
+| 검수 작업 | 서버 계약과 React 컴포넌트는 보존하되 현재 UI 진입점과 브라우저 상태 로딩은 비활성화 |
+| 작업 큐 | 재활성화 시 수동 항목, 저신뢰도, 3D 실패, geometry/pole REVIEW, 간격 이상, 미검수 구간, 수동 flag를 mutation-safe cursor queue로 처리 |
+| 수동 객체 | `TRAFFIC_SIGN` bbox를 놓는 즉시 3D proposal 계산을 시작하고, 분리한 파노라마 창에서도 준비·재시도·확정을 완결하며 `SIGN_SUPPORT_POLE` P0 adapter와 공통 template/proposal 흐름을 사용 |
 | 품질·이력 | exact/near duplicate, required/domain/relation QA, provenance, revision CAS 기반 undo/redo를 제공 |
 | 납품 근거 | 범위·완료율·작업 결과·QA·작업시간·fingerprint report와 edited SHP/provenance/선택형 active-learning ZIP을 생성 |
 
@@ -71,6 +73,7 @@ dataset CRS이며 `failed`에는 저장 가능한 `base_position`이 없다. 이
 POST /api/datasets/{dataset_id}/review-sessions
 GET  /api/datasets/{dataset_id}/review-sessions
 GET  /api/review-sessions/{session_id}
+GET  /api/review-sessions/{session_id}/completion-status
 PATCH /api/review-sessions/{session_id}
 POST /api/review-sessions/{session_id}/tasks/generate
 GET  /api/review-sessions/{session_id}/tasks
@@ -113,32 +116,77 @@ QA 미실행, QA 이후 layer 수정, open error issue 또는 open task가 있�
 명시한다. error issue는 화면에서 임의 해제할 수 없고 원인 데이터를 고친 뒤 QA를 다시
 실행해 사라져야 한다. target layer가 없는 session도 빈 결과와 빈 revision map을 유효한
 최신 QA snapshot으로 저장한다.
+`completion-status`는 완료 mutation과 동일한 fail-closed 판정을 읽기 형태로 반환한다. 응답은
+차단 조건 충족 여부인 `requirements_met`와 현재 session 상태에서 실제 전이가 가능한지 나타내는
+`can_complete`, `session_status`를 분리하며 `Cache-Control: no-store`로 전달한다. 화면은
+작업 개수만으로 완료 버튼을 활성화하지 않고, open task·QA 미실행·stale QA·open error·
+task-resolution outbox 동기화 상태를 서버에서 다시 확인한다.
 
 ### 화면과 작업 context
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 검수 세션: dataset / run / track / class / 범위 / 작업자 / 진행률  │
-├──────────────┬──────────────────────────────────┬───────────────────┤
-│ 작업 큐      │ 지도 · 파노라마 · 점군            │ 객체 template     │
-│ 상태/유형    │ 현재 frame context 고정           │ 필수/자동 속성     │
-│ 이전/다음    │ AI bbox · 수동 bbox · proposal    │ QA · 확인 후 다음 │
-├──────────────┴──────────────────────────────────┴───────────────────┤
-│ 근거: run / model / frame / seed / bbox / quality / edit revision  │
+│ 데이터 · SHP 관리 · 자동 검출 · 설정 · 실행 결과                    │
+├──────────────┬──────────────────────────────────────────────────────┤
+│ 데이터 탐색  │ 2D 지도 · 위성지도 · 3D 지도 · 파노라마 · 3D 점군   │
+│ track/frame  │ 전체 트랙 / 단독 트랙 / 명시적 추가 트랙             │
+├──────────────┴──────────────────────────────────────────────────────┤
+│ 객체 추가·수정 · 제안 상태 · 선택 객체 바로 수정                    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-기존 detachable 지도·파노라마·점군 창과 P0 단축키 relay는 유지하고, P1은 선택된
-review task의 frame context를 세 뷰와 객체 template·QA panel에 공유한다. `J/K`는
-이전·다음 task, `X`는 오검출, `F`는 나중에 확인, `M`은 수동 bbox, `Q`는 QA panel,
-`Shift+Enter`는 확인 후 다음이다. popup은 modifier를 보존해 canonical window handler로
-relay하며 입력 필드에서는 shortcut을 실행하지 않는다.
+기존 detachable 지도·파노라마·점군 창과 P0 단축키 relay는 유지한다. 현재는 review provider를
+disabled 상태로 생성하므로 `J/K`, `X`, `F`, `Q` 검수 명령은 실행되지 않고 분리 창의
+relay 대상에서도 제외한다.
+재활성화할 때 사용할 session/task/QA 컴포넌트와 계약은 삭제하지 않았다. popup과 지도 iframe은
+`N`, `B`, `M`, `R`, `Enter`, `Shift+Enter`, `Esc` 등 일반 작업 shortcut의 modifier를 보존해
+canonical window handler로 relay한다. `aria-modal` dialog가
+열렸거나 버튼·링크·입력 필드처럼 조작 가능한 UI에 focus가
+있을 때는 전역 shortcut을 실행하지 않아
+Enter나 문자 키가 화면 조작과 편집 명령을 동시에 발생시키지 않는다.
+재활성화 시 검수 작업 화면은 현재 frame 범위, 완료 run, 저장할 Point layer와 후보 유형을 한 번에
+받아 session 생성 직후 task 생성을 이어서 실행한다. 완료 task를 `다시 확인`하면 todo에
+머물지 않고 즉시 현재 작업자에게 재할당해 판정 버튼을 바로 사용할 수 있다.
 
 점군 보조 도구는 local clip, Z slice, proposal isolate, 2점 거리/높이 측정과
 `rgb|intensity|classification|height` 색상 모드를 제공한다. 색상 모드는
 `GET /api/datasets/{dataset_id}/points/{frame_id}?color_mode=...`가 실제 intensity/LAS
 classification 또는 높이에서 RGB를 만든 MMSP v1 derivative를 반환한다. geometry layout을
-바꾸지 않고 mode를 cache fingerprint에 포함한다.
+바꾸지 않고 mode를 cache fingerprint에 포함한다. AI 피처를 선택하면 dataset CRS의
+`focus=x,y`를 선택 객체와 같은 `support_id`의 관련 지주 위치까지 최대 4번 반복해 보낸다.
+서버는 각 위치의 3m 수직 원통과 첫 선택점에서 각 관련점으로 뻗는 1m corridor의 합집합에
+점 예산 85%, 나머지 25m 배경에 15%를 배정한다. 관련 Point 레이어를 불러오기 전의
+선택점 단독 derivative는 요청하지 않는다. 프런트도 같은 객체·지주 영역을 고밀도로 유지하고,
+표지와 지주가 수평으로 떨어진 경우에도 관련 지주의 XY 수직축 전체를 고밀도로 보존한다.
+배경은 결정적으로 희소화하며 촬영점·선택점·지주 관계선을 표시한다. 선택 해제 시에는 기존
+무초점 sampling byte와 cache key 경로로 복귀한다.
+
+프레임 AI 검출 응답은 등록된 모든 관련 Point 편집 레이어를 visibility와 pagination에
+무관하게 batch 조회한다. 검출 ID와 `support_id`는 import 시 `feature_exact_references` SQLite
+인덱스로 정규화하고 feature/provenance/revision trigger로 같은 transaction에서 동기화한다.
+기존 저장소는 첫 조회에 한 번만 migration하며 한 요청에서 최대 4개 레이어까지만 지연 구축한다.
+신규 import는 이 비용을 가져오기 transaction에서 미리 지불하고, 이후에는 전체 properties JSON
+scan 없이 exact index를 사용한다. provenance의 `source_detection_ids`가 배열이 아니면 구축과
+후속 쓰기를 거부한다. `det_id` 또는 정상 provenance가 정확히 하나의 피처와 일치할 때만
+`layer_id`, `feature_id`, `overlay_revision`을 포함한다. 파노라마 AI 박스를 클릭하면 해당 피처가
+즉시 선택되어 점군 강조가 동기화되고, 고정 tooltip의 `바로 수정`은 속성 편집 창을 연다.
+일치하지 않거나 중복이면 각각
+`not_found`, `ambiguous`, 탐색 한계나 저장소 오류면 `unavailable`로 fail-closed 처리해
+임의의 피처를 열지 않는다. 단건 확인 계약은 다음과 같다.
+
+```http
+GET /api/datasets/{dataset_id}/detections/overlay-feature
+    ?source_id={source_id}&observation_id={observation_id}
+
+GET /api/datasets/{dataset_id}/overlays/support-features
+    ?support_id={support_identity}
+```
+
+두 번째 계약은 모든 Point 레이어에서 같은 지주 identity를 정확 조회하므로 공간 조회의 5,000개
+페이지 제한이나 레이어 가시성에 영향을 받지 않는다. 목록과 exact scan은 같은 정렬·1,000개
+catalog 경계를 사용한다. 손상·탐색 한도 초과는 `unavailable`과 빈 `items`로 fail-closed 처리한다.
+프런트는 layer revision 단위로 성공 응답과 진행 중 Promise를 공유하며, 실패 시 공간 조회의
+부분 지주 집합으로 고밀도 focus나 관계선을 만들지 않는다.
 
 ### 지원 template
 
@@ -182,10 +230,18 @@ manual observation, creation tool, proposal quality, review status, operator와 
 `feature_provenance`에 보존한다. edited SHP ZIP은 DBF schema를 임의 확장하지 않고 현재
 session에 귀속된 provenance만 sidecar JSON으로 함께 내보낸다.
 
-수동 bbox proposal은 메모리에서 15분 TTL과 최대 개수 제한을 가지므로 서버 재시작 후에는
+수동 bbox를 놓으면 별도 계산 버튼 없이 proposal 생성을 시작한다. point catalog가 준비 중이면
+같은 `ManualObservation` ID로 제한된 횟수만 자동 재시도하고, 작업자는 중간에 취소하거나 자동 재시도
+소진 후 수동으로 계속할 수 있다. proposal은 메모리에서 15분 TTL과 최대 개수 제한을 가지므로
+서버 재시작 후에는
 다시 inference해야 한다. inference는 overlay를 수정하지 않으며 commit 시 revision과
 duplicate를 다시 검사한다. 요청 취소 후에도 worker가 끝날 때까지 공용 semaphore ownership을
 유지해 reader와 cache를 조기에 닫지 않는다.
+
+bbox와 지주 바닥점 proposal은 시작 당시 검수 task·session·dataset·layer·frame/range·track
+scope를 함께 고정한다. proposal 준비 또는 commit 중 다른 검수 항목으로 전환되면 최신 항목을
+대신 해소하거나 자동으로 넘기지 않으며, 서버도 task의 exact frame 또는 interval range/track이
+proposal 원본 frame을 포함하는지 commit 시 다시 검증한다.
 
 report와 두 ZIP은 session/task/event/QA digest 및 유효 target layer의 실제 feature DB
 revision을 생성 전후 비교한다. 생성 중 registry나 layer가 바뀌면 임시 결과를 폐기하고

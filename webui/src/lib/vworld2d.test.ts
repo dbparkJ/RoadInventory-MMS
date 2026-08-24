@@ -255,7 +255,11 @@ describe('VWorld 2D general-map adapter', () => {
         type: 'FeatureCollection' as const,
         features: [{
           type: 'Feature' as const,
-          properties: { track_color: '#579cf2' },
+          properties: {
+            track_id: 'track-selected',
+            track_color: '#579cf2',
+            selected: 1,
+          },
           geometry: { type: 'LineString' as const, coordinates: [[127, 37], [127.1, 37.1]] },
         }],
       },
@@ -286,6 +290,7 @@ describe('VWorld 2D general-map adapter', () => {
       },
       onFrame: vi.fn(),
       onOverlay: vi.fn(),
+      onTrack: vi.fn(),
     }
 
     const dataSource = createVWorld2DDataSource(runtime)
@@ -303,6 +308,17 @@ describe('VWorld 2D general-map adapter', () => {
       (feature) => feature.get('overlay_feature_id') === 'feature-7',
     )
     expect(JSON.stringify(selectedOverlayFeature?.style)).toContain(MAP_SELECTED_FEATURE_COLOR)
+
+    const selectedRouteFeature = sdk.source.features.find(
+      (feature) => feature.get('track_id') === 'track-selected',
+    )
+    expect(selectedRouteFeature?.style).toMatchObject({
+      value: { stroke: { value: { width: 7 } } },
+    })
+
+    sdk.map.picked = selectedRouteFeature ?? null
+    handleVWorld2DClick(runtime, { pixel: [1, 1], coordinate: [1270, 370] }, input)
+    expect(input.onTrack).toHaveBeenCalledWith('track-selected')
 
     sdk.map.picked = sdk.source.features.find((feature) => feature.get('frame_id') === 'frame-1') ?? null
     handleVWorld2DClick(runtime, { pixel: [1, 1], coordinate: [1270, 370] }, input)

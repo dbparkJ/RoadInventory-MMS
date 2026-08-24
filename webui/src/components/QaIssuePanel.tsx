@@ -1,7 +1,7 @@
 import { AlertCircle, CheckCircle2, LoaderCircle, Play, RefreshCcw, ShieldCheck, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
-import { isTextEntryTarget } from '../lib/frameNavigation'
+import { hasOpenModalDialog, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 import type { QaIssue, QaIssueSeverity, QaIssueStatus } from '../types'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
 import { useOptionalReviewWorkspace } from './ReviewContext'
@@ -28,27 +28,45 @@ export function QaIssuePanel() {
   const [updating, setUpdating] = useState(false)
   const [error, setError] = useState('')
   const requestRef = useRef(0)
+  const requestControllerRef = useRef<AbortController | null>(null)
+  const runRequestRef = useRef(0)
+  const runControllerRef = useRef<AbortController | null>(null)
+  const patchRequestRef = useRef(0)
+  const patchControllerRef = useRef<AbortController | null>(null)
+  const latestLoadIssuesRef = useRef<((offset?: number, append?: boolean) => Promise<void>) | null>(null)
+  const sessionId = review?.session?.id ?? ''
+  const activeSessionIdRef = useRef(sessionId)
+  activeSessionIdRef.current = sessionId
   const selectedIssue = issues.find((issue) => issue.id === selectedIssueId) ?? null
   const enabled = Boolean(review?.enabled && review.session)
 
   const loadIssues = useCallback(async (offset = 0, append = false) => {
-    if (!review?.session) return
+    if (!sessionId) return
     const requestId = requestRef.current + 1
     requestRef.current = requestId
+    requestControllerRef.current?.abort()
+    const controller = new AbortController()
+    requestControllerRef.current = controller
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      requestRef.current === requestId &&
+      activeSessionIdRef.current === sessionId
+    )
     setLoading(true)
     setError('')
     if (!append) setNextOffset(null)
     try {
       const response = await api.qaIssues(
-        review.session.id,
+        sessionId,
         {
           offset,
           limit: 200,
           status: statusFilter,
           severity: severityFilter || undefined,
         },
+        controller.signal,
       )
-      if (requestRef.current !== requestId) return
+      if (!isCurrentRequest()) return
       setIssues((current) => append
         ? [...current, ...response.items.filter((issue) => !current.some((known) => known.id === issue.id))]
         : response.items)
@@ -60,12 +78,35 @@ export function QaIssuePanel() {
         )
       }
     } catch (reason) {
-      if (requestRef.current !== requestId) return
+      if (!isCurrentRequest()) return
       setError(reason instanceof Error ? reason.message : 'QA 오류를 불러오지 못했습니다.')
     } finally {
-      if (requestRef.current === requestId) setLoading(false)
+      if (isCurrentRequest()) setLoading(false)
+      if (requestControllerRef.current === controller) requestControllerRef.current = null
     }
-  }, [review?.session, severityFilter, statusFilter])
+  }, [sessionId, severityFilter, statusFilter])
+  latestLoadIssuesRef.current = loadIssues
+
+  useEffect(() => {
+    requestRef.current += 1
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = null
+    runRequestRef.current += 1
+    runControllerRef.current?.abort()
+    runControllerRef.current = null
+    patchRequestRef.current += 1
+    patchControllerRef.current?.abort()
+    patchControllerRef.current = null
+    setIssues([])
+    setTotal(0)
+    setNextOffset(null)
+    setSelectedIssueId('')
+    setOverrideReason('')
+    setLoading(false)
+    setRunning(false)
+    setUpdating(false)
+    setError('')
+  }, [sessionId])
 
   useEffect(() => {
     if (!open || !enabled) return
@@ -75,15 +116,33 @@ export function QaIssuePanel() {
   useEffect(() => {
     if (enabled) return
     requestRef.current += 1
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = null
+    runRequestRef.current += 1
+    runControllerRef.current?.abort()
+    runControllerRef.current = null
+    patchRequestRef.current += 1
+    patchControllerRef.current?.abort()
+    patchControllerRef.current = null
     setOpen(false)
     setIssues([])
     setTotal(0)
     setNextOffset(null)
   }, [enabled])
 
+  useEffect(
+    () => () => {
+      requestControllerRef.current?.abort()
+      runControllerRef.current?.abort()
+      patchControllerRef.current?.abort()
+    },
+    [],
+  )
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
+        hasOpenModalDialog() ||
         event.defaultPrevented ||
         event.repeat ||
         event.altKey ||
@@ -91,7 +150,7 @@ export function QaIssuePanel() {
         event.metaKey ||
         event.shiftKey ||
         event.code !== 'KeyQ' ||
-        isTextEntryTarget(event.target) ||
+        isWorkspaceShortcutBlockedTarget(event.target) ||
         !enabled
       ) return
       event.preventDefault()
@@ -102,16 +161,31 @@ export function QaIssuePanel() {
   }, [enabled])
 
   const runQa = async () => {
-    if (!review?.session || running) return
+    if (!review?.session || !sessionId || running) return
+    const requestId = runRequestRef.current + 1
+    runRequestRef.current = requestId
+    runControllerRef.current?.abort()
+    const controller = new AbortController()
+    runControllerRef.current = controller
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      runRequestRef.current === requestId &&
+      activeSessionIdRef.current === sessionId
+    )
     setRunning(true)
     setError('')
     try {
-      await api.runQa(review.session.id)
-      await loadIssues()
+      const result = await api.runQa(sessionId, controller.signal)
+      if (!isCurrentRequest()) return
+      await review.recordQaRun(result, sessionId)
+      if (!isCurrentRequest()) return
+      await latestLoadIssuesRef.current?.()
     } catch (reason) {
+      if (!isCurrentRequest()) return
       setError(reason instanceof Error ? reason.message : 'QA 검사를 실행하지 못했습니다.')
     } finally {
-      setRunning(false)
+      if (isCurrentRequest()) setRunning(false)
+      if (runControllerRef.current === controller) runControllerRef.current = null
     }
   }
 
@@ -138,18 +212,33 @@ export function QaIssuePanel() {
       setError('경고를 무시하려면 3자 이상의 사유를 입력해 주세요.')
       return
     }
+    const issue = selectedIssue
+    const requestSessionId = sessionId
+    const requestId = patchRequestRef.current + 1
+    patchRequestRef.current = requestId
+    patchControllerRef.current?.abort()
+    const controller = new AbortController()
+    patchControllerRef.current = controller
+    const isCurrentRequest = () => (
+      !controller.signal.aborted &&
+      patchRequestRef.current === requestId &&
+      activeSessionIdRef.current === requestSessionId
+    )
     setUpdating(true)
     setError('')
     try {
-      await api.patchQaIssue(selectedIssue.id, {
+      await api.patchQaIssue(issue.id, {
         status,
         ...(status === 'dismissed' ? { override_reason: reason } : {}),
-      })
-      await loadIssues()
+      }, controller.signal)
+      if (!isCurrentRequest()) return
+      await latestLoadIssuesRef.current?.()
     } catch (reason) {
+      if (!isCurrentRequest()) return
       setError(reason instanceof Error ? reason.message : 'QA 상태를 저장하지 못했습니다.')
     } finally {
-      setUpdating(false)
+      if (isCurrentRequest()) setUpdating(false)
+      if (patchControllerRef.current === controller) patchControllerRef.current = null
     }
   }
 

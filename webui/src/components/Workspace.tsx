@@ -1,9 +1,6 @@
 import {
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronUp,
-  CircleGauge,
   CloudOff,
   Eye,
   EyeOff,
@@ -21,7 +18,7 @@ import {
 } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api } from '../lib/api'
-import { frameNavigationDirection } from '../lib/frameNavigation'
+import { frameNavigationDirection, hasOpenModalDialog } from '../lib/frameNavigation'
 import type { PanoramaHoverProjection } from '../lib/panoramaProjection'
 import { TRACK_COLORS } from '../lib/route'
 import { naturalSortTracks } from '../lib/tracks'
@@ -30,10 +27,6 @@ import type { DatasetSummary, Frame, FrameRange, RoutePoint, SurveySegment } fro
 import type { MapMode } from '../views/MapView'
 import { DetachablePanel, type DetachablePanelHandle } from './DetachablePanel'
 import { useOptionalOverlayWorkspace } from './OverlayContext'
-import { ReviewQueue } from './ReviewQueue'
-import { ObjectTemplatePanel } from './ObjectTemplatePanel'
-import { ProposalInspector } from './ProposalInspector'
-import { QaIssuePanel } from './QaIssuePanel'
 
 export const OPEN_POINT_CLOUD_EVENT = 'mms-open-pointcloud'
 
@@ -48,6 +41,7 @@ interface WorkspaceProps {
   frames: Frame[]
   frame: Frame | null
   selectedTrack?: string
+  visibleTrackIds?: ReadonlySet<string>
   frameRange: FrameRange | null
   route: RoutePoint[]
   routeLoading: boolean
@@ -67,6 +61,8 @@ interface WorkspaceProps {
   onTogglePointCloud: () => void
   onToggleAttributeTable?: () => void
   onFrameChange: (frame: Frame) => void
+  onTrackChange?: (trackId: string) => void
+  onVisibleTrackIdsChange?: (trackIds: ReadonlySet<string>) => void
   onMoveFrame: (direction: -1 | 1) => void
   /** @deprecated 작업 설정은 통합 설정 패널로 이동했습니다. */
   onToggleInspector?: () => void
@@ -80,6 +76,7 @@ export function Workspace({
   frames,
   frame,
   selectedTrack,
+  visibleTrackIds: controlledVisibleTrackIds,
   frameRange,
   route,
   routeLoading,
@@ -97,6 +94,8 @@ export function Workspace({
   onTogglePointCloud,
   onToggleAttributeTable,
   onFrameChange,
+  onTrackChange,
+  onVisibleTrackIdsChange,
   onMoveFrame,
   onOpenSource,
   onUseDemo,
@@ -113,15 +112,22 @@ export function Workspace({
   const [trackVisibility, setTrackVisibility] = useState<{
     catalogueKey: string
     hiddenTrackIds: ReadonlySet<string>
-  }>(() => ({ catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set() }))
+    mode: 'all' | 'custom'
+  }>(() => ({ catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set(), mode: 'all' }))
+  const localAllTracksSelected =
+    trackVisibility.catalogueKey !== trackCatalogueKey || trackVisibility.mode === 'all'
   const hiddenTrackIds =
     trackVisibility.catalogueKey === trackCatalogueKey
       ? trackVisibility.hiddenTrackIds
       : new Set<string>()
-  const visibleTrackIds = useMemo(
+  const localVisibleTrackIds = useMemo(
     () => new Set(sortedTracks.filter((track) => !hiddenTrackIds.has(track.id)).map((track) => track.id)),
     [hiddenTrackIds, sortedTracks],
   )
+  const visibleTrackIds = controlledVisibleTrackIds ?? localVisibleTrackIds
+  const allTracksSelected = controlledVisibleTrackIds
+    ? sortedTracks.length > 0 && sortedTracks.every((track) => controlledVisibleTrackIds.has(track.id))
+    : localAllTracksSelected
   const trackOrder = useMemo(() => sortedTracks.map((track) => track.id), [sortedTracks])
   const [layerCardCollapsed, setLayerCardCollapsed] = useState(false)
   const [surveySegments, setSurveySegments] = useState<SurveySegment[]>([])
@@ -153,7 +159,7 @@ export function Workspace({
     setTrackVisibility((current) =>
       current.catalogueKey === trackCatalogueKey
         ? current
-        : { catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set() },
+        : { catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set(), mode: 'all' },
     )
   }, [trackCatalogueKey])
 
@@ -307,18 +313,46 @@ export function Workspace({
   }
 
   const toggleTrackLayer = (trackId: string) => {
+    if (onVisibleTrackIdsChange) {
+      const next = new Set(visibleTrackIds)
+      if (allTracksSelected) {
+        next.clear()
+        next.add(trackId)
+      } else if (next.has(trackId)) next.delete(trackId)
+      else next.add(trackId)
+      onVisibleTrackIdsChange(next)
+      return
+    }
     setTrackVisibility((current) => {
-      const nextHidden = new Set(
-        current.catalogueKey === trackCatalogueKey ? current.hiddenTrackIds : [],
-      )
+      const currentIsAll = current.catalogueKey !== trackCatalogueKey || current.mode === 'all'
+      if (currentIsAll) {
+        return {
+          catalogueKey: trackCatalogueKey,
+          hiddenTrackIds: new Set(
+            sortedTracks.filter((track) => track.id !== trackId).map((track) => track.id),
+          ),
+          mode: 'custom',
+        }
+      }
+
+      const nextHidden = new Set(current.hiddenTrackIds)
       if (nextHidden.has(trackId)) nextHidden.delete(trackId)
       else nextHidden.add(trackId)
-      return { catalogueKey: trackCatalogueKey, hiddenTrackIds: nextHidden }
+      return { catalogueKey: trackCatalogueKey, hiddenTrackIds: nextHidden, mode: 'custom' }
     })
+  }
+
+  const showAllTrackLayers = () => {
+    if (onVisibleTrackIdsChange) {
+      onVisibleTrackIdsChange(new Set(sortedTracks.map((track) => track.id)))
+      return
+    }
+    setTrackVisibility({ catalogueKey: trackCatalogueKey, hiddenTrackIds: new Set(), mode: 'all' })
   }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (hasOpenModalDialog()) return
       const direction = frameNavigationDirection(event)
       if (direction === -1 && canMovePrevious) {
         event.preventDefault()
@@ -419,12 +453,6 @@ export function Workspace({
               데모 데이터
             </span>
           )}
-          {frame && (
-            <span className="context-badge">
-              <CircleGauge size={13} />
-              Frame {String(frame.index + 1).padStart(4, '0')}
-            </span>
-          )}
           {externalAction}
         </div>
       </header>
@@ -455,7 +483,6 @@ export function Workspace({
                 frames={frames}
                 selectedFrame={frame}
                 activeTrackId={selectedTrack}
-                showAllTracks={settings.showAllMapTracks}
                 visibleTrackIds={visibleTrackIds}
                 trackOrder={trackOrder}
                 frameRange={frameRange}
@@ -463,6 +490,7 @@ export function Workspace({
                 mapMode={mapMode}
                 onMapModeChange={setMapMode}
                 onSelectFrame={onFrameChange}
+                onSelectTrack={onTrackChange}
                 surveySegments={visibleSurveySegments}
                 surveyDraft={surveyDraft}
                 surveyDraftColor={surveyDraftColor}
@@ -500,33 +528,66 @@ export function Workspace({
               </header>
               {!layerCardCollapsed && (
                 <div id="map-layer-quick-list" className="map-layer-quick-list">
+                  {sortedTracks.length > 0 && (
+                    <button
+                      type="button"
+                      className={allTracksSelected ? 'active' : ''}
+                      aria-label="전체 트랙 모두 표시"
+                      aria-pressed={allTracksSelected}
+                      onClick={showAllTrackLayers}
+                      title="전체 트랙 모두 표시"
+                    >
+                      <i className="map-layer-track-swatch">
+                        <Route size={11} />
+                      </i>
+                      <span>전체 트랙</span>
+                      <small>{sortedTracks.length.toLocaleString('ko-KR')}개</small>
+                      {allTracksSelected ? <Eye size={13} /> : <EyeOff size={13} />}
+                    </button>
+                  )}
                   {sortedTracks.map((track, index) => {
                     const visible = visibleTrackIds.has(track.id)
                     const current = selectedTrack === track.id
                     const trackColor = TRACK_COLORS[index % TRACK_COLORS.length]
+                    const visibilityAction = allTracksSelected
+                      ? '이 트랙만 표시'
+                      : visible
+                        ? '숨기기'
+                        : '추가 표시'
                     return (
-                      <button
-                        type="button"
+                      <div
                         key={`track:${track.id}`}
-                        className={`${visible ? 'active' : ''} ${current ? 'current-track' : ''}`.trim()}
-                        aria-pressed={visible}
-                        onClick={() => toggleTrackLayer(track.id)}
-                        title={`${track.name || track.id} 트랙 ${visible ? '숨기기' : '표시'}${
-                          current ? ' (현재 작업 트랙)' : ''
-                        }`}
+                        className={`map-layer-track-row ${visible ? 'active' : ''} ${current ? 'current-track' : ''}`.trim()}
                       >
-                        <i
-                          className="map-layer-track-swatch"
-                          style={{ color: trackColor, borderColor: trackColor }}
+                        <button
+                          type="button"
+                          className="map-layer-track-select"
+                          aria-current={current ? 'true' : undefined}
+                          onClick={() => onTrackChange?.(track.id)}
+                          title={`${track.name || track.id} 작업 구간 선택`}
                         >
-                          <Route size={11} />
-                        </i>
-                        <span>{track.name || track.id}</span>
-                        <small>
-                          {current ? '현재 · ' : ''}{track.frame_count.toLocaleString('ko-KR')}
-                        </small>
-                        {visible ? <Eye size={13} /> : <EyeOff size={13} />}
-                      </button>
+                          <i
+                            className="map-layer-track-swatch"
+                            style={{ color: trackColor, borderColor: trackColor }}
+                          >
+                            <Route size={11} />
+                          </i>
+                          <span>{track.name || track.id}</span>
+                          <small>
+                            {current ? '현재 · ' : ''}{track.frame_count.toLocaleString('ko-KR')}
+                          </small>
+                        </button>
+                        <button
+                          type="button"
+                          className="map-layer-track-visibility"
+                          aria-label={`${track.name || track.id} 트랙 ${visibilityAction}`}
+                          aria-pressed={visible}
+                          onClick={() => toggleTrackLayer(track.id)}
+                          title={`${track.name || track.id} 트랙 ${visibilityAction}`}
+                        >
+                          {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                        </button>
+                      </div>
                     )
                   })}
                   {overlay?.layers.map((layer) => {
@@ -681,20 +742,12 @@ export function Workspace({
                           detectionRevisionKey={detectionRevisionKey}
                           forwardOffsetDeg={settings.panoramaForwardOffsetDeg}
                           quality={settings.panoramaDefaultQuality}
-                          pointOverlayEnabled={settings.panoramaPointOverlayEnabled}
-                          panoramaOpacity={settings.panoramaImageOpacity}
                           maxOverlayDistanceM={settings.detectionVisibilityDistanceM}
                           poleBaseMarkerColor={settings.poleBaseMarkerColor}
                           poleBaseMarkerSizeM={settings.poleBaseMarkerSizeM}
                           linkedHoverPoint={hoveredPanoramaPoint}
                           onQualityChange={(quality) =>
                             onSettingsChange?.({ panoramaDefaultQuality: quality })
-                          }
-                          onPointOverlayEnabledChange={(enabled) =>
-                            onSettingsChange?.({ panoramaPointOverlayEnabled: enabled })
-                          }
-                          onPanoramaOpacityChange={(opacity) =>
-                            onSettingsChange?.({ panoramaImageOpacity: opacity })
                           }
                           onPreviousFrame={() => onMoveFrame(-1)}
                           onNextFrame={() => onMoveFrame(1)}
@@ -754,37 +807,6 @@ export function Workspace({
           </>
         )}
 
-        <ReviewQueue />
-        <ObjectTemplatePanel />
-        <ProposalInspector />
-        <QaIssuePanel />
-
-        {dataset && frame && (
-          <div className="frame-navigator">
-            <button
-              type="button"
-              disabled={!canMovePrevious}
-              onClick={() => onMoveFrame(-1)}
-              aria-label="이전 프레임"
-              title="이전 프레임 (← 또는 A)"
-            >
-              <ChevronLeft size={17} />
-            </button>
-            <span>
-              <strong>{String(frame.index + 1).padStart(4, '0')}</strong>
-              <small>/ {dataset.frame_count.toLocaleString('ko-KR')}</small>
-            </span>
-            <button
-              type="button"
-              disabled={!canMoveNext}
-              onClick={() => onMoveFrame(1)}
-              aria-label="다음 프레임"
-              title="다음 프레임 (→ 또는 D)"
-            >
-              <ChevronRight size={17} />
-            </button>
-          </div>
-        )}
       </div>
     </main>
   )

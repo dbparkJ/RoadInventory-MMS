@@ -10,6 +10,7 @@ import {
   pickedEntityId,
   pickedEntityIdsAtPosition,
   renderVWorldOverlay,
+  renderVWorldRoute,
   renderVWorldScene,
   selectedFrameDistanceScale,
   startVWorldMap,
@@ -348,6 +349,38 @@ describe('VWorld WebGL 3.0 adapter', () => {
     expect((selectedFrame?.point as { scaleByDistance?: unknown }).scaleByDistance).toMatchObject(
       selectedFrameDistanceScale(),
     )
+  })
+
+  it('returns route click targets and emphasizes the selected track', () => {
+    const { runtime, source, collection } = fakeRuntime()
+    const onTrack = vi.fn()
+
+    const targets = renderVWorldRoute(runtime, source, {
+      type: 'FeatureCollection',
+      features: [{
+        type: 'Feature',
+        properties: {
+          track_id: 'track-selected',
+          track_color: '#579cf2',
+          selected: 1,
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates: [[127, 37], [127.1, 37.1]],
+        },
+      }],
+    }, onTrack)
+
+    const halo = collection.values.find((entity) => entity.id === 'route:0:halo')
+    const route = collection.values.find((entity) => entity.id === 'route:0')
+    expect((halo?.polyline as { width?: number }).width).toBe(12)
+    expect((route?.polyline as { width?: number }).width).toBe(7)
+
+    targets.get('route:0:halo')?.()
+    targets.get('route:0')?.()
+    expect(onTrack).toHaveBeenCalledTimes(2)
+    expect(onTrack).toHaveBeenNthCalledWith(1, 'track-selected')
+    expect(onTrack).toHaveBeenNthCalledWith(2, 'track-selected')
   })
 
   it('maps every rendered SHP entity back to its hover properties', () => {

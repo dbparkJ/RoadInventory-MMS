@@ -1,13 +1,20 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as THREE from 'three'
+import type {
+  ManualObjectContextValue,
+  ManualProposalReadyData,
+  ManualProposalState,
+} from '../components/ManualObjectContext'
 import { api } from '../lib/api'
+import { POINT_CLOUD_DETECTION_FOCUS_EVENT } from '../lib/detectionFocus'
 import type { Frame, PanoramaProjectionMetadata } from '../types'
 import PanoramaView, {
   deduplicatePanoramaDetectionBoxes,
   nearestPanoramaPointIndex,
   panoramaDetectionBox,
   panoramaDetectionBoxContainsUv,
+  panoramaDetectionHitsAtUv,
   panoramaDetectionPointRadius,
   panoramaDetectionModelKey,
   panoramaDetectionModels,
@@ -15,6 +22,7 @@ import PanoramaView, {
   panoramaForwardYaw,
   panoramaFovAfterWheel,
   panoramaOverlayAtUv,
+  PanoramaManualProposalStatus,
   panoramaPoleBaseMarkerRadiusPx,
   panoramaPoleBasePreviewProjection,
   panoramaRayYaw,
@@ -249,6 +257,91 @@ const PROJECTION_METADATA: PanoramaProjectionMetadata = {
   up: [0, 0, 1],
   yaw_offset_deg: 0,
   pitch_offset_deg: 0,
+}
+
+const MANUAL_READY_DATA: ManualProposalReadyData = {
+  frameId: FRAME.id,
+  targetLayerId: 'traffic-layer',
+  templateId: 'TRAFFIC_SIGN',
+  geometry: {
+    type: 'equirectangular_bbox',
+    u_intervals: [[0.2, 0.4]],
+    v_min: 0.3,
+    v_max: 0.6,
+    image_width: 4_096,
+    image_height: 2_048,
+  },
+  observation: {
+    observation_id: 'observation-1',
+    dataset_id: 'dataset-1',
+    frame_id: FRAME.id,
+    view_type: 'panorama',
+    class_name: 'TRAFFIC_SIGN',
+    geometry_2d: {
+      type: 'equirectangular_bbox',
+      u_intervals: [[0.2, 0.4]],
+      v_min: 0.3,
+      v_max: 0.6,
+      image_width: 4_096,
+      image_height: 2_048,
+    },
+    created_by: 'operator-local',
+  },
+  proposal: {
+    proposal_id: 'proposal-1',
+    tool_id: 'panorama_bbox_point_v1',
+    status: 'auto',
+    coordinate_space: 'dataset',
+    geometry: { type: 'Point', coordinates: [10, 20, 30] },
+    property_patch: {},
+    quality: { score: 0.9 },
+    reason_codes: [],
+    evidence: { frame_id: FRAME.id },
+  },
+  duplicate: {
+    exact_duplicate: false,
+    blocked: false,
+    candidates: [],
+    warning_count: 0,
+    radius_m: 0.75,
+  },
+  idempotencyKey: 'manual_commit_fixture',
+  reviewTaskSnapshot: null,
+}
+
+function manualWorkspaceForStatus(
+  proposalState: ManualProposalState,
+  overrides: Partial<ManualObjectContextValue> = {},
+): ManualObjectContextValue {
+  return {
+    proposalState,
+    allowNearDuplicate: false,
+    duplicateOverrideReason: '',
+    missingRequiredFields: [],
+    properties: {},
+    template: {
+      template_id: 'TRAFFIC_SIGN',
+      class_name: 'TRAFFIC_SIGN',
+      geometry_type: 'Point',
+      tool_id: 'panorama_bbox_point_v1',
+      duplicate_radius_m: 0.75,
+      continuous: true,
+      required_semantics: ['class'],
+      relation_semantics: [],
+    },
+    targetLayer: null,
+    setProperty: vi.fn(),
+    setAllowNearDuplicate: vi.fn(),
+    setDuplicateOverrideReason: vi.fn(),
+    submitStagedBbox: vi.fn(async () => undefined),
+    retryProposal: vi.fn(async () => undefined),
+    retryBbox: vi.fn(),
+    cancel: vi.fn(),
+    confirmProposal: vi.fn(async () => undefined),
+    canConfirmAndNext: false,
+    reviewTaskLinkChanged: false,
+    ...overrides,
+  } as unknown as ManualObjectContextValue
 }
 
 type PanoramaResult =
@@ -642,6 +735,9 @@ describe('panoramaDetectionBox', () => {
       featureId: 'det-1',
       properties: { class_nm: 'traffic_sign', conf: 0.91 },
       color: '#ffb84d',
+      identityKey: 'source-model-a\u0000det-1',
+      sourceId: 'source-model-a',
+      observationId: 'det-1',
     })
 
     const linked = { ...box, featureId: 'feature-7' }
@@ -718,6 +814,186 @@ describe('panoramaDetectionBox', () => {
       featureId: 'feature-7',
       color: '#22c55e',
     })
+
+    const serverResolved = reconcilePanoramaDetectionBoxes([{
+      ...raw,
+      layerId: 'hidden-layer',
+      featureId: 'hidden-feature',
+      overlayResolution: 'matched',
+    }], [representative])
+    expect(serverResolved[0]).toMatchObject({
+      layerId: 'hidden-layer',
+      featureId: 'hidden-feature',
+      layerName: 'YOLO · model-a.pt',
+    })
+
+    const authoritativeMiss = reconcilePanoramaDetectionBoxes([{
+      ...raw,
+      overlayResolution: 'not_found',
+    }], [representative])
+    expect(authoritativeMiss[0].layerId).toBeUndefined()
+    expect(authoritativeMiss[0].featureId).toBeUndefined()
+  })
+
+  it('returns every overlapping same-frame detection in stable hit order', () => {
+    const common: Omit<RenderPanoramaDetectionBox, 'sourceId' | 'observationId'> = {
+      layerName: 'YOLO · signals.pt',
+      properties: { class_nm: 'traffic_signal' },
+      color: '#ffb84d',
+      selected: false,
+      detectionBox: {
+        left: 400,
+        top: 150,
+        right: 600,
+        bottom: 350,
+        panoramaWidth: 1000,
+        panoramaHeight: 500,
+        label: 'traffic_signal',
+      },
+    }
+    const hits = panoramaDetectionHitsAtUv([
+      { ...common, sourceId: 'source-a', observationId: 'det-0' },
+      {
+        ...common,
+        sourceId: 'source-a',
+        observationId: 'det-1',
+        detectionBox: { ...common.detectionBox, left: 450, right: 550 },
+      },
+    ], 0.5, 0.5)
+
+    expect(hits.map((hit) => hit.observationId)).toEqual(['det-1', 'det-0'])
+    expect(hits.map((hit) => hit.identityKey)).toEqual([
+      'source-a\u0000det-1',
+      'source-a\u0000det-0',
+    ])
+  })
+})
+
+describe('PanoramaManualProposalStatus', () => {
+  it('keeps retry, redraw, and cancel actions inside a detached panorama document', () => {
+    const popup = document.createElement('iframe')
+    document.body.appendChild(popup)
+    const popupDocument = popup.contentDocument!
+    const container = popupDocument.createElement('div')
+    popupDocument.body.appendChild(container)
+    const manual = manualWorkspaceForStatus({
+      status: 'error',
+      frameId: FRAME.id,
+      geometry: MANUAL_READY_DATA.geometry,
+      observation: MANUAL_READY_DATA.observation,
+      message: '3D 위치를 계산하지 못했습니다.',
+      reasonCodes: ['NO_VALID_POINT'],
+    })
+    const view = render(
+      <PanoramaManualProposalStatus manualObject={manual} currentFrameId={FRAME.id} />,
+      { container },
+    )
+
+    expect(view.getByRole('alert')).toHaveTextContent('3D 위치를 계산하지 못했습니다.')
+    fireEvent.click(view.getByRole('button', { name: '계산 재시도' }))
+    fireEvent.click(view.getByRole('button', { name: 'bbox 다시 그리기' }))
+    fireEvent.click(view.getByRole('button', { name: '취소' }))
+
+    expect(manual.retryProposal).toHaveBeenCalledTimes(1)
+    expect(manual.retryBbox).toHaveBeenCalledTimes(1)
+    expect(manual.cancel).toHaveBeenCalledTimes(1)
+    expect(view.getByRole('alert').ownerDocument).toBe(popupDocument)
+    view.unmount()
+    popup.remove()
+  })
+
+  it('shows bounded catalog progress and lets the operator cancel it', () => {
+    const manual = manualWorkspaceForStatus({
+      status: 'loading',
+      frameId: FRAME.id,
+      geometry: MANUAL_READY_DATA.geometry,
+      observation: MANUAL_READY_DATA.observation,
+      preparingAttempt: 3,
+      preparingMaxAttempts: 8,
+    })
+    render(<PanoramaManualProposalStatus manualObject={manual} currentFrameId={FRAME.id} />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('원본 점군 준비 중 · 자동 재시도 3/8')
+    fireEvent.click(screen.getByRole('button', { name: '취소' }))
+    expect(manual.cancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('confirms or commits-and-advances a ready proposal without leaving the panorama', () => {
+    const manual = manualWorkspaceForStatus(
+      { status: 'ready', data: MANUAL_READY_DATA },
+      { canConfirmAndNext: true },
+    )
+    render(<PanoramaManualProposalStatus manualObject={manual} currentFrameId={FRAME.id} />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('3D 제안 준비 · 10.000, 20.000, 30.000')
+    fireEvent.click(screen.getByRole('button', { name: '확인' }))
+    fireEvent.click(screen.getByRole('button', { name: '저장 후 다음' }))
+    expect(manual.confirmProposal).toHaveBeenNthCalledWith(1, false)
+    expect(manual.confirmProposal).toHaveBeenNthCalledWith(2, true)
+  })
+
+  it('shows and blocks a ready proposal when the review task changed', () => {
+    const manual = manualWorkspaceForStatus(
+      { status: 'ready', data: MANUAL_READY_DATA },
+      { reviewTaskLinkChanged: true },
+    )
+    render(<PanoramaManualProposalStatus manualObject={manual} currentFrameId={FRAME.id} />)
+
+    expect(screen.getByRole('alert')).toHaveTextContent('검수 항목이 바뀌었습니다')
+    expect(screen.getByRole('button', { name: '확인' })).toBeDisabled()
+    expect(manual.confirmProposal).not.toHaveBeenCalled()
+  })
+
+  it('preserves numeric and domain property types in detached required-field inputs', () => {
+    const setProperty = vi.fn()
+    const manual = manualWorkspaceForStatus(
+      { status: 'ready', data: MANUAL_READY_DATA },
+      {
+        missingRequiredFields: ['COUNT', 'KIND'],
+        setProperty,
+        targetLayer: {
+          id: 'traffic-layer',
+          dataset_id: 'dataset-1',
+          name: 'Traffic signs',
+          geometry_type: 'Point',
+          feature_count: 0,
+          revision: 1,
+          fields: [
+            { name: 'COUNT', type: 'N', decimal: 0, required: true },
+            { name: 'KIND', type: 'C', required: true },
+          ],
+        },
+        template: {
+          template_id: 'TRAFFIC_SIGN',
+          class_name: 'TRAFFIC_SIGN',
+          geometry_type: 'Point',
+          tool_id: 'panorama_bbox_point_v1',
+          duplicate_radius_m: 0.75,
+          continuous: true,
+          required_semantics: ['class'],
+          relation_semantics: [],
+          domains: { KIND: [1, 'warning'] },
+        },
+      },
+    )
+    render(<PanoramaManualProposalStatus manualObject={manual} currentFrameId={FRAME.id} />)
+
+    const count = screen.getByRole('spinbutton', { name: '파노라마 필수 속성 COUNT' })
+    const kind = screen.getByRole('combobox', { name: '파노라마 필수 속성 KIND' })
+    fireEvent.change(count, { target: { value: '12' } })
+    fireEvent.change(kind, { target: { value: '1' } })
+
+    expect(setProperty).toHaveBeenNthCalledWith(1, 'COUNT', 12)
+    expect(setProperty).toHaveBeenNthCalledWith(2, 'KIND', 1)
+    expect(screen.getByRole('button', { name: '확인' })).toBeDisabled()
+  })
+
+  it('does not expose a proposal from a stale frame', () => {
+    const manual = manualWorkspaceForStatus({ status: 'ready', data: MANUAL_READY_DATA })
+    const { container } = render(
+      <PanoramaManualProposalStatus manualObject={manual} currentFrameId={NEXT_FRAME.id} />,
+    )
+    expect(container).toBeEmptyDOMElement()
   })
 })
 
@@ -869,7 +1145,27 @@ describe('PanoramaView frame navigation', () => {
     expect(stage).not.toHaveClass('dragging')
   })
 
-  it('pins a YOLO hit instead of navigating the scene behind it', async () => {
+  it.each([
+    {
+      name: 'selects a server-matched YOLO hit immediately while keeping the pinned edit action',
+      overlayMatch: {
+        layer_id: 'hidden-layer',
+        feature_id: 'feature-7',
+        overlay_resolution: 'matched' as const,
+      },
+      expectedSelection: { layerId: 'hidden-layer', featureId: 'feature-7' },
+    },
+    {
+      name: 'keeps an unmatched YOLO hit pinned without selecting an unrelated feature',
+      overlayMatch: {},
+      expectedSelection: null,
+    },
+    {
+      name: 'fails closed when a malformed match omits the feature id',
+      overlayMatch: { layer_id: 'broken-layer' },
+      expectedSelection: null,
+    },
+  ])('$name', async ({ overlayMatch, expectedSelection }) => {
     class PointerEventMock extends MouseEvent {
       readonly isPrimary: boolean
       readonly pointerId: number
@@ -883,6 +1179,21 @@ describe('PanoramaView frame navigation', () => {
       }
     }
     vi.stubGlobal('PointerEvent', PointerEventMock)
+    const selectFeature = vi.fn()
+    const pointCloudFocusListener = vi.fn()
+    window.addEventListener(
+      POINT_CLOUD_DETECTION_FOCUS_EVENT,
+      pointCloudFocusListener,
+    )
+    overlayWorkspaceMock.current = {
+      features: {},
+      layerColor: vi.fn(() => '#22c55e'),
+      layers: [],
+      pickMode: false,
+      selectFeature,
+      selected: null,
+      visibleLayerIds: new Set(),
+    }
     vi.mocked(api.panorama).mockResolvedValueOnce({ kind: 'url', value: '/pano.jpg' })
     vi.mocked(api.frameDetections).mockResolvedValueOnce({
       dataset_id: 'dataset-1',
@@ -893,6 +1204,7 @@ describe('PanoramaView frame navigation', () => {
         source_id: 'model-a',
         source_name: 'traffic-sign.pt',
         observation_id: 'det-1',
+        ...overlayMatch,
         properties: {
           img_name: FRAME.image_name,
           class_nm: 'traffic_sign',
@@ -958,16 +1270,39 @@ describe('PanoramaView frame navigation', () => {
     fireEvent.pointerUp(canvas, { button: 0, clientX: 500, clientY: 250 })
 
     expect(onFrameChange).not.toHaveBeenCalled()
+    expect(pointCloudFocusListener).toHaveBeenCalledOnce()
+    expect(
+      (pointCloudFocusListener.mock.calls[0][0] as CustomEvent).detail,
+    ).toEqual({
+      datasetId: 'dataset-1',
+      frameId: FRAME.id,
+      sourceId: 'model-a',
+      observationId: 'det-1',
+    })
     expect(screen.getByRole('dialog')).toHaveTextContent('traffic_sign')
+    if (expectedSelection) {
+      expect(selectFeature).toHaveBeenCalledOnce()
+      expect(selectFeature).toHaveBeenCalledWith(expectedSelection, { navigate: false })
+      expect(screen.getByRole('button', { name: '자세히' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '수정하기' })).toBeEnabled()
+    } else {
+      expect(selectFeature).not.toHaveBeenCalled()
+      expect(screen.getByRole('button', { name: '자세히' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '수정하기' })).toBeDisabled()
+    }
     expect(container.querySelector('.panorama-scene-navigation-hint')).not.toBeInTheDocument()
+    window.removeEventListener(
+      POINT_CLOUD_DETECTION_FOCUS_EVENT,
+      pointCloudFocusListener,
+    )
   })
 
-  it('shows the reverse-geocoded address while retaining frame coordinates', async () => {
+  it('shows the reverse-geocoded address without the removed frame coordinate card', async () => {
     render(<PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />)
-    expect(screen.getByText('37.566500, 126.978000')).toBeInTheDocument()
     await waitFor(() => {
       expect(screen.getByText('서울특별시 중구 세종대로 110')).toBeInTheDocument()
     })
+    expect(screen.queryByText('37.566500, 126.978000')).not.toBeInTheDocument()
     expect(api.frameAddress).toHaveBeenCalledWith(
       'dataset-1',
       'frame-12',
@@ -1367,7 +1702,29 @@ describe('PanoramaView media lifecycle', () => {
     ])
   })
 
-  it('keeps one renderer and panorama texture while overlay data and image opacity change', async () => {
+  it('reloads panorama boxes when a linked overlay feature revision changes', async () => {
+    const overlayForRevision = (revision: number) => ({
+      features: {},
+      layerColor: vi.fn(() => '#22c55e'),
+      layers: [{ id: 'linked-layer', revision }],
+      pickMode: false,
+      selectFeature: vi.fn(),
+      selected: null,
+      visibleLayerIds: new Set(),
+    })
+    overlayWorkspaceMock.current = overlayForRevision(1)
+    const { rerender } = render(
+      <PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />,
+    )
+
+    await waitFor(() => expect(api.frameDetections).toHaveBeenCalledTimes(1))
+    overlayWorkspaceMock.current = overlayForRevision(2)
+    rerender(<PanoramaView datasetId="dataset-1" frame={FRAME} demoMode={false} />)
+
+    await waitFor(() => expect(api.frameDetections).toHaveBeenCalledTimes(2))
+  })
+
+  it('removes the visual point overlay and loads point samples only for coordinate picking', async () => {
     vi.mocked(api.panorama).mockResolvedValue({ kind: 'url', value: '/panorama/frame-12.webp' })
     vi.mocked(api.panoramaPoints).mockResolvedValue(mmsoPayload())
 
@@ -1376,48 +1733,39 @@ describe('PanoramaView media lifecycle', () => {
         datasetId="dataset-1"
         frame={FRAME}
         demoMode={false}
-        pointOverlayEnabled
-        panoramaOpacity={0.65}
       />,
     )
 
     await waitFor(() => {
-      expect(container.querySelector('[data-point-count="1"]')).toBeInTheDocument()
       expect(threeSpies.textureLoads).toHaveBeenCalledWith('/panorama/frame-12.webp')
     })
+    expect(api.panoramaPoints).not.toHaveBeenCalled()
+    expect(screen.queryByRole('checkbox', { name: '파노라마 포인트 오버레이 표시' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('slider', { name: '파노라마 영상 투명도' })).not.toBeInTheDocument()
+    expect(container.querySelector('[data-panorama-opacity="1"]')).toBeInTheDocument()
     expect(threeSpies.rendererConstructed).toHaveBeenCalledTimes(1)
     expect(threeSpies.textureLoads).toHaveBeenCalledTimes(1)
 
+    overlayWorkspaceMock.current = {
+      applyPickedCoordinate: vi.fn(),
+      features: {},
+      layerColor: vi.fn(() => '#22c55e'),
+      layers: [],
+      pickMode: true,
+      selectFeature: vi.fn(),
+      selected: null,
+      visibleLayerIds: new Set(),
+    }
     rerender(
       <PanoramaView
         datasetId="dataset-1"
         frame={FRAME}
         demoMode={false}
-        pointOverlayEnabled
-        panoramaOpacity={0.2}
-      />,
-    )
-    rerender(
-      <PanoramaView
-        datasetId="dataset-1"
-        frame={FRAME}
-        demoMode={false}
-        pointOverlayEnabled={false}
-        panoramaOpacity={0.2}
-      />,
-    )
-    rerender(
-      <PanoramaView
-        datasetId="dataset-1"
-        frame={FRAME}
-        demoMode={false}
-        pointOverlayEnabled
-        panoramaOpacity={0.2}
       />,
     )
 
-    await waitFor(() => expect(api.panoramaPoints).toHaveBeenCalledTimes(2))
-    expect(container.querySelector('[data-panorama-opacity="0.2"]')).toBeInTheDocument()
+    await waitFor(() => expect(api.panoramaPoints).toHaveBeenCalledTimes(1))
+    expect(container.querySelector('[data-point-count="1"]')).toBeInTheDocument()
     expect(threeSpies.rendererConstructed).toHaveBeenCalledTimes(1)
     expect(threeSpies.textureLoads).toHaveBeenCalledTimes(1)
   })

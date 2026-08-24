@@ -1,6 +1,7 @@
 import type {
   BootstrapResponse,
   DatasetDetail,
+  DetectionOverlayResolution,
   DetectionModelOption,
   FrameDetectionResponse,
   FrameAddressResponse,
@@ -27,6 +28,7 @@ import type {
   OverlayHistoryMutationRequest,
   OverlayHistoryMutationResponse,
   OverlayReviewMetadata,
+  OverlaySupportFeatureResponse,
   PanoramaOverlayFeature,
   PanoramaDetectionBoxObservation,
   PanoramaProjectionMetadata,
@@ -39,6 +41,7 @@ import type {
   QaIssueStatus,
   QaRunResponse,
   RouteResponse,
+  ReviewCompletionStatus,
   ReviewSession,
   ReviewSessionCreateRequest,
   ReviewSessionPage,
@@ -65,6 +68,10 @@ import type {
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 const DEFAULT_TIMEOUT = 15_000
+
+export type PointPreviewFocus =
+  | readonly [number, number]
+  | readonly [number, number, number]
 
 export class ApiError extends Error {
   readonly status: number
@@ -381,6 +388,13 @@ export const api = {
     })
   },
 
+  reviewCompletionStatus(sessionId: string, signal?: AbortSignal) {
+    return json<ReviewCompletionStatus>(
+      `/api/review-sessions/${encodeURIComponent(sessionId)}/completion-status`,
+      { signal },
+    )
+  },
+
   patchReviewTask(taskId: string, payload: ReviewTaskPatch, signal?: AbortSignal) {
     return json<{ task: ReviewTask }>(`/api/review-tasks/${encodeURIComponent(taskId)}`, {
       method: 'PATCH',
@@ -664,6 +678,20 @@ export const api = {
     )
   },
 
+  overlaySupportFeatures(
+    datasetId: string,
+    supportId: string,
+    signal?: AbortSignal,
+  ) {
+    return json<OverlaySupportFeatureResponse>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/overlays/support-features`,
+        { support_id: supportId },
+      ),
+      { signal, timeout: 300_000 },
+    )
+  },
+
   overlayFeature(
     datasetId: string,
     layerId: string,
@@ -858,6 +886,21 @@ export const api = {
     )
   },
 
+  detectionOverlayFeature(
+    datasetId: string,
+    sourceId: string,
+    observationId: string,
+    signal?: AbortSignal,
+  ) {
+    return json<DetectionOverlayResolution>(
+      buildApiUrl(
+        `/api/datasets/${encodeURIComponent(datasetId)}/detections/overlay-feature`,
+        { source_id: sourceId, observation_id: observationId },
+      ),
+      { signal, timeout: 30_000 },
+    )
+  },
+
   frameAddress(datasetId: string, frameId: string, signal?: AbortSignal) {
     return json<FrameAddressResponse>(
       `/api/datasets/${encodeURIComponent(datasetId)}/frames/${encodeURIComponent(frameId)}/address`,
@@ -901,12 +944,19 @@ export const api = {
     budget: number,
     signal?: AbortSignal,
     colorMode: 'rgb' | 'intensity' | 'classification' | 'height' = 'rgb',
+    focuses?: readonly PointPreviewFocus[],
   ) {
+    const baseUrl = buildApiUrl(
+      `/api/datasets/${encodeURIComponent(id)}/points/${encodeURIComponent(frameId)}`,
+      { budget, color_mode: colorMode },
+    )
+    const focusQuery = new URLSearchParams()
+    focuses?.forEach((focus) => focusQuery.append('focus', focus.join(',')))
+    const pointUrl = focusQuery.size
+      ? `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}${focusQuery.toString()}`
+      : baseUrl
     const response = await request(
-      buildApiUrl(`/api/datasets/${encodeURIComponent(id)}/points/${encodeURIComponent(frameId)}`, {
-        budget,
-        color_mode: colorMode,
-      }),
+      pointUrl,
       {
         signal,
         // A cold 1M-point derivative may need to read multiple source blocks

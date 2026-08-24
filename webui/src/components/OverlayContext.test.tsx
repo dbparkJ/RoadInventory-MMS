@@ -2,11 +2,14 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api, ApiError } from '../lib/api'
 import type {
+  Frame,
   OverlayCoordinateSpace,
   OverlayFeature,
   OverlayFeatureCollection,
   OverlayLayer,
   PoleBaseInferResponse,
+  ReviewSession,
+  ReviewTask,
 } from '../types'
 
 const reviewContextMocks = vi.hoisted(() => ({
@@ -97,6 +100,66 @@ const AUTO_POLE_BASE_RESULT: PoleBaseInferResponse = {
   warnings: [],
 }
 
+const REVIEW_FRAME_1: Frame = {
+  id: 'frame-1',
+  index: 10,
+  track_id: 'track-1',
+  timestamp: '2026-08-24T00:00:00Z',
+  coordinate: null,
+  has_panorama: true,
+  has_points: true,
+}
+
+function reviewSession(id = 'review-session-1'): ReviewSession {
+  return {
+    id,
+    dataset_id: 'dataset-1',
+    source_run_ids: [],
+    target_layer_ids: [LAYER.id],
+    track_ids: [REVIEW_FRAME_1.track_id],
+    frame_range: [REVIEW_FRAME_1.index, REVIEW_FRAME_1.index],
+    class_filters: [],
+    status: 'active',
+    created_by: 'operator-local',
+    created_at: '2026-08-24T00:00:00Z',
+    updated_at: '2026-08-24T00:00:00Z',
+    last_task_id: null,
+    qa_layer_revisions: null,
+    qa_ran_at: null,
+  }
+}
+
+function reviewTask(
+  id: string,
+  sessionId = 'review-session-1',
+  overrides: Partial<ReviewTask> = {},
+): ReviewTask {
+  return {
+    id,
+    session_id: sessionId,
+    dataset_id: 'dataset-1',
+    task_type: 'MANUAL_SCAN',
+    status: 'in_progress',
+    priority: 50,
+    frame_id: REVIEW_FRAME_1.id,
+    track_id: REVIEW_FRAME_1.track_id,
+    frame_start: null,
+    frame_end: null,
+    source_run_id: null,
+    source_detection_id: null,
+    target_layer_id: LAYER.id,
+    class_hint: null,
+    reason_codes: [],
+    location_hint: null,
+    claimed_by: 'operator-local',
+    resolved_feature_ids: [],
+    resolution: null,
+    created_at: '2026-08-24T00:00:00Z',
+    updated_at: '2026-08-24T00:00:00Z',
+    ...overrides,
+  }
+}
+
 function feature(id: string, coordinate: number, label = id): OverlayFeature {
   return {
     type: 'Feature',
@@ -176,6 +239,14 @@ function WorkspaceProbe() {
         {overlay.poleBaseProposal.status === 'ready'
           ? overlay.poleBaseProposal.result.status
           : 'none'}
+      </output>
+      <output data-testid="pole-review-task">
+        {overlay.poleBaseProposal.status === 'ready'
+          ? overlay.poleBaseProposal.reviewTaskSnapshot?.id ?? 'unlinked'
+          : 'none'}
+      </output>
+      <output data-testid="pole-review-task-changed">
+        {overlay.poleBaseReviewTaskChanged ? 'changed' : 'same'}
       </output>
       <output data-testid="pole-reason-codes">
         {overlay.poleBaseProposal.status === 'error'
@@ -298,6 +369,9 @@ function WorkspaceProbe() {
       <button type="button" onClick={() => void overlay.confirmPoleBaseProposal()}>
         confirm pole
       </button>
+      <button type="button" onClick={() => void overlay.confirmPoleBaseProposal(true)}>
+        confirm pole and next
+      </button>
       <button type="button" onClick={() => overlay.retryPoleBasePick()}>
         retry pole
       </button>
@@ -322,13 +396,14 @@ function WorkspaceProbe() {
       <button type="button" onClick={() => void overlay.deleteField(LAYER.id, 'label')}>
         delete field
       </button>
-      <button
-        type="button"
+      <div
+        role="application"
+        tabIndex={0}
         aria-label="focused viewer shortcut surface"
         onKeyDown={(event) => event.stopPropagation()}
       >
         focused viewer shortcut surface
-      </button>
+      </div>
       <button
         type="button"
         onClick={() => void overlay.updateLayerMetadata(LAYER.id, { name: '새 이름', color: '#112233' })}
@@ -637,7 +712,7 @@ describe('OverlayProvider pick-mode shortcuts', () => {
     // guards against a completed point-pick leaving N permanently bound to the
     // previous create target. The viewer also stops bubbling, as map SDKs do
     // after the picked canvas has retained keyboard focus.
-    const viewer = screen.getByRole('button', { name: 'focused viewer shortcut surface' })
+    const viewer = screen.getByRole('application', { name: 'focused viewer shortcut surface' })
     fireEvent.keyDown(viewer, { key: 'n', code: 'KeyN' })
     expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
 
@@ -667,7 +742,7 @@ describe('OverlayProvider pick-mode shortcuts', () => {
     await waitFor(() => expect(deleteOverlayFeature).toHaveBeenCalledOnce())
     await waitFor(() => expect(screen.getByTestId('selected-id')).toHaveTextContent('none'))
 
-    const viewer = screen.getByRole('button', { name: 'focused viewer shortcut surface' })
+    const viewer = screen.getByRole('application', { name: 'focused viewer shortcut surface' })
     fireEvent.keyDown(viewer, { key: 'n', code: 'KeyN' })
     expect(screen.getByTestId('pick-target')).toHaveTextContent('create')
 
@@ -757,6 +832,180 @@ describe('manual pole-base proposals', () => {
       ),
     ).toEqual({})
     expect(poleBaseReasonMessage('NO_GROUND_SUPPORT')).toContain('지면')
+  })
+
+  it('blocks a ready proposal after same-frame task or session switches and relinks only after retry', async () => {
+    mockFeaturePages(POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const created = feature('pole-after-task-switch', 10.1, '')
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockResolvedValue({
+      feature: created,
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+    })
+    const sessionA = reviewSession()
+    const sessionB = reviewSession('review-session-2')
+    const reload = vi.fn()
+    const moveTask = vi.fn()
+    let reviewWorkspace = {
+      activeFrame: REVIEW_FRAME_1,
+      session: sessionA,
+      currentTask: reviewTask('task-pole-a'),
+      reload,
+      moveTask,
+    }
+    reviewContextMocks.useOptionalReviewWorkspace.mockImplementation(
+      () => reviewWorkspace as never,
+    )
+    const rendered = renderWorkspace(REVIEW_FRAME_1.id)
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin pole once' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-review-task')).toHaveTextContent('task-pole-a'))
+    expect(screen.getByTestId('pole-review-task-changed')).toHaveTextContent('same')
+
+    reviewWorkspace = {
+      ...reviewWorkspace,
+      currentTask: reviewTask('task-pole-b'),
+    }
+    rendered.rerender(
+      <OverlayProvider datasetId="dataset-1" activeFrameId={REVIEW_FRAME_1.id} demoMode={false}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    await waitFor(() => expect(screen.getByTestId('pole-review-task-changed')).toHaveTextContent('changed'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    reviewWorkspace = {
+      ...reviewWorkspace,
+      session: sessionB,
+      currentTask: reviewTask('task-pole-c', sessionB.id),
+    }
+    rendered.rerender(
+      <OverlayProvider datasetId="dataset-1" activeFrameId={REVIEW_FRAME_1.id} demoMode={false}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole' }))
+    expect(createOverlayFeature).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'retry pole' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-review-task')).toHaveTextContent('task-pole-c'))
+    expect(screen.getByTestId('pole-review-task-changed')).toHaveTextContent('same')
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole and next' }))
+
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature.mock.calls[0][2]).toMatchObject({
+      review_metadata: expect.objectContaining({ task_id: 'task-pole-c' }),
+    })
+    await waitFor(() => expect(moveTask).toHaveBeenCalledWith(1))
+  })
+
+  it('keeps the snapshotted task metadata but does not move a newly selected session after an in-flight save', async () => {
+    mockFeaturePages(POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    let resolveCreate!: (value: Awaited<ReturnType<typeof api.createOverlayFeature>>) => void
+    const createOverlayFeature = vi.spyOn(api, 'createOverlayFeature').mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof api.createOverlayFeature>>>((resolve) => {
+        resolveCreate = resolve
+      }),
+    )
+    const sessionA = reviewSession()
+    const moveTaskA = vi.fn()
+    const moveTaskB = vi.fn()
+    let reviewWorkspace = {
+      activeFrame: REVIEW_FRAME_1,
+      session: sessionA,
+      currentTask: reviewTask('task-pole-a'),
+      reload: vi.fn(),
+      moveTask: moveTaskA,
+    }
+    reviewContextMocks.useOptionalReviewWorkspace.mockImplementation(
+      () => reviewWorkspace as never,
+    )
+    const rendered = renderWorkspace(REVIEW_FRAME_1.id)
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+    fireEvent.click(screen.getByRole('button', { name: 'begin pole once' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-review-task')).toHaveTextContent('task-pole-a'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'confirm pole and next' }))
+    await waitFor(() => expect(createOverlayFeature).toHaveBeenCalledOnce())
+    expect(createOverlayFeature.mock.calls[0][2]).toMatchObject({
+      review_metadata: expect.objectContaining({ task_id: 'task-pole-a' }),
+    })
+
+    const sessionB = reviewSession('review-session-2')
+    reviewWorkspace = {
+      activeFrame: REVIEW_FRAME_1,
+      session: sessionB,
+      currentTask: reviewTask('task-pole-b', sessionB.id),
+      reload: vi.fn(),
+      moveTask: moveTaskB,
+    }
+    rendered.rerender(
+      <OverlayProvider datasetId="dataset-1" activeFrameId={REVIEW_FRAME_1.id} demoMode={false}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    resolveCreate({
+      feature: feature('pole-in-flight', 10.1, ''),
+      revision: 5,
+      coordinate_space: 'dataset',
+      crs: 'EPSG:5186',
+      fields: POLE_LAYER.fields ?? [],
+    })
+
+    await waitFor(() => expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle'))
+    expect(moveTaskA).not.toHaveBeenCalled()
+    expect(moveTaskB).not.toHaveBeenCalled()
+  })
+
+  it('links only an interval task whose ordinal range and track cover the proposal frame', async () => {
+    mockFeaturePages(POLE_LAYER)
+    vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
+    const session = reviewSession()
+    let reviewWorkspace = {
+      activeFrame: REVIEW_FRAME_1,
+      session,
+      currentTask: reviewTask('task-interval-miss', session.id, {
+        frame_id: null,
+        frame_start: REVIEW_FRAME_1.index + 1,
+        frame_end: REVIEW_FRAME_1.index + 3,
+      }),
+      reload: vi.fn(),
+      moveTask: vi.fn(),
+    }
+    reviewContextMocks.useOptionalReviewWorkspace.mockImplementation(
+      () => reviewWorkspace as never,
+    )
+    const rendered = renderWorkspace(REVIEW_FRAME_1.id)
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+    fireEvent.click(screen.getByRole('button', { name: 'begin pole once' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-review-task')).toHaveTextContent('unlinked'))
+
+    reviewWorkspace = {
+      ...reviewWorkspace,
+      currentTask: reviewTask('task-interval-match', session.id, {
+        frame_id: null,
+        frame_start: REVIEW_FRAME_1.index - 1,
+        frame_end: REVIEW_FRAME_1.index + 1,
+      }),
+    }
+    rendered.rerender(
+      <OverlayProvider datasetId="dataset-1" activeFrameId={REVIEW_FRAME_1.id} demoMode={false}>
+        <WorkspaceProbe />
+      </OverlayProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'retry pole' }))
+    fireEvent.click(screen.getByRole('button', { name: 'apply pole seed' }))
+    await waitFor(() => expect(screen.getByTestId('pole-review-task')).toHaveTextContent('task-interval-match'))
   })
 
   it('stages a regular create click, infers on the first B, and creates on the second B', async () => {
@@ -1158,6 +1407,18 @@ describe('manual pole-base proposals', () => {
     expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('ready')
   })
 
+  it('does not start pole-base picking with B behind an open modal dialog', async () => {
+    mockFeaturePages(POLE_LAYER)
+    renderWorkspace()
+    await waitFor(() => expect(screen.getByTestId('active-layer')).toHaveTextContent(LAYER.id))
+    render(<section role="dialog" aria-modal="true" aria-label="도움말" />)
+
+    fireEvent.keyDown(window, { key: 'b', code: 'KeyB' })
+
+    expect(screen.getByTestId('pole-proposal-status')).toHaveTextContent('idle')
+    expect(screen.getByTestId('pick-target')).toHaveTextContent('none')
+  })
+
   it('supports B, R, and two-level Escape globally while ignoring editable inputs', async () => {
     mockFeaturePages(POLE_LAYER)
     vi.spyOn(api, 'inferPoleBase').mockResolvedValue(AUTO_POLE_BASE_RESULT)
@@ -1525,12 +1786,9 @@ describe('manual pole-base proposals', () => {
     })
     const reload = vi.fn()
     reviewContextMocks.useOptionalReviewWorkspace.mockReturnValue({
-      currentTask: {
-        id: 'task-pole-1',
-        dataset_id: 'dataset-1',
-        target_layer_id: POLE_LAYER.id,
-        status: 'in_progress',
-      },
+      activeFrame: REVIEW_FRAME_1,
+      session: reviewSession(),
+      currentTask: reviewTask('task-pole-1'),
       reload,
     })
     renderWorkspace()

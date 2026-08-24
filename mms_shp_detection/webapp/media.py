@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
@@ -42,6 +42,13 @@ POINT_PREVIEW_MAX_PAYLOAD_BYTES = (
 POINT_PREVIEW_DENSE_RADIUS_M = 15.0
 POINT_PREVIEW_MAX_RADIUS_M = 25.0
 POINT_PREVIEW_DENSE_BUDGET_FRACTION = 0.75
+POINT_PREVIEW_FOCUS_RADIUS_M = 3.0
+POINT_PREVIEW_FOCUS_BUDGET_FRACTION = 0.85
+POINT_PREVIEW_FOCUS_CORRIDOR_RADIUS_M = 1.0
+POINT_PREVIEW_MAX_FOCUS_CORRIDOR_RADIUS_M = POINT_PREVIEW_FOCUS_RADIUS_M
+POINT_PREVIEW_MAX_FOCUS_COUNT = 4
+POINT_PREVIEW_MAX_FOCUS_QUERY_LENGTH = 160
+POINT_PREVIEW_MAX_ABSOLUTE_COORDINATE = 1_000_000_000.0
 VWORLD_ADDRESS_ENDPOINT = "https://api.vworld.kr/req/address"
 VWORLD_DEVELOPMENT_KEY = "EE4D1CA9-BEA1-3AFF-AE81-DE0B92A0E352"
 VWORLD_ADDRESS_RESPONSE_LIMIT_BYTES = 256 * 1024
@@ -433,6 +440,102 @@ def _bbox_distance_3d(block: dict[str, Any], origin: np.ndarray) -> float:
     return float(np.linalg.norm(delta))
 
 
+def _segment_intersects_expanded_bbox(
+    start: np.ndarray,
+    end: np.ndarray,
+    minimum: np.ndarray,
+    maximum: np.ndarray,
+    padding: float,
+) -> bool:
+    """Conservatively test a focus relation against a padded block AABB."""
+
+    lower = minimum - padding
+    upper = maximum + padding
+    direction = end - start
+    enter = 0.0
+    leave = 1.0
+    for axis in range(int(start.shape[0])):
+        if abs(float(direction[axis])) <= 1e-12:
+            if start[axis] < lower[axis] or start[axis] > upper[axis]:
+                return False
+            continue
+        first = float((lower[axis] - start[axis]) / direction[axis])
+        second = float((upper[axis] - start[axis]) / direction[axis])
+        if first > second:
+            first, second = second, first
+        enter = max(enter, first)
+        leave = min(leave, second)
+        if enter > leave:
+            return False
+    return True
+
+
+def _block_intersects_focus_roi(
+    block: dict[str, Any],
+    focus_centers: tuple[np.ndarray, ...],
+    *,
+    focus_radius: float,
+    focus_corridor_radius: float,
+) -> bool:
+    dimensions = int(focus_centers[0].shape[0])
+    minimum = np.asarray(block.get("min", []), dtype=np.float64)
+    maximum = np.asarray(block.get("max", []), dtype=np.float64)
+    if (
+        minimum.shape != (3,)
+        or maximum.shape != (3,)
+        or not np.all(np.isfinite(minimum))
+        or not np.all(np.isfinite(maximum))
+        or np.any(minimum > maximum)
+    ):
+        return False
+    lower = minimum[:dimensions]
+    upper = maximum[:dimensions]
+    for center in focus_centers:
+        delta = np.maximum(np.maximum(lower - center, center - upper), 0.0)
+        if float(np.linalg.norm(delta)) <= focus_radius:
+            return True
+    if focus_corridor_radius <= 0.0:
+        return False
+    anchor = focus_centers[0]
+    return any(
+        _segment_intersects_expanded_bbox(
+            anchor,
+            end,
+            lower,
+            upper,
+            focus_corridor_radius,
+        )
+        for end in focus_centers[1:]
+    )
+
+
+def _bounded_preview_candidates(
+    candidates: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    *,
+    focus_centers: tuple[np.ndarray, ...] | None = None,
+    focus_radius: float = POINT_PREVIEW_FOCUS_RADIUS_M,
+    focus_corridor_radius: float = POINT_PREVIEW_FOCUS_CORRIDOR_RADIUS_M,
+) -> list[tuple[float, dict[str, Any], dict[str, Any]]]:
+    """Keep the fixed block cap while placing selected-object blocks first."""
+
+    limit = min(MAX_PREVIEW_BLOCKS, 32)
+    if not focus_centers:
+        return candidates[:limit]
+    prioritized = sorted(
+        enumerate(candidates),
+        key=lambda entry: (
+            not _block_intersects_focus_roi(
+                entry[1][2],
+                focus_centers,
+                focus_radius=focus_radius,
+                focus_corridor_radius=focus_corridor_radius,
+            ),
+            entry[0],
+        ),
+    )
+    return [candidate for _index, candidate in prioritized[:limit]]
+
+
 def _catalog_fingerprint(catalog: dict[str, Any]) -> str:
     serialized = json.dumps(
         catalog.get("signature", {}),
@@ -565,6 +668,11 @@ def _sample_nearby_points(
     radius: float,
     dense_radius: float | None = None,
     dense_budget_fraction: float = POINT_PREVIEW_DENSE_BUDGET_FRACTION,
+    focus_center: np.ndarray | None = None,
+    focus_centers: tuple[np.ndarray, ...] | None = None,
+    focus_radius: float = POINT_PREVIEW_FOCUS_RADIUS_M,
+    focus_corridor_radius: float = POINT_PREVIEW_FOCUS_CORRIDOR_RADIUS_M,
+    focus_budget_fraction: float = POINT_PREVIEW_FOCUS_BUDGET_FRACTION,
     color_mode: PointPreviewColorMode = "rgb",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from mms_shp_detection.pointcloud import (
@@ -591,9 +699,35 @@ def _sample_nearby_points(
         )
     )
 
+    if focus_center is not None and focus_centers is not None:
+        raise ValueError("Use focus_center or focus_centers, not both.")
+    resolved_focus_centers = (
+        (focus_center,) if focus_center is not None else focus_centers
+    )
     # A quota per nearby block keeps a dense scanner strip from consuming the
-    # complete response before adjacent blocks contribute any context.
-    bounded_candidates = candidates[: min(MAX_PREVIEW_BLOCKS, 32)]
+    # complete response before adjacent blocks contribute any context. Focus
+    # blocks are promoted before applying that cap so a fragmented file near
+    # the capture origin cannot evict the selected object.
+    bounded_candidates = _bounded_preview_candidates(
+        candidates,
+        focus_centers=resolved_focus_centers,
+        focus_radius=focus_radius,
+        focus_corridor_radius=focus_corridor_radius,
+    )
+    if resolved_focus_centers:
+        return _sample_focus_bands(
+            bounded_candidates,
+            catalog,
+            reader,
+            origin=origin,
+            budget=budget,
+            focus_centers=resolved_focus_centers,
+            focus_radius=focus_radius,
+            focus_corridor_radius=focus_corridor_radius,
+            maximum_radius=radius,
+            focus_budget_fraction=focus_budget_fraction,
+            color_mode=color_mode,
+        )
     if dense_radius is not None:
         return _sample_distance_bands(
             bounded_candidates,
@@ -748,6 +882,190 @@ def _safe_preview_point_file(
     }
 
 
+def _focus_point_mask(
+    xyz: np.ndarray,
+    focus_center: np.ndarray,
+    *,
+    radius_squared: float,
+) -> np.ndarray:
+    """Select a spherical XYZ ROI or a vertical cylindrical XY ROI."""
+
+    dimensions = int(focus_center.shape[0])
+    delta = xyz[:, :dimensions] - focus_center[None, :]
+    return np.sum(delta * delta, axis=1) <= radius_squared
+
+
+def _focus_corridor_mask(
+    xyz: np.ndarray,
+    start: np.ndarray,
+    end: np.ndarray,
+    *,
+    radius_squared: float,
+) -> np.ndarray:
+    """Select a capsule around one ordered relation segment."""
+
+    dimensions = int(start.shape[0])
+    points = xyz[:, :dimensions]
+    segment = end - start
+    length_squared = float(np.dot(segment, segment))
+    if length_squared <= 0.0:
+        return _focus_point_mask(xyz, start, radius_squared=radius_squared)
+    projection = np.clip(
+        np.sum((points - start[None, :]) * segment[None, :], axis=1)
+        / length_squared,
+        0.0,
+        1.0,
+    )
+    nearest = start[None, :] + projection[:, None] * segment[None, :]
+    delta = points - nearest
+    return np.sum(delta * delta, axis=1) <= radius_squared
+
+
+def _focus_roi_mask(
+    xyz: np.ndarray,
+    focus_centers: tuple[np.ndarray, ...],
+    *,
+    focus_radius_squared: float,
+    corridor_radius_squared: float,
+) -> np.ndarray:
+    """Union focus ROIs and corridors from the selected anchor to related centres."""
+
+    mask = np.zeros(xyz.shape[0], dtype=bool)
+    for center in focus_centers:
+        mask |= _focus_point_mask(
+            xyz,
+            center,
+            radius_squared=focus_radius_squared,
+        )
+    if corridor_radius_squared <= 0.0:
+        return mask
+    anchor = focus_centers[0]
+    for end in focus_centers[1:]:
+        mask |= _focus_corridor_mask(
+            xyz,
+            anchor,
+            end,
+            radius_squared=corridor_radius_squared,
+        )
+    return mask
+
+
+def _sample_focus_bands(
+    candidates: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    catalog: dict[str, Any],
+    reader: Any,
+    *,
+    origin: np.ndarray,
+    budget: int,
+    focus_centers: tuple[np.ndarray, ...],
+    focus_radius: float,
+    focus_corridor_radius: float,
+    maximum_radius: float,
+    focus_budget_fraction: float,
+    color_mode: PointPreviewColorMode,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prioritize a selected-object ROI while retaining sparse frame context."""
+
+    safe_candidates = [
+        (_safe_preview_point_file(point_file, catalog), block)
+        for _distance, point_file, block in candidates
+    ]
+    focus_squared = focus_radius * focus_radius
+    corridor_squared = focus_corridor_radius * focus_corridor_radius
+    maximum_squared = maximum_radius * maximum_radius
+    band_counts: list[tuple[int, int]] = []
+    for point_file, block in safe_candidates:
+        xyz, _rgb, _intensity = reader.read_block_points(point_file, block)
+        xyz = np.asarray(xyz, dtype=np.float64)
+        if xyz.size == 0:
+            band_counts.append((0, 0))
+            continue
+        frame_mask = np.sum((xyz - origin[None, :]) ** 2, axis=1) <= maximum_squared
+        focus_mask = frame_mask & _focus_roi_mask(
+            xyz,
+            focus_centers,
+            focus_radius_squared=focus_squared,
+            corridor_radius_squared=corridor_squared,
+        )
+        focus_count = int(np.count_nonzero(focus_mask))
+        background_count = int(np.count_nonzero(frame_mask & ~focus_mask))
+        band_counts.append((focus_count, background_count))
+
+    focus_quota, background_quota = _distance_band_quotas(
+        sum(count[0] for count in band_counts),
+        sum(count[1] for count in band_counts),
+        budget,
+        dense_budget_fraction=focus_budget_fraction,
+    )
+    focus_by_block = _per_block_sample_quotas(
+        [count[0] for count in band_counts], focus_quota
+    )
+    background_by_block = _per_block_sample_quotas(
+        [count[1] for count in band_counts], background_quota
+    )
+
+    xyz_parts: list[np.ndarray] = []
+    rgb_parts: list[np.ndarray] = []
+    intensity_parts: list[np.ndarray] = []
+    classification_parts: list[np.ndarray] = []
+    for index, (point_file, block) in enumerate(safe_candidates):
+        if focus_by_block[index] <= 0 and background_by_block[index] <= 0:
+            continue
+        xyz, rgb, intensity, classification = _read_preview_block(
+            reader,
+            point_file,
+            block,
+            include_classification=color_mode == "classification",
+        )
+        if xyz.size == 0:
+            continue
+        frame_mask = np.sum((xyz - origin[None, :]) ** 2, axis=1) <= maximum_squared
+        focus_mask = frame_mask & _focus_roi_mask(
+            xyz,
+            focus_centers,
+            focus_radius_squared=focus_squared,
+            corridor_radius_squared=corridor_squared,
+        )
+        selected_parts: list[np.ndarray] = []
+        for mask, quota in (
+            (focus_mask, focus_by_block[index]),
+            (frame_mask & ~focus_mask, background_by_block[index]),
+        ):
+            selected = np.flatnonzero(mask)
+            if selected.size > quota:
+                positions = np.linspace(0, selected.size - 1, quota, dtype=np.int64)
+                selected = selected[positions]
+            if selected.size:
+                selected_parts.append(selected)
+        if not selected_parts:
+            continue
+        selected = np.concatenate(selected_parts)
+        selected_xyz = np.asarray(xyz[selected], dtype=np.float64)
+        selected_rgb = np.asarray(rgb[selected], dtype=np.uint8)
+        if selected_rgb.shape != (selected_xyz.shape[0], 3):
+            selected_rgb = np.full((selected_xyz.shape[0], 3), 210, dtype=np.uint8)
+        xyz_parts.append(selected_xyz)
+        rgb_parts.append(selected_rgb)
+        intensity_parts.append(np.asarray(intensity[selected]))
+        classification_parts.append(np.asarray(classification[selected]))
+
+    if not xyz_parts:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint8),
+            origin,
+        )
+    xyz = np.concatenate(xyz_parts)
+    rgb = _point_preview_colors(
+        xyz,
+        np.concatenate(rgb_parts),
+        np.concatenate(intensity_parts),
+        np.concatenate(classification_parts),
+        color_mode,
+    )
+    return xyz, rgb, origin
+
+
 def _sample_distance_bands(
     candidates: list[tuple[float, dict[str, Any], dict[str, Any]]],
     catalog: dict[str, Any],
@@ -861,6 +1179,9 @@ def _build_mmsp(
     reader: Any,
     *,
     budget: int,
+    focus_center: np.ndarray | None = None,
+    focus_centers: tuple[np.ndarray, ...] | None = None,
+    focus_corridor_radius: float = POINT_PREVIEW_FOCUS_CORRIDOR_RADIUS_M,
     color_mode: PointPreviewColorMode = "rgb",
 ) -> bytes:
     if budget < 1 or budget > POINT_PREVIEW_MAX_BUDGET:
@@ -874,6 +1195,9 @@ def _build_mmsp(
         budget=budget,
         radius=POINT_PREVIEW_MAX_RADIUS_M,
         dense_radius=POINT_PREVIEW_DENSE_RADIUS_M,
+        focus_center=focus_center,
+        focus_centers=focus_centers,
+        focus_corridor_radius=focus_corridor_radius,
         color_mode=color_mode,
     )
     if xyz.size:
@@ -908,6 +1232,115 @@ def _build_mmsp(
     if len(payload) != count * MMSP_RECORD_BYTES:
         raise RuntimeError("Unexpected MMSP record alignment.")
     return header + payload
+
+
+def _validated_point_preview_focus(
+    task: dict[str, Any],
+    *,
+    focus_x: float | None,
+    focus_y: float | None,
+    focus_z: float | None,
+) -> np.ndarray | None:
+    """Validate an optional selection centre expressed in dataset CRS units."""
+
+    if focus_x is None and focus_y is None and focus_z is None:
+        return None
+    if focus_x is None or focus_y is None:
+        raise ValueError("focus_x and focus_y must be provided together.")
+    values = [focus_x, focus_y] if focus_z is None else [focus_x, focus_y, focus_z]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Point preview focus coordinates must be finite.")
+    if any(abs(value) > POINT_PREVIEW_MAX_ABSOLUTE_COORDINATE for value in values):
+        raise ValueError("Point preview focus coordinates are outside the supported range.")
+
+    origin = np.asarray(task.get("origin"), dtype=np.float64)
+    if origin.shape != (3,) or not np.all(np.isfinite(origin)):
+        raise ValueError("Frame has no valid projected point-cloud origin.")
+    dimensions = len(values)
+    distance = math.hypot(
+        *(float(value) - float(origin[index]) for index, value in enumerate(values))
+    )
+    if distance > POINT_PREVIEW_MAX_RADIUS_M:
+        raise ValueError(
+            "Point preview focus must be within "
+            f"{POINT_PREVIEW_MAX_RADIUS_M:g}m of the frame origin."
+        )
+    return np.asarray(values[:dimensions], dtype=np.float64)
+
+
+def _validated_point_preview_focuses(
+    task: dict[str, Any],
+    *,
+    focus_x: float | None,
+    focus_y: float | None,
+    focus_z: float | None,
+    focus: list[str] | None,
+) -> tuple[np.ndarray, ...] | None:
+    """Validate legacy and repeated dataset-CRS focus query values."""
+
+    legacy_focus = _validated_point_preview_focus(
+        task,
+        focus_x=focus_x,
+        focus_y=focus_y,
+        focus_z=focus_z,
+    )
+    raw_focuses = focus or []
+    requested_count = len(raw_focuses) + int(legacy_focus is not None)
+    if requested_count > POINT_PREVIEW_MAX_FOCUS_COUNT:
+        raise ValueError(
+            "Point preview supports at most "
+            f"{POINT_PREVIEW_MAX_FOCUS_COUNT} focus coordinates."
+        )
+
+    centers: list[np.ndarray] = []
+    if legacy_focus is not None:
+        centers.append(legacy_focus)
+    for index, raw_focus in enumerate(raw_focuses, start=1):
+        if len(raw_focus) > POINT_PREVIEW_MAX_FOCUS_QUERY_LENGTH:
+            raise ValueError(f"focus entry {index} is too long.")
+        parts = [part.strip() for part in raw_focus.split(",")]
+        if len(parts) not in (2, 3) or any(not part for part in parts):
+            raise ValueError(
+                f"focus entry {index} must contain x,y or x,y,z in dataset CRS."
+            )
+        try:
+            values = [float(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError(
+                f"focus entry {index} must contain numeric coordinates."
+            ) from exc
+        centers.append(
+            _validated_point_preview_focus(
+                task,
+                focus_x=values[0],
+                focus_y=values[1],
+                focus_z=values[2] if len(values) == 3 else None,
+            )
+        )
+
+    if not centers:
+        return None
+    dimensions = int(centers[0].shape[0])
+    if any(int(center.shape[0]) != dimensions for center in centers[1:]):
+        raise ValueError("All point preview focus coordinates must use the same dimensions.")
+    return tuple(centers)
+
+
+def _point_preview_focus_fingerprint(focus_center: np.ndarray) -> str:
+    """Serialize validated focus coordinates without locale or rounding ambiguity."""
+
+    return ",".join(float(value).hex() for value in focus_center)
+
+
+def _point_preview_focuses_fingerprint(
+    focus_centers: tuple[np.ndarray, ...],
+) -> str:
+    """Serialize dimensions, order, and exact values for a multi-focus cache key."""
+
+    return "|".join(
+        f"{int(center.shape[0])}:{_point_preview_focus_fingerprint(center)}"
+        for center in focus_centers
+    )
 
 
 def _panorama_axes(
@@ -1318,6 +1751,15 @@ async def points(
         le=POINT_PREVIEW_MAX_BUDGET,
     ),
     color_mode: PointPreviewColorMode = "rgb",
+    focus_x: float | None = Query(None),
+    focus_y: float | None = Query(None),
+    focus_z: float | None = Query(None),
+    focus: Annotated[list[str] | None, Query()] = None,
+    focus_corridor_radius: float = Query(
+        POINT_PREVIEW_FOCUS_CORRIDOR_RADIUS_M,
+        ge=0.0,
+        le=POINT_PREVIEW_MAX_FOCUS_CORRIDOR_RADIUS_M,
+    ),
 ) -> Response:
     dataset = require_ready_dataset(request, dataset_id)
     frame = request.app.state.store.get_frame(dataset_id, frame_id)
@@ -1328,6 +1770,25 @@ async def points(
             status_code=503,
             detail="Point-cloud preview dependencies are not installed on this server.",
         )
+
+    try:
+        focus_centers = _validated_point_preview_focuses(
+            frame["task"],
+            focus_x=focus_x,
+            focus_y=focus_y,
+            focus_z=focus_z,
+            focus=focus,
+        )
+        if not math.isfinite(focus_corridor_radius):
+            raise ValueError("Point preview focus corridor radius must be finite.")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    extended_focus_requested = bool(focus)
+    legacy_focus_center = (
+        focus_centers[0]
+        if focus_centers is not None and not extended_focus_requested
+        else None
+    )
 
     catalog = request.app.state.catalogs.get(dataset_id)
     if catalog is None:
@@ -1352,12 +1813,34 @@ async def points(
             headers={"Retry-After": "2", "Cache-Control": "no-store"},
         )
 
-    fingerprint_payload = (
-        f"mmsp-v4\0{dataset_id}\0{frame_id}\0{budget}\0{color_mode}\0"
-        f"{POINT_PREVIEW_DENSE_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
-        f"{POINT_PREVIEW_DENSE_BUDGET_FRACTION:.4f}\0"
-        f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
-    )
+    if focus_centers is None:
+        # Preserve the legacy cache key as well as its sampling behaviour when
+        # no selected-object focus was requested.
+        fingerprint_payload = (
+            f"mmsp-v4\0{dataset_id}\0{frame_id}\0{budget}\0{color_mode}\0"
+            f"{POINT_PREVIEW_DENSE_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
+            f"{POINT_PREVIEW_DENSE_BUDGET_FRACTION:.4f}\0"
+            f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
+        )
+    elif not extended_focus_requested:
+        # Keep the original single-focus derivative key and sampling path for
+        # clients using focus_x/focus_y(/focus_z).
+        fingerprint_payload = (
+            f"mmsp-v5-focus\0{dataset_id}\0{frame_id}\0{budget}\0{color_mode}\0"
+            f"{POINT_PREVIEW_FOCUS_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
+            f"{POINT_PREVIEW_FOCUS_BUDGET_FRACTION:.4f}\0"
+            f"{_point_preview_focus_fingerprint(focus_centers[0])}\0"
+            f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
+        )
+    else:
+        fingerprint_payload = (
+            f"mmsp-v6-multi-focus\0{dataset_id}\0{frame_id}\0{budget}\0{color_mode}\0"
+            f"{POINT_PREVIEW_FOCUS_RADIUS_M:.4f}\0{POINT_PREVIEW_MAX_RADIUS_M:.4f}\0"
+            f"{POINT_PREVIEW_FOCUS_BUDGET_FRACTION:.4f}\0"
+            f"{float(focus_corridor_radius).hex()}\0"
+            f"{_point_preview_focuses_fingerprint(focus_centers)}\0"
+            f"{_catalog_fingerprint(catalog)}\0{_task_point_fingerprint(frame['task'])}"
+        )
     fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
     output_path = (
         request.app.state.config.state_dir
@@ -1390,6 +1873,11 @@ async def points(
                             catalog,
                             request.app.state.point_reader,
                             budget=budget,
+                            focus_center=legacy_focus_center,
+                            focus_centers=(
+                                focus_centers if extended_focus_requested else None
+                            ),
+                            focus_corridor_radius=focus_corridor_radius,
                             color_mode=color_mode,
                         )
                         await asyncio.to_thread(_write_once, output_path, payload)

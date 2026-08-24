@@ -9,6 +9,7 @@ import threading
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,11 @@ from pyproj import CRS
 
 from mms_shp_detection.shp_writer import make_detection_id
 from mms_shp_detection.webapp import create_app
-from mms_shp_detection.webapp.overlays import _validate_point_geometry
+from mms_shp_detection.webapp.overlays import (
+    _feature_db,
+    _rebuild_exact_reference_index,
+    _validate_point_geometry,
+)
 
 NOW = "2026-08-03T00:00:00+00:00"
 
@@ -58,6 +63,52 @@ def _seed_dataset(app, dataset_id: str = "dataset-a") -> None:
     )
 
 
+def _seed_review_scope_dataset(app, dataset_id: str = "dataset-a") -> None:
+    app.state.store.upsert_scanning_dataset(
+        dataset_id=dataset_id,
+        name="Review Scope Dataset",
+        root_id="root-review-scope",
+        relative_path="",
+        crs="EPSG:32652",
+        now=NOW,
+    )
+    frames = []
+    for frame_id, ordinal, track_id, x_offset in (
+        ("frame-a0", 0, "track-a", 0.0),
+        ("frame-a1", 1, "track-a", 10.0),
+        ("frame-a2", 3, "track-a", 20.0),
+        ("frame-b1", 2, "track-b", 30.0),
+    ):
+        frames.append(
+            {
+                "id": frame_id,
+                "ordinal": ordinal,
+                "track_id": track_id,
+                "task": {
+                    "image_name": f"{frame_id}.jpg",
+                    "origin": [300_000.0 + x_offset, 4_100_000.0, 10.0],
+                    "direction": [1.0, 0.0, 0.0],
+                    "up": [0.0, 0.0, 1.0],
+                },
+                "longitude": 126.75 + (x_offset / 100_000.0),
+                "latitude": 37.03,
+                "altitude": 10.0,
+                "heading": 90.0,
+            }
+        )
+    app.state.store.finish_dataset_scan(
+        dataset_id,
+        frames=frames,
+        tracks=[
+            {"id": "track-a", "name": "Track A", "frame_count": 3},
+            {"id": "track-b", "name": "Track B", "frame_count": 1},
+        ],
+        bbox=[126.75, 37.03, 126.751, 37.03],
+        warnings=[],
+        now=NOW,
+    )
+
+
 def _write_bundle(
     directory: Path,
     stem: str = "poles",
@@ -82,6 +133,20 @@ def _write_bundle(
     if include_cpg:
         label = {"utf-8": "UTF-8", "cp949": "949", "euc-kr": "EUC-KR"}[encoding]
         primary.with_suffix(".cpg").write_text(label, encoding="ascii")
+    return sorted(directory.glob(f"{stem}.*"))
+
+
+def _write_support_bundle(directory: Path, stem: str) -> list[Path]:
+    primary = directory / f"{stem}.shp"
+    writer = shapefile.Writer(str(primary), shapeType=shapefile.POINTZ, encoding="utf-8")
+    writer.field("support_id", "C", size=40)
+    writer.pointz(300_010.0, 4_100_000.0, 10.0)
+    writer.record("GANTRY-01")
+    writer.close()
+    primary.with_suffix(".prj").write_text(
+        CRS.from_epsg(32652).to_wkt(version="WKT1_ESRI"), encoding="utf-8"
+    )
+    primary.with_suffix(".cpg").write_text("UTF-8", encoding="ascii")
     return sorted(directory.glob(f"{stem}.*"))
 
 
@@ -138,6 +203,29 @@ def _write_detection_bundle(directory: Path, stem: str = "detected_signs") -> li
         250,
         1000,
         500,
+    )
+    writer.close()
+    primary.with_suffix(".prj").write_text(
+        CRS.from_epsg(32652).to_wkt(version="WKT1_ESRI"), encoding="utf-8"
+    )
+    primary.with_suffix(".cpg").write_text("UTF-8", encoding="ascii")
+    return sorted(directory.glob(f"{stem}.*"))
+
+
+def _write_detection_pole_bundle(
+    directory: Path,
+    stem: str = "detected_poles",
+) -> list[Path]:
+    primary = directory / f"{stem}.shp"
+    writer = shapefile.Writer(str(primary), shapeType=shapefile.POINTZ, encoding="utf-8")
+    writer.field("det_id", "C", size=20)
+    writer.field("pole_type", "C", size=12)
+    writer.field("support_id", "C", size=20)
+    writer.pointz(300_009.5, 4_100_000.0, 4.0)
+    writer.record(
+        make_detection_id("record-a", "frame-a.jpg", 1),
+        "SINGLE",
+        "P-same-support",
     )
     writer.close()
     primary.with_suffix(".prj").write_text(
@@ -1044,6 +1132,8 @@ class WebAppOverlayTests(unittest.TestCase):
             shp_root.mkdir(parents=True)
             for source in _write_detection_bundle(Path(bundle_text)):
                 (shp_root / source.name).write_bytes(source.read_bytes())
+            for source in _write_detection_pole_bundle(Path(bundle_text)):
+                (shp_root / source.name).write_bytes(source.read_bytes())
             result_root = model_root / "txt" / "record-a"
             result_root.mkdir(parents=True)
             # The frame registry uses record-a for the safe, exact per-frame lookup.
@@ -1062,6 +1152,7 @@ class WebAppOverlayTests(unittest.TestCase):
             (result_root / "frame-a.txt").write_text(
                 json.dumps(
                     {
+                        "schema_version": 17,
                         "record_name": "record-a",
                         "image_name": "frame-a.jpg",
                         "detections": [
@@ -1122,7 +1213,254 @@ class WebAppOverlayTests(unittest.TestCase):
                 self.assertEqual(boxes[0]["feature_id"], "f_000000001")
                 self.assertFalse(boxes[1]["properties"]["accepted"])
 
-                layer_dir = next((state / "overlays").iterdir()) / layer_id
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "_rebuild_exact_reference_index",
+                    side_effect=AssertionError("imports must be pre-indexed"),
+                ):
+                    frame_detections = client.get(
+                        "/api/datasets/dataset-a/frames/frame-a/detections"
+                    )
+                self.assertEqual(
+                    frame_detections.status_code, 200, frame_detections.text
+                )
+                detection_items = frame_detections.json()["items"]
+                self.assertEqual(detection_items[0]["overlay_resolution"], "matched")
+                self.assertEqual(detection_items[0]["layer_id"], layer_id)
+                self.assertEqual(detection_items[0]["feature_id"], "f_000000001")
+                self.assertEqual(
+                    detection_items[1]["overlay_resolution"], "not_found"
+                )
+                self.assertNotIn("layer_id", detection_items[1])
+                source_id = detection_items[0]["source_id"]
+                detection_id = detection_items[0]["observation_id"]
+
+                resolved = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(resolved.status_code, 200, resolved.text)
+                self.assertEqual(resolved.headers["cache-control"], "private, no-store")
+                self.assertEqual(resolved.json()["status"], "matched")
+                self.assertEqual(
+                    resolved.json()["match"],
+                    {
+                        "layer_id": layer_id,
+                        "feature_id": "f_000000001",
+                        "revision": 1,
+                        "evidence": ["property"],
+                    },
+                )
+
+                pole_import = client.post(
+                    "/api/runs/run-detections/shapefile/import",
+                    json={
+                        "path": "model-a/shp/detected_poles.shp",
+                        "name": "Detected support poles",
+                    },
+                )
+                self.assertEqual(pole_import.status_code, 201, pole_import.text)
+                relation_resolved = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(
+                    relation_resolved.status_code, 200, relation_resolved.text
+                )
+                self.assertEqual(relation_resolved.json()["status"], "matched")
+                self.assertEqual(
+                    relation_resolved.json()["match"]["layer_id"], layer_id
+                )
+                self.assertEqual(relation_resolved.json()["candidate_count"], 2)
+
+                # A correction may replace the DBF identity while retaining the
+                # exact raw observation in the private provenance store.
+                corrected = client.patch(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features/f_000000001",
+                    json={
+                        "properties": {"det_id": "D0000000000000000000"},
+                        "expected_revision": 1,
+                        "review_metadata": {
+                            "source_detection_ids": [detection_id],
+                            "creation_tool": "test-resolver",
+                        },
+                    },
+                )
+                self.assertEqual(corrected.status_code, 200, corrected.text)
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "_rebuild_exact_reference_index",
+                    side_effect=AssertionError("current index must be reused"),
+                ):
+                    resolved_from_provenance = client.get(
+                        "/api/datasets/dataset-a/detections/overlay-feature",
+                        params={
+                            "source_id": source_id,
+                            "observation_id": detection_id,
+                        },
+                    )
+                self.assertEqual(
+                    resolved_from_provenance.status_code,
+                    200,
+                    resolved_from_provenance.text,
+                )
+                self.assertEqual(
+                    resolved_from_provenance.json()["match"]["evidence"],
+                    ["provenance"],
+                )
+
+                # Re-importing the same result creates a real ambiguity. Layer
+                # visibility, import recency, and pagination must not pick a winner.
+                duplicate_import = client.post(
+                    "/api/runs/run-detections/shapefile/import",
+                    json={
+                        "path": "model-a/shp/detected_signs.shp",
+                        "name": "Detected signs duplicate",
+                    },
+                )
+                self.assertEqual(
+                    duplicate_import.status_code, 201, duplicate_import.text
+                )
+                duplicate_layer = duplicate_import.json()["layer"]
+                ambiguous = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(ambiguous.status_code, 200, ambiguous.text)
+                self.assertEqual(ambiguous.json()["status"], "ambiguous")
+                self.assertIsNone(ambiguous.json()["match"])
+                self.assertEqual(ambiguous.json()["candidate_count"], 3)
+
+                ambiguous_frame = client.get(
+                    "/api/datasets/dataset-a/frames/frame-a/detections"
+                )
+                self.assertEqual(ambiguous_frame.status_code, 200)
+                ambiguous_item = ambiguous_frame.json()["items"][0]
+                self.assertEqual(ambiguous_item["overlay_resolution"], "ambiguous")
+                self.assertEqual(ambiguous_item["overlay_candidate_count"], 3)
+                self.assertNotIn("layer_id", ambiguous_item)
+                self.assertNotIn("feature_id", ambiguous_item)
+
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "DETECTION_OVERLAY_RESOLVER_MAX_POINT_LAYERS",
+                    1,
+                ):
+                    bounded = client.get(
+                        "/api/datasets/dataset-a/detections/overlay-feature",
+                        params={
+                            "source_id": source_id,
+                            "observation_id": detection_id,
+                        },
+                    )
+                self.assertEqual(bounded.status_code, 200, bounded.text)
+                self.assertEqual(bounded.json()["status"], "unavailable")
+                self.assertFalse(bounded.json()["scan_complete"])
+                self.assertIsNone(bounded.json()["match"])
+
+                # Deleting one duplicate records a durable tombstone without
+                # hiding the same raw observation while another live imported
+                # feature still owns it.
+                deleted_corrected = client.delete(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features/f_000000001",
+                    params={"expected_revision": 2},
+                )
+                self.assertEqual(
+                    deleted_corrected.status_code, 200, deleted_corrected.text
+                )
+                self.assertIn(
+                    detection_id.casefold(),
+                    deleted_corrected.json()["suppressed_detection_ids"],
+                )
+                still_matched = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(still_matched.json()["status"], "matched")
+                self.assertEqual(
+                    still_matched.json()["match"]["layer_id"],
+                    duplicate_layer["id"],
+                )
+                self.assertEqual(still_matched.json()["tombstone_count"], 1)
+
+                deleted_duplicate = client.delete(
+                    "/api/datasets/dataset-a/overlays/"
+                    f"{duplicate_layer['id']}/features/f_000000001",
+                    params={"expected_revision": duplicate_layer["revision"]},
+                )
+                self.assertEqual(
+                    deleted_duplicate.status_code, 200, deleted_duplicate.text
+                )
+                deleted_resolution = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(deleted_resolution.status_code, 200)
+                self.assertEqual(deleted_resolution.json()["status"], "deleted")
+                # The live pole-side audit row remains queryable, but the two
+                # object tombstones still suppress the raw detection.
+                self.assertEqual(deleted_resolution.json()["candidate_count"], 1)
+                self.assertEqual(deleted_resolution.json()["tombstone_count"], 2)
+
+                overlay_dataset_root = next((state / "overlays").iterdir())
+                for deleted_layer_id in (layer_id, duplicate_layer["id"]):
+                    connection = sqlite3.connect(
+                        overlay_dataset_root / deleted_layer_id / "features.sqlite3"
+                    )
+                    try:
+                        connection.execute(
+                            "UPDATE metadata SET value='stale' "
+                            "WHERE key='exact_reference_index_version'"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                rebuilt_resolution = client.get(
+                    "/api/datasets/dataset-a/detections/overlay-feature",
+                    params={
+                        "source_id": source_id,
+                        "observation_id": detection_id,
+                    },
+                )
+                self.assertEqual(rebuilt_resolution.json()["status"], "deleted")
+                self.assertEqual(rebuilt_resolution.json()["tombstone_count"], 2)
+
+                suppressed_frame = client.get(
+                    "/api/datasets/dataset-a/frames/frame-a/detections"
+                )
+                self.assertEqual(suppressed_frame.status_code, 200)
+                self.assertEqual(suppressed_frame.json()["suppressed_count"], 1)
+                self.assertEqual(suppressed_frame.json()["count"], 1)
+                self.assertEqual(
+                    suppressed_frame.json()["items"][0]["properties"]["class_nm"],
+                    "rejected_candidate",
+                )
+
+                legacy_projection = client.get(
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/project/frame-a",
+                    params={"max_distance": 100},
+                )
+                self.assertEqual(legacy_projection.status_code, 200)
+                self.assertEqual(
+                    len(legacy_projection.json()["detection_boxes"]), 1
+                )
+
+                layer_dir = overlay_dataset_root / layer_id
                 manifest_path = layer_dir / "manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 original_reference = manifest["source_reference"]
@@ -1149,6 +1487,422 @@ class WebAppOverlayTests(unittest.TestCase):
                     params={"max_distance": 100},
                 )
                 self.assertEqual(mismatch.json()["detection_boxes"], [])
+
+    def test_support_feature_lookup_is_exact_cross_layer_and_fail_closed(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as first_bundle_text,
+            tempfile.TemporaryDirectory() as second_bundle_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            _seed_dataset(app)
+            with TestClient(app) as client:
+                layer_ids: list[str] = []
+                for directory, stem in (
+                    (Path(first_bundle_text), "supports_a"),
+                    (Path(second_bundle_text), "supports_b"),
+                ):
+                    uploaded = client.post(
+                        "/api/datasets/dataset-a/overlays",
+                        files=_multipart(_write_support_bundle(directory, stem)),
+                    )
+                    self.assertEqual(uploaded.status_code, 201, uploaded.text)
+                    layer_id = uploaded.json()["layer"]["id"]
+                    layer_ids.append(layer_id)
+
+                # Index construction must remain inside the caller's write
+                # transaction so a failed rebuild cannot expose a partial
+                # table or trigger set to concurrent readers.
+                overlay_root = next((Path(state_text) / "overlays").iterdir())
+                first_layer_dir = overlay_root / layer_ids[0]
+                with (
+                    self.assertRaisesRegex(TypeError, "must be an array"),
+                    _feature_db(first_layer_dir, write=True) as connection,
+                ):
+                    connection.execute(
+                        "DROP TRIGGER exact_refs_provenance_validate_insert"
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO feature_provenance(
+                            feature_id,provenance_json,updated_at
+                        ) VALUES(?,?,?)
+                        """,
+                        (
+                            "f_000000001",
+                            json.dumps({"source_detection_ids": "not-an-array"}),
+                            NOW,
+                        ),
+                    )
+                    _rebuild_exact_reference_index(connection)
+                with (
+                    self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "source_detection_ids must be an array",
+                    ),
+                    _feature_db(first_layer_dir, write=True) as connection,
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO feature_provenance(
+                            feature_id,provenance_json,updated_at
+                        ) VALUES(?,?,?)
+                        """,
+                        (
+                            "f_000000001",
+                            json.dumps({"source_detection_ids": {"bad": "shape"}}),
+                            NOW,
+                        ),
+                    )
+                with _feature_db(first_layer_dir, write=True) as connection:
+                    connection.execute(
+                        """
+                        UPDATE metadata SET value='stale'
+                        WHERE key='exact_reference_index_version'
+                        """
+                    )
+                with (
+                    self.assertRaisesRegex(RuntimeError, "rollback index build"),
+                    _feature_db(first_layer_dir, write=True) as connection,
+                ):
+                    _rebuild_exact_reference_index(connection)
+                    self.assertTrue(connection.in_transaction)
+                    raise RuntimeError("rollback index build")
+                with closing(
+                    sqlite3.connect(first_layer_dir / "features.sqlite3")
+                ) as connection:
+                    table = connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='table' AND name='feature_exact_references'
+                        """
+                    ).fetchone()
+                    version = connection.execute(
+                        """
+                        SELECT value FROM metadata
+                        WHERE key='exact_reference_index_version'
+                        """
+                    ).fetchone()
+                self.assertIsNotNone(table)
+                self.assertEqual(version, ("stale",))
+
+                matched = client.get(
+                    "/api/datasets/dataset-a/overlays/support-features",
+                    params={"support_id": "gantry-01"},
+                )
+                self.assertEqual(matched.status_code, 200, matched.text)
+                self.assertEqual(matched.headers["cache-control"], "private, no-store")
+                self.assertEqual(matched.json()["status"], "matched")
+                self.assertEqual(matched.json()["count"], 2)
+                self.assertEqual(
+                    {item["layer_id"] for item in matched.json()["items"]},
+                    set(layer_ids),
+                )
+                self.assertTrue(matched.json()["scan_complete"])
+
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "_rebuild_exact_reference_index",
+                    side_effect=AssertionError("current index must be reused"),
+                ):
+                    reused = client.get(
+                        "/api/datasets/dataset-a/overlays/support-features",
+                        params={"support_id": "GANTRY-01"},
+                    )
+                self.assertEqual(reused.status_code, 200, reused.text)
+                self.assertEqual(reused.json()["count"], 2)
+
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES",
+                    1,
+                ):
+                    bounded_catalog = client.get(
+                        "/api/datasets/dataset-a/overlays"
+                    )
+                    catalog_bounded_lookup = client.get(
+                        "/api/datasets/dataset-a/overlays/support-features",
+                        params={"support_id": "GANTRY-01"},
+                    )
+                self.assertEqual(len(bounded_catalog.json()["items"]), 1)
+                self.assertEqual(
+                    catalog_bounded_lookup.json()["status"], "unavailable"
+                )
+                self.assertEqual(catalog_bounded_lookup.json()["items"], [])
+
+                with patch(
+                    "mms_shp_detection.webapp.overlays."
+                    "SUPPORT_FEATURE_RESOLVER_MAX_CANDIDATES",
+                    1,
+                ):
+                    bounded = client.get(
+                        "/api/datasets/dataset-a/overlays/support-features",
+                        params={"support_id": "GANTRY-01"},
+                    )
+                self.assertEqual(bounded.status_code, 200, bounded.text)
+                self.assertEqual(bounded.json()["status"], "unavailable")
+                self.assertEqual(bounded.json()["items"], [])
+                self.assertFalse(bounded.json()["scan_complete"])
+
+                with _feature_db(first_layer_dir, write=True) as connection:
+                    connection.execute(
+                        """
+                        UPDATE metadata SET value='stale'
+                        WHERE key='exact_reference_index_version'
+                        """
+                    )
+                with (
+                    patch(
+                        "mms_shp_detection.webapp.overlays."
+                        "EXACT_REFERENCE_MAX_LAZY_MIGRATIONS_PER_REQUEST",
+                        0,
+                    ),
+                    patch(
+                        "mms_shp_detection.webapp.overlays."
+                        "_rebuild_exact_reference_index",
+                        side_effect=AssertionError("bounded lookup must not rebuild"),
+                    ),
+                ):
+                    migration_bounded = client.get(
+                        "/api/datasets/dataset-a/overlays/support-features",
+                        params={"support_id": "GANTRY-01"},
+                    )
+                self.assertEqual(migration_bounded.status_code, 200)
+                self.assertEqual(migration_bounded.json()["status"], "unavailable")
+                self.assertEqual(migration_bounded.json()["items"], [])
+
+    def test_review_linked_manual_pole_edits_enforce_direct_and_interval_frames(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+            tempfile.TemporaryDirectory() as bundle_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            _seed_review_scope_dataset(app)
+            with TestClient(app) as client:
+                uploaded = client.post(
+                    "/api/datasets/dataset-a/overlays",
+                    files=_multipart(_write_bundle(Path(bundle_text))),
+                )
+                self.assertEqual(uploaded.status_code, 201, uploaded.text)
+                layer_id = uploaded.json()["layer"]["id"]
+                session_response = client.post(
+                    "/api/datasets/dataset-a/review-sessions",
+                    json={
+                        "target_layer_ids": [layer_id],
+                        "status": "active",
+                        "created_by": "operator-local",
+                    },
+                )
+                self.assertEqual(
+                    session_response.status_code, 201, session_response.text
+                )
+                session_id = session_response.json()["session"]["id"]
+
+                direct_response = client.post(
+                    f"/api/review-sessions/{session_id}/tasks",
+                    json={
+                        "task_type": "MANUAL_SCAN",
+                        "priority": 50,
+                        "frame_id": "frame-a0",
+                        "target_layer_id": layer_id,
+                        "class_hint": "SIGN_SUPPORT_POLE",
+                    },
+                )
+                self.assertEqual(direct_response.status_code, 201, direct_response.text)
+                direct_task_id = direct_response.json()["task"]["id"]
+
+                interval_response = client.post(
+                    f"/api/review-sessions/{session_id}/tasks/generate",
+                    json={
+                        "tasks": [
+                            {
+                                "task_type": "UNREVIEWED_INTERVAL",
+                                "priority": 50,
+                                "frame_id": "frame-a1",
+                                "track_id": "track-a",
+                                "frame_start": 0,
+                                "frame_end": 2,
+                                "target_layer_id": layer_id,
+                                "class_hint": "SIGN_SUPPORT_POLE",
+                            }
+                        ]
+                    },
+                )
+                self.assertEqual(
+                    interval_response.status_code, 200, interval_response.text
+                )
+                interval_task_id = interval_response.json()["items"][0]["id"]
+
+                for task_id in (direct_task_id, interval_task_id):
+                    claimed = client.patch(
+                        f"/api/review-tasks/{task_id}",
+                        json={
+                            "status": "in_progress",
+                            "claimed_by": "operator-local",
+                        },
+                    )
+                    self.assertEqual(claimed.status_code, 200, claimed.text)
+
+                def review_metadata(
+                    task_id: str, source_frame_ids: list[str]
+                ) -> dict[str, object]:
+                    return {
+                        "source_frame_ids": source_frame_ids,
+                        "creation_tool": "manual_pole_base_v1",
+                        "created_by": "operator-local",
+                        "task_id": task_id,
+                    }
+
+                def assert_unresolved(task_id: str) -> None:
+                    response = client.get(f"/api/review-tasks/{task_id}")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    task = response.json()["task"]
+                    self.assertEqual(task["status"], "in_progress")
+                    self.assertEqual(task["resolved_feature_ids"], [])
+
+                feature_url = (
+                    f"/api/datasets/dataset-a/overlays/{layer_id}/features"
+                )
+                direct_patch = {
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [300_100.0, 4_100_000.0, 9.0],
+                    },
+                    "coordinate_space": "dataset",
+                    "expected_revision": 1,
+                    "manual_object_validation": {
+                        "template_id": "SIGN_SUPPORT_POLE"
+                    },
+                }
+                missing_direct_evidence = client.patch(
+                    f"{feature_url}/f_000000001",
+                    json={
+                        **direct_patch,
+                        "idempotency_key": "missing-direct-evidence-key",
+                        "review_metadata": review_metadata(direct_task_id, []),
+                    },
+                )
+                self.assertEqual(
+                    missing_direct_evidence.status_code,
+                    422,
+                    missing_direct_evidence.text,
+                )
+                self.assertIn(
+                    "require source_frame_ids",
+                    missing_direct_evidence.json()["detail"],
+                )
+                wrong_direct = client.patch(
+                    f"{feature_url}/f_000000001",
+                    json={
+                        **direct_patch,
+                        "idempotency_key": "wrong-direct-frame-key",
+                        "review_metadata": review_metadata(
+                            direct_task_id, ["frame-a1"]
+                        ),
+                    },
+                )
+                self.assertEqual(wrong_direct.status_code, 422, wrong_direct.text)
+                self.assertIn("exactly match", wrong_direct.json()["detail"])
+                extra_direct = client.patch(
+                    f"{feature_url}/f_000000001",
+                    json={
+                        **direct_patch,
+                        "idempotency_key": "extra-direct-frame-key",
+                        "review_metadata": review_metadata(
+                            direct_task_id, ["frame-a0", "frame-a1"]
+                        ),
+                    },
+                )
+                self.assertEqual(extra_direct.status_code, 422, extra_direct.text)
+                assert_unresolved(direct_task_id)
+
+                matching_direct = client.patch(
+                    f"{feature_url}/f_000000001",
+                    json={
+                        **direct_patch,
+                        "idempotency_key": "matching-direct-frame-key",
+                        "review_metadata": review_metadata(
+                            direct_task_id, ["frame-a0"]
+                        ),
+                    },
+                )
+                self.assertEqual(
+                    matching_direct.status_code, 200, matching_direct.text
+                )
+                direct_task = client.get(
+                    f"/api/review-tasks/{direct_task_id}"
+                ).json()["task"]
+                self.assertEqual(direct_task["status"], "corrected")
+
+                interval_create = {
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [300_120.0, 4_100_000.0, 9.0],
+                    },
+                    "coordinate_space": "dataset",
+                    "expected_revision": 2,
+                    "manual_object_validation": {
+                        "template_id": "SIGN_SUPPORT_POLE"
+                    },
+                }
+                wrong_range = client.post(
+                    feature_url,
+                    json={
+                        **interval_create,
+                        "idempotency_key": "wrong-interval-range-key",
+                        "review_metadata": review_metadata(
+                            interval_task_id, ["frame-a2"]
+                        ),
+                    },
+                )
+                self.assertEqual(wrong_range.status_code, 422, wrong_range.text)
+                self.assertIn("range or track", wrong_range.json()["detail"])
+                wrong_track = client.post(
+                    feature_url,
+                    json={
+                        **interval_create,
+                        "idempotency_key": "wrong-interval-track-key",
+                        "review_metadata": review_metadata(
+                            interval_task_id, ["frame-b1"]
+                        ),
+                    },
+                )
+                self.assertEqual(wrong_track.status_code, 422, wrong_track.text)
+                assert_unresolved(interval_task_id)
+
+                matching_interval = client.post(
+                    feature_url,
+                    json={
+                        **interval_create,
+                        "idempotency_key": "matching-interval-frame-key",
+                        "review_metadata": review_metadata(
+                            interval_task_id, ["frame-a1"]
+                        ),
+                    },
+                )
+                self.assertEqual(
+                    matching_interval.status_code, 201, matching_interval.text
+                )
+                interval_task = client.get(
+                    f"/api/review-tasks/{interval_task_id}"
+                ).json()["task"]
+                self.assertEqual(interval_task["status"], "manual_added")
+                self.assertEqual(
+                    interval_task["resolved_feature_ids"],
+                    [matching_interval.json()["feature"]["id"]],
+                )
 
     def test_feature_create_commits_geometry_and_validated_properties_atomically(self) -> None:
         with (

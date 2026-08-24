@@ -176,12 +176,7 @@ describe('DetachablePanel keyboard relay', () => {
         ['p', 'KeyP'],
         ['b', 'KeyB'],
         ['r', 'KeyR'],
-        ['j', 'KeyJ'],
-        ['k', 'KeyK'],
         ['m', 'KeyM'],
-        ['q', 'KeyQ'],
-        ['x', 'KeyX'],
-        ['f', 'KeyF'],
         ['Enter', 'Enter'],
         ['Escape', 'Escape'],
       ] as const
@@ -196,6 +191,20 @@ describe('DetachablePanel keyboard relay', () => {
         expect(shortcut.defaultPrevented).toBe(true)
       })
 
+      expect(onKeyDown.mock.calls.map(([event]) => event.code)).toEqual(
+        shortcuts.map(([, code]) => code),
+      )
+
+      ;['KeyJ', 'KeyK', 'KeyQ', 'KeyX', 'KeyF'].forEach((code) => {
+        const retiredReviewShortcut = new KeyboardEvent('keydown', {
+          key: code.slice(3).toLowerCase(),
+          code,
+          bubbles: true,
+          cancelable: true,
+        })
+        popup.dispatchEvent(retiredReviewShortcut)
+        expect(retiredReviewShortcut.defaultPrevented).toBe(false)
+      })
       expect(onKeyDown.mock.calls.map(([event]) => event.code)).toEqual(
         shortcuts.map(([, code]) => code),
       )
@@ -217,7 +226,7 @@ describe('DetachablePanel keyboard relay', () => {
     }
   })
 
-  it('does not relay workspace shortcuts while typing in popup controls', () => {
+  it('does not relay workspace shortcuts from popup form and action controls', () => {
     const { popup, addEventListener } = fakePopup()
     vi.spyOn(window, 'open').mockReturnValue(popup)
     const onKeyDown = vi.fn()
@@ -226,13 +235,18 @@ describe('DetachablePanel keyboard relay', () => {
       render(<Harness />)
       fireEvent.click(screen.getByRole('button', { name: 'popup 열기' }))
       const input = popup.document.createElement('input')
+      const button = popup.document.createElement('button')
+      const dialog = popup.document.createElement('section')
+      dialog.setAttribute('role', 'dialog')
       popup.document.body.appendChild(input)
+      popup.document.body.appendChild(button)
+      popup.document.body.appendChild(dialog)
       const relay = addEventListener.mock.calls.find(([type]) => type === 'keydown')?.[1] as
         | ((event: KeyboardEvent) => void)
         | undefined
       expect(relay).toBeDefined()
 
-      ;['KeyB', 'KeyR', 'KeyJ', 'KeyK', 'KeyM', 'KeyQ', 'KeyX', 'KeyF', 'Enter', 'Escape'].forEach((code) => {
+      ;['KeyB', 'KeyR', 'KeyM', 'Enter', 'Escape'].forEach((code) => {
         const key = code.startsWith('Key') ? code.slice(3).toLowerCase() : code
         const event = new KeyboardEvent('keydown', {
           key,
@@ -243,6 +257,24 @@ describe('DetachablePanel keyboard relay', () => {
         Object.defineProperty(event, 'target', { value: input })
         relay?.(event)
       })
+
+      const buttonEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        bubbles: true,
+        cancelable: true,
+      })
+      Object.defineProperty(buttonEnter, 'target', { value: button })
+      relay?.(buttonEnter)
+
+      const dialogEscape = new KeyboardEvent('keydown', {
+        key: 'Escape',
+        code: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      })
+      Object.defineProperty(dialogEscape, 'target', { value: dialog })
+      relay?.(dialogEscape)
 
       expect(onKeyDown).not.toHaveBeenCalled()
     } finally {

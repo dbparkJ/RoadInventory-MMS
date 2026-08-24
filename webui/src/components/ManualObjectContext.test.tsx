@@ -1,6 +1,6 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
 import type {
   EquirectangularBBoxGeometry,
   Frame,
@@ -8,6 +8,7 @@ import type {
   ManualObjectTemplate,
   ManualObservation,
   OverlayLayer,
+  ReviewTask,
 } from '../types'
 import type { OverlayContextValue } from './OverlayContext'
 
@@ -28,6 +29,8 @@ vi.mock('./ReviewContext', () => ({
 
 import {
   ManualObjectProvider,
+  MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS,
+  MANUAL_PROPOSAL_PREPARING_RETRY_MS,
   manualEffectiveProperties,
   missingManualRequiredFields,
   seamSafeBboxFromUv,
@@ -136,6 +139,49 @@ const PROPOSAL: GeometryProposal = {
   evidence: { frame_id: FRAME_1.id, observation_id: OBSERVATION.observation_id },
 }
 
+function reviewTask(id: string): ReviewTask {
+  return {
+    id,
+    session_id: 'review-session-1',
+    dataset_id: 'dataset-1',
+    task_type: 'MANUAL_SCAN',
+    status: 'in_progress',
+    priority: 50,
+    frame_id: FRAME_1.id,
+    track_id: FRAME_1.track_id,
+    frame_start: null,
+    frame_end: null,
+    source_run_id: null,
+    source_detection_id: null,
+    target_layer_id: TRAFFIC_LAYER.id,
+    class_hint: 'TRAFFIC_SIGN',
+    reason_codes: [],
+    location_hint: null,
+    claimed_by: 'operator-local',
+    resolved_feature_ids: [],
+    resolution: null,
+    created_at: '2026-08-24T00:00:00Z',
+    updated_at: '2026-08-24T00:00:00Z',
+  }
+}
+
+const REVIEW_SESSION = {
+  id: 'review-session-1',
+  dataset_id: 'dataset-1',
+  source_run_ids: [],
+  target_layer_ids: [TRAFFIC_LAYER.id],
+  track_ids: [FRAME_1.track_id],
+  frame_range: [FRAME_1.index, FRAME_2.index] as [number, number],
+  class_filters: [],
+  status: 'active' as const,
+  created_by: 'operator-local',
+  created_at: '2026-08-24T00:00:00Z',
+  updated_at: '2026-08-24T00:00:00Z',
+  last_task_id: null,
+  qa_layer_revisions: null,
+  qa_ran_at: null,
+}
+
 function makeOverlay(): OverlayContextValue {
   return {
     datasetId: 'dataset-1',
@@ -157,6 +203,7 @@ function makeOverlay(): OverlayContextValue {
     pickMode: false,
     pickTarget: null,
     poleBaseProposal: { status: 'idle' },
+    poleBaseReviewTaskChanged: false,
     setPickMode: vi.fn(),
     beginCreatePoint: vi.fn(),
     beginStagedPointCreate: vi.fn(),
@@ -200,31 +247,54 @@ function WorkspaceProbe() {
       <output data-testid="template-id">{manual.templateId}</output>
       <output data-testid="target-layer-id">{manual.targetLayerId || 'none'}</output>
       <output data-testid="proposal-status">{manual.proposalState.status}</output>
+      <output data-testid="bbox-mode">{String(manual.bboxMode)}</output>
       <output data-testid="proposal-frame">{stateFrameId(manual.proposalState)}</output>
       <output data-testid="proposal-position">
         {manual.proposalPosition?.join(',') ?? 'none'}
       </output>
+      <output data-testid="proposal-review-task">
+        {manual.proposalState.status === 'ready' || manual.proposalState.status === 'committing'
+          ? manual.proposalState.data.reviewTaskSnapshot?.id ?? 'unlinked'
+          : 'none'}
+      </output>
+      <output data-testid="review-task-link-changed">
+        {String(manual.reviewTaskLinkChanged)}
+      </output>
+      <output data-testid="effective-note">{String(manual.effectiveProperties.NOTE ?? 'none')}</output>
       <button type="button" onClick={() => manual.setTemplateId('SIGN_SUPPORT_POLE')}>
         select pole
       </button>
       <button type="button" onClick={manual.beginTrafficSignBbox}>begin bbox</button>
       <button type="button" onClick={manual.startSelectedTemplate}>start selected template</button>
       <button type="button" onClick={() => void manual.submitBbox(BBOX)}>submit bbox</button>
+      <button type="button" onClick={() => manual.stageBbox(BBOX)}>release bbox</button>
+      <button type="button" onClick={() => void manual.retryProposal()}>retry proposal</button>
+      <button type="button" onClick={manual.retryBbox}>retry bbox</button>
       <button type="button" onClick={() => void manual.confirmProposal()}>confirm proposal</button>
+      <button type="button" onClick={() => void manual.confirmProposal(true)}>confirm and next</button>
     </div>
   )
 }
 
-function ManualHarness({ frame }: { frame: Frame }) {
+function ManualHarness({
+  frame,
+  notify,
+}: {
+  frame: Frame
+  notify?: (entry: { tone: 'success' | 'error' | 'info'; title: string; message?: string }) => void
+}) {
   return (
-    <ManualObjectProvider enabled datasetId="dataset-1" frame={frame}>
+    <ManualObjectProvider enabled datasetId="dataset-1" frame={frame} notify={notify}>
       <WorkspaceProbe />
     </ManualObjectProvider>
   )
 }
 
-function renderManual(frame: Frame = FRAME_1) {
-  return render(<ManualHarness frame={frame} />)
+function renderManual(
+  frame: Frame = FRAME_1,
+  notify?: (entry: { tone: 'success' | 'error' | 'info'; title: string; message?: string }) => void,
+) {
+  return render(<ManualHarness frame={frame} notify={notify} />)
 }
 
 function mockTemplates() {
@@ -376,6 +446,152 @@ describe('manual template properties', () => {
 })
 
 describe('ManualObjectProvider state reconciliation', () => {
+  it('starts the 3D proposal immediately when a valid bbox is released', async () => {
+    mockTemplates()
+    mockReadyProposal()
+    const createObservation = vi.mocked(api.createManualObservation)
+    const createProposal = vi.mocked(api.createManualObjectProposal)
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    // A duplicated pointer-up/release must not create a second observation or
+    // proposal while the first auto-submit is still in flight.
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    expect(createObservation).toHaveBeenCalledTimes(1)
+    expect(createObservation).toHaveBeenCalledWith(
+      'dataset-1',
+      FRAME_1.id,
+      expect.objectContaining({ geometry_2d: BBOX }),
+      expect.any(AbortSignal),
+    )
+    expect(createProposal).toHaveBeenCalledTimes(1)
+  })
+
+  it('automatically retries a preparing point catalog with the same observation and a finite bound', async () => {
+    mockTemplates()
+    vi.spyOn(api, 'createManualObservation').mockResolvedValue({
+      observation: OBSERVATION,
+      target_layer_id: TRAFFIC_LAYER.id,
+    })
+    const createProposal = vi.spyOn(api, 'createManualObjectProposal').mockRejectedValue(
+      new ApiError('Point-cloud index is being prepared.', 202, 'CATALOG_PREPARING'),
+    )
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+      fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+      await act(async () => { await Promise.resolve() })
+      expect(createProposal).toHaveBeenCalledTimes(1)
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('loading')
+
+      for (let attempt = 1; attempt < MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS; attempt += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(MANUAL_PROPOSAL_PREPARING_RETRY_MS)
+        })
+      }
+
+      expect(createProposal).toHaveBeenCalledTimes(MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS)
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('error')
+      expect(api.createManualObservation).toHaveBeenCalledTimes(1)
+
+      fireEvent.click(screen.getByRole('button', { name: 'retry proposal' }))
+      await act(async () => { await Promise.resolve() })
+      expect(createProposal).toHaveBeenCalledTimes(MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS + 1)
+      expect(api.createManualObservation).toHaveBeenCalledTimes(1)
+      expect(createProposal).toHaveBeenLastCalledWith(
+        'dataset-1',
+        FRAME_1.id,
+        expect.objectContaining({ observation_id: OBSERVATION.observation_id }),
+        expect.any(AbortSignal),
+      )
+      fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('becomes ready when the point catalog finishes during an automatic retry', async () => {
+    mockTemplates()
+    vi.spyOn(api, 'createManualObservation').mockResolvedValue({
+      observation: OBSERVATION,
+      target_layer_id: TRAFFIC_LAYER.id,
+    })
+    const createProposal = vi.spyOn(api, 'createManualObjectProposal')
+      .mockRejectedValueOnce(
+        new ApiError('Point-cloud index is being prepared.', 202, 'CATALOG_PREPARING'),
+      )
+      .mockResolvedValue({
+        proposal: PROPOSAL,
+        target_layer_id: TRAFFIC_LAYER.id,
+        expires_in_seconds: 600,
+      })
+    vi.spyOn(api, 'duplicateManualObjectPreflight').mockResolvedValue({
+      exact_duplicate: false,
+      blocked: false,
+      candidates: [],
+      warning_count: 0,
+      radius_m: 0.75,
+    })
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+      fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+      await act(async () => { await Promise.resolve() })
+      expect(createProposal).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MANUAL_PROPOSAL_PREPARING_RETRY_MS)
+      })
+
+      expect(createProposal).toHaveBeenCalledTimes(2)
+      expect(api.createManualObservation).toHaveBeenCalledTimes(1)
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending catalog retry without issuing another proposal request', async () => {
+    mockTemplates()
+    vi.spyOn(api, 'createManualObservation').mockResolvedValue({
+      observation: OBSERVATION,
+      target_layer_id: TRAFFIC_LAYER.id,
+    })
+    const createProposal = vi.spyOn(api, 'createManualObjectProposal').mockRejectedValue(
+      new ApiError('Point-cloud index is being prepared.', 202, 'CATALOG_PREPARING'),
+    )
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+      fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+      await act(async () => { await Promise.resolve() })
+      expect(createProposal).toHaveBeenCalledTimes(1)
+
+      fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('idle')
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MANUAL_PROPOSAL_PREPARING_RETRY_MS * 2)
+      })
+      expect(createProposal).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('starts the pole adapter with only effective target fields and fixed class aliases', async () => {
     mockTemplates()
     const overlay = makeOverlay()
@@ -389,6 +605,7 @@ describe('ManualObjectProvider state reconciliation', () => {
     await waitFor(() => {
       expect(screen.getByTestId('template-id')).toHaveTextContent('SIGN_SUPPORT_POLE')
       expect(screen.getByTestId('target-layer-id')).toHaveTextContent(POLE_LAYER.id)
+      expect(screen.getByTestId('effective-note')).toHaveTextContent('template default')
     })
     fireEvent.click(screen.getByRole('button', { name: 'start selected template' }))
 
@@ -409,7 +626,7 @@ describe('ManualObjectProvider state reconciliation', () => {
     expect(vi.mocked(overlay.beginStagedPointCreate).mock.calls[0][2]?.properties).not.toHaveProperty('class')
   })
 
-  it('advances Shift+Enter pole review only after a synchronized pole save succeeds', async () => {
+  it('delegates Shift+Enter pole save-and-next navigation to the snapshotted workflow', async () => {
     mockTemplates()
     const overlay = makeOverlay()
     const confirmPoleBaseProposal = vi
@@ -427,6 +644,7 @@ describe('ManualObjectProvider state reconciliation', () => {
       frameId: FRAME_1.id,
       seed: [10, 20, 35],
       idempotencyKey: 'pole-base-fixture-key',
+      reviewTaskSnapshot: null,
       result: {
         status: 'auto',
         algorithm: 'manual_seed_axis_ground_intersection',
@@ -460,11 +678,13 @@ describe('ManualObjectProvider state reconciliation', () => {
 
     fireEvent.keyDown(window, { key: 'Enter', code: 'Enter', shiftKey: true })
     await waitFor(() => expect(confirmPoleBaseProposal).toHaveBeenCalledTimes(1))
+    expect(confirmPoleBaseProposal).toHaveBeenLastCalledWith(true)
     expect(moveTask).not.toHaveBeenCalled()
 
     fireEvent.keyDown(window, { key: 'Enter', code: 'Enter', shiftKey: true })
     await waitFor(() => expect(confirmPoleBaseProposal).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(moveTask).toHaveBeenCalledWith(1))
+    expect(confirmPoleBaseProposal).toHaveBeenLastCalledWith(true)
+    expect(moveTask).not.toHaveBeenCalled()
   })
 
   it('switches a remembered pole template back to its traffic layer when M starts bbox mode', async () => {
@@ -500,6 +720,21 @@ describe('ManualObjectProvider state reconciliation', () => {
       expect(screen.getByTestId('proposal-frame')).toHaveTextContent(FRAME_1.id)
     })
     expect(overlay.setActiveLayerId).toHaveBeenCalledWith(TRAFFIC_LAYER.id)
+  })
+
+  it('keeps M and Escape from changing a manual workflow behind an open help modal', async () => {
+    mockTemplates()
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('idle'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    expect(screen.getByTestId('proposal-status')).toHaveTextContent('drawing')
+    render(<section role="dialog" aria-modal="true" aria-label="도움말" />)
+
+    fireEvent.keyDown(window, { key: 'm', code: 'KeyM' })
+    fireEvent.keyDown(window, { key: 'Escape', code: 'Escape' })
+
+    expect(screen.getByTestId('proposal-status')).toHaveTextContent('drawing')
   })
 
   it('aborts an in-flight duplicate preflight and removes its server proposal on frame change', async () => {
@@ -596,6 +831,203 @@ describe('ManualObjectProvider state reconciliation', () => {
     expect(screen.getByTestId('proposal-position')).toHaveTextContent('none')
   })
 
+  it('keeps the bbox bound to its starting review task and blocks a same-scope task switch', async () => {
+    mockTemplates()
+    mockReadyProposal()
+    const overlay = makeOverlay()
+    const reload = vi.fn()
+    const notify = vi.fn()
+    let currentTask = reviewTask('task-started')
+    contextMocks.useOverlayWorkspace.mockReturnValue(overlay)
+    contextMocks.useOptionalReviewWorkspace.mockImplementation(() => ({
+      currentTask,
+      session: REVIEW_SESSION,
+      reload,
+    }))
+    const commit = vi.spyOn(api, 'commitManualObjectProposal').mockResolvedValue({
+      feature: {
+        type: 'Feature',
+        id: 'feature-current-task',
+        geometry: { type: 'Point', coordinates: [10, 20, 30] },
+        properties: { CLASS_NM: 'TRAFFIC_SIGN' },
+      },
+      revision: 8,
+      coordinate_space: 'dataset',
+      idempotent_replay: false,
+      edit_transaction_id: 'edit-current-task',
+      duplicate_warnings: [],
+      task_resolution_pending: false,
+    })
+    const view = renderManual(FRAME_1, notify)
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready')
+      expect(screen.getByTestId('proposal-review-task')).toHaveTextContent('task-started')
+    })
+
+    currentTask = reviewTask('task-selected-later')
+    view.rerender(<ManualHarness frame={FRAME_1} notify={notify} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('review-task-link-changed')).toHaveTextContent('true')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'confirm proposal' }))
+    expect(commit).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+      tone: 'info',
+      title: '검수 항목이 바뀌어 저장을 중단했습니다.',
+    }))
+    expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready')
+
+    fireEvent.click(screen.getByRole('button', { name: 'retry bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('proposal-review-task')).toHaveTextContent('task-selected-later')
+      expect(screen.getByTestId('review-task-link-changed')).toHaveTextContent('false')
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'confirm proposal' }))
+
+    await waitFor(() => expect(commit).toHaveBeenCalledWith(
+      PROPOSAL.proposal_id,
+      expect.objectContaining({ task_id: 'task-selected-later' }),
+      expect.any(AbortSignal),
+    ))
+  })
+
+  it('does not retroactively link an initially unlinked bbox to a later task', async () => {
+    mockTemplates()
+    mockReadyProposal()
+    const overlay = makeOverlay()
+    let currentTask: ReviewTask | null = null
+    contextMocks.useOverlayWorkspace.mockReturnValue(overlay)
+    contextMocks.useOptionalReviewWorkspace.mockImplementation(() => ({
+      currentTask,
+      session: REVIEW_SESSION,
+      reload: vi.fn(),
+    }))
+    const commit = vi.spyOn(api, 'commitManualObjectProposal').mockResolvedValue({
+      feature: {
+        type: 'Feature',
+        id: 'feature-unlinked',
+        geometry: { type: 'Point', coordinates: [10, 20, 30] },
+        properties: { CLASS_NM: 'TRAFFIC_SIGN' },
+      },
+      revision: 8,
+      coordinate_space: 'dataset',
+      idempotent_replay: false,
+      edit_transaction_id: 'edit-unlinked',
+      duplicate_warnings: [],
+      task_resolution_pending: false,
+    })
+    const view = renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    await waitFor(() => expect(screen.getByTestId('proposal-review-task')).toHaveTextContent('unlinked'))
+
+    currentTask = reviewTask('task-selected-later')
+    view.rerender(<ManualHarness frame={FRAME_1} />)
+    fireEvent.click(screen.getByRole('button', { name: 'confirm proposal' }))
+
+    await waitFor(() => expect(commit).toHaveBeenCalled())
+    expect(commit.mock.calls[0][1]).not.toHaveProperty('task_id')
+  })
+
+  it('ends bbox mode after save-and-next so the next task captures a fresh scope', async () => {
+    mockTemplates()
+    mockReadyProposal()
+    const overlay = makeOverlay()
+    const moveTask = vi.fn()
+    contextMocks.useOverlayWorkspace.mockReturnValue(overlay)
+    contextMocks.useOptionalReviewWorkspace.mockReturnValue({
+      currentTask: reviewTask('task-before-next'),
+      session: REVIEW_SESSION,
+      reload: vi.fn(),
+      moveTask,
+    })
+    vi.spyOn(api, 'commitManualObjectProposal').mockResolvedValue({
+      feature: {
+        type: 'Feature',
+        id: 'feature-before-next',
+        geometry: { type: 'Point', coordinates: [10, 20, 30] },
+        properties: { CLASS_NM: 'TRAFFIC_SIGN' },
+      },
+      revision: 8,
+      coordinate_space: 'dataset',
+      idempotent_replay: false,
+      edit_transaction_id: 'edit-before-next',
+      duplicate_warnings: [],
+      task_resolution_pending: false,
+    })
+    renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm and next' }))
+
+    await waitFor(() => {
+      expect(moveTask).toHaveBeenCalledWith(1)
+      expect(screen.getByTestId('proposal-status')).toHaveTextContent('idle')
+      expect(screen.getByTestId('bbox-mode')).toHaveTextContent('false')
+    })
+  })
+
+  it('does not advance a newly selected review task after an older save-and-next finishes', async () => {
+    mockTemplates()
+    mockReadyProposal()
+    const overlay = makeOverlay()
+    const moveTask = vi.fn()
+    const reload = vi.fn()
+    let currentTask = reviewTask('task-commit-started')
+    contextMocks.useOverlayWorkspace.mockReturnValue(overlay)
+    contextMocks.useOptionalReviewWorkspace.mockImplementation(() => ({
+      currentTask,
+      session: REVIEW_SESSION,
+      reload,
+      moveTask,
+    }))
+    const commit = deferred<Awaited<ReturnType<typeof api.commitManualObjectProposal>>>()
+    vi.spyOn(api, 'commitManualObjectProposal').mockReturnValue(commit.promise)
+    const view = renderManual()
+    await waitFor(() => expect(screen.getByTestId('target-layer-id')).toHaveTextContent(TRAFFIC_LAYER.id))
+
+    fireEvent.click(screen.getByRole('button', { name: 'begin bbox' }))
+    fireEvent.click(screen.getByRole('button', { name: 'release bbox' }))
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('ready'))
+    fireEvent.click(screen.getByRole('button', { name: 'confirm and next' }))
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('committing'))
+
+    currentTask = reviewTask('task-selected-during-commit')
+    view.rerender(<ManualHarness frame={FRAME_1} />)
+    commit.resolve({
+      feature: {
+        type: 'Feature',
+        id: 'feature-from-started-task',
+        geometry: { type: 'Point', coordinates: [10, 20, 30] },
+        properties: { CLASS_NM: 'TRAFFIC_SIGN' },
+      },
+      revision: 8,
+      coordinate_space: 'dataset',
+      idempotent_replay: false,
+      edit_transaction_id: 'edit-from-started-task',
+      duplicate_warnings: [],
+      task_resolution_pending: false,
+    })
+
+    await waitFor(() => expect(screen.getByTestId('proposal-status')).toHaveTextContent('idle'))
+    expect(moveTask).not.toHaveBeenCalled()
+    expect(overlay.selectFeature).toHaveBeenCalledWith(
+      { layerId: TRAFFIC_LAYER.id, featureId: 'feature-from-started-task' },
+      { navigate: false },
+    )
+  })
+
   it('retries linked task resolution once after a successful manual commit', async () => {
     mockTemplates()
     mockReadyProposal()
@@ -603,12 +1035,8 @@ describe('ManualObjectProvider state reconciliation', () => {
     contextMocks.useOverlayWorkspace.mockReturnValue(overlay)
     const reload = vi.fn()
     contextMocks.useOptionalReviewWorkspace.mockReturnValue({
-      currentTask: {
-        id: 'task-manual-1',
-        dataset_id: 'dataset-1',
-        target_layer_id: TRAFFIC_LAYER.id,
-        status: 'in_progress',
-      },
+      currentTask: reviewTask('task-manual-1'),
+      session: REVIEW_SESSION,
       reload,
     })
     vi.spyOn(api, 'commitManualObjectProposal').mockResolvedValue({

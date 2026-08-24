@@ -73,8 +73,10 @@ bash scripts/setup_web.sh
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_web.ps1 --dry-run
 ```
 
-기본 저장소는 프로젝트의 `data` 폴더입니다. 서버/NAS 폴더를 노출할 때는 허용할
-루트만 반복 지정하며, UI와 API에는 이 루트 바깥의 절대경로가 공개되지 않습니다.
+기본 저장소는 프로젝트의 `data` 폴더이며, `config.yaml`의 `paths.data_root`가
+별도의 기존 폴더를 가리키면 기본 웹 실행에도 함께 등록됩니다. 서버/NAS 폴더를
+추가로 노출할 때는 허용할 루트만 반복 지정하며, UI와 API에는 이 루트 바깥의
+절대경로가 공개되지 않습니다.
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\run_web.py `

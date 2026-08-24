@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { frameNavigationDirection, isTextEntryTarget } from '../lib/frameNavigation'
+import { frameNavigationDirection, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 
 interface DetachablePanelControls {
   detached: boolean
@@ -119,7 +119,7 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
         !event.altKey &&
         !event.ctrlKey &&
         !event.metaKey &&
-        !isTextEntryTarget(event.target) &&
+        !isWorkspaceShortcutBlockedTarget(event.target) &&
         (
           (
             !event.shiftKey &&
@@ -128,12 +128,7 @@ export const DetachablePanel = forwardRef<DetachablePanelHandle, DetachablePanel
               event.code === 'KeyN' ||
               event.code === 'KeyB' ||
               event.code === 'KeyR' ||
-              event.code === 'KeyJ' ||
-              event.code === 'KeyK' ||
               event.code === 'KeyM' ||
-              event.code === 'KeyQ' ||
-              event.code === 'KeyX' ||
-              event.code === 'KeyF' ||
               event.key === 'Enter' ||
               event.key === 'Escape'
             )

@@ -61,12 +61,12 @@ export function ObjectTemplatePanel() {
     : null
 
   return (
-    <aside className={`manual-template-panel ${collapsed ? 'collapsed' : ''}`} aria-label="객체 템플릿">
+    <aside className={`manual-template-panel ${collapsed ? 'collapsed' : ''}`} aria-label="객체 추가·수정">
       <header>
-        <span><BoxSelect size={15} /><strong>객체 템플릿</strong></span>
+        <span><BoxSelect size={15} /><strong>객체 추가·수정</strong></span>
         <button
           type="button"
-          aria-label={collapsed ? '객체 템플릿 펼치기' : '객체 템플릿 접기'}
+          aria-label={collapsed ? '객체 추가·수정 펼치기' : '객체 추가·수정 접기'}
           onClick={() => setCollapsed((value) => !value)}
         >
           {collapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
@@ -77,7 +77,7 @@ export function ObjectTemplatePanel() {
           <label>
             <span>객체 종류</span>
             <select
-              aria-label="수동 객체 템플릿"
+              aria-label="추가·수정할 객체 종류"
               value={manual.templateId}
               disabled={manual.templatesLoading}
               onChange={(event) => manual.setTemplateId(event.target.value as typeof manual.templateId)}
@@ -180,7 +180,7 @@ export function ObjectTemplatePanel() {
           </button>
           <small className="manual-template-help">
             {manual.templateId === 'TRAFFIC_SIGN'
-              ? '파노라마에서 드래그한 뒤 제안을 확인합니다.'
+              ? '파노라마에서 드래그를 놓으면 3D 위치 계산이 자동으로 시작됩니다.'
               : '기존 P0 방식으로 점을 선택하고 B → B로 저장합니다.'}
           </small>
         </div>

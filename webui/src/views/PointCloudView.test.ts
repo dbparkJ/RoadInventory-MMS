@@ -7,18 +7,30 @@ import {
   closestPointHitIndex,
   applyPointCloudPickedCoordinate,
   buildPointCloudDisplayPayload,
+  buildPointCloudSelectionDisplay,
   createPointCloudRenderLoop,
   DEFAULT_POINT_CLOUD_BUDGET,
   datasetPointToFrameLocal,
   demoPanoramaProjectionMetadata,
+  mergeNearbyOverlayFeatures,
   pointCloudOverlayPointSize,
   pointCloudMeasurement,
   pointCloudOwnerWindow,
   pointCloudBudgetsForMaximum,
   pointCloudDetectionWireframePositions,
+  pointCloudDetectionFocus,
+  pointCloudDetectionFocusKey,
   pointCloudDetectionsFromObservations,
+  pointCloudExactSupportFocusState,
+  pointCloudFocusTransitionProgress,
   pointCloudHoverState,
+  pointCloudInfrastructureLayerFocus,
   pointCloudPickTargetAcceptsPoint,
+  pointCloudPreviewFocuses,
+  pointCloudSelectionFocus,
+  pointCloudSelectionFocusForState,
+  pointHitIndices,
+  nextCycledPointHit,
   pointCloudYoloBoxHalfSize,
   poleBasePreviewGeometry,
   poleBasePrimaryWarning,
@@ -28,6 +40,7 @@ import {
   POINT_CLOUD_YOLO_RAYCAST_THRESHOLD,
   POINT_CLOUD_BUDGETS,
   restorePointCloudViewState,
+  type RenderPointCloudDetection,
   type RenderOverlayPoint,
 } from './PointCloudView'
 
@@ -46,6 +59,74 @@ describe('PointCloudView local tools', () => {
     bounds: { min: [0, 0, 0], max: [5, 5, 2] },
     pointCount: 3,
   }
+
+  it('merges exact support matches over paged spatial duplicates', () => {
+    const spatial = {
+      layerId: 'poles',
+      layerName: 'Support poles',
+      color: '#111111',
+      visible: true,
+      feature: {
+        type: 'Feature' as const,
+        id: 'pole-1',
+        geometry: { type: 'Point', coordinates: [1, 2, 0] },
+        properties: { support_id: 'stale' },
+      },
+    }
+    const exact = {
+      ...spatial,
+      color: '#22c55e',
+      visible: false,
+      feature: { ...spatial.feature, properties: { support_id: 'pole-1' } },
+    }
+
+    const merged = mergeNearbyOverlayFeatures([spatial], [exact])
+
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toEqual(exact)
+  })
+
+  it('fails closed instead of focusing a partial support lookup', () => {
+    expect(pointCloudExactSupportFocusState(null, '', '', 'request-a')).toBe('ready')
+    expect(pointCloudExactSupportFocusState('pole-1', '', '', 'request-a')).toBe('pending')
+    expect(pointCloudExactSupportFocusState('pole-1', '', 'request-a', 'request-a'))
+      .toBe('failed')
+    expect(pointCloudExactSupportFocusState('pole-1', 'request-a', '', 'request-a'))
+      .toBe('ready')
+  })
+
+  it('focuses the selected AI result immediately while exact support data is pending', () => {
+    const selected: RenderOverlayPoint = {
+      layerId: 'signals',
+      layerName: '신호등',
+      featureId: 'signal-1',
+      color: '#ffb84d',
+      position: [2, 3, 8],
+      selected: true,
+      properties: { det_id: 'det-1', support_id: 'pole-1' },
+    }
+    const support: RenderOverlayPoint = {
+      ...selected,
+      layerId: 'poles',
+      layerName: '지주',
+      featureId: 'pole-1',
+      position: [2.2, 3.1, 0],
+      selected: false,
+      properties: { support_id: 'pole-1', pole_status: 'AUTO' },
+    }
+
+    expect(pointCloudSelectionFocusForState([selected, support], 'pending')?.related).toEqual([])
+    expect(pointCloudSelectionFocusForState([selected, support], 'failed')?.selected).toBe(selected)
+    expect(pointCloudSelectionFocusForState([selected, support], 'ready')?.related).toEqual([support])
+  })
+
+  it('eases the selection focus transition into its final state', () => {
+    expect(pointCloudFocusTransitionProgress(-1)).toBe(0)
+    expect(pointCloudFocusTransitionProgress(0)).toBe(0)
+    expect(pointCloudFocusTransitionProgress(130)).toBeCloseTo(0.875)
+    expect(pointCloudFocusTransitionProgress(260)).toBe(1)
+    expect(pointCloudFocusTransitionProgress(1, 0)).toBe(1)
+  })
 
   it('reuses the bounded MMSP payload while no local geometry filter is active', () => {
     expect(buildPointCloudDisplayPayload(payload, {
@@ -81,6 +162,377 @@ describe('PointCloudView local tools', () => {
       distanceXy: 5,
       vertical: 12,
     })
+  })
+
+  it('keeps an AI-selected sign and its support-linked pole as one visual focus', () => {
+    const points: RenderOverlayPoint[] = [
+      {
+        layerId: 'signs',
+        layerName: '표지 검출',
+        featureId: 'sign-1',
+        color: '#ffb84d',
+        position: [1, 2, 5],
+        selected: true,
+        properties: { det_id: 'det-1', support_id: 'POLE-7', class_nm: 'traffic_light' },
+      },
+      {
+        layerId: 'signs',
+        layerName: '표지 검출',
+        featureId: 'sign-sibling',
+        color: '#ffb84d',
+        position: [1.1, 2.05, 4.8],
+        selected: false,
+        properties: { det_id: 'det-2', support_id: 'pole-7', class_nm: 'traffic_sign' },
+      },
+      {
+        layerId: 'poles',
+        layerName: '지주 하단',
+        featureId: 'pole-7',
+        color: '#2bcfa8',
+        position: [1.2, 2.1, 0],
+        selected: false,
+        properties: { support_id: 'pole-7', pole_status: 'AUTO' },
+      },
+      {
+        layerId: 'poles',
+        layerName: '지주 하단',
+        featureId: 'pole-other',
+        color: '#2bcfa8',
+        position: [8, 8, 0],
+        selected: false,
+        properties: { support_id: 'pole-other' },
+      },
+    ]
+
+    const focus = pointCloudSelectionFocus(points)
+
+    expect(focus?.supportId).toBe('pole-7')
+    expect(focus?.related.map((point) => point.featureId)).toEqual(['pole-7'])
+    expect(focus?.focalPositions).toEqual([[1, 2, 5], [1.2, 2.1, 0]])
+    expect(focus?.guideSegments).toEqual([
+      [[1, 2, 5], [1.2, 2.1, 5]],
+      [[1.2, 2.1, 5], [1.2, 2.1, 0]],
+    ])
+    expect(pointCloudPreviewFocuses(focus, [100, 200, 30])).toEqual([
+      [101, 202],
+      [101.2, 202.1],
+    ])
+    expect(pointCloudPreviewFocuses(focus, [100, 200, 30], Number.NaN)).toEqual([
+      [101, 202],
+      [101.2, 202.1],
+    ])
+    expect(pointCloudSelectionFocus([{
+      ...points[0],
+      layerName: '기타 객체',
+      properties: { source: 'manual' },
+    }])).toBeNull()
+  })
+
+  it('focuses a selected support pole and links back to its signs and signals', () => {
+    const pole: RenderOverlayPoint = {
+      layerId: 'poles',
+      layerName: '지주 하단',
+      featureId: 'pole-7',
+      color: '#2bcfa8',
+      position: [1.2, 2.1, 0],
+      selected: true,
+      properties: { support_id: 'pole-7', pole_status: 'AUTO' },
+    }
+    const sign: RenderOverlayPoint = {
+      layerId: 'signs',
+      layerName: '교통표지',
+      featureId: 'sign-1',
+      color: '#ffb84d',
+      position: [1, 2, 5],
+      selected: false,
+      properties: { det_id: 'det-1', support_id: 'POLE-7', class_nm: 'traffic_sign' },
+    }
+
+    const focus = pointCloudSelectionFocus([pole, sign])
+
+    expect(focus?.selected).toBe(pole)
+    expect(focus?.related).toEqual([sign])
+    expect(focus?.guideSegments).toEqual([
+      [[1, 2, 5], [1.2, 2.1, 5]],
+      [[1.2, 2.1, 5], [1.2, 2.1, 0]],
+    ])
+  })
+
+  it('focuses a raw detection even when no editable layer or feature is linked', () => {
+    const detection: RenderPointCloudDetection = {
+      sourceId: 'run-a/model.pt',
+      observationId: 'frame-12:0',
+      layerName: 'YOLO · model.pt',
+      color: '#ffb84d',
+      position: [4, 5, 7],
+      selected: false,
+      properties: {
+        class_nm: 'traffic_signal',
+        support_id: 'pole-12',
+      },
+    }
+    const pole: RenderOverlayPoint = {
+      layerId: 'poles',
+      layerName: 'Support poles',
+      featureId: 'pole-12',
+      color: '#2bcfa8',
+      position: [4.5, 5.25, 0],
+      selected: false,
+      properties: { support_id: 'pole-12', pole_status: 'AUTO' },
+    }
+
+    const focus = pointCloudDetectionFocus(detection, [pole])
+
+    expect(detection.layerId).toBeUndefined()
+    expect(detection.featureId).toBeUndefined()
+    expect(focus?.selected).toBe(detection)
+    expect(focus?.related).toEqual([pole])
+    expect(focus?.focalPositions).toEqual([[4, 5, 7], [4.5, 5.25, 0]])
+    expect(focus?.supportPositions).toEqual([[4.5, 5.25, 0]])
+    expect(focus?.guideSegments).toEqual([
+      [[4, 5, 7], [4.5, 5.25, 7]],
+      [[4.5, 5.25, 7], [4.5, 5.25, 0]],
+    ])
+  })
+
+  it('separates same-frame raw detections by source, observation, and position', () => {
+    const base = {
+      sourceId: 'model-a',
+      observationId: 'frame-12:0',
+      position: [1, 2, 3] as [number, number, number],
+    }
+
+    expect(pointCloudDetectionFocusKey(base)).toBe(pointCloudDetectionFocusKey({ ...base }))
+    expect(pointCloudDetectionFocusKey(base)).not.toBe(pointCloudDetectionFocusKey({
+      ...base,
+      sourceId: 'model-b',
+    }))
+    expect(pointCloudDetectionFocusKey(base)).not.toBe(pointCloudDetectionFocusKey({
+      ...base,
+      observationId: 'frame-12:1',
+    }))
+    expect(pointCloudDetectionFocusKey(base)).not.toBe(pointCloudDetectionFocusKey({
+      ...base,
+      position: [1.01, 2, 3],
+    }))
+  })
+
+  it('builds one infrastructure-layer focus for signs, signals, vertical poles, and arms', () => {
+    const points: RenderOverlayPoint[] = [
+      {
+        layerId: 'objects',
+        layerName: 'Detected traffic signs',
+        featureId: 'sign-1',
+        color: '#ffb84d',
+        position: [0, 0, 5],
+        selected: false,
+        properties: { class_nm: 'traffic_sign', support_id: 'pole-1' },
+      },
+      {
+        layerId: 'objects',
+        layerName: 'Detected traffic signals',
+        featureId: 'signal-2',
+        color: '#4dd9ff',
+        position: [10, 1, 6],
+        selected: false,
+        properties: { class_nm: 'traffic_signal', support_id: 'pole-2' },
+      },
+      {
+        layerId: 'poles',
+        layerName: 'Support poles',
+        featureId: 'pole-1',
+        color: '#2bcfa8',
+        position: [2, 0, 0],
+        selected: false,
+        properties: { support_id: 'pole-1', pole_type: 'mast_arm' },
+      },
+      {
+        layerId: 'poles',
+        layerName: 'Support poles',
+        featureId: 'pole-2',
+        color: '#2bcfa8',
+        position: [11, 1, 0],
+        selected: false,
+        properties: { support_id: 'pole-2', pole_status: 'AUTO' },
+      },
+      {
+        layerId: 'markings',
+        layerName: 'Road markings',
+        featureId: 'line-1',
+        color: '#ffffff',
+        position: [3, 3, 0],
+        selected: false,
+        properties: { class_nm: 'lane_marking', det_id: 'det-line' },
+      },
+    ]
+
+    const focus = pointCloudInfrastructureLayerFocus(points)
+
+    expect(focus?.mode).toBe('infrastructure-layer')
+    expect(focus?.selected).toBeNull()
+    expect(focus?.related.map((point) => point.featureId)).toEqual([
+      'sign-1',
+      'signal-2',
+      'pole-1',
+      'pole-2',
+    ])
+    expect(focus?.supportPositions).toEqual([[2, 0, 0], [11, 1, 0]])
+    expect(focus?.guideSegments).toEqual([
+      [[0, 0, 5], [2, 0, 5]],
+      [[2, 0, 5], [2, 0, 0]],
+      [[10, 1, 6], [11, 1, 6]],
+      [[11, 1, 6], [11, 1, 0]],
+    ])
+  })
+
+  it('deduplicates vertical support anchors and rejects focus points beyond the preview', () => {
+    const selected: RenderOverlayPoint = {
+      layerId: 'signals',
+      layerName: '신호등',
+      featureId: 'signal-1',
+      color: '#ffb84d',
+      position: [2, 3, 8],
+      selected: true,
+      properties: { det_id: 'det-1', support_id: 'pole-1' },
+    }
+    const focus = pointCloudSelectionFocus([
+      selected,
+      {
+        ...selected,
+        layerId: 'poles',
+        featureId: 'pole-top',
+        position: [2.25, 3.25, 6],
+        selected: false,
+        properties: { support_id: 'pole-1', pole_status: 'AUTO' },
+      },
+      {
+        ...selected,
+        layerId: 'poles',
+        featureId: 'pole-base',
+        position: [2.25, 3.25, 0],
+        selected: false,
+        properties: { support_id: 'pole-1', pole_status: 'AUTO' },
+      },
+      {
+        ...selected,
+        layerId: 'poles',
+        featureId: 'out-of-range',
+        position: [26, 0, 0],
+        selected: false,
+        properties: { support_id: 'pole-1', pole_status: 'AUTO' },
+      },
+    ])
+
+    expect(pointCloudPreviewFocuses(focus, [1_000, 2_000, 30])).toEqual([
+      [1_002, 2_003],
+      [1_002.25, 2_003.25],
+    ])
+  })
+
+  it('preserves dense object and sign-to-pole corridor points while sparsifying context', () => {
+    const focus = pointCloudSelectionFocus([
+      {
+        layerId: 'signs',
+        layerName: '표지 검출',
+        featureId: 'sign-1',
+        color: '#ffb84d',
+        position: [0, 0, 4],
+        selected: true,
+        properties: { det_id: 'det-1', support_id: 'pole-1' },
+      },
+      {
+        layerId: 'poles',
+        layerName: '지주 하단',
+        featureId: 'pole-1',
+        color: '#2bcfa8',
+        position: [0, 0, 0],
+        selected: false,
+        properties: { support_id: 'POLE-1', pole_status: 'AUTO' },
+      },
+    ])
+    const sourcePositions = [
+      0.125, 0, 4,
+      0.125, 0, 2,
+      0.125, 0, 0,
+      ...Array.from({ length: 20 }, (_, index) => [5 + index, 6, 1]).flat(),
+    ]
+    const source: PointCloudPayload = {
+      positions: new Float32Array(sourcePositions),
+      colors: new Uint8Array(sourcePositions.map((_, index) => index % 255)),
+      bounds: { min: [0, 0, 0], max: [24, 6, 4] },
+      pointCount: sourcePositions.length / 3,
+    }
+
+    const display = buildPointCloudSelectionDisplay(source, focus, {
+      focusRadiusM: 0.3,
+      corridorRadiusM: 0.2,
+      backgroundStride: 1_000_000,
+    })
+
+    expect(display.focusPointCount).toBe(3)
+    expect(display.backgroundPointCount).toBeGreaterThanOrEqual(1)
+    expect(display.backgroundPointCount).toBeLessThan(20)
+    expect([...display.payload.positions.slice(0, 9)]).toEqual([
+      0.125, 0, 4,
+      0.125, 0, 2,
+      0.125, 0, 0,
+    ])
+    expect(display.payload.pointCount).toBe(
+      display.focusPointCount + display.backgroundPointCount,
+    )
+    const restored = buildPointCloudSelectionDisplay(source, null)
+    expect(restored.payload).toBe(source)
+    expect(restored.focusPointCount).toBe(0)
+    expect(restored.backgroundPointCount).toBe(source.pointCount)
+  })
+
+  it('keeps the full vertical support axis dense when the sign is horizontally offset', () => {
+    const focus = pointCloudSelectionFocus([
+      {
+        layerId: 'signals',
+        layerName: 'Signals',
+        featureId: 'signal-1',
+        color: '#ffb84d',
+        position: [0, 0, 5],
+        selected: true,
+        properties: { det_id: 'det-1', support_id: 'pole-1' },
+      },
+      {
+        layerId: 'poles',
+        layerName: 'Support poles',
+        featureId: 'pole-1',
+        color: '#2bcfa8',
+        position: [2, 0, 0],
+        selected: false,
+        properties: { support_id: 'pole-1', pole_status: 'AUTO' },
+      },
+    ])
+    const sourcePositions = [
+      0.1, 0, 5,
+      2.1, 0, 4,
+      1, 0, 5,
+      1, 0, 2.5,
+      8, 8, 1,
+    ]
+    const source: PointCloudPayload = {
+      positions: new Float32Array(sourcePositions),
+      colors: null,
+      bounds: { min: [0, 0, 0], max: [8, 8, 5] },
+      pointCount: sourcePositions.length / 3,
+    }
+
+    const display = buildPointCloudSelectionDisplay(source, focus, {
+      focusRadiusM: 0.3,
+      corridorRadiusM: 0.2,
+      backgroundStride: 1_000_000,
+    })
+
+    expect(display.focusPointCount).toBe(3)
+    expect([...display.payload.positions.slice(0, 9)]).toEqual([
+      0.10000000149011612, 0, 5,
+      2.0999999046325684, 0, 4,
+      1, 0, 5,
+    ])
   })
 })
 
@@ -292,6 +744,48 @@ describe('PointCloudView camera continuity', () => {
     expect(points[0].featureId).toBeUndefined()
   })
 
+  it('uses the server-resolved editable feature even when its layer is hidden', () => {
+    const points = pointCloudDetectionsFromObservations([{
+      source_id: 'source-a',
+      observation_id: 'det-1',
+      layer_id: 'hidden-layer',
+      feature_id: 'feature-99',
+      overlay_resolution: 'matched',
+      overlay_candidate_count: 1,
+      dataset_position: [1010, 2000, 32],
+      properties: { det_id: 'det-1', class_nm: 'traffic_sign' },
+    }], [1000, 2000, 30], [])
+
+    expect(points[0]).toMatchObject({
+      layerId: 'hidden-layer',
+      featureId: 'feature-99',
+      selected: false,
+    })
+  })
+
+  it('does not override an authoritative not-found result with a visible heuristic match', () => {
+    const representative: RenderOverlayPoint = {
+      layerId: 'layer-1',
+      layerName: 'Detected signs',
+      featureId: 'feature-7',
+      color: '#22c55e',
+      position: [10, 0, 2],
+      selected: false,
+      properties: { det_id: 'det-1' },
+    }
+    const points = pointCloudDetectionsFromObservations([{
+      source_id: 'source-a',
+      observation_id: 'det-1',
+      overlay_resolution: 'not_found',
+      overlay_candidate_count: 0,
+      dataset_position: [1010, 2000, 32],
+      properties: { det_id: 'det-1' },
+    }], [1000, 2000, 30], [representative])
+
+    expect(points[0].layerId).toBeUndefined()
+    expect(points[0].featureId).toBeUndefined()
+  })
+
   it('keeps one model color even when observations come from different source paths', () => {
     const observations = ['run-a/model.pt', 'run-b/model.pt'].map((sourceId, index) => ({
       source_id: sourceId,
@@ -437,6 +931,35 @@ describe('PointCloudView camera continuity', () => {
         20,
       ),
     ).toBe(9)
+  })
+
+  it('cycles through overlapping point hits on repeated clicks', () => {
+    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100)
+    camera.position.set(0, 0, 0)
+    camera.lookAt(0, 0, -1)
+    camera.updateProjectionMatrix()
+    camera.updateMatrixWorld(true)
+    const indices = pointHitIndices(
+      [
+        { index: 3, point: new THREE.Vector3(0, 0, -5), distance: 5 },
+        { index: 9, point: new THREE.Vector3(0, 0, -10), distance: 10 },
+        // Duplicate Three intersections for one vertex must not create an
+        // extra stop in the click cycle.
+        { index: 3, point: new THREE.Vector3(0, 0, -5), distance: 5.1 },
+      ],
+      { x: 0, y: 0 },
+      camera,
+      800,
+      800,
+      7,
+    )
+
+    expect(indices).toEqual([3, 9])
+    expect(nextCycledPointHit(indices, null)).toBe(3)
+    expect(nextCycledPointHit(indices, 3)).toBe(9)
+    expect(nextCycledPointHit(indices, 9)).toBe(3)
+    expect(nextCycledPointHit(indices, 404)).toBe(3)
+    expect(nextCycledPointHit([], null)).toBeNull()
   })
 
   it('reprojects the actual Points vertex instead of Three ray closest-point intersections', () => {

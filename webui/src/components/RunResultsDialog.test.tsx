@@ -154,7 +154,7 @@ describe('RunResultsDialog', () => {
 
     try {
       render(<RunResultsDialog run={RUN} onClose={vi.fn()} />)
-      const importButton = await screen.findByRole('button', { name: /검수 레이어로 열기/ })
+      const importButton = await screen.findByRole('button', { name: /편집 레이어로 열기/ })
 
       fireEvent.click(importButton)
 

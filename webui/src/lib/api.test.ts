@@ -65,6 +65,36 @@ describe('overlay feature creation', () => {
   })
 })
 
+describe('overlay support feature lookup', () => {
+  it('uses the dataset-wide exact support endpoint with an encoded identity', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          dataset_id: 'dataset/a',
+          support_id: 'Pole 7/A',
+          status: 'not_found',
+          items: [],
+          count: 0,
+          candidate_count: 0,
+          scan_complete: true,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.overlaySupportFeatures('dataset/a', 'Pole 7/A')
+
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/overlays/support-features?support_id=Pole+7%2FA',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+})
+
 describe('overlay layer metadata', () => {
   it('patches the display name and color with an optimistic metadata revision', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -235,6 +265,26 @@ describe('review workspace API contracts', () => {
       expect(fetchMock.mock.calls[1][0]).toBe('/api/qa/issues/issue%2Fa')
       expect(fetchMock.mock.calls[1][1]?.method).toBe('PATCH')
       expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({ status: 'resolved' })
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('encodes the lightweight review completion-status endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        session_status: 'active',
+        requirements_met: false,
+        can_complete: false,
+        blockers: { qa_not_run: 1 },
+        checked_at: '2026-08-24T00:00:00Z',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    )
+    try {
+      await api.reviewCompletionStatus('session/a')
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/review-sessions/session%2Fa/completion-status',
+      )
     } finally {
       fetchMock.mockRestore()
     }
@@ -539,6 +589,64 @@ describe('point preview API', () => {
       await api.points('dataset/a', 'frame 1', 120_000, undefined, 'classification')
       expect(fetchMock.mock.calls[0][0]).toBe(
         '/api/datasets/dataset%2Fa/points/frame%201?budget=120000&color_mode=classification',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('requests ordered dataset-coordinate focus points without changing the legacy call', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(new ArrayBuffer(40), {
+        status: 200,
+        headers: { 'Content-Type': 'application/vnd.mmsp' },
+      }),
+    )
+
+    try {
+      await api.points(
+        'dataset/a',
+        'frame 1',
+        250_000,
+        undefined,
+        'rgb',
+        [
+          [209123.456, 412345.678],
+          [209124.25, 412346.5],
+        ],
+      )
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/points/frame%201?budget=250000&color_mode=rgb&focus=209123.456%2C412345.678&focus=209124.25%2C412346.5',
+      )
+    } finally {
+      fetchMock.mockRestore()
+    }
+  })
+
+  it('resolves an observation independently of loaded overlay pages', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          source_id: 'det-src_0123456789abcdef0123456789abcdef',
+          observation_id: 'Dabc:1',
+          status: 'not_found',
+          match: null,
+          candidates: [],
+          candidate_count: 0,
+          scan_complete: true,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    try {
+      await api.detectionOverlayFeature(
+        'dataset/a',
+        'det-src_0123456789abcdef0123456789abcdef',
+        'Dabc:1',
+      )
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        '/api/datasets/dataset%2Fa/detections/overlay-feature?source_id=det-src_0123456789abcdef0123456789abcdef&observation_id=Dabc%3A1',
       )
     } finally {
       fetchMock.mockRestore()

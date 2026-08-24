@@ -150,6 +150,10 @@ model_filters:
                 path.read_text(encoding="utf-8"),
                 Loader=_Yaml12SafeLoader,
             )
+            self.assertEqual(
+                Path(document["paths"]["data_root"]),
+                root.resolve(),
+            )
             self.assertEqual(document["runtime"]["pole_classification_mode"], "off")
             self.assertEqual(document["model_filters"]["traffic.pt"]["conf"], 0.8)
             self.assertEqual(

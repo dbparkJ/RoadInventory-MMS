@@ -1,4 +1,4 @@
-import { Image, Map, MapPin, RotateCcw, ScanLine, Settings, View, X } from 'lucide-react'
+import { Image, MapPin, RotateCcw, ScanLine, Settings, View, X } from 'lucide-react'
 import type { ReactNode } from 'react'
 import {
   MAX_POLE_BASE_MARKER_SIZE_M,
@@ -105,45 +105,10 @@ export function GeneralSettingsPanel({
           <div className="general-settings-section-title">
             <ScanLine size={17} aria-hidden="true" />
             <span>
-              <h3 id="overlay-settings-title">파노라마 포인트</h3>
-              <small>파노라마 위에 같은 프레임의 3D 포인트를 겹쳐 표시합니다.</small>
+              <h3 id="overlay-settings-title">검출 표시</h3>
+              <small>파노라마에 표시할 검출 결과의 범위를 설정합니다.</small>
             </span>
           </div>
-
-          <label className="general-settings-switch-row">
-            <span>
-              <strong>포인트 오버레이</strong>
-              <small>{settings.panoramaPointOverlayEnabled ? '표시 중' : '숨김'}</small>
-            </span>
-            <input
-              type="checkbox"
-              aria-label="파노라마 포인트 오버레이 표시"
-              checked={settings.panoramaPointOverlayEnabled}
-              onChange={(event) =>
-                onChange({ panoramaPointOverlayEnabled: event.target.checked })
-              }
-            />
-          </label>
-
-          <label className="general-settings-slider">
-            <span>
-              <strong>파노라마 영상 투명도</strong>
-              <output>{Math.round(settings.panoramaImageOpacity * 100)}%</output>
-            </span>
-            <input
-              type="range"
-              aria-label="파노라마 영상 투명도"
-              min={0}
-              max={1}
-              step={0.05}
-              value={settings.panoramaImageOpacity}
-              disabled={!settings.panoramaPointOverlayEnabled}
-              onChange={(event) =>
-                onChange({ panoramaImageOpacity: Number(event.target.value) })
-              }
-            />
-            <small>포인트는 선명하게 유지하고 배경 영상만 흐리게 조절합니다.</small>
-          </label>
 
           <label className="general-settings-slider">
             <span>
@@ -205,33 +170,6 @@ export function GeneralSettingsPanel({
               onChange={(event) => onChange({ poleBaseMarkerSizeM: Number(event.target.value) })}
             />
             <small>데이터셋 좌표계 기준의 마커 반지름입니다.</small>
-          </label>
-        </section>
-
-        <section className="general-settings-section" aria-labelledby="map-settings-title">
-          <div className="general-settings-section-title">
-            <Map size={17} aria-hidden="true" />
-            <span>
-              <h3 id="map-settings-title">지도</h3>
-              <small>복잡한 경로의 기본 표시 범위를 정합니다.</small>
-            </span>
-          </div>
-
-          <label className="general-settings-switch-row">
-            <span>
-              <strong>모든 트랙 함께 표시</strong>
-              <small>
-                {settings.showAllMapTracks
-                  ? '전체 트랙을 각 색상으로 표시합니다.'
-                  : '활성 트랙만 색상으로 표시합니다.'}
-              </small>
-            </span>
-            <input
-              type="checkbox"
-              aria-label="지도에 모든 트랙 표시"
-              checked={settings.showAllMapTracks}
-              onChange={(event) => onChange({ showAllMapTracks: event.target.checked })}
-            />
           </label>
         </section>
 

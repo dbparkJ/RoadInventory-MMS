@@ -2,11 +2,11 @@
   position: relative;
   z-index: 20;
   display: flex;
-  min-height: 46px;
-  flex: 0 0 46px;
-  align-items: center;
-  gap: 18px;
-  padding: 5px 14px;
+  min-height: 68px;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 14px 6px;
   color: #aebdc6;
   background: linear-gradient(90deg, rgba(14, 34, 49, 0.98), rgba(10, 26, 40, 0.98));
   border-bottom: 1px solid rgba(69, 205, 174, 0.18);
@@ -21,13 +21,31 @@
   align-items: center;
 }
 
+.review-work-main,
+.review-work-meta {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+}
+
+.review-work-main {
+  min-height: 32px;
+  gap: 14px;
+}
+
+.review-work-meta {
+  min-height: 21px;
+  gap: 14px;
+}
+
 .review-session-title {
   gap: 8px;
   color: var(--mint);
 }
 
 .review-session-title > span {
-  min-width: 116px;
+  min-width: 185px;
   flex-direction: column;
   align-items: flex-start;
 }
@@ -48,7 +66,7 @@
 
 .review-session-select {
   display: flex;
-  min-width: 210px;
+  min-width: 260px;
   flex-direction: column;
   gap: 3px;
 }
@@ -64,7 +82,7 @@
 }
 
 .review-session-progress {
-  min-width: 230px;
+  min-width: 190px;
   gap: 8px;
 }
 
@@ -112,7 +130,113 @@
 }
 
 .review-session-actions {
+  margin-left: auto;
   gap: 5px;
+}
+
+.review-work-steps {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-work-steps li {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #526b7c;
+  font-size: 7.5px;
+  white-space: nowrap;
+}
+
+.review-work-steps li:not(:last-child)::after {
+  width: 9px;
+  height: 1px;
+  margin-left: 2px;
+  content: '';
+  background: rgba(111, 147, 168, 0.2);
+}
+
+.review-work-steps li > span {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  color: #668093;
+  font-size: 7px;
+  background: rgba(103, 133, 151, 0.1);
+  border: 1px solid rgba(103, 133, 151, 0.16);
+  border-radius: 50%;
+}
+
+.review-work-steps li.done,
+.review-work-steps li.current {
+  color: #91aaae;
+}
+
+.review-work-steps li.done > span,
+.review-work-steps li.current > span {
+  color: #041a18;
+  background: var(--mint);
+  border-color: var(--mint);
+}
+
+.review-work-steps li.current {
+  color: var(--mint);
+  font-weight: 700;
+}
+
+.review-work-scope {
+  display: flex;
+  min-width: 0;
+  gap: 10px;
+  margin: 0;
+  overflow: hidden;
+  color: #597284;
+  font-size: 7.5px;
+  white-space: nowrap;
+}
+
+.review-work-scope span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.review-work-scope strong {
+  color: #8299a5;
+  font-weight: 500;
+}
+
+.review-work-scope.empty {
+  color: #78909d;
+}
+
+.review-completion-gate {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: #d39a72;
+  font-size: 7.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-completion-gate.ready {
+  color: var(--mint);
+}
+
+.review-completion-gate button {
+  padding: 0;
+  color: #86a4b2;
+  font: inherit;
+  text-decoration: underline;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
 }
 
 .review-source-run-select {
@@ -183,7 +307,7 @@
 }
 
 .review-candidate-popover,
-.review-create-popover {
+.review-start-popover {
   position: absolute;
   top: calc(100% + 5px);
   right: 12px;
@@ -200,23 +324,63 @@
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.38);
 }
 
-.review-create-popover {
-  right: 270px;
-  min-width: 250px;
+.review-candidate-popover[hidden],
+.review-start-popover[hidden] {
+  display: none;
 }
 
-.review-create-popover > label {
+.review-start-popover {
+  right: 235px;
+  min-width: 360px;
+  gap: 9px;
+}
+
+.review-start-popover > header,
+.review-start-popover > section,
+.review-start-popover > section > label {
   display: grid;
   gap: 3px;
 }
 
-.review-create-popover > label > span,
-.review-create-popover > small {
+.review-start-popover > header small,
+.review-start-popover > section > label > span,
+.review-start-popover > section p,
+.review-candidate-popover > small {
   color: #708897;
   font-size: 8px;
 }
 
-.review-create-popover select {
+.review-start-popover > section {
+  padding: 7px;
+  background: rgba(104, 137, 155, 0.035);
+  border: 1px solid rgba(104, 137, 155, 0.1);
+  border-radius: 6px;
+}
+
+.review-start-popover > section b {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #afc1c7;
+  font-size: 8px;
+}
+
+.review-start-popover > section b > span {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  color: #061a18;
+  font-size: 7px;
+  background: var(--mint);
+  border-radius: 50%;
+}
+
+.review-start-popover > section p {
+  margin: 2px 0 0 19px;
+}
+
+.review-start-popover select {
   min-width: 0;
   height: 27px;
   padding: 0 24px 0 7px;
@@ -228,7 +392,7 @@
 }
 
 .review-candidate-popover strong,
-.review-create-popover strong {
+.review-start-popover strong {
   color: #c7d7db;
   font-size: 9px;
 }
@@ -236,6 +400,28 @@
 .review-candidate-popover label {
   display: flex;
   align-items: center;
+  gap: 5px;
+}
+
+.review-source-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin-top: 3px;
+}
+
+.review-source-grid label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #8198a5;
+  font-size: 8px;
+}
+
+.review-start-popover > footer,
+.review-candidate-popover > footer {
+  display: flex;
+  justify-content: flex-end;
   gap: 5px;
 }
 
@@ -476,6 +662,21 @@
   text-align: center;
 }
 
+.review-queue-message p {
+  margin: 0;
+  color: #8aa0ab;
+}
+
+.review-queue-message small {
+  max-width: 230px;
+  color: #617a89;
+  font-size: 8px;
+}
+
+.review-queue-message .button {
+  justify-self: center;
+}
+
 .review-queue-message.error,
 .review-queue-inline-error {
   color: #dc967e;
@@ -497,6 +698,14 @@
 
   .review-session-bar {
     gap: 10px;
+  }
+
+  .review-session-title > span {
+    min-width: 0;
+  }
+
+  .review-work-scope {
+    display: none;
   }
 
   .review-session-progress {
@@ -523,5 +732,21 @@
 
   .review-session-progress progress {
     width: 100%;
+  }
+
+  .review-work-main {
+    flex-wrap: wrap;
+  }
+
+  .review-session-actions {
+    width: 100%;
+    margin-left: 0;
+    overflow-x: auto;
+  }
+
+  .review-start-popover {
+    right: 8px;
+    left: 8px;
+    min-width: 0;
   }
 }

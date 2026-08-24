@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from mms_shp_detection.geometry import (
     apply_panorama_angular_offsets,
@@ -17,6 +17,7 @@ from mms_shp_detection.geometry import (
 from mms_shp_detection.shp_writer import make_detection_id
 
 from .datasets import require_ready_dataset
+from .overlays import resolve_detection_overlay_features
 from .security import UnsafePath, normalize_relative_path, opaque_id, resolve_under_root
 
 router = APIRouter(prefix="/api", tags=["detections"])
@@ -28,6 +29,8 @@ MAX_DETECTION_RESULT_BYTES = 16 * 1024**2
 MAX_DETECTION_REQUEST_BYTES = 64 * 1024**2
 MAX_DETECTIONS_PER_FRAME = 2_000
 MODEL_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+DETECTION_SOURCE_ID = re.compile(r"^det-src_[0-9a-f]{32}$")
+DETECTION_OBSERVATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 EQUIRECTANGULAR_BBOX_SPACES = {
     "equirectangular_pixels",
     "panorama_equirectangular_pixels",
@@ -376,8 +379,11 @@ def _items_from_payload(
             continue
         bbox, panorama_width, panorama_height, mapping = converted
         try:
-            detection_index = int(detection.get("detection_index") or ordinal)
-        except (TypeError, ValueError):
+            # Detection indices are zero-based in current pipeline artifacts.
+            # ``0 or ordinal`` collapsed the first and second observations to
+            # the same stable ID when the second observation had index 1.
+            detection_index = int(detection.get("detection_index", ordinal))
+        except (TypeError, ValueError, OverflowError):
             detection_index = ordinal
         detection_id = make_detection_id(record_name, detection_image, detection_index)
         identity = (
@@ -408,6 +414,7 @@ def _items_from_payload(
             "bbox_space": "panorama_equirectangular_pixels",
             "bbox_mapping": mapping,
             "accepted": _public_scalar(detection.get("accepted_for_shp")),
+            "support_id": _public_scalar(detection.get("support_id")),
             **(
                 {
                     "x": dataset_position[0],
@@ -568,14 +575,78 @@ def frame_detections(
                     "count": len(model_items),
                 }
             )
+    resolution_by_observation = resolve_detection_overlay_features(
+        request.app,
+        dataset_id,
+        [
+            (str(item["source_id"]), str(item["observation_id"]))
+            for item in items
+        ],
+    )
+    visible_items: list[dict[str, Any]] = []
+    suppressed_count = 0
+    for item in items:
+        key = (
+            str(item["source_id"]).strip().casefold(),
+            str(item["observation_id"]).strip().casefold(),
+        )
+        resolution = resolution_by_observation[key]
+        if resolution["status"] == "deleted":
+            suppressed_count += 1
+            continue
+        item["overlay_resolution"] = resolution["status"]
+        item["overlay_candidate_count"] = resolution["candidate_count"]
+        match = resolution["match"]
+        if match is not None:
+            item["layer_id"] = match["layer_id"]
+            item["feature_id"] = match["feature_id"]
+            item["overlay_revision"] = match["revision"]
+        visible_items.append(item)
+    visible_counts: dict[str, int] = {}
+    for item in visible_items:
+        source_id = str(item["source_id"])
+        visible_counts[source_id] = visible_counts.get(source_id, 0) + 1
+    for model in models:
+        model["count"] = visible_counts.get(str(model["source_id"]), 0)
     return {
         "dataset_id": dataset_id,
         "frame_id": frame_id,
         "coordinate_space": "panorama_equirectangular_pixels",
         "projection": "equirectangular",
-        "items": items,
+        "items": visible_items,
         "models": models,
-        "count": len(items),
+        "count": len(visible_items),
+        "suppressed_count": suppressed_count,
         "model_count": len(payloads),
         "truncated": payload_scan_truncated or items_truncated,
     }
+
+
+@router.get("/datasets/{dataset_id}/detections/overlay-feature")
+def detection_overlay_feature(
+    dataset_id: str,
+    request: Request,
+    response: Response,
+    source_id: str = Query(
+        ...,
+        min_length=40,
+        max_length=40,
+        pattern=DETECTION_SOURCE_ID.pattern,
+    ),
+    observation_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=160,
+        pattern=DETECTION_OBSERVATION_ID.pattern,
+    ),
+) -> dict[str, Any]:
+    """Find an exact editable Point feature for one raw AI observation."""
+
+    require_ready_dataset(request, dataset_id)
+    response.headers["Cache-Control"] = "private, no-store"
+    key = (source_id.casefold(), observation_id.casefold())
+    return resolve_detection_overlay_features(
+        request.app,
+        dataset_id,
+        [(source_id, observation_id)],
+    )[key]

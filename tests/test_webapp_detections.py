@@ -105,6 +105,67 @@ def _payload(model_name: str, detections: list[dict], *, schema_version: int = 1
 
 
 class WebAppDetectionTests(unittest.TestCase):
+    def test_zero_based_same_frame_indices_remain_distinct_and_stable(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            state = Path(state_text)
+            app = create_app(
+                allowed_roots=[Path(root_text)], state_dir=state, start_runner=False
+            )
+            _seed_dataset(app)
+            common = {
+                "image_name": "frame-a.jpg",
+                "confidence": 0.9,
+                "panorama_width": 4000,
+                "panorama_height": 2000,
+                "accepted_for_shp": True,
+            }
+            _completed_run(
+                app,
+                state,
+                run_id="run-zero-based",
+                created_at=NOW,
+                payloads={
+                    "model-a": _payload(
+                        "traffic-light.pt",
+                        [
+                            {
+                                **common,
+                                "detection_index": 0,
+                                "class_id": 1,
+                                "class_name": "signal-left",
+                                "bbox_xyxy": [1800, 800, 1900, 900],
+                                "x": 300_010.0,
+                                "y": 4_100_010.0,
+                                "z": 14.0,
+                            },
+                            {
+                                **common,
+                                "detection_index": 1,
+                                "class_id": 2,
+                                "class_name": "signal-right",
+                                "bbox_xyxy": [2000, 800, 2100, 900],
+                                "x": 300_012.0,
+                                "y": 4_100_010.0,
+                                "z": 14.0,
+                            },
+                        ],
+                    ),
+                },
+            )
+
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/datasets/dataset-a/frames/frame-a/detections"
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            items = response.json()["items"]
+            self.assertEqual([item["properties"]["det_index"] for item in items], [0, 1])
+            self.assertEqual(len({item["observation_id"] for item in items}), 2)
+
     def test_frame_boxes_do_not_require_an_imported_or_visible_shp_layer(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

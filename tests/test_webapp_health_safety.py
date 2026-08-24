@@ -225,6 +225,36 @@ class WebAppHealthSafetyTests(unittest.TestCase):
                 (Path(root_text).resolve(),),
             )
 
+    def test_pipeline_data_root_is_available_on_default_web_startup(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as project_text,
+            tempfile.TemporaryDirectory() as external_text,
+        ):
+            project = Path(project_text)
+            default_root = project / "data"
+            default_root.mkdir()
+            external_root = Path(external_text).resolve()
+            (project / "config.yaml").write_text(
+                f"paths:\n  data_root: {external_root.as_posix()}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"MMS_WEB_STORAGE_ROOTS": ""}):
+                config = WebAppConfig(
+                    project_root=project,
+                    state_dir=project / "state",
+                    allowed_roots=None,
+                    enable_run_worker=False,
+                )
+            self.assertEqual(
+                tuple(Path(path).resolve() for path in config.allowed_roots or ()),
+                (default_root.resolve(), external_root),
+            )
+            app = create_app(config)
+            with TestClient(app) as client:
+                roots = client.get("/api/storage").json()["roots"]
+            self.assertEqual(len(roots), 2)
+            self.assertNotIn(str(external_root), str(roots))
+
 
 if __name__ == "__main__":
     unittest.main()

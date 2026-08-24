@@ -65,6 +65,30 @@ def _panorama_alignment_defaults(config_path: Path) -> tuple[float, float]:
         return 0.0, 0.0
 
 
+def _pipeline_data_root(config_path: Path) -> Path | None:
+    """Resolve an existing pipeline data root for zero-argument web startup."""
+
+    try:
+        if (
+            config_path.is_symlink()
+            or not config_path.is_file()
+            or config_path.stat().st_size > 2 * 1024**2
+        ):
+            return None
+        document = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        paths = document.get("paths") if isinstance(document, dict) else None
+        value = paths.get("data_root") if isinstance(paths, dict) else None
+        if value in {None, ""}:
+            return None
+        candidate = Path(str(value)).expanduser()
+        if not candidate.is_absolute():
+            candidate = config_path.parent / candidate
+        resolved = candidate.resolve(strict=True)
+        return resolved if resolved.is_dir() else None
+    except (OSError, TypeError, ValueError, yaml.YAMLError):
+        return None
+
+
 @dataclass(frozen=True)
 class StorageRoot:
     id: str
@@ -147,7 +171,17 @@ class WebAppConfig:
                     Path(item) for item in configured.split(os.pathsep) if item.strip()
                 )
             else:
-                self.allowed_roots = (self.project_root / "data",)
+                default_root = self.project_root / "data"
+                pipeline_root = _pipeline_data_root(self.pipeline_config_path)
+                existing_roots = [default_root] if default_root.is_dir() else []
+                if pipeline_root is not None and pipeline_root.is_dir():
+                    try:
+                        pipeline_root.relative_to(default_root.resolve(strict=True))
+                    except (FileNotFoundError, ValueError):
+                        existing_roots.append(pipeline_root)
+                # Preserve the original explicit startup error when neither
+                # conventional nor configured storage exists.
+                self.allowed_roots = tuple(existing_roots or (default_root,))
         if (self.auth_username is None) != (self.auth_password is None):
             raise ValueError("Web authentication requires both username and password.")
         if self.auth_username is not None and (

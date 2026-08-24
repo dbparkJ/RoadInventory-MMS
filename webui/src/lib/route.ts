@@ -20,6 +20,7 @@ export interface RouteFeatureProperties {
   track_id: string
   track_index: number
   track_color: string
+  selected?: 0 | 1
 }
 
 function groupRouteByTrack(route: RoutePoint[]): Map<string, RoutePoint[]> {
@@ -58,6 +59,7 @@ export function buildTrackColorMap(
 export function buildRouteFeatureCollection(
   route: RoutePoint[],
   trackColors?: ReadonlyMap<string, string>,
+  activeTrackId?: string,
 ): FeatureCollection<LineString, RouteFeatureProperties> {
   const tracks = groupRouteByTrack(route)
 
@@ -73,6 +75,7 @@ export function buildRouteFeatureCollection(
                 track_index: trackIndex,
                 track_color:
                   trackColors?.get(trackId) ?? TRACK_COLORS[trackIndex % TRACK_COLORS.length],
+                selected: activeTrackId && trackId === activeTrackId ? 1 : 0,
               },
               geometry: {
                 type: 'LineString' as const,
@@ -95,6 +98,7 @@ export function buildRouteRangeFeatureCollection(
   frameIndexes: ReadonlyMap<string, number>,
   frameRange: readonly [number, number] | null | undefined,
   trackColors?: ReadonlyMap<string, string>,
+  activeTrackId?: string,
 ): FeatureCollection<LineString, RouteFeatureProperties> {
   if (!frameRange) return { type: 'FeatureCollection', features: [] }
 
@@ -113,6 +117,7 @@ export function buildRouteRangeFeatureCollection(
             track_index: trackIndex,
             track_color:
               trackColors?.get(trackId) ?? TRACK_COLORS[trackIndex % TRACK_COLORS.length],
+            selected: activeTrackId && trackId === activeTrackId ? 1 : 0,
           },
           geometry: {
             type: 'LineString',

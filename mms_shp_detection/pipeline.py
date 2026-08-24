@@ -2656,6 +2656,428 @@ def reconcile_remote_supports_from_direct_anchors(
     return reconciled
 
 
+def reconcile_repeated_shared_arm_supports(
+    detection_records: list[dict[str, Any]],
+    clustered_pole_relations: list[dict[str, Any]],
+    *,
+    min_frame_observations: int = 2,
+    max_frame_span: int = 4,
+    cluster_xy_radius_m: float = 0.20,
+    cluster_z_radius_m: float = 0.30,
+    arm_perpendicular_tolerance_m: float = 0.20,
+    arm_height_tolerance_m: float = 0.40,
+    min_arm_length_m: float = 1.0,
+    min_projection_fraction: float = 0.05,
+    max_projection_fraction: float = 0.98,
+) -> list[dict[str, Any]]:
+    """Attach repeated unsupported signals to one verified shared mast arm.
+
+    This fallback runs *after* physical pole observations have been clustered.
+    It therefore reuses an existing support ID and never invents a second pole
+    coordinate.  A target is eligible only when a stable multi-frame signal
+    cluster lies on the finite pole-to-supported-signal segment of exactly one
+    repeatedly observed AUTO support.  Existing relations are left untouched.
+    """
+
+    def finite_number(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def optional_integer(value: Any) -> int | None:
+        number = finite_number(value)
+        if number is None or not number.is_integer():
+            return None
+        return int(number)
+
+    def frame_key(item: dict[str, Any]) -> str:
+        image_name = str(item.get("image_name") or "").strip().casefold()
+        if image_name:
+            return f"image:{image_name}"
+        timestamp = str(item.get("timestamp_iso") or "").strip()
+        if timestamp:
+            return f"time:{timestamp}"
+        pose_row = optional_integer(item.get("pose_row_number"))
+        return f"row:{pose_row}" if pose_row is not None else ""
+
+    if min_frame_observations < 2:
+        raise ValueError("min_frame_observations must be at least two")
+    if max_frame_span < 1:
+        raise ValueError("max_frame_span must be positive")
+    positive_parameters = (
+        cluster_xy_radius_m,
+        cluster_z_radius_m,
+        arm_perpendicular_tolerance_m,
+        arm_height_tolerance_m,
+        min_arm_length_m,
+    )
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0.0
+        for value in positive_parameters
+    ):
+        raise ValueError("shared-arm reconciliation tolerances must be positive")
+    if not (
+        0.0 <= min_projection_fraction < max_projection_fraction <= 1.0
+    ):
+        raise ValueError("shared-arm projection fractions must be ordered in [0, 1]")
+
+    relations = [
+        dict(item) for item in clustered_pole_relations if isinstance(item, dict)
+    ]
+    existing_detection_ids = {
+        str(item.get("detection_id") or "").strip()
+        for item in relations
+        if str(item.get("detection_id") or "").strip()
+    }
+
+    relations_by_support: dict[str, list[dict[str, Any]]] = {}
+    for relation in relations:
+        support_id = str(relation.get("support_id") or "").strip()
+        if support_id:
+            relations_by_support.setdefault(support_id, []).append(relation)
+
+    eligible_supports: list[dict[str, Any]] = []
+    for support_id, members in sorted(relations_by_support.items()):
+        representative = members[0]
+        obs_count = optional_integer(representative.get("obs_count"))
+        outlier_count = optional_integer(
+            representative.get("consensus_outlier_count")
+        )
+        auto_anchors = [
+            item
+            for item in members
+            if str(item.get("pole_status") or "") == "AUTO"
+            and not bool(item.get("support_reconciled"))
+        ]
+        anchor_frames = {frame_key(item) for item in auto_anchors if frame_key(item)}
+        if (
+            obs_count is None
+            or obs_count < min_frame_observations
+            or outlier_count not in {None, 0}
+            or len(anchor_frames) < min_frame_observations
+        ):
+            continue
+        pole_xyz = tuple(
+            finite_number(representative.get(key))
+            for key in ("pole_x", "pole_y", "pole_z")
+        )
+        if any(value is None for value in pole_xyz):
+            continue
+        endpoints: list[dict[str, Any]] = []
+        for item in auto_anchors:
+            if str(item.get("model_object_type") or "") != "traffic_signal":
+                continue
+            endpoint_xyz = tuple(
+                finite_number(item.get(key))
+                for key in ("sign_x", "sign_y", "sign_z")
+            )
+            if any(value is None for value in endpoint_xyz):
+                continue
+            arm_length = math.hypot(
+                endpoint_xyz[0] - pole_xyz[0],
+                endpoint_xyz[1] - pole_xyz[1],
+            )
+            if arm_length < min_arm_length_m:
+                continue
+            endpoints.append(
+                {
+                    "xyz": np.asarray(endpoint_xyz, dtype=np.float64),
+                    "relation": item,
+                    "arm_length_m": arm_length,
+                }
+            )
+        if not endpoints:
+            continue
+        eligible_supports.append(
+            {
+                "support_id": support_id,
+                "record_name": str(representative.get("record_name") or ""),
+                "pole_xyz": np.asarray(pole_xyz, dtype=np.float64),
+                "template": representative,
+                "anchor_frames": sorted(anchor_frames),
+                "endpoints": endpoints,
+            }
+        )
+
+    if not eligible_supports:
+        return relations
+
+    unsupported: list[dict[str, Any]] = []
+    for record in detection_records:
+        if not isinstance(record, dict):
+            continue
+        detection_id = str(record.get("detection_id") or "").strip()
+        if (
+            not detection_id
+            or detection_id in existing_detection_ids
+            or str(record.get("model_object_type") or "") != "traffic_signal"
+        ):
+            continue
+        xyz = tuple(finite_number(record.get(key)) for key in ("x", "y", "z"))
+        pose_row = optional_integer(record.get("pose_row_number"))
+        if any(value is None for value in xyz) or pose_row is None:
+            continue
+        normalized = dict(record)
+        normalized["_shared_arm_xyz"] = np.asarray(xyz, dtype=np.float64)
+        normalized["_shared_arm_pose_row"] = pose_row
+        normalized["_shared_arm_frame_key"] = frame_key(record)
+        unsupported.append(normalized)
+
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in unsupported:
+        class_key = str(item.get("class_id"))
+        if item.get("class_id") is None:
+            class_key = str(item.get("class_name") or "").casefold()
+        buckets.setdefault(
+            (str(item.get("record_name") or ""), class_key), []
+        ).append(item)
+
+    target_clusters: list[list[dict[str, Any]]] = []
+    for bucket_items in buckets.values():
+        ordered = sorted(
+            bucket_items,
+            key=lambda item: (
+                int(item["_shared_arm_pose_row"]),
+                str(item.get("image_name") or "").casefold(),
+                str(item.get("detection_id") or ""),
+            ),
+        )
+        if not ordered:
+            continue
+        coordinates = np.asarray(
+            [item["_shared_arm_xyz"][:2] for item in ordered],
+            dtype=np.float64,
+        )
+        neighbours = cKDTree(coordinates).query_ball_tree(
+            cKDTree(coordinates),
+            r=float(cluster_xy_radius_m),
+        )
+        unseen = set(range(len(ordered)))
+        while unseen:
+            seed = min(unseen)
+            stack = [seed]
+            component: list[int] = []
+            unseen.remove(seed)
+            while stack:
+                index = stack.pop()
+                component.append(index)
+                for neighbour in neighbours[index]:
+                    if (
+                        neighbour in unseen
+                        and abs(
+                            float(ordered[index]["_shared_arm_xyz"][2])
+                            - float(ordered[neighbour]["_shared_arm_xyz"][2])
+                        )
+                        <= cluster_z_radius_m
+                    ):
+                        unseen.remove(neighbour)
+                        stack.append(neighbour)
+            members = [ordered[index] for index in sorted(component)]
+            # Reject connected-component chains: every observation in a stable
+            # target cluster must satisfy the configured complete-link bounds.
+            stable = all(
+                np.linalg.norm(
+                    left["_shared_arm_xyz"][:2] - right["_shared_arm_xyz"][:2]
+                )
+                <= cluster_xy_radius_m + 1e-12
+                and abs(
+                    float(left["_shared_arm_xyz"][2])
+                    - float(right["_shared_arm_xyz"][2])
+                )
+                <= cluster_z_radius_m + 1e-12
+                for left_index, left in enumerate(members)
+                for right in members[left_index + 1 :]
+            )
+            frame_keys = {
+                str(item["_shared_arm_frame_key"])
+                for item in members
+                if str(item["_shared_arm_frame_key"])
+            }
+            pose_rows = sorted(
+                {int(item["_shared_arm_pose_row"]) for item in members}
+            )
+            if (
+                stable
+                and len(frame_keys) >= min_frame_observations
+                and len(pose_rows) >= min_frame_observations
+                and pose_rows[-1] - pose_rows[0] <= max_frame_span
+            ):
+                target_clusters.append(members)
+
+    reconciled = list(relations)
+    for members in target_clusters:
+        target_xyz = np.median(
+            np.asarray(
+                [item["_shared_arm_xyz"] for item in members],
+                dtype=np.float64,
+            ),
+            axis=0,
+        )
+        record_name = str(members[0].get("record_name") or "")
+        matches_by_support: dict[str, list[tuple[float, dict[str, Any], float]]] = {}
+        for support in eligible_supports:
+            if support["record_name"] != record_name:
+                continue
+            pole_xyz = support["pole_xyz"]
+            for endpoint in support["endpoints"]:
+                endpoint_xyz = endpoint["xyz"]
+                arm_xy = endpoint_xyz[:2] - pole_xyz[:2]
+                arm_length_sq = float(np.dot(arm_xy, arm_xy))
+                if arm_length_sq <= 0.0:
+                    continue
+
+                member_evidence: list[tuple[float, float, float]] = []
+                for member in members:
+                    member_xyz = member["_shared_arm_xyz"]
+                    projection = float(
+                        np.dot(member_xyz[:2] - pole_xyz[:2], arm_xy)
+                        / arm_length_sq
+                    )
+                    projected_xy = pole_xyz[:2] + (projection * arm_xy)
+                    perpendicular = float(
+                        np.linalg.norm(member_xyz[:2] - projected_xy)
+                    )
+                    height_delta = abs(float(member_xyz[2] - endpoint_xyz[2]))
+                    member_evidence.append(
+                        (projection, perpendicular, height_delta)
+                    )
+                if not all(
+                    min_projection_fraction <= projection <= max_projection_fraction
+                    and perpendicular <= arm_perpendicular_tolerance_m
+                    and height_delta <= arm_height_tolerance_m
+                    for projection, perpendicular, height_delta in member_evidence
+                ):
+                    continue
+                if float(target_xyz[2] - pole_xyz[2]) < 1.8:
+                    continue
+                target_projection = float(
+                    np.dot(target_xyz[:2] - pole_xyz[:2], arm_xy)
+                    / arm_length_sq
+                )
+                target_projected_xy = pole_xyz[:2] + target_projection * arm_xy
+                target_perpendicular = float(
+                    np.linalg.norm(target_xyz[:2] - target_projected_xy)
+                )
+                matches_by_support.setdefault(support["support_id"], []).append(
+                    (
+                        target_perpendicular,
+                        {**support, "matched_endpoint": endpoint},
+                        target_projection,
+                    )
+                )
+
+        # There must be exactly one physical support, even if that support has
+        # more than one compatible endpoint observation of the same mast arm.
+        if len(matches_by_support) != 1:
+            continue
+        support_id, support_matches = next(iter(matches_by_support.items()))
+        perpendicular, support, projection = min(
+            support_matches,
+            key=lambda item: (
+                item[0],
+                abs(float(item[2]) - 0.5),
+                str(
+                    item[1]["matched_endpoint"]["relation"].get("detection_id")
+                    or ""
+                ),
+            ),
+        )
+        pole_xyz = support["pole_xyz"]
+        endpoint = support["matched_endpoint"]
+        endpoint_xyz = endpoint["xyz"]
+        pose_rows = sorted(
+            {int(item["_shared_arm_pose_row"]) for item in members}
+        )
+        source_detection_ids = sorted(
+            str(item.get("detection_id") or "") for item in members
+        )
+        xy_spread = float(
+            max(
+                np.linalg.norm(item["_shared_arm_xyz"][:2] - target_xyz[:2])
+                for item in members
+            )
+        )
+        z_spread = float(
+            max(
+                abs(float(item["_shared_arm_xyz"][2] - target_xyz[2]))
+                for item in members
+            )
+        )
+        for member in members:
+            relation = dict(support["template"])
+            relation.update(
+                {
+                    key: member.get(key)
+                    for key in (
+                        "record_name",
+                        "detection_index",
+                        "detection_id",
+                        "class_id",
+                        "class_name",
+                        "confidence",
+                        "image_name",
+                        "timestamp_iso",
+                        "run_fingerprint",
+                        "model_name",
+                        "model_key",
+                        "model_profile",
+                        "model_object_type",
+                        "pose_format",
+                        "pose_row_number",
+                        "route_id",
+                        "gps_week",
+                        "pointcloud_source",
+                    )
+                }
+            )
+            relation.update(
+                {
+                    "support_id": support_id,
+                    "sign_x": float(member["_shared_arm_xyz"][0]),
+                    "sign_y": float(member["_shared_arm_xyz"][1]),
+                    "sign_z": float(member["_shared_arm_xyz"][2]),
+                    "pole_x": float(pole_xyz[0]),
+                    "pole_y": float(pole_xyz[1]),
+                    "pole_z": float(pole_xyz[2]),
+                    "pole_method": "MULTI_FRAME_SHARED_ARM",
+                    "pole_status": "REVIEW",
+                    "pole_quality": 0.0,
+                    "association_distance_m": float(
+                        np.linalg.norm(member["_shared_arm_xyz"][:2] - pole_xyz[:2])
+                    ),
+                    "pole_search_mode": "multi_frame_shared_arm",
+                    "pole_fallback_attempted": False,
+                    "pole_fallback_used": False,
+                    "pole_point_crop_path": None,
+                    "pole_debug_image_path": None,
+                    "support_reconciled": True,
+                    "support_reconciliation_method": "shared_arm",
+                    "support_shared_arm_projection_fraction": projection,
+                    "support_shared_arm_perpendicular_m": perpendicular,
+                    "support_shared_arm_endpoint_detection_id": str(
+                        endpoint["relation"].get("detection_id") or ""
+                    ),
+                    "support_shared_arm_endpoint_x": float(endpoint_xyz[0]),
+                    "support_shared_arm_endpoint_y": float(endpoint_xyz[1]),
+                    "support_shared_arm_endpoint_z": float(endpoint_xyz[2]),
+                    "support_shared_arm_target_pose_rows": pose_rows,
+                    "support_shared_arm_target_detection_ids": source_detection_ids,
+                    "support_shared_arm_target_xy_spread_m": xy_spread,
+                    "support_shared_arm_target_z_spread_m": z_spread,
+                    "support_shared_arm_anchor_frames": list(
+                        support["anchor_frames"]
+                    ),
+                }
+            )
+            reconciled.append(relation)
+            existing_detection_ids.add(str(member.get("detection_id") or ""))
+    return reconciled
+
+
 def refresh_shapefile_from_txt(
     txt_dir: Path,
     shp_path: Path,
@@ -2696,6 +3118,10 @@ def refresh_shapefile_from_txt(
             for item in pole_relations
             if int(item.get("obs_count") or 1) >= pole_min_observations
         ]
+        pole_relations = reconcile_repeated_shared_arm_supports(
+            records,
+            pole_relations,
+        )
     attach_support_ids_to_detection_records(records, pole_relations)
     records, pole_relations = deduplicate_sign_and_pole_observations(
         records,
@@ -4753,12 +5179,35 @@ def find_pole_bases_with_corridor_fallback(
         if result is not None and getattr(result, "candidates", ())
         else None
     )
-    strict_is_direct = bool(
+    strict_association_distance: float | None = None
+    strict_completeness_ratio: float | None = None
+    if strict_candidate is not None:
+        try:
+            strict_association_distance = float(
+                getattr(strict_candidate, "association_distance_m", math.inf)
+            )
+            strict_completeness_ratio = float(
+                getattr(strict_candidate, "completeness_ratio", None)
+            )
+        except (TypeError, ValueError, OverflowError):
+            strict_association_distance = None
+            strict_completeness_ratio = None
+    strict_is_sufficient_direct = bool(
         strict_candidate is not None
-        and float(strict_candidate.association_distance_m)
+        and strict_association_distance is not None
+        and math.isfinite(strict_association_distance)
+        and strict_association_distance
         <= parameters.direct_max_axis_sign_distance_m
+        and strict_completeness_ratio is not None
+        and math.isfinite(strict_completeness_ratio)
+        and strict_completeness_ratio
+        >= float(
+            getattr(parameters, "preferred_min_completeness_ratio", 0.75)
+        )
+        and str(getattr(strict_candidate, "occlusion_status", "") or "")
+        != "GROUND_CONFLICT"
     )
-    if not strict_is_direct and np.any(expanded_mask & ~strict_mask):
+    if not strict_is_sufficient_direct and np.any(expanded_mask & ~strict_mask):
         searched_mask = expanded_mask
         mode = "remote_expanded"
         expanded_result = find_pole_bases(
@@ -8047,6 +8496,10 @@ def finalize_prepared_model_run(
             for item in merged_poles
             if int(item.get("obs_count") or 1) >= int(runtime["pole_min_observations"])
         ]
+        merged_poles = reconcile_repeated_shared_arm_supports(
+            records,
+            merged_poles,
+        )
     attach_support_ids_to_detection_records(records, merged_poles)
     records, merged_poles = deduplicate_sign_and_pole_observations(
         records,

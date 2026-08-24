@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   OVERLAY_DETAILS_EVENT,
   OverlayHoverTooltip,
+  clampOverlayTooltipPosition,
   openOverlayFeatureDetails,
   overlayHoverClassName,
   overlayHoverLayerColor,
@@ -13,6 +14,17 @@ import {
 afterEach(cleanup)
 
 describe('OverlayHoverTooltip', () => {
+  it('clamps a dragged card inside its viewport with padding', () => {
+    expect(clampOverlayTooltipPosition(-40, 400, 100, 90, 320, 240)).toEqual({
+      left: 8,
+      top: 142,
+    })
+    expect(clampOverlayTooltipPosition(40, 50, 400, 300, 320, 240)).toEqual({
+      left: 8,
+      top: 8,
+    })
+  })
+
   it('uses the detected class as the primary title and shows a compact colored layer badge', () => {
     const { container } = render(
       <OverlayHoverTooltip
@@ -116,6 +128,9 @@ describe('OverlayHoverTooltip', () => {
     expect(screen.getByRole('dialog')).toHaveTextContent('속성 2개 더 있음')
     expect(screen.getByRole('dialog')).not.toHaveTextContent('empty')
     fireEvent.click(screen.getByRole('button', { name: '자세히' }))
+    expect(screen.getByRole('dialog')).toHaveTextContent('empty')
+    expect(screen.getByRole('dialog')).not.toHaveTextContent('더 있음')
+    fireEvent.click(screen.getByRole('button', { name: '수정하기' }))
     fireEvent.click(screen.getByRole('button', { name: '고정 속성 닫기' }))
     expect(onDetails).toHaveBeenCalledWith(hover)
     expect(onClose).toHaveBeenCalledOnce()
@@ -188,7 +203,66 @@ describe('OverlayHoverTooltip', () => {
 
     onClose.mockClear()
     rerender(<OverlayHoverTooltip hover={hover} pinned onClose={onClose} />)
+    expect(screen.getByRole('button', { name: '자세히' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: '수정하기' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '수정하기' })).toHaveAttribute(
+      'title',
+      '편집 가능한 결과 피처가 연결되지 않았습니다.',
+    )
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledOnce()
+  })
+
+  it('drags a pinned card by its header and clamps it to the offset container', () => {
+    const { container } = render(
+      <div>
+        <OverlayHoverTooltip
+          hover={{
+            identityKey: 'detection:7',
+            layerName: 'traffic-signs',
+            featureId: 'f-7',
+            properties: { class_nm: 'warning-sign' },
+            x: 10,
+            y: 20,
+            viewportWidth: 320,
+            viewportHeight: 240,
+          }}
+          pinned
+        />
+      </div>,
+    )
+    const offsetParent = container.firstElementChild as HTMLElement
+    const dialog = screen.getByRole('dialog')
+    const header = dialog.querySelector('header') as HTMLElement
+    Object.defineProperty(dialog, 'offsetParent', { configurable: true, value: offsetParent })
+    Object.defineProperty(offsetParent, 'clientWidth', { configurable: true, value: 320 })
+    Object.defineProperty(offsetParent, 'clientHeight', { configurable: true, value: 240 })
+    vi.spyOn(offsetParent, 'getBoundingClientRect').mockReturnValue({
+      left: 20,
+      top: 30,
+    } as DOMRect)
+    vi.spyOn(dialog, 'getBoundingClientRect').mockReturnValue({
+      left: 40,
+      top: 50,
+      width: 100,
+      height: 100,
+    } as DOMRect)
+    const dispatchPointer = (
+      type: 'pointerdown' | 'pointermove' | 'pointerup',
+      values: Record<string, number>,
+    ) => {
+      const event = new Event(type, { bubbles: true, cancelable: true })
+      Object.entries(values).forEach(([key, value]) => {
+        Object.defineProperty(event, key, { configurable: true, value })
+      })
+      fireEvent(header, event)
+    }
+
+    dispatchPointer('pointerdown', { pointerId: 7, button: 0, clientX: 50, clientY: 60 })
+    expect(dialog).toHaveClass('dragging')
+    dispatchPointer('pointermove', { pointerId: 7, clientX: 500, clientY: 500 })
+    expect(dialog).toHaveStyle({ left: '212px', top: '132px' })
+    dispatchPointer('pointerup', { pointerId: 7, clientX: 500, clientY: 500 })
+    expect(dialog).not.toHaveClass('dragging')
   })
 })

@@ -930,12 +930,33 @@ button:disabled {
   width: 100%;
   min-height: 48px;
   align-items: center;
-  gap: 9px;
-  padding: 6px 8px 6px 6px;
+  gap: 2px;
+  padding: 0 5px 0 0;
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 8px;
+}
+
+.track-row-select {
+  display: flex;
+  min-width: 0;
+  min-height: 46px;
+  flex: 1;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 4px 6px 6px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+}
+
+.track-row-select:focus-visible,
+.track-visibility-toggle:focus-visible {
+  outline: 2px solid rgba(49, 211, 170, 0.7);
+  outline-offset: -2px;
 }
 
 .track-row:hover {
@@ -971,7 +992,7 @@ button:disabled {
   background: #e67da2;
 }
 
-.track-row > span:nth-child(2) {
+.track-row-select > span:nth-child(2) {
   display: flex;
   min-width: 0;
   flex: 1;
@@ -997,8 +1018,34 @@ button:disabled {
   font-size: 8px;
 }
 
-.track-row > svg {
+.track-row-select > svg {
   color: #496174;
+}
+
+.track-visibility-toggle {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  color: #6d8799;
+  background: rgba(7, 17, 31, 0.42);
+  border: 1px solid rgba(121, 149, 169, 0.13);
+  border-radius: 6px;
+}
+
+.track-visibility-toggle:hover {
+  color: #9ff4dd;
+  background: rgba(49, 211, 170, 0.1);
+  border-color: rgba(49, 211, 170, 0.25);
+}
+
+.track-row.track-hidden .track-row-select {
+  opacity: 0.48;
+}
+
+.track-row.track-hidden .track-visibility-toggle {
+  color: #4e6576;
 }
 
 .frame-section {
@@ -1669,7 +1716,7 @@ button:disabled {
 }
 
 .layer-toggles .base-layer {
-  cursor: default;
+  cursor: pointer;
 }
 
 .lazy-layer-note,
@@ -2172,6 +2219,43 @@ button:disabled {
 
 .map-layer-quick-list button.current-track {
   box-shadow: inset 2px 0 rgba(255, 255, 255, 0.28);
+}
+
+.map-layer-track-row {
+  display: flex;
+  min-width: 0;
+  border-radius: 6px;
+}
+
+.map-layer-track-row:hover,
+.map-layer-track-row.active {
+  background: rgba(57, 215, 174, 0.08);
+}
+
+.map-layer-track-row.current-track {
+  box-shadow: inset 2px 0 rgba(255, 255, 255, 0.28);
+}
+
+.map-layer-quick-list .map-layer-track-row > .map-layer-track-select {
+  flex: 1;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  background: transparent;
+  box-shadow: none;
+}
+
+.map-layer-quick-list .map-layer-track-row > .map-layer-track-visibility {
+  display: grid;
+  width: 31px;
+  min-height: 31px;
+  flex: 0 0 31px;
+  grid-template-columns: 1fr;
+  place-items: center;
+  align-self: center;
+  padding: 0;
+}
+
+.map-layer-track-row.active > .map-layer-track-visibility > svg {
+  color: var(--mint);
 }
 
 .map-layer-quick-list button > i.map-layer-track-swatch {
@@ -2752,6 +2836,8 @@ button:disabled {
 }
 
 .overlay-hover-tooltip.pinned {
+  max-height: min(520px, calc(100% - 16px));
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   pointer-events: auto;
   border-color: rgba(255, 209, 102, 0.52);
   box-shadow: 0 14px 38px rgba(0, 0, 0, 0.48), 0 0 0 1px rgba(255, 209, 102, 0.08);
@@ -2765,6 +2851,16 @@ button:disabled {
   gap: 10px;
   padding: 8px 9px;
   border-bottom: 1px solid rgba(143, 171, 191, 0.16);
+}
+
+.overlay-hover-tooltip.pinned .overlay-hover-drag-handle {
+  cursor: grab;
+  touch-action: none;
+}
+
+.overlay-hover-tooltip.pinned.dragging .overlay-hover-drag-handle {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .overlay-hover-title {
@@ -2839,9 +2935,11 @@ button:disabled {
 }
 
 .overlay-hover-tooltip dl {
+  min-height: 0;
   min-width: 0;
   margin: 0;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .overlay-hover-tooltip dl > div {
@@ -2880,14 +2978,22 @@ button:disabled {
 
 .overlay-hover-tooltip footer {
   display: flex;
-  justify-content: flex-end;
+  gap: 6px;
+  justify-content: stretch;
   padding: 6px 8px 7px;
   border-top: 1px solid rgba(143, 171, 191, 0.12);
+}
+
+.overlay-hover-tooltip footer small {
+  color: #8298a7;
+  font-size: 9px;
 }
 
 .overlay-hover-tooltip footer button {
   display: inline-flex;
   min-height: 25px;
+  flex: 1;
+  justify-content: center;
   align-items: center;
   gap: 5px;
   padding: 0 8px;
@@ -3148,6 +3254,23 @@ button:disabled {
   border-radius: 4px;
 }
 
+.viewer-toolbar .pointcloud-infrastructure-toggle.active {
+  color: #081b16;
+  background: var(--mint);
+  box-shadow: 0 0 0 1px rgba(121, 255, 217, 0.32), 0 0 14px rgba(57, 215, 174, 0.22);
+}
+
+.panorama-point-status.manual-object-status {
+  font-size: 9.5px;
+}
+
+.panorama-point-status.manual-object-status button,
+.panorama-point-status.manual-object-status input:not([type='checkbox']),
+.panorama-point-status.manual-object-status select {
+  min-height: 24px;
+  font-size: 9px;
+}
+
 .viewer-data-card {
   position: absolute;
   right: 14px;
@@ -3243,6 +3366,18 @@ button:disabled {
   list-style: none;
   cursor: pointer;
   border-radius: 5px;
+}
+
+.overlay-hover-tooltip footer button.secondary {
+  color: #a9bcc7;
+  background: rgba(122, 151, 170, 0.13);
+  border: 1px solid rgba(143, 171, 191, 0.18);
+}
+
+.overlay-hover-tooltip footer button:disabled {
+  color: #647987;
+  cursor: not-allowed;
+  background: rgba(90, 111, 126, 0.1);
 }
 
 .pointcloud-tool-menu > summary::-webkit-details-marker {

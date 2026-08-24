@@ -9,8 +9,9 @@ import {
   type ReactNode,
 } from 'react'
 import { api, ApiError } from '../lib/api'
-import { isTextEntryTarget } from '../lib/frameNavigation'
+import { hasOpenModalDialog, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 import type {
+  Frame,
   OverlayCoordinateSpace,
   OverlayEncoding,
   OverlayFeature,
@@ -22,6 +23,7 @@ import type {
   OverlayManualObjectValidation,
   OverlayReviewMetadata,
   PoleBaseInferResponse,
+  ReviewTask,
 } from '../types'
 import { useOptionalReviewWorkspace } from './ReviewContext'
 
@@ -79,6 +81,7 @@ interface StagedPointWorkflow {
   target: DirectPointPickTarget
   continuous: boolean
   templateOptions?: PoleBaseTemplateOptions
+  reviewTaskSnapshot: PoleBaseReviewTaskSnapshot | null
 }
 
 interface StagedPointCloudCoordinate extends StagedPointWorkflow {
@@ -126,6 +129,102 @@ export interface PoleBaseTemplateValidation {
   overrideReason: string
 }
 
+export interface PoleBaseReviewTaskSnapshot {
+  id: string
+  sessionId: string
+  datasetId: string
+  targetLayerId: string | null
+  proposalFrameId: string
+  frameId: string | null
+  trackId: string | null
+  frameStart: number | null
+  frameEnd: number | null
+}
+
+function poleReviewTaskCoversFrame(task: ReviewTask, frame: Frame): boolean {
+  const hasFrameStart = task.frame_start !== null
+  const hasFrameEnd = task.frame_end !== null
+  if (hasFrameStart || hasFrameEnd) {
+    return Boolean(
+      hasFrameStart &&
+      hasFrameEnd &&
+      task.track_id !== null &&
+      task.track_id === frame.track_id &&
+      frame.index >= task.frame_start! &&
+      frame.index <= task.frame_end!,
+    )
+  }
+  return (
+    task.frame_id === frame.id &&
+    (task.track_id === null || task.track_id === frame.track_id)
+  )
+}
+
+function snapshotPoleReviewTask(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  datasetId: string,
+  layerId: string,
+  frame: Frame | null | undefined,
+  expectedFrameId?: string,
+): PoleBaseReviewTaskSnapshot | null {
+  if (
+    !task ||
+    !frame ||
+    (expectedFrameId !== undefined && frame.id !== expectedFrameId) ||
+    sessionId !== task.session_id ||
+    task.dataset_id !== datasetId ||
+    task.status !== 'in_progress' ||
+    (task.target_layer_id !== null && task.target_layer_id !== layerId) ||
+    !poleReviewTaskCoversFrame(task, frame)
+  ) {
+    return null
+  }
+  return {
+    id: task.id,
+    sessionId: task.session_id,
+    datasetId: task.dataset_id,
+    targetLayerId: task.target_layer_id,
+    proposalFrameId: frame.id,
+    frameId: task.frame_id,
+    trackId: task.track_id,
+    frameStart: task.frame_start,
+    frameEnd: task.frame_end,
+  }
+}
+
+function poleReviewTaskHasSnapshotScope(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  snapshot: PoleBaseReviewTaskSnapshot,
+): task is ReviewTask {
+  return Boolean(
+    task &&
+    sessionId === snapshot.sessionId &&
+    task.id === snapshot.id &&
+    task.session_id === snapshot.sessionId &&
+    task.dataset_id === snapshot.datasetId &&
+    task.target_layer_id === snapshot.targetLayerId &&
+    task.frame_id === snapshot.frameId &&
+    task.track_id === snapshot.trackId &&
+    task.frame_start === snapshot.frameStart &&
+    task.frame_end === snapshot.frameEnd
+  )
+}
+
+function poleReviewTaskMatchesSnapshot(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  snapshot: PoleBaseReviewTaskSnapshot,
+  proposalFrameId: string,
+): task is ReviewTask {
+  return (
+    snapshot.proposalFrameId === proposalFrameId &&
+    task?.status === 'in_progress' &&
+    poleReviewTaskHasSnapshotScope(task, sessionId, snapshot)
+  )
+}
+
 export type PoleBaseProposalState =
   | { status: 'idle' }
   | { status: 'picking'; target: PoleBaseTarget }
@@ -142,6 +241,7 @@ export type PoleBaseProposalState =
       seed: [number, number, number]
       result: PoleBaseInferResponse
       idempotencyKey: string
+      reviewTaskSnapshot: PoleBaseReviewTaskSnapshot | null
       templateValidation?: PoleBaseTemplateValidation
     }
   | {
@@ -362,6 +462,7 @@ export interface OverlayContextValue {
   pickMode: boolean
   pickTarget: OverlayPickTarget | null
   poleBaseProposal: PoleBaseProposalState
+  poleBaseReviewTaskChanged: boolean
   setPickMode: (enabled: boolean) => void
   beginCreatePoint: (layerId: string) => void
   beginStagedPointCreate: (
@@ -377,7 +478,7 @@ export interface OverlayContextValue {
   beginCreatePoleBase: (layerId: string, continuous?: boolean) => void
   beginRecomputeSelectedPoleBase: () => void
   applyPoleSeed: (frameId: string, coordinates: [number, number, number]) => Promise<void>
-  confirmPoleBaseProposal: () => Promise<boolean>
+  confirmPoleBaseProposal: (nextTask?: boolean) => Promise<boolean>
   retryPoleBasePick: () => void
   cancelPoleBaseProposal: () => void
   handlePoleBaseFrameChange: (frameId: string) => void
@@ -494,6 +595,7 @@ export function OverlayProvider({
   const poleBaseRequestIdRef = useRef(0)
   const poleBaseSaveIdRef = useRef(0)
   const poleBaseConfirmingRef = useRef(false)
+  const poleBaseReviewTaskSnapshotRef = useRef<PoleBaseReviewTaskSnapshot | null>(null)
   const featureTaskResolutionPendingRef = useRef<boolean | null>(null)
   const savedFeatureIdRef = useRef<string | number | null>(null)
   const stagedPointWorkflowRef = useRef<StagedPointWorkflow | null>(null)
@@ -501,8 +603,23 @@ export function OverlayProvider({
   const directActualPointPickRef = useRef(false)
   const activeDatasetIdRef = useRef(datasetId)
   activeDatasetIdRef.current = datasetId
+  const reviewRef = useRef(review)
+  reviewRef.current = review
   const visibleLayerIdsRef = useRef(visibleLayerIds)
   visibleLayerIdsRef.current = visibleLayerIds
+
+  const capturePoleReviewTask = useCallback(
+    (layerId: string, expectedFrameId?: string) =>
+      snapshotPoleReviewTask(
+        reviewRef.current?.currentTask,
+        reviewRef.current?.session?.id,
+        datasetId,
+        layerId,
+        reviewRef.current?.activeFrame,
+        expectedFrameId,
+      ),
+    [datasetId],
+  )
 
   const commitPoleBaseProposal = useCallback((proposal: PoleBaseProposalState) => {
     poleBaseProposalRef.current = proposal
@@ -518,6 +635,7 @@ export function OverlayProvider({
   const restoreStagedPointWorkflow = useCallback(
     (workflow: StagedPointWorkflow) => {
       stagedPointWorkflowRef.current = workflow
+      poleBaseReviewTaskSnapshotRef.current = workflow.reviewTaskSnapshot
       stagedPointCloudCoordinateRef.current = null
       directActualPointPickRef.current = false
       setActiveLayerId(workflow.target.layerId)
@@ -531,6 +649,7 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    poleBaseReviewTaskSnapshotRef.current = null
     stagedPointWorkflowRef.current = null
     stagedPointCloudCoordinateRef.current = null
     directActualPointPickRef.current = false
@@ -627,9 +746,10 @@ export function OverlayProvider({
         target: { kind: 'create', layerId },
         continuous,
         templateOptions,
+        reviewTaskSnapshot: capturePoleReviewTask(layerId),
       }
     },
-    [beginCreatePoint, demoMode, layers],
+    [beginCreatePoint, capturePoleReviewTask, demoMode, layers],
   )
 
   const beginStagedSelectedPointMove = useCallback(() => {
@@ -643,8 +763,9 @@ export function OverlayProvider({
         featureId: selected.featureId,
       },
       continuous: false,
+      reviewTaskSnapshot: capturePoleReviewTask(selected.layerId),
     }
-  }, [selected, setPickMode])
+  }, [capturePoleReviewTask, selected, setPickMode])
 
   const updateStagedPoleBaseTemplateOptions = useCallback(
     (layerId: string, templateOptions: PoleBaseTemplateOptions) => {
@@ -735,6 +856,7 @@ export function OverlayProvider({
       abortPoleBaseRequest()
       poleBaseSaveIdRef.current += 1
       poleBaseConfirmingRef.current = false
+      poleBaseReviewTaskSnapshotRef.current = capturePoleReviewTask(layerId)
       stagedPointWorkflowRef.current = null
       stagedPointCloudCoordinateRef.current = null
       directActualPointPickRef.current = false
@@ -746,6 +868,7 @@ export function OverlayProvider({
     },
     [
       abortPoleBaseRequest,
+      capturePoleReviewTask,
       commitPoleBaseProposal,
       demoMode,
       layers,
@@ -775,6 +898,7 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    poleBaseReviewTaskSnapshotRef.current = capturePoleReviewTask(selected.layerId)
     stagedPointWorkflowRef.current = null
     stagedPointCloudCoordinateRef.current = null
     directActualPointPickRef.current = false
@@ -789,6 +913,7 @@ export function OverlayProvider({
     window.dispatchEvent(new CustomEvent('mms-open-pointcloud'))
   }, [
     abortPoleBaseRequest,
+    capturePoleReviewTask,
     commitPoleBaseProposal,
     demoMode,
     layers,
@@ -811,6 +936,7 @@ export function OverlayProvider({
         return
       }
       if (poleBaseProposalRef.current.status !== 'idle') clearPoleBaseWorkflow()
+      poleBaseReviewTaskSnapshotRef.current = null
       stagedPointWorkflowRef.current = null
       stagedPointCloudCoordinateRef.current = null
       directActualPointPickRef.current = true
@@ -835,16 +961,24 @@ export function OverlayProvider({
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
     const target = proposal.target
+    const proposalFrameId = 'frameId' in proposal ? proposal.frameId : undefined
+    const nextSnapshot = capturePoleReviewTask(target.layerId, proposalFrameId)
     if (workflow && stagedWorkflowMatchesPoleTarget(workflow, target)) {
-      restoreStagedPointWorkflow(workflow)
+      restoreStagedPointWorkflow({ ...workflow, reviewTaskSnapshot: nextSnapshot })
       return
     }
+    poleBaseReviewTaskSnapshotRef.current = nextSnapshot
     stagedPointWorkflowRef.current = null
     stagedPointCloudCoordinateRef.current = null
     directActualPointPickRef.current = false
     setPickTarget(target)
     commitPoleBaseProposal({ status: 'picking', target })
-  }, [abortPoleBaseRequest, commitPoleBaseProposal, restoreStagedPointWorkflow])
+  }, [
+    abortPoleBaseRequest,
+    capturePoleReviewTask,
+    commitPoleBaseProposal,
+    restoreStagedPointWorkflow,
+  ])
 
   const cancelPoleBaseProposal = useCallback(() => {
     clearPoleBaseWorkflow()
@@ -855,7 +989,16 @@ export function OverlayProvider({
       const staged = stagedPointCloudCoordinateRef.current
       if (staged && staged.frameId !== frameId) stagedPointCloudCoordinateRef.current = null
       const proposal = poleBaseProposalRef.current
-      if (proposal.status === 'idle' || proposal.status === 'picking') return
+      if (proposal.status === 'idle') return
+      if (proposal.status === 'picking') {
+        const nextSnapshot = capturePoleReviewTask(proposal.target.layerId, frameId)
+        poleBaseReviewTaskSnapshotRef.current = nextSnapshot
+        const workflow = stagedPointWorkflowRef.current
+        if (workflow && stagedWorkflowMatchesPoleTarget(workflow, proposal.target)) {
+          stagedPointWorkflowRef.current = { ...workflow, reviewTaskSnapshot: nextSnapshot }
+        }
+        return
+      }
       if (proposal.frameId === frameId) return
       const workflow = stagedPointWorkflowRef.current
       abortPoleBaseRequest()
@@ -863,15 +1006,24 @@ export function OverlayProvider({
       poleBaseConfirmingRef.current = false
       const target = proposal.target
       if (workflow && stagedWorkflowMatchesPoleTarget(workflow, target)) {
-        restoreStagedPointWorkflow(workflow)
+        restoreStagedPointWorkflow({
+          ...workflow,
+          reviewTaskSnapshot: capturePoleReviewTask(target.layerId, frameId),
+        })
         return
       }
+      poleBaseReviewTaskSnapshotRef.current = capturePoleReviewTask(target.layerId, frameId)
       stagedPointWorkflowRef.current = null
       stagedPointCloudCoordinateRef.current = null
       setPickTarget(target)
       commitPoleBaseProposal({ status: 'picking', target })
     },
-    [abortPoleBaseRequest, commitPoleBaseProposal, restoreStagedPointWorkflow],
+    [
+      abortPoleBaseRequest,
+      capturePoleReviewTask,
+      commitPoleBaseProposal,
+      restoreStagedPointWorkflow,
+    ],
   )
 
   useEffect(() => {
@@ -883,6 +1035,7 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    poleBaseReviewTaskSnapshotRef.current = null
     stagedPointWorkflowRef.current = null
     stagedPointCloudCoordinateRef.current = null
     directActualPointPickRef.current = false
@@ -1552,6 +1705,7 @@ export function OverlayProvider({
       poleBaseRequestRef.current = { requestId, controller }
       const requestDatasetId = datasetId
       const target = proposal.target
+      const reviewTaskSnapshot = poleBaseReviewTaskSnapshotRef.current
       commitPoleBaseProposal({ status: 'loading', target, frameId, seed: coordinates })
       try {
         const result = await api.inferPoleBase(
@@ -1638,6 +1792,7 @@ export function OverlayProvider({
           seed: coordinates,
           result,
           idempotencyKey: featureMutationKey('pole-base'),
+          reviewTaskSnapshot,
           ...(templateValidation ? { templateValidation } : {}),
         })
         const reasonMessage = poleBaseReasonMessages(result.reason_codes).join(' · ')
@@ -1693,7 +1848,7 @@ export function OverlayProvider({
     ],
   )
 
-  const confirmPoleBaseProposal = useCallback(async () => {
+  const confirmPoleBaseProposal = useCallback(async (nextTask = false) => {
     const proposal = poleBaseProposalRef.current
     if (
       proposal.status !== 'ready' ||
@@ -1703,6 +1858,24 @@ export function OverlayProvider({
     ) {
       return false
     }
+    const linkedTaskSnapshot = proposal.reviewTaskSnapshot
+    if (
+      linkedTaskSnapshot &&
+      !poleReviewTaskMatchesSnapshot(
+        reviewRef.current?.currentTask,
+        reviewRef.current?.session?.id,
+        linkedTaskSnapshot,
+        proposal.frameId,
+      )
+    ) {
+      notify?.({
+        tone: 'info',
+        title: '검수 항목이 바뀌어 저장을 중단했습니다.',
+        message: '현재 검수 항목에서 지주 바닥점을 다시 선택해 주세요.',
+      })
+      return false
+    }
+    const linkedTaskId = linkedTaskSnapshot?.id
     const layer = layers.find((candidate) => candidate.id === proposal.target.layerId)
     if (!layer || !datasetId || demoMode) return false
     const target = proposal.target
@@ -1782,12 +1955,7 @@ export function OverlayProvider({
       creation_tool: 'manual_pole_base_v1',
       proposal_quality: proposal.result.quality.score,
       created_by: 'operator-local',
-      ...(review?.currentTask?.dataset_id === datasetId &&
-      review.currentTask.status === 'in_progress' &&
-      (review.currentTask.target_layer_id === null ||
-        review.currentTask.target_layer_id === target.layerId)
-        ? { task_id: review.currentTask.id }
-        : {}),
+      ...(linkedTaskId ? { task_id: linkedTaskId } : {}),
     }
     const saveId = poleBaseSaveIdRef.current + 1
     poleBaseSaveIdRef.current = saveId
@@ -1843,7 +2011,7 @@ export function OverlayProvider({
           // reconciliation state below instead of allowing a duplicate save.
         }
       }
-      review?.reload()
+      reviewRef.current?.reload()
       if (
         poleBaseSaveIdRef.current !== saveId ||
         activeDatasetIdRef.current !== datasetId ||
@@ -1852,6 +2020,7 @@ export function OverlayProvider({
         return false
       }
       if (featureTaskResolutionPendingRef.current) {
+        poleBaseReviewTaskSnapshotRef.current = null
         stagedPointWorkflowRef.current = null
         stagedPointCloudCoordinateRef.current = null
         directActualPointPickRef.current = false
@@ -1872,11 +2041,31 @@ export function OverlayProvider({
         })
         return false
       }
-      if (
+      const movedToNextTask = Boolean(
+        nextTask &&
+        linkedTaskSnapshot &&
+        poleReviewTaskHasSnapshotScope(
+          reviewRef.current?.currentTask,
+          reviewRef.current?.session?.id,
+          linkedTaskSnapshot,
+        )
+      )
+      if (movedToNextTask) reviewRef.current?.moveTask(1)
+      poleBaseReviewTaskSnapshotRef.current = null
+      if (nextTask) {
+        stagedPointWorkflowRef.current = null
+        stagedPointCloudCoordinateRef.current = null
+        directActualPointPickRef.current = false
+        setPickTarget((current) => (current === target ? null : current))
+        commitPoleBaseProposal({ status: 'idle' })
+      } else if (
         matchingStagedWorkflow?.target.kind === 'create' &&
         matchingStagedWorkflow.continuous
       ) {
-        restoreStagedPointWorkflow(matchingStagedWorkflow)
+        restoreStagedPointWorkflow({
+          ...matchingStagedWorkflow,
+          reviewTaskSnapshot: null,
+        })
       } else if (
         !matchingStagedWorkflow &&
         target.kind === 'pole-base-create' &&
@@ -1950,11 +2139,6 @@ export function OverlayProvider({
     layers,
     notify,
     refresh,
-    review?.currentTask?.dataset_id,
-    review?.currentTask?.id,
-    review?.currentTask?.status,
-    review?.currentTask?.target_layer_id,
-    review?.reload,
     restoreStagedPointWorkflow,
     selected,
     selectedDatasetFeature,
@@ -2038,7 +2222,11 @@ export function OverlayProvider({
       const workflow =
         existingWorkflow && directPointTargetsMatch(existingWorkflow.target, target)
           ? existingWorkflow
-          : { target, continuous: false }
+          : {
+              target,
+              continuous: false,
+              reviewTaskSnapshot: capturePoleReviewTask(target.layerId, frameId),
+            }
       if (poleBaseProposalRef.current.status !== 'idle') {
         clearPoleBaseWorkflow()
         setPickTarget(target)
@@ -2052,7 +2240,14 @@ export function OverlayProvider({
         message: 'B를 눌러 지주 하단을 산출하거나 P를 눌러 선택 좌표를 그대로 저장하세요.',
       })
     },
-    [applyPickedCoordinate, clearPoleBaseWorkflow, notify, pickTarget, selected],
+    [
+      applyPickedCoordinate,
+      capturePoleReviewTask,
+      clearPoleBaseWorkflow,
+      notify,
+      pickTarget,
+      selected,
+    ],
   )
 
   const startStagedPoleBaseInference = useCallback((): boolean => {
@@ -2077,6 +2272,7 @@ export function OverlayProvider({
     abortPoleBaseRequest()
     poleBaseSaveIdRef.current += 1
     poleBaseConfirmingRef.current = false
+    poleBaseReviewTaskSnapshotRef.current = staged.reviewTaskSnapshot
     directActualPointPickRef.current = false
     setPickTarget(target)
     commitPoleBaseProposal({ status: 'picking', target })
@@ -2125,7 +2321,11 @@ export function OverlayProvider({
       }
       if (stagedPointCloudCoordinateRef.current === staged) {
         if (staged.target.kind === 'create' && staged.continuous) {
-          restoreStagedPointWorkflow({ target: staged.target, continuous: true })
+          restoreStagedPointWorkflow({
+            target: staged.target,
+            continuous: true,
+            reviewTaskSnapshot: null,
+          })
         } else {
           stagedPointWorkflowRef.current = null
           stagedPointCloudCoordinateRef.current = null
@@ -2182,12 +2382,13 @@ export function OverlayProvider({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
+        hasOpenModalDialog() ||
         event.defaultPrevented ||
         event.altKey ||
         event.ctrlKey ||
         event.metaKey ||
         event.shiftKey ||
-        isTextEntryTarget(event.target)
+        isWorkspaceShortcutBlockedTarget(event.target)
       ) {
         return
       }
@@ -2397,6 +2598,17 @@ export function OverlayProvider({
     [features, layerColor, layers, visibleLayerIds],
   )
 
+  const poleBaseReviewTaskChanged = Boolean(
+    poleBaseProposal.status === 'ready' &&
+    poleBaseProposal.reviewTaskSnapshot &&
+    !poleReviewTaskMatchesSnapshot(
+      review?.currentTask,
+      review?.session?.id,
+      poleBaseProposal.reviewTaskSnapshot,
+      poleBaseProposal.frameId,
+    ),
+  )
+
   const value = useMemo<OverlayContextValue>(
     () => ({
       datasetId,
@@ -2417,6 +2629,7 @@ export function OverlayProvider({
       pickMode,
       pickTarget,
       poleBaseProposal,
+      poleBaseReviewTaskChanged,
       poleBaseInferenceEnabled,
       setPickMode,
       beginCreatePoint,
@@ -2476,6 +2689,7 @@ export function OverlayProvider({
       pickMode,
       pickTarget,
       poleBaseProposal,
+      poleBaseReviewTaskChanged,
       poleBaseInferenceEnabled,
       refresh,
       removeLayer,

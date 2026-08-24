@@ -10,22 +10,26 @@ type MockMapMode = '2d' | 'satellite' | '3d'
 vi.mock('../views/MapView', () => ({
   MapView: ({
     mapMode,
-    onMapModeChange,
+    activeTrackId,
     visibleTrackIds,
     surveySegments,
     surveyDraft,
     surveyDraftPreview,
     surveyDrawing,
+    onMapModeChange,
+    onSelectTrack,
     onAddSurveyPoint,
     onPreviewSurveyPoint,
   }: {
     mapMode: MockMapMode
-    onMapModeChange: (mode: MockMapMode) => void
+    activeTrackId?: string
     visibleTrackIds?: ReadonlySet<string>
     surveySegments?: unknown[]
     surveyDraft?: [number, number][]
     surveyDraftPreview?: [number, number] | null
     surveyDrawing?: boolean
+    onMapModeChange?: (mode: MockMapMode) => void
+    onSelectTrack?: (trackId: string) => void
     onAddSurveyPoint?: (coordinate: [number, number]) => void
     onPreviewSurveyPoint?: (coordinate: [number, number] | null) => void
   }) => {
@@ -35,6 +39,7 @@ vi.mock('../views/MapView', () => ({
         data-testid="map-view"
         data-instance={instance}
         data-mode={mapMode}
+        data-active-track={activeTrackId ?? ''}
         data-track-layer-visible={String(visibleTrackIds?.has('track-1') ?? true)}
         data-visible-tracks={visibleTrackIds ? [...visibleTrackIds].join(',') : ''}
         data-survey-count={surveySegments?.length ?? 0}
@@ -42,8 +47,14 @@ vi.mock('../views/MapView', () => ({
         data-survey-preview={surveyDraftPreview ? surveyDraftPreview.join(',') : 'none'}
         data-survey-drawing={String(Boolean(surveyDrawing))}
       >
-        <button type="button" onClick={() => onMapModeChange('satellite')}>mock satellite</button>
-        <button type="button" onClick={() => onMapModeChange('3d')}>mock 3D</button>
+        <div role="group" aria-label="지도 모드 선택">
+          <button type="button" onClick={() => onMapModeChange?.('2d')}>2D</button>
+          <button type="button" onClick={() => onMapModeChange?.('satellite')}>위성지도</button>
+          <button type="button" onClick={() => onMapModeChange?.('3d')}>3D</button>
+        </div>
+        <button type="button" onClick={() => onSelectTrack?.('track-1')}>
+          Track 01 경로 선택
+        </button>
         <button
           type="button"
           aria-label="현장조사 점 추가"
@@ -276,10 +287,21 @@ describe('Workspace popup viewers', () => {
 
     expect(map).toHaveAttribute('data-track-layer-visible', 'true')
     expect(panel.querySelector('#map-layer-quick-list')).not.toBeNull()
+    expect(screen.getByRole('button', { name: '전체 트랙 모두 표시' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
+    fireEvent.click(screen.getByTitle('Track 01 트랙 이 트랙만 표시'))
+    expect(map).toHaveAttribute('data-track-layer-visible', 'true')
+    expect(screen.getByRole('button', { name: '전체 트랙 모두 표시' })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
 
     fireEvent.click(screen.getByTitle('Track 01 트랙 숨기기'))
     expect(map).toHaveAttribute('data-track-layer-visible', 'false')
-    expect(screen.getByTitle('Track 01 트랙 표시')).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByTitle('Track 01 트랙 추가 표시')).toHaveAttribute('aria-pressed', 'false')
 
     fireEvent.click(screen.getByRole('button', { name: '지도 레이어 카드 최소화' }))
     expect(panel).toHaveClass('collapsed')
@@ -290,10 +312,10 @@ describe('Workspace popup viewers', () => {
     )
   })
 
-  it('naturally sorts individual tracks and resets visibility for another dataset', async () => {
+  it('supports exclusive, additive, and all-track visibility and resets for another dataset', async () => {
     const view = renderWorkspace({ dataset: MULTI_TRACK_DATASET, selectedTrack: 'sec-2' })
     const map = await screen.findByTestId('map-view')
-    const trackButtons = screen.getAllByTitle(/SEC_\d+ 트랙/)
+    const trackButtons = screen.getAllByTitle(/SEC_\d+ 작업 구간 선택/)
 
     expect(trackButtons.map((button) => button.querySelector('span')?.textContent)).toEqual([
       'SEC_01',
@@ -303,15 +325,48 @@ describe('Workspace popup viewers', () => {
     ])
     expect(map).toHaveAttribute('data-visible-tracks', 'sec-1,sec-2,sec-5,sec-10')
 
-    fireEvent.click(screen.getByTitle('SEC_02 트랙 숨기기 (현재 작업 트랙)'))
-    expect(map).toHaveAttribute('data-visible-tracks', 'sec-1,sec-5,sec-10')
-    expect(screen.getByTitle('SEC_02 트랙 표시 (현재 작업 트랙)')).toHaveAttribute(
+    fireEvent.click(screen.getByTitle('SEC_02 트랙 이 트랙만 표시'))
+    expect(map).toHaveAttribute('data-visible-tracks', 'sec-2')
+    expect(screen.getByTitle('SEC_02 트랙 숨기기')).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
+    fireEvent.click(screen.getByTitle('SEC_05 트랙 추가 표시'))
+    expect(map).toHaveAttribute('data-visible-tracks', 'sec-2,sec-5')
+
+    fireEvent.click(screen.getByTitle('SEC_02 트랙 숨기기'))
+    expect(map).toHaveAttribute('data-visible-tracks', 'sec-5')
+    expect(screen.getByTitle('SEC_02 트랙 추가 표시')).toHaveAttribute(
       'aria-pressed',
       'false',
     )
 
+    fireEvent.click(screen.getByRole('button', { name: '전체 트랙 모두 표시' }))
+    expect(map).toHaveAttribute('data-visible-tracks', 'sec-1,sec-2,sec-5,sec-10')
+    expect(screen.getByRole('button', { name: '전체 트랙 모두 표시' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
     view.rerender(<Workspace {...view.props} dataset={DATASET} selectedTrack="track-1" />)
     expect(screen.getByTestId('map-view')).toHaveAttribute('data-visible-tracks', 'track-1')
+  })
+
+  it('forwards the selected work track to the map and a map route click back to the parent', async () => {
+    const onTrackChange = vi.fn()
+    renderWorkspace({ selectedTrack: 'track-1', onTrackChange })
+
+    const map = await screen.findByTestId('map-view')
+    expect(map).toHaveAttribute('data-active-track', 'track-1')
+
+    fireEvent.click(screen.getByTitle('Track 01 작업 구간 선택'))
+    expect(onTrackChange).toHaveBeenCalledWith('track-1')
+    onTrackChange.mockClear()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Track 01 경로 선택' }))
+    expect(onTrackChange).toHaveBeenCalledOnce()
+    expect(onTrackChange).toHaveBeenCalledWith('track-1')
   })
 
   it('exposes the attribute table next to 3D points and delegates popup lifecycle', async () => {
@@ -347,7 +402,7 @@ describe('Workspace popup viewers', () => {
     }
     const view = render(<Workspace {...props} />)
     const mainInstance = (await screen.findByTestId('map-view')).dataset.instance
-    fireEvent.click(screen.getByRole('button', { name: 'mock satellite' }))
+    fireEvent.click(screen.getByRole('button', { name: '위성지도' }))
     expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', 'satellite')
 
     view.rerender(<Workspace {...props} detached />)
@@ -361,7 +416,7 @@ describe('Workspace popup viewers', () => {
     expect(popupInstance).not.toBe(mainInstance)
     expect(returnedInstance).not.toBe(popupInstance)
 
-    fireEvent.click(screen.getByRole('button', { name: 'mock 3D' }))
+    fireEvent.click(screen.getByRole('button', { name: '3D' }))
     expect(screen.getByTestId('map-view')).toHaveAttribute('data-mode', '3d')
   })
 
@@ -441,6 +496,18 @@ describe('Workspace frame shortcuts', () => {
 
     expect(onMoveFrame).not.toHaveBeenCalled()
     input.remove()
+  })
+
+  it('does not move frames behind an open modal dialog', async () => {
+    const onMoveFrame = vi.fn()
+    renderWorkspace({ onMoveFrame })
+    await screen.findByTestId('map-view')
+    render(<section role="dialog" aria-modal="true" aria-label="도움말" />)
+
+    fireEvent.keyDown(window, { key: 'ArrowLeft', code: 'ArrowLeft' })
+    fireEvent.keyDown(window, { key: 'd', code: 'KeyD' })
+
+    expect(onMoveFrame).not.toHaveBeenCalled()
   })
 
   it('keeps A/D and arrow navigation live on a focused view after feature create and delete', async () => {

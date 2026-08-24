@@ -97,7 +97,7 @@ export function RunResultsDialog({
         }),
       )
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'SHP 검수 레이어를 열지 못했습니다.')
+      setError(reason instanceof Error ? reason.message : 'SHP 편집 레이어를 열지 못했습니다.')
     } finally {
       setImportingPath(null)
     }
@@ -227,7 +227,7 @@ export function RunResultsDialog({
                       )}
                     >
                       {importingPath === shapefile.path ? <LoaderCircle size={14} className="spin" /> : <Import size={14} />}
-                      {importedPath === shapefile.path ? '검수 레이어에 추가됨' : '검수 레이어로 열기'}
+                      {importedPath === shapefile.path ? '편집 레이어에 추가됨' : '편집 레이어로 열기'}
                     </button>
                   </article>
                 ))}

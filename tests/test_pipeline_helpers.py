@@ -59,6 +59,7 @@ from mms_shp_detection.pipeline import (
     pole_cross_profile_candidate_key,
     prepare_shared_pipeline_context,
     reconcile_remote_supports_from_direct_anchors,
+    reconcile_repeated_shared_arm_supports,
     render_forward_detection_view,
     resolve_matched_crs_wkt,
     resolve_num_workers,
@@ -496,7 +497,10 @@ class PanoramaSeamTests(unittest.TestCase):
             dtype=np.float64,
         )
         valid = np.asarray([True, True, True, False, True])
-        parameters = SimpleNamespace(direct_max_axis_sign_distance_m=0.75)
+        parameters = SimpleNamespace(
+            direct_max_axis_sign_distance_m=0.75,
+            preferred_min_completeness_ratio=0.75,
+        )
 
         strict, expanded = build_pole_search_corridor_masks(
             points,
@@ -544,7 +548,13 @@ class PanoramaSeamTests(unittest.TestCase):
 
         strict_result = SimpleNamespace(
             representative_xyz=np.zeros(3),
-            candidates=(SimpleNamespace(association_distance_m=0.3),),
+            candidates=(
+                SimpleNamespace(
+                    association_distance_m=0.3,
+                    completeness_ratio=0.85,
+                    occlusion_status="VISIBLE",
+                ),
+            ),
         )
         with mock.patch(
             "mms_shp_detection.pipeline.find_pole_bases",
@@ -618,6 +628,64 @@ class PanoramaSeamTests(unittest.TestCase):
             )
         self.assertIs(result, strict_better)
         self.assertEqual(mode, "remote_expanded")
+
+    def test_pole_search_expands_for_incomplete_or_ground_conflicting_direct_result(
+        self,
+    ) -> None:
+        points = np.asarray([[0.3, 0.0, 2.0], [6.75, 0.0, 2.0]])
+        pixels = np.asarray([[500.0, 700.0], [927.0, 823.0]])
+        valid = np.asarray([True, True])
+        parameters = SimpleNamespace(
+            direct_max_axis_sign_distance_m=0.75,
+            preferred_min_completeness_ratio=0.75,
+        )
+
+        for completeness, occlusion_status in (
+            (0.31, "VISIBLE"),
+            (0.92, "GROUND_CONFLICT"),
+            (None, "UNKNOWN"),
+        ):
+            with self.subTest(
+                completeness=completeness,
+                occlusion_status=occlusion_status,
+            ):
+                strict_candidate = SimpleNamespace(
+                    association_distance_m=0.3,
+                    completeness_ratio=completeness,
+                    occlusion_status=occlusion_status,
+                )
+                expanded_candidate = SimpleNamespace(
+                    association_distance_m=4.0,
+                    completeness_ratio=0.90,
+                    occlusion_status="VISIBLE",
+                )
+                strict_result = SimpleNamespace(candidates=(strict_candidate,))
+                expanded_result = SimpleNamespace(candidates=(expanded_candidate,))
+                with (
+                    mock.patch(
+                        "mms_shp_detection.pipeline.find_pole_bases",
+                        side_effect=[strict_result, expanded_result],
+                    ) as finder,
+                    mock.patch(
+                        "mms_shp_detection.pipeline.select_pole_candidate",
+                        return_value=expanded_candidate,
+                    ),
+                ):
+                    result, searched, mode, _strict_count, _expanded_count = (
+                        find_pole_bases_with_corridor_fallback(
+                            points,
+                            pixels,
+                            valid,
+                            np.asarray([0.0, 0.0, 5.0]),
+                            (324.0, 481.0, 700.0, 1023.0),
+                            parameters,
+                        )
+                    )
+
+                self.assertIs(result, expanded_result)
+                self.assertEqual(mode, "remote_expanded")
+                self.assertEqual(finder.call_count, 2)
+                np.testing.assert_array_equal(searched, [True, True])
 
     def test_adaptive_pole_debug_overview_contains_clipped_base_and_ground(self) -> None:
         pano_height, pano_width = 360, 720
@@ -1715,6 +1783,202 @@ class MultiModelExecutionTests(unittest.TestCase):
                 PoleSearchParameters(),
             ),
             fallback_actual,
+        )
+
+    def _shared_arm_reconciliation_fixture(
+        self,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        relations = [
+            {
+                "record_name": "route_shared_arm",
+                "detection_id": f"supported-{row}",
+                "detection_index": 1,
+                "model_object_type": "traffic_signal",
+                "class_id": 1,
+                "class_name": "vehicular_signal",
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "sign_x": 10.0,
+                "sign_y": 0.0,
+                "sign_z": 5.0,
+                "pole_x": 0.0,
+                "pole_y": 0.0,
+                "pole_z": 0.0,
+                "support_id": "P-shared",
+                "obs_count": 2,
+                "consensus_outlier_count": 0,
+                "pole_type": "SINGLE",
+                "pole_method": "MULTI_FRAME",
+                "pole_status": "AUTO",
+                "pole_occlusion_status": "VISIBLE",
+                "association_distance_m": 10.0,
+                "pole_point_crop_path": f"supported-{row}.las",
+                "pole_debug_image_path": f"supported-{row}.jpg",
+            }
+            for row in (100, 101)
+        ]
+        targets = [
+            {
+                "record_name": "route_shared_arm",
+                "detection_id": f"target-{row}",
+                "detection_index": 2,
+                "model_object_type": "traffic_signal",
+                "class_id": 2,
+                "class_name": "pedestrian_signal",
+                "confidence": 0.91,
+                "image_name": f"frame{row}.jpg",
+                "pose_row_number": row,
+                "x": 6.0 + (0.02 * offset),
+                "y": 0.05 - (0.02 * offset),
+                "z": 5.02 + (0.02 * offset),
+            }
+            for offset, row in enumerate((102, 103))
+        ]
+        return targets, relations
+
+    def test_repeated_signal_on_unique_shared_arm_reuses_verified_support(
+        self,
+    ) -> None:
+        targets, relations = self._shared_arm_reconciliation_fixture()
+
+        reconciled = reconcile_repeated_shared_arm_supports(targets, relations)
+
+        self.assertEqual(len(reconciled), 4)
+        inferred = [
+            item
+            for item in reconciled
+            if str(item["detection_id"]).startswith("target-")
+        ]
+        self.assertEqual(len(inferred), 2)
+        self.assertTrue(all(item["support_id"] == "P-shared" for item in inferred))
+        self.assertTrue(
+            all(
+                item["pole_method"] == "MULTI_FRAME_SHARED_ARM"
+                for item in inferred
+            )
+        )
+        self.assertTrue(all(item["pole_status"] == "REVIEW" for item in inferred))
+        self.assertTrue(all(item["support_reconciled"] for item in inferred))
+        self.assertTrue(
+            all(item["pole_point_crop_path"] is None for item in inferred)
+        )
+        self.assertTrue(
+            all(item["pole_debug_image_path"] is None for item in inferred)
+        )
+        self.assertAlmostEqual(
+            inferred[0]["support_shared_arm_projection_fraction"],
+            0.601,
+            delta=0.01,
+        )
+        self.assertLessEqual(
+            inferred[0]["support_shared_arm_perpendicular_m"],
+            0.20,
+        )
+        self.assertEqual(
+            inferred[0]["support_shared_arm_target_pose_rows"],
+            [102, 103],
+        )
+        self.assertEqual(
+            [item["detection_id"] for item in reconciled[:2]],
+            ["supported-100", "supported-101"],
+        )
+
+    def test_shared_arm_reconciliation_requires_repeated_stable_target(
+        self,
+    ) -> None:
+        targets, relations = self._shared_arm_reconciliation_fixture()
+
+        self.assertEqual(
+            reconcile_repeated_shared_arm_supports(targets[:1], relations),
+            relations,
+        )
+
+        unstable = copy.deepcopy(targets)
+        unstable[1]["x"] = 6.40
+        self.assertEqual(
+            reconcile_repeated_shared_arm_supports(unstable, relations),
+            relations,
+        )
+
+        distant_frames = copy.deepcopy(targets)
+        distant_frames[1]["pose_row_number"] = 110
+        distant_frames[1]["image_name"] = "frame110.jpg"
+        self.assertEqual(
+            reconcile_repeated_shared_arm_supports(distant_frames, relations),
+            relations,
+        )
+
+    def test_shared_arm_reconciliation_rejects_segment_height_and_support_ambiguity(
+        self,
+    ) -> None:
+        targets, relations = self._shared_arm_reconciliation_fixture()
+        for label, mutate in (
+            (
+                "past-endpoint",
+                lambda item: item.update({"x": 10.2}),
+            ),
+            (
+                "height-mismatch",
+                lambda item: item.update({"z": 5.6}),
+            ),
+        ):
+            with self.subTest(label=label):
+                rejected = copy.deepcopy(targets)
+                for item in rejected:
+                    mutate(item)
+                self.assertEqual(
+                    reconcile_repeated_shared_arm_supports(rejected, relations),
+                    relations,
+                )
+
+        competing = [
+            {
+                **item,
+                "support_id": "P-competing",
+                "pole_y": 0.10,
+                "sign_y": 0.10,
+                "detection_id": str(item["detection_id"]).replace(
+                    "supported", "competing"
+                ),
+            }
+            for item in relations
+        ]
+        self.assertEqual(
+            reconcile_repeated_shared_arm_supports(
+                targets,
+                [*relations, *competing],
+            ),
+            [*relations, *competing],
+        )
+
+    def test_shared_arm_reconciliation_never_replaces_existing_auto_relation(
+        self,
+    ) -> None:
+        targets, relations = self._shared_arm_reconciliation_fixture()
+        protected = {
+            **relations[0],
+            "detection_id": "target-102",
+            "image_name": "frame102.jpg",
+            "pose_row_number": 102,
+            "pole_method": "GROUND_SNAP",
+            "pole_status": "AUTO",
+            "sign_x": targets[0]["x"],
+            "sign_y": targets[0]["y"],
+            "sign_z": targets[0]["z"],
+        }
+
+        reconciled = reconcile_repeated_shared_arm_supports(
+            targets,
+            [*relations, protected],
+        )
+
+        protected_after = next(
+            item for item in reconciled if item["detection_id"] == "target-102"
+        )
+        self.assertEqual(protected_after, protected)
+        self.assertEqual(protected_after["pole_status"], "AUTO")
+        self.assertFalse(
+            any(item["detection_id"] == "target-103" for item in reconciled)
         )
 
     def test_two_direct_frames_reconcile_one_missing_remote_support(self) -> None:

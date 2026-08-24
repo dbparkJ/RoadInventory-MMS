@@ -105,6 +105,11 @@ export function ProposalInspector() {
   const poleTemplateValidation =
     poleProposal?.status === 'ready' ? poleProposal.templateValidation : undefined
   const visible = Boolean(manual?.enabled && (proposalState?.status !== 'idle' || poleProposal?.status !== 'idle' || layer))
+  const hasEssentialFeedback = Boolean(
+    (proposalState && proposalState.status !== 'idle') ||
+    (poleProposal && poleProposal.status !== 'idle'),
+  )
+  const inspectorCollapsed = collapsed && !hasEssentialFeedback
   const proposalQuality =
     proposalState?.status === 'ready' || proposalState?.status === 'committing'
       ? proposalState.data.proposal.quality
@@ -117,14 +122,38 @@ export function ProposalInspector() {
   if (!visible || !manual || !overlay) return null
 
   return (
-    <aside className={`proposal-inspector ${collapsed ? 'collapsed' : ''}`} aria-label="제안 검사기">
+    <aside className={`proposal-inspector ${inspectorCollapsed ? 'collapsed' : ''}`} aria-label="제안 검사기">
       <header>
-        <span><History size={15} /><strong>제안 · 편집 이력</strong></span>
-        <button type="button" aria-label={collapsed ? '제안 검사기 펼치기' : '제안 검사기 접기'} onClick={() => setCollapsed((value) => !value)}>
-          {collapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        <span>
+          <History size={15} />
+          <strong>제안 · 편집 이력</strong>
+          {proposalState && proposalState.status !== 'idle' && (
+            <small role="status">
+              {proposalState.status === 'drawing'
+                ? 'bbox 선택'
+                : proposalState.status === 'loading'
+                  ? '3D 계산 중'
+                  : proposalState.status === 'error'
+                    ? '계산 실패'
+                    : proposalState.status === 'committing'
+                      ? '저장 중'
+                      : '확인 대기'}
+            </small>
+          )}
+        </span>
+        <button
+          type="button"
+          aria-label={inspectorCollapsed ? '제안 검사기 펼치기' : '제안 검사기 접기'}
+          aria-disabled={hasEssentialFeedback}
+          title={hasEssentialFeedback ? '진행 중인 제안 상태는 접을 수 없습니다.' : undefined}
+          onClick={() => {
+            if (!hasEssentialFeedback) setCollapsed((value) => !value)
+          }}
+        >
+          {inspectorCollapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
         </button>
       </header>
-      {!collapsed && (
+      {!inspectorCollapsed && (
         <div className="proposal-inspector-body">
           {proposalState?.status === 'drawing' && <p>파노라마에서 객체를 사각형으로 드래그하세요.</p>}
           {proposalState?.status === 'adjusting' && (
@@ -134,12 +163,26 @@ export function ProposalInspector() {
               <button type="button" className="button secondary compact" onClick={manual.retryBbox}><RotateCcw size={13} /> 다시 그리기</button>
             </div>
           )}
-          {proposalState?.status === 'loading' && <p><LoaderCircle className="spin" size={14} /> bbox 근거에서 3D 위치를 계산하고 있습니다.</p>}
+          {proposalState?.status === 'loading' && (
+            <div className="proposal-actions-block" role="status">
+              <p>
+                <LoaderCircle className="spin" size={14} />
+                {proposalState.preparingAttempt
+                  ? `원본 점군 준비 중 · 자동 재시도 ${proposalState.preparingAttempt}/${proposalState.preparingMaxAttempts}`
+                  : 'bbox에서 3D 위치를 계산하고 있습니다.'}
+              </p>
+              <button type="button" className="button secondary compact" onClick={manual.cancel}>취소</button>
+            </div>
+          )}
           {proposalState?.status === 'error' && (
             <div className="proposal-error" role="alert">
               <strong><AlertTriangle size={14} /> 제안 실패</strong>
               <span>{proposalState.message}</span>
-              <div><button type="button" className="button secondary compact" onClick={manual.retryBbox}>다시 선택</button><button type="button" className="button secondary compact" onClick={manual.cancel}>취소</button></div>
+              <div>
+                {proposalState.geometry && <button type="button" className="button primary compact" onClick={() => void manual.retryProposal()}>계산 재시도</button>}
+                <button type="button" className="button secondary compact" onClick={manual.retryBbox}>bbox 다시 그리기</button>
+                <button type="button" className="button secondary compact" onClick={manual.cancel}>취소</button>
+              </div>
             </div>
           )}
           {(proposalState?.status === 'ready' || proposalState?.status === 'committing') && (
@@ -158,10 +201,11 @@ export function ProposalInspector() {
                 </div>
               )}
               {manual.missingRequiredFields.length > 0 && <p className="proposal-blocked">필수 속성: {manual.missingRequiredFields.join(', ')}</p>}
+              {manual.reviewTaskLinkChanged && <p className="proposal-blocked" role="alert">검수 항목이 바뀌었습니다. bbox 수정으로 다시 그리거나 취소한 뒤 현재 항목에서 시작하세요.</p>}
               {proposalState.data.saveError && <p className="proposal-blocked">{proposalState.data.saveError}</p>}
               <div className="proposal-confirm-actions">
-                <button type="button" className="button primary compact" disabled={proposalState.status === 'committing' || proposalState.data.duplicate.blocked || manual.missingRequiredFields.length > 0} onClick={() => void manual.confirmProposal(false)}>{proposalState.status === 'committing' ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} 확인</button>
-                <button type="button" className="button primary compact" disabled={proposalState.status === 'committing' || proposalState.data.duplicate.blocked || manual.missingRequiredFields.length > 0} onClick={() => void manual.confirmProposal(true)}>Shift+Enter · 저장 후 다음</button>
+                <button type="button" className="button primary compact" disabled={proposalState.status === 'committing' || proposalState.data.duplicate.blocked || manual.missingRequiredFields.length > 0 || manual.reviewTaskLinkChanged} onClick={() => void manual.confirmProposal(false)}>{proposalState.status === 'committing' ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />} 확인</button>
+                {manual.canConfirmAndNext && <button type="button" className="button primary compact" disabled={proposalState.status === 'committing' || proposalState.data.duplicate.blocked || manual.missingRequiredFields.length > 0 || manual.reviewTaskLinkChanged} onClick={() => void manual.confirmProposal(true)}>Shift+Enter · 저장 후 다음</button>}
                 <button type="button" className="button secondary compact" disabled={proposalState.status === 'committing'} onClick={manual.retryBbox}><RotateCcw size={13} /> bbox 수정</button>
                 <button type="button" className="button secondary compact" disabled={proposalState.status === 'committing'} onClick={manual.cancel}><X size={13} /> 취소</button>
               </div>
@@ -201,8 +245,13 @@ export function ProposalInspector() {
                   필수 속성: {poleTemplateValidation.missingRequiredFields.join(', ')}
                 </p>
               )}
+              {overlay.poleBaseReviewTaskChanged && (
+                <p className="proposal-blocked" role="alert">
+                  검수 항목이 바뀌었습니다. 현재 항목에서 바닥점을 다시 선택해 주세요.
+                </p>
+              )}
               <div>
-                {poleProposal.status === 'ready' && poleProposal.result.status !== 'failed' && <button type="button" className="button primary compact" disabled={poleBaseTemplateValidationBlocksSave(poleTemplateValidation)} onClick={() => void overlay.confirmPoleBaseProposal()}>확인</button>}
+                {poleProposal.status === 'ready' && poleProposal.result.status !== 'failed' && <button type="button" className="button primary compact" disabled={overlay.poleBaseReviewTaskChanged || poleBaseTemplateValidationBlocksSave(poleTemplateValidation)} onClick={() => void overlay.confirmPoleBaseProposal()}>확인</button>}
                 {poleProposal.status !== 'picking' &&
                   !(
                     poleProposal.status === 'error' &&

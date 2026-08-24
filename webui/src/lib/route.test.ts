@@ -41,6 +41,21 @@ describe('buildRouteFeatureCollection', () => {
     ).toEqual([])
   })
 
+  it('marks only the active track as selected', () => {
+    const collection = buildRouteFeatureCollection(
+      [
+        { lon: 127, lat: 37, track_id: 'track-a' },
+        { lon: 127.1, lat: 37.1, track_id: 'track-a' },
+        { lon: 128, lat: 38, track_id: 'track-b' },
+        { lon: 128.1, lat: 38.1, track_id: 'track-b' },
+      ],
+      undefined,
+      'track-b',
+    )
+
+    expect(collection.features.map((feature) => feature.properties.selected)).toEqual([0, 1])
+  })
+
   it('does not shift a later track color when an earlier track has one point', () => {
     const collection = buildRouteFeatureCollection([
       { lon: 127, lat: 37, track_id: 'single' },

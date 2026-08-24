@@ -141,6 +141,7 @@ export interface VWorld2DSceneInput {
   overlay: FeatureCollection
   onFrame: (frameId: string) => void
   onOverlay: (layerId: string, featureId: string) => void
+  onTrack?: (trackId: string) => void
 }
 
 export interface VWorld2DOverlayHoverTarget {
@@ -362,7 +363,7 @@ export function renderVWorld2DScene(
 export function handleVWorld2DClick(
   runtime: VWorld2DRuntime,
   event: { pixel?: unknown; coordinate?: unknown },
-  input: Pick<VWorld2DSceneInput, 'onFrame' | 'onOverlay'>,
+  input: Pick<VWorld2DSceneInput, 'onFrame' | 'onOverlay' | 'onTrack'>,
   onCoordinate?: (coordinate: [number, number, number]) => void,
 ): void {
   let handled = false
@@ -381,8 +382,14 @@ export function handleVWorld2DClick(
         handled = true
         return feature
       }
-      // Returning undefined keeps OpenLayers walking lower layers.  Saved
-      // field-survey and route lines are visual guides, not hit targets.
+      const trackId = feature.get('track_id')
+      if (typeof trackId === 'string' && trackId && input.onTrack) {
+        input.onTrack(trackId)
+        handled = true
+        return feature
+      }
+      // Returning undefined keeps OpenLayers walking lower layers. Saved
+      // field-survey lines remain visual guides rather than hit targets.
       return undefined
     })
   }
@@ -525,7 +532,7 @@ function styleForFeature(
     return new ol.style.Style({
       stroke: new ol.style.Stroke({
         color: displayColor,
-        width: kind === 'route-range' ? 6 : kind === 'route' ? 4 : selected ? 6 : 3,
+        width: kind === 'route-range' ? 6 : kind === 'route' ? (selected ? 7 : 4) : selected ? 6 : 3,
       }),
       zIndex: kind === 'route-range' ? 12 : kind === 'route' ? 10 : selected ? 22 : 20,
     })

@@ -443,8 +443,13 @@ export function renderVWorldRoute(
   runtime: VWorldRuntime,
   source: VWorldCustomDataSource,
   route: FeatureCollection,
-): void {
-  replaceEntities(source.entities, () => appendRoute(runtime, source.entities, route))
+  onTrack?: (trackId: string) => void,
+): ReadonlyMap<string, () => void> {
+  const clickTargets = new Map<string, () => void>()
+  replaceEntities(source.entities, () =>
+    appendRoute(runtime, source.entities, route, onTrack, clickTargets),
+  )
+  return clickTargets
 }
 
 export function renderVWorldRouteRange(
@@ -488,22 +493,32 @@ function appendRoute(
   runtime: VWorldRuntime,
   entities: VWorldEntityCollection,
   route: FeatureCollection,
+  onTrack?: (trackId: string) => void,
+  clickTargets?: Map<string, () => void>,
 ): void {
   route.features.forEach((feature, index) => {
     if (feature.geometry?.type !== 'LineString') return
     const color = propertyString(feature, 'track_color', '#579cf2')
-    addPolyline(runtime, entities, feature.geometry.coordinates, `route:${index}:halo`, {
+    const selected = propertyNumber(feature, 'selected') === 1
+    const trackId = propertyString(feature, 'track_id', '')
+    const haloId = `route:${index}:halo`
+    const routeId = `route:${index}`
+    const haloAdded = addPolyline(runtime, entities, feature.geometry.coordinates, haloId, {
       color: '#07111f',
-      alpha: 0.58,
-      width: 8,
+      alpha: selected ? 0.82 : 0.58,
+      width: selected ? 12 : 8,
       zIndex: 0,
     })
-    addPolyline(runtime, entities, feature.geometry.coordinates, `route:${index}`, {
+    const routeAdded = addPolyline(runtime, entities, feature.geometry.coordinates, routeId, {
       color,
       alpha: 0.98,
-      width: 4,
-      zIndex: 1,
+      width: selected ? 7 : 4,
+      zIndex: selected ? 3 : 1,
     })
+    if (onTrack && clickTargets && trackId) {
+      if (haloAdded) clickTargets.set(haloId, () => onTrack(trackId))
+      if (routeAdded) clickTargets.set(routeId, () => onTrack(trackId))
+    }
   })
 }
 

@@ -6,6 +6,8 @@ import {
   Cloud,
   Database,
   Gauge,
+  Eye,
+  EyeOff,
   Layers3,
   LocateFixed,
   LoaderCircle,
@@ -30,6 +32,7 @@ interface DatasetPanelProps {
   datasets: DatasetSummary[]
   selectedDataset: DatasetSummary | null
   selectedTrack: string
+  visibleTrackIds?: ReadonlySet<string>
   frames: Frame[]
   selectedFrame: Frame | null
   framesLoading: boolean
@@ -42,6 +45,8 @@ interface DatasetPanelProps {
   collapsed?: boolean
   onDatasetChange: (id: string) => void
   onTrackChange: (id: string) => void
+  onTrackVisibilityChange?: (id: string, visible: boolean) => void
+  onShowAllTracks?: () => void
   onFrameChange: (frame: Frame) => void
   onLoadMoreFrames: () => void
   onOpenSource: () => void
@@ -53,6 +58,7 @@ export function DatasetPanel({
   datasets,
   selectedDataset,
   selectedTrack,
+  visibleTrackIds,
   selectedFrame,
   focusOverlayLayerId,
   removingDataset = false,
@@ -60,6 +66,8 @@ export function DatasetPanel({
   collapsed = false,
   onDatasetChange,
   onTrackChange,
+  onTrackVisibilityChange,
+  onShowAllTracks,
   onOpenSource,
   onRemoveDataset,
   onToggleCollapsed,
@@ -72,6 +80,7 @@ export function DatasetPanel({
     () => naturalSortTracks(selectedDataset?.tracks ?? []),
     [selectedDataset?.tracks],
   )
+  const allTracksVisible = !visibleTrackIds || sortedTracks.every((track) => visibleTrackIds.has(track.id))
 
   useEffect(() => {
     if (!datasetMenuOpen) return
@@ -313,38 +322,72 @@ export function DatasetPanel({
               <small>{selectedDataset.tracks.length} tracks</small>
             </div>
             <div className="track-list">
-              <button
-                type="button"
-                className={`track-row ${selectedTrack === '' ? 'active' : ''}`}
-                onClick={() => onTrackChange('')}
-              >
-                <span className="track-rail all" />
-                <span>
-                  <strong>전체 구간</strong>
-                  <small>{formatCount(selectedDataset.frame_count)} 프레임</small>
-                </span>
-                <Box size={15} />
-              </button>
-              {sortedTracks.map((track, index) => (
+              <div className={`track-row ${selectedTrack === '' ? 'active' : ''}`}>
                 <button
                   type="button"
-                  key={track.id}
-                  className={`track-row ${selectedTrack === track.id ? 'active' : ''}`}
-                  onClick={() => onTrackChange(track.id)}
+                  className="track-row-select"
+                  onClick={() => onTrackChange('')}
                 >
-                  <span
-                    className="track-rail"
-                    style={{ backgroundColor: TRACK_COLORS[index % TRACK_COLORS.length] }}
-                  />
+                  <span className="track-rail all" />
                   <span>
-                    <strong>{track.name}</strong>
-                    <small>
-                      {formatCount(track.frame_count)} · {formatDistance(track.distance_m)}
-                    </small>
+                    <strong>전체 구간</strong>
+                    <small>{formatCount(selectedDataset.frame_count)} 프레임</small>
                   </span>
-                  <Gauge size={15} />
+                  <Box size={15} />
                 </button>
-              ))}
+                {onShowAllTracks && (
+                  <button
+                    type="button"
+                    className="track-visibility-toggle"
+                    aria-label="전체 트랙 표시"
+                    aria-pressed={allTracksVisible}
+                    title="전체 트랙 표시"
+                    onClick={onShowAllTracks}
+                  >
+                    <Eye size={14} />
+                  </button>
+                )}
+              </div>
+              {sortedTracks.map((track, index) => {
+                const visible = visibleTrackIds?.has(track.id) ?? true
+                return (
+                  <div
+                    key={track.id}
+                    className={`track-row ${selectedTrack === track.id ? 'active' : ''} ${visible ? '' : 'track-hidden'}`.trim()}
+                  >
+                    <button
+                      type="button"
+                      className="track-row-select"
+                      aria-current={selectedTrack === track.id ? 'true' : undefined}
+                      onClick={() => onTrackChange(track.id)}
+                    >
+                      <span
+                        className="track-rail"
+                        style={{ backgroundColor: TRACK_COLORS[index % TRACK_COLORS.length] }}
+                      />
+                      <span>
+                        <strong>{track.name}</strong>
+                        <small>
+                          {formatCount(track.frame_count)} · {formatDistance(track.distance_m)}
+                        </small>
+                      </span>
+                      <Gauge size={15} />
+                    </button>
+                    {onTrackVisibilityChange && (
+                      <button
+                        type="button"
+                        className="track-visibility-toggle"
+                        aria-label={`${track.name} 트랙 ${visible ? '숨기기' : '표시'}`}
+                        aria-pressed={visible}
+                        title={`${track.name} 트랙 ${visible ? '끄기' : '켜기'}`}
+                        onClick={() => onTrackVisibilityChange(track.id, !visible)}
+                      >
+                        {visible ? <Eye size={14} /> : <EyeOff size={14} />}
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </section>
 

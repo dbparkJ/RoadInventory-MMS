@@ -25,7 +25,6 @@ import { OverlayAttributePanel, OverlayPanel } from './components/OverlayPanel'
 import { OptimizationPanel, DEFAULT_PARAMETERS } from './components/OptimizationPanel'
 import { RunQueue } from './components/RunQueue'
 import { ReviewProvider } from './components/ReviewContext'
-import { ReviewSessionBar } from './components/ReviewSessionBar'
 import { StorageDialog } from './components/StorageDialog'
 import { ToastRegion, type Toast } from './components/ToastRegion'
 import { Workspace } from './components/Workspace'
@@ -52,6 +51,10 @@ import type {
   RunRequest,
 } from './types'
 
+// Keep the completed review workspace implementation available for a later
+// rollout, but disable all browser-side review state and shortcuts for now.
+const REVIEW_WORKSPACE_UI_ENABLED = false
+
 function App() {
   const [boot, setBoot] = useState<BootstrapResponse | null>(null)
   const [booting, setBooting] = useState(true)
@@ -60,6 +63,10 @@ function App() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([])
   const [datasetId, setDatasetId] = useState('')
   const [trackId, setTrackId] = useState('')
+  const [trackVisibility, setTrackVisibility] = useState<{
+    datasetId: string
+    visibleTrackIds: ReadonlySet<string>
+  }>({ datasetId: '', visibleTrackIds: new Set() })
   const [frames, setFrames] = useState<Frame[]>([])
   const [selectedFrame, setSelectedFrame] = useState<Frame | null>(null)
   const [frameRange, setFrameRange] = useState<FrameRange | null>(null)
@@ -105,6 +112,29 @@ function App() {
   frameScopeRef.current = `${datasetId}::${trackId}`
 
   const selectedDataset = datasets.find((dataset) => dataset.id === datasetId) ?? null
+  const visibleTrackIds = useMemo(() => {
+    const allTrackIds = selectedDataset?.tracks.map((track) => track.id) ?? []
+    if (trackVisibility.datasetId !== datasetId) return new Set(allTrackIds)
+    return new Set(allTrackIds.filter((id) => trackVisibility.visibleTrackIds.has(id)))
+  }, [datasetId, selectedDataset?.tracks, trackVisibility])
+
+  const changeVisibleTrackIds = useCallback((trackIds: ReadonlySet<string>) => {
+    setTrackVisibility({ datasetId, visibleTrackIds: new Set(trackIds) })
+  }, [datasetId])
+
+  const changeTrack = useCallback((id: string) => {
+    setFrameRange(null)
+    setTrackId(id)
+    if (!id) return
+    setTrackVisibility((current) => {
+      const allTrackIds = selectedDataset?.tracks.map((track) => track.id) ?? []
+      const next = current.datasetId === datasetId
+        ? new Set(current.visibleTrackIds)
+        : new Set(allTrackIds)
+      next.add(id)
+      return { datasetId, visibleTrackIds: next }
+    })
+  }, [datasetId, selectedDataset?.tracks])
   const activeRuns = runs.filter((run) =>
     ['queued', 'preparing', 'running', 'cancelling'].includes(run.status),
   )
@@ -688,7 +718,11 @@ function App() {
 
   return (
     <ReviewProvider
-      enabled={Boolean(boot?.capabilities?.review_workspace) && !demoMode}
+      enabled={
+        REVIEW_WORKSPACE_UI_ENABLED &&
+        Boolean(boot?.capabilities?.review_workspace) &&
+        !demoMode
+      }
       datasetId={datasetId}
       activeFrame={selectedFrame}
       frameRange={frameRange}
@@ -800,10 +834,6 @@ function App() {
         </div>
       </header>
 
-      <ReviewSessionBar
-        activeLearningExportEnabled={Boolean(boot?.capabilities?.active_learning_export)}
-      />
-
       {connectionIssue && (
         <div className="offline-banner">
           <CloudOff size={14} />
@@ -823,6 +853,7 @@ function App() {
               datasets={datasets}
               selectedDataset={selectedDataset}
               selectedTrack={trackId}
+              visibleTrackIds={visibleTrackIds}
               frames={frames}
               selectedFrame={selectedFrame}
               framesLoading={framesLoading}
@@ -838,10 +869,16 @@ function App() {
                 setDatasetId(id)
                 setTrackId('')
               }}
-              onTrackChange={(id) => {
-                setFrameRange(null)
-                setTrackId(id)
+              onTrackChange={changeTrack}
+              onTrackVisibilityChange={(id, visible) => {
+                const next = new Set(visibleTrackIds)
+                if (visible) next.add(id)
+                else next.delete(id)
+                changeVisibleTrackIds(next)
               }}
+              onShowAllTracks={() => changeVisibleTrackIds(
+                new Set(selectedDataset?.tracks.map((track) => track.id) ?? []),
+              )}
               onFrameChange={setSelectedFrame}
               onLoadMoreFrames={() => void loadMoreFrames()}
               onOpenSource={() => setSourceOpen(true)}
@@ -859,6 +896,7 @@ function App() {
               frames={frames}
               frame={selectedFrame}
               selectedTrack={trackId}
+              visibleTrackIds={visibleTrackIds}
               frameRange={frameRange}
               route={route}
               routeLoading={routeLoading}
@@ -876,6 +914,8 @@ function App() {
               onTogglePointCloud={() => setPointCloudOpen((value) => !value)}
               onToggleAttributeTable={toggleAttributeTable}
               onFrameChange={setSelectedFrame}
+              onTrackChange={changeTrack}
+              onVisibleTrackIdsChange={changeVisibleTrackIds}
               onMoveFrame={moveFrame}
               onOpenSource={() => setSourceOpen(true)}
               onUseDemo={useDemo}

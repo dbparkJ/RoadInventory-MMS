@@ -1,4 +1,14 @@
-import { AlertTriangle, Box, Crosshair, Image as ImageIcon, Layers, LoaderCircle, Map as MapIcon, Navigation2, RotateCcw } from 'lucide-react'
+import {
+  AlertTriangle,
+  Box,
+  Crosshair,
+  Image as ImageIcon,
+  Layers,
+  LoaderCircle,
+  Map as MapIcon,
+  Navigation2,
+  RotateCcw,
+} from 'lucide-react'
 import type { FeatureCollection } from 'geojson'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -7,7 +17,7 @@ import {
   type OverlayHoverState,
 } from '../components/OverlayHoverTooltip'
 import { useOptionalOverlayWorkspace } from '../components/OverlayContext'
-import { frameNavigationDirection, isTextEntryTarget } from '../lib/frameNavigation'
+import { frameNavigationDirection, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 import {
   MAP_SELECTED_FEATURE_COLOR,
   MAP_SELECTED_FRAME_COLOR,
@@ -41,27 +51,37 @@ import {
 } from '../lib/vworld'
 
 export function relayMapOverlayShortcut(event: KeyboardEvent, ownerWindow: Window): boolean {
-  const globalShortcut =
-    frameNavigationDirection(event) !== null ||
-    event.code === 'KeyN' ||
-    event.code === 'KeyP' ||
-    event.key === 'Escape'
-  if (
-    event.defaultPrevented ||
-    !globalShortcut ||
-    event.altKey ||
-    event.ctrlKey ||
-    event.metaKey ||
-    event.shiftKey ||
-    isTextEntryTarget(event.target)
-  ) {
-    return false
-  }
+  const workspaceEditShortcut =
+    !event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !isWorkspaceShortcutBlockedTarget(event.target) &&
+    (
+      (
+        !event.shiftKey &&
+        (
+          event.code === 'KeyN' ||
+          event.code === 'KeyP' ||
+          event.code === 'KeyB' ||
+          event.code === 'KeyR' ||
+          event.code === 'KeyM' ||
+          event.key === 'Enter' ||
+          event.key === 'Escape'
+        )
+      ) ||
+      (event.shiftKey && event.key === 'Enter')
+    )
+  const globalShortcut = frameNavigationDirection(event) !== null || workspaceEditShortcut
+  if (event.defaultPrevented || !globalShortcut) return false
   const KeyboardEventConstructor = ownerWindow.document.defaultView?.KeyboardEvent ?? KeyboardEvent
   const relayedEvent = new KeyboardEventConstructor('keydown', {
     key: event.key,
     code: event.code,
     repeat: event.repeat,
+    altKey: event.altKey,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
     bubbles: true,
     cancelable: true,
   })
@@ -197,8 +217,9 @@ interface MapViewProps {
   frameRange?: FrameRange | null
   loading: boolean
   mapMode: MapMode
-  onMapModeChange: (mode: MapMode) => void
+  onMapModeChange?: (mode: MapMode) => void
   onSelectFrame: (frame: Frame) => void
+  onSelectTrack?: (trackId: string) => void
   surveySegments?: SurveySegment[]
   surveyDraft?: [number, number][]
   surveyDraftColor?: string
@@ -295,6 +316,7 @@ export function MapView({
   mapMode,
   onMapModeChange,
   onSelectFrame,
+  onSelectTrack,
   surveySegments = [],
   surveyDraft = [],
   surveyDraftColor = '#f59e0b',
@@ -313,9 +335,11 @@ export function MapView({
   const sourcesRef = useRef<VWorldSources | null>(null)
   const sources2DRef = useRef<VWorld2DSources | null>(null)
   const frameClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
+  const routeClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
   const overlayClickTargetsRef = useRef<ReadonlyMap<string, () => void>>(new Map())
   const overlayHoverTargetsRef = useRef<ReadonlyMap<string, VWorldOverlayHoverTarget>>(new Map())
   const onSelectRef = useRef(onSelectFrame)
+  const onSelectTrackRef = useRef(onSelectTrack)
   const framesRef = useRef(frames)
   const fittedRouteRef = useRef('')
   const initialCameraRef = useRef(
@@ -338,6 +362,7 @@ export function MapView({
   const onPreviewSurveyPointRef = useRef(onPreviewSurveyPoint)
 
   onSelectRef.current = onSelectFrame
+  onSelectTrackRef.current = onSelectTrack
   framesRef.current = frames
   overlayRef.current = overlay
   mapModeRef.current = mapMode
@@ -348,6 +373,12 @@ export function MapView({
   pinnedMapHoverRef.current = pinnedMapHover
   const vworld2DActive = isVWorld2DMapMode(mapMode)
   const ready = vworld2DActive ? ready2D : ready3D
+
+  useEffect(() => {
+    setMapError(null)
+    setMapHover(null)
+    setPinnedMapHover(null)
+  }, [mapMode])
 
   const overlayGeoJson = useMemo<FeatureCollection>(
     () => ({
@@ -446,11 +477,17 @@ export function MapView({
   const renderedFrameGeoJson = collectionForMapLayer(frameGeoJson, hasVisibleTracks)
 
   const routeGeoJson = useMemo(() => {
-    return buildRouteFeatureCollection(visibleRoute, trackColors)
-  }, [trackColors, visibleRoute])
+    return buildRouteFeatureCollection(visibleRoute, trackColors, activeTrackId)
+  }, [activeTrackId, trackColors, visibleRoute])
   const routeRangeGeoJson = useMemo(
-    () => buildRouteRangeFeatureCollection(visibleRoute, frameIndexes, frameRange, trackColors),
-    [frameIndexes, frameRange, trackColors, visibleRoute],
+    () => buildRouteRangeFeatureCollection(
+      visibleRoute,
+      frameIndexes,
+      frameRange,
+      trackColors,
+      activeTrackId,
+    ),
+    [activeTrackId, frameIndexes, frameRange, trackColors, visibleRoute],
   )
   const renderedRouteGeoJson = collectionForMapLayer(routeGeoJson, hasVisibleTracks)
   const renderedRouteRangeGeoJson = collectionForMapLayer(routeRangeGeoJson, hasVisibleTracks)
@@ -522,6 +559,7 @@ export function MapView({
                 overlayHoverTargetsRef.current,
                 frameClickTargetsRef.current,
                 overlayClickTargetsRef.current,
+                routeClickTargetsRef.current,
               ],
             )
             const hoverTarget = entityId
@@ -564,6 +602,13 @@ export function MapView({
               : undefined
             if (overlayTarget) {
               overlayTarget()
+              return
+            }
+            const routeTarget = entityId
+              ? routeClickTargetsRef.current.get(entityId)
+              : undefined
+            if (routeTarget) {
+              routeTarget()
               return
             }
           } catch {
@@ -709,6 +754,7 @@ export function MapView({
       if (runtimeRef.current === runtime) runtimeRef.current = null
       if (sourcesRef.current === sources) sourcesRef.current = null
       frameClickTargetsRef.current = new Map()
+      routeClickTargetsRef.current = new Map()
       overlayClickTargetsRef.current = new Map()
       overlayHoverTargetsRef.current = new Map()
       setMapHover(null)
@@ -814,6 +860,7 @@ export function MapView({
               onOverlay: (layerId, featureId) => {
                 overlayRef.current?.selectFeature({ layerId, featureId })
               },
+              onTrack: (trackId) => onSelectTrackRef.current?.(trackId),
             },
             (coordinate) => {
               const current = overlayRef.current
@@ -936,7 +983,12 @@ export function MapView({
     const source = sourcesRef.current?.route
     if (!runtime || !source || !ready3D) return
     try {
-      renderVWorldRoute(runtime, source, renderedRouteGeoJson)
+      routeClickTargetsRef.current = renderVWorldRoute(
+        runtime,
+        source,
+        renderedRouteGeoJson,
+        (trackId) => onSelectTrackRef.current?.(trackId),
+      )
     } catch (reason) {
       setMapError(reason instanceof Error ? reason.message : 'VWorld 이동 경로를 갱신하지 못했습니다.')
     }
@@ -1030,7 +1082,7 @@ export function MapView({
 
   useEffect(() => {
     if (!ready || !hasVisibleTracks || visibleRoute.length === 0) return
-    const routeKey = `${visibleTrackIds ? [...visibleTrackIds].sort().join(',') : effectiveTrackId ?? 'all'}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
+    const routeKey = `${mapMode}:${visibleTrackIds ? [...visibleTrackIds].sort().join(',') : effectiveTrackId ?? 'all'}:${visibleRoute[0]?.frame_id ?? ''}:${visibleRoute.at(-1)?.frame_id ?? ''}:${visibleRoute.length}`
     if (fittedRouteRef.current === routeKey) return
     fittedRouteRef.current = routeKey
     const coordinates = visibleRoute.map((point) => [point.lon, point.lat] as const)
@@ -1041,7 +1093,7 @@ export function MapView({
       const runtime = runtimeRef.current
       if (runtime) setVWorldSceneMode(runtime, '3d', cameraTargetForCoordinates(coordinates))
     }
-  }, [effectiveTrackId, hasVisibleTracks, ready, visibleRoute, visibleTrackIds, vworld2DActive])
+  }, [effectiveTrackId, hasVisibleTracks, mapMode, ready, visibleRoute, visibleTrackIds, vworld2DActive])
 
   useEffect(() => {
     if (!ready || !selectedOverlayCoordinate) return
@@ -1088,7 +1140,7 @@ export function MapView({
     setMapError(null)
     setMapHover(null)
     setPinnedMapHover(null)
-    onMapModeChange(mode)
+    onMapModeChange?.(mode)
   }
 
   return (
@@ -1255,7 +1307,7 @@ export function MapView({
           </span>
         )}
         {overlayErrorCount > 0 && (
-          <span className="map-overlay-error" title="SHP 검수 패널에서 다시 불러올 수 있습니다.">
+          <span className="map-overlay-error" title="SHP 레이어 패널에서 다시 불러올 수 있습니다.">
             SHP 로드 오류 {overlayErrorCount}개
           </span>
         )}

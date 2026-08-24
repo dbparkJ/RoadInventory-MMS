@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react'
 import { api, ApiError } from '../lib/api'
-import { isTextEntryTarget } from '../lib/frameNavigation'
+import { hasOpenModalDialog, isWorkspaceShortcutBlockedTarget } from '../lib/frameNavigation'
 import type {
   EquirectangularBBoxGeometry,
   Frame,
@@ -20,6 +20,7 @@ import type {
   ManualObservation,
   OverlayField,
   OverlayLayer,
+  ReviewTask,
 } from '../types'
 import {
   useOverlayWorkspace,
@@ -60,6 +61,9 @@ const CLASS_FIELD_ALIASES = new Set([
   'TYPE',
 ])
 
+export const MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS = 8
+export const MANUAL_PROPOSAL_PREPARING_RETRY_MS = 2_000
+
 interface StoredManualObjectPreferences {
   templateId?: ManualObjectTemplateId
   targetLayers?: Partial<Record<ManualObjectTemplateId, string>>
@@ -76,20 +80,40 @@ export interface ManualProposalReadyData {
   proposal: GeometryProposal
   duplicate: ManualDuplicatePreflightResponse
   idempotencyKey: string
+  reviewTaskSnapshot: ManualReviewTaskSnapshot | null
   saveError?: string
+}
+
+export interface ManualReviewTaskSnapshot {
+  id: string
+  sessionId: string
+  datasetId: string
+  targetLayerId: string | null
+  frameId: string | null
+  trackId: string | null
+  frameStart: number | null
+  frameEnd: number | null
 }
 
 export type ManualProposalState =
   | { status: 'idle' }
   | { status: 'drawing'; frameId: string }
   | { status: 'adjusting'; frameId: string; geometry: EquirectangularBBoxGeometry }
-  | { status: 'loading'; frameId: string; geometry: EquirectangularBBoxGeometry }
+  | {
+      status: 'loading'
+      frameId: string
+      geometry: EquirectangularBBoxGeometry
+      observation?: ManualObservation
+      preparingAttempt?: number
+      preparingMaxAttempts?: number
+    }
   | { status: 'ready'; data: ManualProposalReadyData }
   | { status: 'committing'; data: ManualProposalReadyData }
   | {
       status: 'error'
       frameId: string
       geometry?: EquirectangularBBoxGeometry
+      observation?: ManualObservation
       message: string
       reasonCodes: string[]
     }
@@ -124,9 +148,12 @@ export interface ManualObjectContextValue {
   stageBbox: (geometry: EquirectangularBBoxGeometry) => void
   submitStagedBbox: () => Promise<void>
   submitBbox: (geometry: EquirectangularBBoxGeometry) => Promise<void>
+  retryProposal: () => Promise<void>
   retryBbox: () => void
   cancel: () => void
   confirmProposal: (nextTask?: boolean) => Promise<void>
+  canConfirmAndNext: boolean
+  reviewTaskLinkChanged: boolean
 }
 
 const ManualObjectContext = createContext<ManualObjectContextValue | null>(null)
@@ -262,8 +289,97 @@ function requestKey(prefix: string): string {
   return `${prefix}_${random}`
 }
 
+function waitForManualProposalRetry(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, MANUAL_PROPOSAL_PREPARING_RETRY_MS)
+    const abort = () => {
+      window.clearTimeout(timeoutId)
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
 function proposalFromState(state: ManualProposalState): GeometryProposal | null {
   return state.status === 'ready' || state.status === 'committing' ? state.data.proposal : null
+}
+
+function reviewTaskCoversFrame(task: ReviewTask, frame: Frame): boolean {
+  const hasRange = task.frame_start != null && task.frame_end != null
+  if (hasRange) {
+    if (frame.index < task.frame_start! || frame.index > task.frame_end!) return false
+  } else if (task.frame_id !== frame.id) {
+    return false
+  }
+  return task.track_id === null || task.track_id === frame.track_id
+}
+
+function linkableReviewTask(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  datasetId: string,
+  layerId: string,
+  frame: Frame,
+): ReviewTask | null {
+  if (
+    !task ||
+    sessionId !== task.session_id ||
+    task.dataset_id !== datasetId ||
+    task.status !== 'in_progress' ||
+    (task.target_layer_id !== null && task.target_layer_id !== layerId) ||
+    !reviewTaskCoversFrame(task, frame)
+  ) {
+    return null
+  }
+  return task
+}
+
+function snapshotReviewTask(task: ReviewTask | null): ManualReviewTaskSnapshot | null {
+  if (!task) return null
+  return {
+    id: task.id,
+    sessionId: task.session_id,
+    datasetId: task.dataset_id,
+    targetLayerId: task.target_layer_id,
+    frameId: task.frame_id,
+    trackId: task.track_id,
+    frameStart: task.frame_start,
+    frameEnd: task.frame_end,
+  }
+}
+
+function reviewTaskHasSnapshotScope(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  snapshot: ManualReviewTaskSnapshot,
+): task is ReviewTask {
+  return Boolean(
+    task &&
+    sessionId === snapshot.sessionId &&
+    task.id === snapshot.id &&
+    task.session_id === snapshot.sessionId &&
+    task.dataset_id === snapshot.datasetId &&
+    task.target_layer_id === snapshot.targetLayerId &&
+    task.frame_id === snapshot.frameId &&
+    task.track_id === snapshot.trackId &&
+    task.frame_start === snapshot.frameStart &&
+    task.frame_end === snapshot.frameEnd
+  )
+}
+
+function reviewTaskMatchesSnapshot(
+  task: ReviewTask | null | undefined,
+  sessionId: string | null | undefined,
+  snapshot: ManualReviewTaskSnapshot,
+): task is ReviewTask {
+  return task?.status === 'in_progress' && reviewTaskHasSnapshotScope(task, sessionId, snapshot)
 }
 
 export function ManualObjectProvider({
@@ -298,6 +414,9 @@ export function ManualObjectProvider({
   const mountedRef = useRef(true)
   const scopeRef = useRef(`${datasetId}:${frame?.id ?? ''}`)
   const preferencesRef = useRef<StoredManualObjectPreferences>({})
+  const bboxReviewTaskSnapshotRef = useRef<ManualReviewTaskSnapshot | null>(null)
+  const reviewRef = useRef(review)
+  reviewRef.current = review
   const stateRef = useRef(proposalState)
   stateRef.current = proposalState
 
@@ -346,27 +465,9 @@ export function ManualObjectProvider({
     overlay.updateStagedPoleBaseTemplateOptions(targetLayerId, poleTemplateOptions)
   }, [overlay.updateStagedPoleBaseTemplateOptions, poleTemplateOptions, targetLayerId, templateId])
 
-  const linkedReviewTask = useMemo(() => {
-    const task = review?.currentTask
-    if (
-      !task ||
-      task.dataset_id !== datasetId ||
-      task.status !== 'in_progress' ||
-      (task.target_layer_id !== null && task.target_layer_id !== targetLayerId)
-    ) {
-      return null
-    }
-    return task
-  }, [datasetId, review?.currentTask, targetLayerId])
-
   const warnIfReviewTaskWillNotLink = useCallback((layerId = targetLayerId) => {
     const task = review?.currentTask
-    if (
-      !task ||
-      (task.dataset_id === datasetId &&
-        task.status === 'in_progress' &&
-        (task.target_layer_id === null || task.target_layer_id === layerId))
-    ) return
+    if (!task || (frame && linkableReviewTask(task, review?.session?.id, datasetId, layerId, frame))) return
     notify?.({
       tone: 'info',
       title: '현재 검수 항목에는 자동 연결하지 않습니다',
@@ -378,7 +479,7 @@ export function ManualObjectProvider({
           ? '검수 항목과 선택한 대상 레이어가 다릅니다. 대상 레이어를 확인해 주세요.'
           : '현재 검수 범위와 수동 객체 작업 범위가 다릅니다.',
     })
-  }, [datasetId, notify, review?.currentTask, targetLayerId])
+  }, [datasetId, frame, notify, review?.currentTask, review?.session?.id, targetLayerId])
 
   const abortRequest = useCallback(() => {
     requestIdRef.current += 1
@@ -463,11 +564,15 @@ export function ManualObjectProvider({
     const previous = stateRef.current
     if (!commitInFlightRef.current) abortRequest()
     if (previous.status !== 'committing') forgetServerProposal(previous)
+    bboxReviewTaskSnapshotRef.current =
+      bboxMode && continuous && frame
+        ? snapshotReviewTask(linkableReviewTask(review?.currentTask, review?.session?.id, datasetId, targetLayerId, frame))
+        : null
     setProposalState(
       bboxMode && continuous && frame ? { status: 'drawing', frameId: frame.id } : { status: 'idle' },
     )
     if (!continuous) setBboxMode(false)
-  }, [abortRequest, bboxMode, continuous, datasetId, forgetServerProposal, frame])
+  }, [abortRequest, bboxMode, continuous, datasetId, forgetServerProposal, frame, review?.currentTask, review?.session?.id, targetLayerId])
 
   useEffect(() => {
     mountedRef.current = true
@@ -488,6 +593,7 @@ export function ManualObjectProvider({
       }
       abortRequest()
       forgetServerProposal(stateRef.current)
+      bboxReviewTaskSnapshotRef.current = null
       setBboxMode(false)
       setProposalState({ status: 'idle' })
       if (overlay.poleBaseProposal.status !== 'idle') overlay.cancelPoleBaseProposal()
@@ -510,6 +616,7 @@ export function ManualObjectProvider({
       }
       abortRequest()
       forgetServerProposal(stateRef.current)
+      bboxReviewTaskSnapshotRef.current = null
       setBboxMode(false)
       setProposalState({ status: 'idle' })
       if (overlay.poleBaseProposal.status !== 'idle') overlay.cancelPoleBaseProposal()
@@ -577,24 +684,19 @@ export function ManualObjectProvider({
     warnIfReviewTaskWillNotLink(layer.id)
     abortRequest()
     forgetServerProposal(stateRef.current)
+    bboxReviewTaskSnapshotRef.current = snapshotReviewTask(
+      linkableReviewTask(review?.currentTask, review?.session?.id, datasetId, layer.id, frame),
+    )
     if (overlay.poleBaseProposal.status !== 'idle') overlay.cancelPoleBaseProposal()
     setAllowNearDuplicate(false)
     setDuplicateOverrideReason('')
     setBboxMode(true)
     setProposalState({ status: 'drawing', frameId: frame.id })
     overlay.setActiveLayerId(layer.id)
-  }, [abortRequest, enabled, forgetServerProposal, frame, notify, overlay, persistPreferences, pointLayers, review?.session?.target_layer_ids, targetLayerId, templateId, warnIfReviewTaskWillNotLink])
-
-  const stageBbox = useCallback(
-    (geometry: EquirectangularBBoxGeometry) => {
-      if (!bboxMode || !frame) return
-      setProposalState({ status: 'adjusting', frameId: frame.id, geometry })
-    },
-    [bboxMode, frame],
-  )
+  }, [abortRequest, datasetId, enabled, forgetServerProposal, frame, notify, overlay, persistPreferences, pointLayers, review?.currentTask, review?.session?.id, review?.session?.target_layer_ids, targetLayerId, templateId, warnIfReviewTaskWillNotLink])
 
   const submitBbox = useCallback(
-    async (geometry: EquirectangularBBoxGeometry) => {
+    async (geometry: EquirectangularBBoxGeometry, existingObservation?: ManualObservation) => {
       if (!enabled || !datasetId || !frame || !targetLayer || templateId !== 'TRAFFIC_SIGN') return
       abortRequest()
       forgetServerProposal(stateRef.current)
@@ -603,33 +705,78 @@ export function ManualObjectProvider({
       const controller = new AbortController()
       requestRef.current = { id: requestId, controller }
       const expectedScope = `${datasetId}:${frame.id}`
-      setProposalState({ status: 'loading', frameId: frame.id, geometry })
+      setProposalState({
+        status: 'loading',
+        frameId: frame.id,
+        geometry,
+        ...(existingObservation ? { observation: existingObservation } : {}),
+      })
       setAllowNearDuplicate(false)
       setDuplicateOverrideReason('')
       let serverProposalId = ''
+      let observation = existingObservation
       try {
-        const observationResponse = await api.createManualObservation(
-          datasetId,
-          frame.id,
-          {
-            target_layer_id: targetLayer.id,
-            template_id: 'TRAFFIC_SIGN',
-            geometry_2d: geometry,
-            created_by: 'operator-local',
-          },
-          controller.signal,
-        )
-        const proposalResponse = await api.createManualObjectProposal(
-          datasetId,
-          frame.id,
-          {
-            target_layer_id: targetLayer.id,
-            observation_id: observationResponse.observation.observation_id,
-            template_id: 'TRAFFIC_SIGN',
-            property_patch: effectiveProperties,
-          },
-          controller.signal,
-        )
+        if (!observation) {
+          const observationResponse = await api.createManualObservation(
+            datasetId,
+            frame.id,
+            {
+              target_layer_id: targetLayer.id,
+              template_id: 'TRAFFIC_SIGN',
+              geometry_2d: geometry,
+              created_by: 'operator-local',
+            },
+            controller.signal,
+          )
+          observation = observationResponse.observation
+        }
+        let proposalResponse: Awaited<ReturnType<typeof api.createManualObjectProposal>> | null = null
+        for (let attempt = 1; attempt <= MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS; attempt += 1) {
+          try {
+            proposalResponse = await api.createManualObjectProposal(
+              datasetId,
+              frame.id,
+              {
+                target_layer_id: targetLayer.id,
+                observation_id: observation.observation_id,
+                template_id: 'TRAFFIC_SIGN',
+                property_patch: effectiveProperties,
+              },
+              controller.signal,
+            )
+            break
+          } catch (reason) {
+            const catalogPreparing =
+              reason instanceof ApiError &&
+              (reason.status === 202 || reason.code === 'CATALOG_PREPARING')
+            if (!catalogPreparing || attempt >= MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS) {
+              if (catalogPreparing) {
+                throw new ApiError(
+                  `원본 점군 준비가 지연되어 자동 재시도 ${MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS}회를 마쳤습니다. 계산 재시도를 눌러 계속할 수 있습니다.`,
+                  202,
+                  'CATALOG_PREPARING',
+                  reason.details,
+                )
+              }
+              throw reason
+            }
+            if (
+              controller.signal.aborted ||
+              requestIdRef.current !== requestId ||
+              scopeRef.current !== expectedScope
+            ) return
+            setProposalState({
+              status: 'loading',
+              frameId: frame.id,
+              geometry,
+              observation,
+              preparingAttempt: attempt + 1,
+              preparingMaxAttempts: MANUAL_PROPOSAL_PREPARING_MAX_ATTEMPTS,
+            })
+            await waitForManualProposalRetry(controller.signal)
+          }
+        }
+        if (!proposalResponse) return
         const proposal = proposalResponse.proposal
         serverProposalId = proposal.proposal_id
         if (
@@ -646,6 +793,7 @@ export function ManualObjectProvider({
             status: 'error',
             frameId: frame.id,
             geometry,
+            observation,
             message: proposal.reason_codes.join(' · ') || 'bbox에서 3D 위치를 산출하지 못했습니다.',
             reasonCodes: proposal.reason_codes,
           })
@@ -657,7 +805,7 @@ export function ManualObjectProvider({
             target_layer_id: targetLayer.id,
             template_id: 'TRAFFIC_SIGN',
             position: proposal.geometry.coordinates,
-            observation_id: observationResponse.observation.observation_id,
+            observation_id: observation.observation_id,
           },
           controller.signal,
         )
@@ -676,10 +824,11 @@ export function ManualObjectProvider({
             targetLayerId: targetLayer.id,
             templateId: 'TRAFFIC_SIGN',
             geometry,
-            observation: observationResponse.observation,
+            observation,
             proposal,
             duplicate,
             idempotencyKey: requestKey('manual_commit'),
+            reviewTaskSnapshot: bboxReviewTaskSnapshotRef.current,
           },
         })
       } catch (reason) {
@@ -692,6 +841,7 @@ export function ManualObjectProvider({
           status: 'error',
           frameId: frame.id,
           geometry,
+          ...(observation ? { observation } : {}),
           message,
           reasonCodes: reason instanceof ApiError && reason.code ? [reason.code] : [],
         })
@@ -703,11 +853,48 @@ export function ManualObjectProvider({
     [abortRequest, datasetId, effectiveProperties, enabled, forgetServerProposal, frame, notify, targetLayer, templateId],
   )
 
+  const stageBbox = useCallback(
+    (geometry: EquirectangularBBoxGeometry) => {
+      const current = stateRef.current
+      if (
+        !bboxMode ||
+        !frame ||
+        requestRef.current ||
+        commitInFlightRef.current
+      ) return
+      if (
+        current.status !== 'drawing' &&
+        current.status !== 'adjusting' &&
+        current.status !== 'error'
+      ) return
+      if (current.frameId !== frame.id) return
+      // A released bbox is already an explicit operator action. Start the 3D
+      // proposal immediately so detached panorama users never have to find a
+      // second submit button in the main workspace.
+      void submitBbox(geometry)
+    },
+    [bboxMode, frame, submitBbox],
+  )
+
   const submitStagedBbox = useCallback(async () => {
     const current = stateRef.current
     if (current.status !== 'adjusting') return
     await submitBbox(current.geometry)
   }, [submitBbox])
+
+  const retryProposal = useCallback(async () => {
+    const current = stateRef.current
+    if (
+      current.status !== 'error' ||
+      !current.geometry ||
+      !frame ||
+      current.frameId !== frame.id ||
+      (current.observation && (
+        current.observation.dataset_id !== datasetId || current.observation.frame_id !== frame.id
+      ))
+    ) return
+    await submitBbox(current.geometry, current.observation)
+  }, [datasetId, frame, submitBbox])
 
   const retryBbox = useCallback(() => {
     if (stateRef.current.status === 'committing' || commitInFlightRef.current) {
@@ -716,6 +903,9 @@ export function ManualObjectProvider({
     }
     abortRequest()
     forgetServerProposal(stateRef.current)
+    bboxReviewTaskSnapshotRef.current = frame
+      ? snapshotReviewTask(linkableReviewTask(review?.currentTask, review?.session?.id, datasetId, targetLayerId, frame))
+      : null
     setAllowNearDuplicate(false)
     setDuplicateOverrideReason('')
     if (frame) {
@@ -725,7 +915,7 @@ export function ManualObjectProvider({
       setBboxMode(false)
       setProposalState({ status: 'idle' })
     }
-  }, [abortRequest, forgetServerProposal, frame, notify])
+  }, [abortRequest, datasetId, forgetServerProposal, frame, notify, review?.currentTask, review?.session?.id, targetLayerId])
 
   const cancel = useCallback(() => {
     if (stateRef.current.status === 'committing' || commitInFlightRef.current) {
@@ -734,6 +924,7 @@ export function ManualObjectProvider({
     }
     abortRequest()
     forgetServerProposal(stateRef.current)
+    bboxReviewTaskSnapshotRef.current = null
     setBboxMode(false)
     setProposalState({ status: 'idle' })
     setAllowNearDuplicate(false)
@@ -771,6 +962,23 @@ export function ManualObjectProvider({
       if (current.status !== 'ready') return
       const { data } = current
       const layer = overlay.layers.find((candidate) => candidate.id === data.targetLayerId)
+      const linkedTaskSnapshot = data.reviewTaskSnapshot
+      if (
+        linkedTaskSnapshot &&
+        !reviewTaskMatchesSnapshot(
+          reviewRef.current?.currentTask,
+          reviewRef.current?.session?.id,
+          linkedTaskSnapshot,
+        )
+      ) {
+        notify?.({
+          tone: 'info',
+          title: '검수 항목이 바뀌어 저장을 중단했습니다.',
+          message: '이 bbox는 작업 시작 당시 항목에 연결되어 있습니다. bbox 수정으로 다시 그리거나 취소한 뒤 현재 항목에서 시작해 주세요.',
+        })
+        return
+      }
+      const linkedTaskId = linkedTaskSnapshot?.id
       if (!layer || missingRequiredFields.length > 0) {
         notify?.({
           tone: 'info',
@@ -810,7 +1018,7 @@ export function ManualObjectProvider({
           {
             expected_revision: currentRevision,
             idempotency_key: data.idempotencyKey,
-            ...(linkedReviewTask ? { task_id: linkedReviewTask.id } : {}),
+            ...(linkedTaskId ? { task_id: linkedTaskId } : {}),
             created_by: 'operator-local',
             properties: effectiveProperties,
             allow_near_duplicate: allowNearDuplicate,
@@ -827,7 +1035,7 @@ export function ManualObjectProvider({
           scopeRef.current !== expectedScope
         ) {
           void overlay.refresh()
-          review?.reload()
+          reviewRef.current?.reload()
           return
         }
         await overlay.refresh()
@@ -836,10 +1044,10 @@ export function ManualObjectProvider({
           { navigate: false },
         )
         let taskResolutionPending = response.task_resolution_pending
-        if (taskResolutionPending && linkedReviewTask) {
+        if (taskResolutionPending && linkedTaskId) {
           try {
             const featureId = String(response.feature.id)
-            const reconciled = await api.resolveReviewTask(linkedReviewTask.id, {
+            const reconciled = await api.resolveReviewTask(linkedTaskId, {
               resolution: 'manual_added',
               resolved_feature_ids: [featureId],
             })
@@ -853,7 +1061,7 @@ export function ManualObjectProvider({
             // The feature already exists; retain the non-retryable warning path.
           }
         }
-        review?.reload()
+        reviewRef.current?.reload()
         if (taskResolutionPending) {
           notify?.({
             tone: 'error',
@@ -866,14 +1074,24 @@ export function ManualObjectProvider({
           setProposalState({ status: 'idle' })
           return
         }
-        if (nextTask) review?.moveTask(1)
+        const movedToNextTask = Boolean(
+          nextTask &&
+          linkedTaskSnapshot &&
+          reviewTaskHasSnapshotScope(
+            reviewRef.current?.currentTask,
+            reviewRef.current?.session?.id,
+            linkedTaskSnapshot,
+          ),
+        )
+        if (movedToNextTask) reviewRef.current?.moveTask(1)
         notify?.({
           tone: 'success',
-          title: nextTask ? '수동 객체를 저장하고 다음 항목으로 이동했습니다' : '수동 객체를 저장했습니다',
+          title: movedToNextTask ? '수동 객체를 저장하고 다음 항목으로 이동했습니다' : '수동 객체를 저장했습니다',
         })
         setAllowNearDuplicate(false)
         setDuplicateOverrideReason('')
-        if (continuous && frame) {
+        bboxReviewTaskSnapshotRef.current = null
+        if (continuous && frame && !nextTask) {
           setBboxMode(true)
           setProposalState({ status: 'drawing', frameId: frame.id })
         } else {
@@ -884,7 +1102,7 @@ export function ManualObjectProvider({
         if (controller.signal.aborted || requestIdRef.current !== requestId) return
         if (scopeRef.current !== expectedScope || !mountedRef.current) {
           void overlay.refresh()
-          review?.reload()
+          reviewRef.current?.reload()
           return
         }
         const message = reason instanceof Error ? reason.message : '수동 객체를 저장하지 못했습니다.'
@@ -902,7 +1120,7 @@ export function ManualObjectProvider({
         if (requestRef.current?.id === requestId) requestRef.current = null
       }
     },
-    [abortRequest, allowNearDuplicate, continuous, datasetId, duplicateOverrideReason, effectiveProperties, frame, linkedReviewTask, missingRequiredFields, notify, overlay, review],
+    [abortRequest, allowNearDuplicate, continuous, datasetId, duplicateOverrideReason, effectiveProperties, frame, missingRequiredFields, notify, overlay],
   )
 
   const shortcutRef = useRef({
@@ -928,12 +1146,13 @@ export function ManualObjectProvider({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
+        hasOpenModalDialog() ||
         event.defaultPrevented ||
         event.repeat ||
         event.altKey ||
         event.ctrlKey ||
         event.metaKey ||
-        isTextEntryTarget(event.target) ||
+        isWorkspaceShortcutBlockedTarget(event.target) ||
         !shortcutRef.current.enabled
       ) return
       const current = stateRef.current
@@ -950,9 +1169,7 @@ export function ManualObjectProvider({
           void shortcutRef.current.confirmProposal(true)
         } else if (shortcutRef.current.overlay.poleBaseProposal.status === 'ready') {
           event.preventDefault()
-          void shortcutRef.current.overlay.confirmPoleBaseProposal().then((savedAndSynchronized) => {
-            if (savedAndSynchronized) shortcutRef.current.review?.moveTask(1)
-          })
+          void shortcutRef.current.overlay.confirmPoleBaseProposal(true)
         }
       } else if (event.key === 'Enter' && !event.shiftKey && current.status === 'ready') {
         event.preventDefault()
@@ -966,6 +1183,18 @@ export function ManualObjectProvider({
   const proposal = proposalFromState(proposalState)
   const proposalPosition =
     proposal?.geometry?.type === 'Point' ? proposal.geometry.coordinates : null
+  const readyReviewTaskSnapshot =
+    proposalState.status === 'ready' || proposalState.status === 'committing'
+      ? proposalState.data.reviewTaskSnapshot
+      : null
+  const reviewTaskLinkChanged = Boolean(
+    readyReviewTaskSnapshot &&
+    !reviewTaskMatchesSnapshot(
+      reviewRef.current?.currentTask,
+      reviewRef.current?.session?.id,
+      readyReviewTaskSnapshot,
+    ),
+  )
   const value = useMemo<ManualObjectContextValue>(
     () => ({
       enabled,
@@ -997,11 +1226,14 @@ export function ManualObjectProvider({
       stageBbox,
       submitStagedBbox,
       submitBbox,
+      retryProposal,
       retryBbox,
       cancel,
       confirmProposal,
+      canConfirmAndNext: Boolean(readyReviewTaskSnapshot) && !reviewTaskLinkChanged,
+      reviewTaskLinkChanged,
     }),
-    [allowNearDuplicate, bboxMode, beginTrafficSignBbox, cancel, confirmProposal, continuous, duplicateOverrideReason, effectiveProperties, enabled, frame, missingRequiredFields, pointLayers, properties, proposalPosition, proposalState, retryBbox, setContinuous, setProperty, setTargetLayerId, setTemplateId, stageBbox, startSelectedTemplate, submitBbox, submitStagedBbox, targetLayer, targetLayerId, template, templateId, templates, templatesLoading],
+    [allowNearDuplicate, bboxMode, beginTrafficSignBbox, cancel, confirmProposal, continuous, duplicateOverrideReason, effectiveProperties, enabled, frame, missingRequiredFields, pointLayers, properties, proposalPosition, proposalState, readyReviewTaskSnapshot, retryBbox, retryProposal, reviewTaskLinkChanged, setContinuous, setProperty, setTargetLayerId, setTemplateId, stageBbox, startSelectedTemplate, submitBbox, submitStagedBbox, targetLayer, targetLayerId, template, templateId, templates, templatesLoading],
   )
 
   return <ManualObjectContext.Provider value={value}>{children}</ManualObjectContext.Provider>

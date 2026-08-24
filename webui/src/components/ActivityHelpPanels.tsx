@@ -28,6 +28,23 @@ const RUN_STATUS: Record<RunStatus, { label: string; tone: string }> = {
   cancelled: { label: '취소됨', tone: 'muted' },
 }
 
+const PANEL_FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
+function panelFocusableElements(panel: HTMLElement): HTMLElement[] {
+  return [...panel.querySelectorAll<HTMLElement>(PANEL_FOCUSABLE_SELECTOR)].filter(
+    (element) =>
+      element.tabIndex >= 0 &&
+      !element.closest('[hidden], [aria-hidden="true"]'),
+  )
+}
+
 interface PanelChromeProps {
   detached: boolean
   externalAction?: ReactNode
@@ -182,7 +199,7 @@ export function HelpPanel({
       onClose={onClose}
     >
       <section className="help-intro">
-        <strong>빠른 작업 순서</strong>
+        <strong>검출 실행 빠른 순서</strong>
         <ol>
           <li><span>1</span> 데이터 폴더를 등록하고 인덱싱 완료를 확인합니다.</li>
           <li><span>2</span> 전체 구간 또는 한 트랙을 선택하고 프레임 범위를 지정합니다.</li>
@@ -194,14 +211,17 @@ export function HelpPanel({
 
       <section className="utility-section">
         <div className="utility-section-heading">
-          <div><span>프레임 단축키</span><small>입력 칸에서는 작동하지 않음</small></div>
+          <div><span>작업 단축키</span><small>버튼·입력 칸에서는 작동하지 않음</small></div>
         </div>
         <dl className="shortcut-grid">
           <div><dt><kbd>A</kbd><kbd>←</kbd></dt><dd>이전 프레임</dd></div>
           <div><dt><kbd>D</kbd><kbd>→</kbd></dt><dd>다음 프레임</dd></div>
-          <div><dt><kbd>N</kbd></dt><dd>활성 Point SHP 레이어의 신규 위치 지정/취소</dd></div>
-          <div><dt><kbd>P</kbd></dt><dd>선택한 SHP 피처의 실제 좌표 지정</dd></div>
-          <div><dt><kbd>Esc</kbd></dt><dd>좌표 지정 또는 열린 창 닫기</dd></div>
+          <div><dt><kbd>N</kbd></dt><dd>활성 Point 레이어의 신규 위치 지정·취소</dd></div>
+          <div><dt><kbd>P</kbd></dt><dd>선택 피처의 실제 좌표 지정</dd></div>
+          <div><dt><kbd>M</kbd></dt><dd>교통표지판 bbox 시작·취소</dd></div>
+          <div><dt><kbd>B</kbd></dt><dd>지주 바닥점 산출·확정</dd></div>
+          <div><dt><kbd>Enter</kbd></dt><dd>객체 제안 저장</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>현재 수동 작업 또는 열린 창 취소</dd></div>
         </dl>
       </section>
 
@@ -253,21 +273,61 @@ function UtilityPanelShell({
   children: ReactNode
 }) {
   const panelRef = useRef<HTMLElement>(null)
+  const previousFocusRef = useRef<{
+    focus: (options?: FocusOptions) => void
+    isConnected?: boolean
+  } | null>(null)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
+
+  const restorePreviousFocus = () => {
+    const previous = previousFocusRef.current
+    if (!previous || previous.isConnected === false) return
+    previous.focus({ preventScroll: true })
+  }
+
+  const closePanel = () => {
+    restorePreviousFocus()
+    onCloseRef.current()
+  }
 
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
-    panel.focus()
+    const ownerDocument = panel.ownerDocument
+    const activeElement = ownerDocument.activeElement as typeof previousFocusRef.current
+    previousFocusRef.current = activeElement && activeElement !== panel ? activeElement : null
+    panel.focus({ preventScroll: true })
     const ownerWindow = panel.ownerDocument.defaultView ?? window
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      onCloseRef.current()
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closePanel()
+        return
+      }
+      if (detached || event.key !== 'Tab') return
+      const focusable = panelFocusableElements(panel)
+      if (focusable.length === 0) {
+        event.preventDefault()
+        panel.focus({ preventScroll: true })
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      const active = ownerDocument.activeElement
+      if (event.shiftKey && (active === first || !panel.contains(active))) {
+        event.preventDefault()
+        last.focus({ preventScroll: true })
+      } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
+        event.preventDefault()
+        first.focus({ preventScroll: true })
+      }
     }
     ownerWindow.addEventListener('keydown', onKeyDown)
-    return () => ownerWindow.removeEventListener('keydown', onKeyDown)
+    return () => {
+      ownerWindow.removeEventListener('keydown', onKeyDown)
+      restorePreviousFocus()
+    }
   }, [detached])
 
   return (
@@ -287,7 +347,7 @@ function UtilityPanelShell({
         </div>
         <div className="utility-panel-actions">
           {externalAction}
-          <button type="button" className="icon-button" onClick={onClose} aria-label={`${title} 닫기`}>
+          <button type="button" className="icon-button" onClick={closePanel} aria-label={`${title} 닫기`}>
             <X size={17} />
           </button>
         </div>

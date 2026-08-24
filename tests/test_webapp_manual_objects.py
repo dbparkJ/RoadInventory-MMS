@@ -503,6 +503,93 @@ class WebAppManualObjectTests(unittest.TestCase):
                 )
                 self.assertEqual(mismatch.status_code, 422, mismatch.text)
 
+    def test_commit_rejects_tasks_outside_the_proposal_frame_or_range(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = self._app(Path(root_text), Path(state_text))
+            _seed_dataset(app, "dataset-a", suffix="a")
+            _create_layer(app, "dataset-a", LAYER_A)
+            with TestClient(app) as client:
+                _, wrong_frame_task = _create_session_task(
+                    client, "dataset-a", LAYER_A, "frame-a2"
+                )
+                observation_id = _create_observation(client)
+                proposal = _create_proposal(
+                    client,
+                    observation_id,
+                    _review_result((300_010.0, 4_100_000.0, 12.0)),
+                )
+                proposal_url = (
+                    f"/api/manual-object-proposals/{proposal['proposal_id']}/commit"
+                )
+
+                wrong_frame = client.post(
+                    proposal_url,
+                    json={
+                        "expected_revision": 1,
+                        "idempotency_key": "wrong-frame-task-key",
+                        "task_id": wrong_frame_task,
+                    },
+                )
+                self.assertEqual(wrong_frame.status_code, 422, wrong_frame.text)
+                self.assertIn("does not match", wrong_frame.json()["detail"])
+
+                task_template = app.state.store.get_review_task(wrong_frame_task)
+                assert task_template is not None
+                wrong_range_task = "rvt_wrong_frame_range"
+                matching_range_task = "rvt_matching_frame_range"
+                interval_tasks = []
+                for task_id, frame_start in (
+                    (wrong_range_task, 1),
+                    (matching_range_task, 0),
+                ):
+                    interval_tasks.append(
+                        {
+                            **task_template,
+                            "id": task_id,
+                            "task_type": "UNREVIEWED_INTERVAL",
+                            "status": "in_progress",
+                            "frame_id": None,
+                            "track_id": "track-a",
+                            "frame_start": frame_start,
+                            "frame_end": 1,
+                            "source_fingerprint": None,
+                            "claimed_by": "operator-local",
+                        }
+                    )
+                app.state.store.create_review_tasks(interval_tasks)
+
+                wrong_range = client.post(
+                    proposal_url,
+                    json={
+                        "expected_revision": 1,
+                        "idempotency_key": "wrong-frame-range-key",
+                        "task_id": wrong_range_task,
+                    },
+                )
+                self.assertEqual(wrong_range.status_code, 422, wrong_range.text)
+                self.assertIn("does not include", wrong_range.json()["detail"])
+                for task_id in (wrong_frame_task, wrong_range_task):
+                    task = client.get(f"/api/review-tasks/{task_id}").json()["task"]
+                    self.assertEqual(task["status"], "in_progress")
+                    self.assertEqual(task["resolved_feature_ids"], [])
+
+                committed = client.post(
+                    proposal_url,
+                    json={
+                        "expected_revision": 1,
+                        "idempotency_key": "matching-frame-range-key",
+                        "task_id": matching_range_task,
+                    },
+                )
+                self.assertEqual(committed.status_code, 200, committed.text)
+                matching_task = client.get(
+                    f"/api/review-tasks/{matching_range_task}"
+                ).json()["task"]
+                self.assertEqual(matching_task["status"], "manual_added")
+
     def test_commit_idempotency_duplicate_override_and_task_ownership(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

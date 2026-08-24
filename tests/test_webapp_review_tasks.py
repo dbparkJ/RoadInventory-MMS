@@ -89,6 +89,100 @@ def _seed_dataset(app, dataset_id: str, suffix: str) -> tuple[str, str, str]:
 
 
 class WebAppReviewTaskTests(unittest.TestCase):
+    def test_completion_status_reuses_gate_for_active_paused_and_completed_work(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as root_text,
+            tempfile.TemporaryDirectory() as state_text,
+        ):
+            app = create_app(
+                allowed_roots=[Path(root_text)],
+                state_dir=Path(state_text),
+                start_runner=False,
+            )
+            frame_id, _, _ = _seed_dataset(app, "dataset-gate", "gate")
+            with TestClient(app) as client:
+                missing = client.get(
+                    "/api/review-sessions/rvw_missing/completion-status"
+                )
+                self.assertEqual(missing.status_code, 404, missing.text)
+
+                created = client.post(
+                    "/api/datasets/dataset-gate/review-sessions",
+                    json={"status": "active"},
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                session_id = created.json()["session"]["id"]
+
+                active = client.get(
+                    f"/api/review-sessions/{session_id}/completion-status"
+                )
+                self.assertEqual(active.status_code, 200, active.text)
+                self.assertEqual(active.headers["cache-control"], "no-store")
+                self.assertEqual(active.json()["session_status"], "active")
+                self.assertFalse(active.json()["requirements_met"])
+                self.assertFalse(active.json()["can_complete"])
+                self.assertEqual(active.json()["blockers"]["qa_not_run"], 1)
+                self.assertIn("checked_at", active.json())
+
+                task_created = client.post(
+                    f"/api/review-sessions/{session_id}/tasks",
+                    json={"task_type": "MANUAL_SCAN", "frame_id": frame_id},
+                )
+                self.assertEqual(task_created.status_code, 201, task_created.text)
+                task_id = task_created.json()["task"]["id"]
+                open_gate = client.get(
+                    f"/api/review-sessions/{session_id}/completion-status"
+                )
+                self.assertEqual(open_gate.json()["blockers"]["open_tasks"], 1)
+                self.assertFalse(open_gate.json()["requirements_met"])
+                claimed = client.patch(
+                    f"/api/review-tasks/{task_id}",
+                    json={"status": "in_progress", "claimed_by": "operator-local"},
+                )
+                self.assertEqual(claimed.status_code, 200, claimed.text)
+                resolved = client.post(
+                    f"/api/review-tasks/{task_id}/resolve",
+                    json={"resolution": "skipped"},
+                )
+                self.assertEqual(resolved.status_code, 200, resolved.text)
+
+                paused = client.patch(
+                    f"/api/review-sessions/{session_id}",
+                    json={"status": "paused"},
+                )
+                self.assertEqual(paused.status_code, 200, paused.text)
+                paused_gate = client.get(
+                    f"/api/review-sessions/{session_id}/completion-status"
+                )
+                self.assertEqual(paused_gate.status_code, 200, paused_gate.text)
+                self.assertEqual(paused_gate.json()["blockers"]["qa_not_run"], 1)
+
+                resumed = client.patch(
+                    f"/api/review-sessions/{session_id}",
+                    json={"status": "active"},
+                )
+                self.assertEqual(resumed.status_code, 200, resumed.text)
+                qa = client.post(f"/api/review-sessions/{session_id}/qa/run")
+                self.assertEqual(qa.status_code, 200, qa.text)
+                ready_gate = client.get(
+                    f"/api/review-sessions/{session_id}/completion-status"
+                )
+                self.assertTrue(ready_gate.json()["requirements_met"])
+                self.assertTrue(ready_gate.json()["can_complete"])
+                completed = client.patch(
+                    f"/api/review-sessions/{session_id}",
+                    json={"status": "completed"},
+                )
+                self.assertEqual(completed.status_code, 200, completed.text)
+                completed_gate = client.get(
+                    f"/api/review-sessions/{session_id}/completion-status"
+                )
+                self.assertEqual(completed_gate.status_code, 200, completed_gate.text)
+                self.assertEqual(completed_gate.json()["session_status"], "completed")
+                self.assertTrue(completed_gate.json()["requirements_met"])
+                self.assertFalse(completed_gate.json()["can_complete"])
+                self.assertFalse(any(completed_gate.json()["blockers"].values()))
+
     def test_filtered_queue_cursor_does_not_skip_after_membership_change(self) -> None:
         with (
             tempfile.TemporaryDirectory() as root_text,

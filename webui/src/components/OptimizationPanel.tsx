@@ -334,7 +334,7 @@ export function OptimizationPanel({
               placeholder="예: 2026년 표지판 검출"
               onChange={(event) => setLayerName(event.target.value)}
             />
-            <small>완료 작업의 기본 실행 이름과 SHP 검수 레이어 이름으로 사용합니다.</small>
+            <small>완료 작업의 기본 실행 이름과 결과 SHP 레이어 이름으로 사용합니다.</small>
           </label>
           {modelsLoading ? (
             <p className="detection-model-status" role="status">검출 모델을 확인하고 있습니다.</p>

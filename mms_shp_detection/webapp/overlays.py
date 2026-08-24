@@ -27,6 +27,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -68,6 +69,23 @@ ZIP_RATIO_LIMIT = 200
 MANIFEST_MAX_BYTES = 2 * 1024**2
 RAW_DETECTION_RESULT_MAX_BYTES = 16 * 1024**2
 RAW_DETECTION_BOX_LIMIT = 2_000
+DETECTION_OVERLAY_RESOLVER_MAX_OBSERVATIONS = 2_000
+DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES = 1_000
+DETECTION_OVERLAY_RESOLVER_MAX_POINT_LAYERS = 1_000
+DETECTION_OVERLAY_RESOLVER_MAX_CANDIDATES = 20
+SUPPORT_FEATURE_RESOLVER_MAX_CANDIDATES = 200
+EXACT_REFERENCE_MAX_LAZY_MIGRATIONS_PER_REQUEST = 4
+EXACT_REFERENCE_INDEX_VERSION = "3"
+_DETECTION_REFERENCE_PROPERTY_KEYS = (
+    "det_id",
+    "detection_id",
+    "source_detection_id",
+)
+_SUPPORT_REFERENCE_PROPERTY_KEYS = (
+    "support_id",
+    "supportid",
+    "pole_id",
+)
 ENCODING_ALIASES = {
     "UTF-8": "utf-8",
     "UTF8": "utf-8",
@@ -277,6 +295,19 @@ def _overlay_root(app: Any, dataset_id: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     if directory.is_symlink():
         raise UnsafePath("Overlay storage cannot be a symbolic link.")
+    return directory.resolve(strict=True)
+
+
+def _existing_overlay_root(app: Any, dataset_id: str) -> Path | None:
+    """Resolve overlay storage for read-only calls without creating it."""
+
+    directory = (
+        app.state.config.state_dir / "overlays" / opaque_id("ds", dataset_id, length=32)
+    )
+    if not directory.exists():
+        return None
+    if directory.is_symlink() or not directory.is_dir():
+        raise UnsafePath("Overlay storage is invalid.")
     return directory.resolve(strict=True)
 
 
@@ -495,7 +526,9 @@ def _raw_detection_boxes_for_frame(
     model_root = source_path.parent.parent
     # Stable for repeated imports of the same run/model output, but opaque so
     # no server path or user-supplied run identifier is exposed to the client.
-    detection_source_id = opaque_id("det-src", run_id, model_root.as_posix(), length=32)
+    detection_source_id = _run_result_detection_source_id(manifest)
+    if detection_source_id is None:
+        return []
     relative_parts = [*model_root.parts, "txt", record_name, f"{image_stem}.txt"]
     try:
         result_relative = normalize_relative_path(
@@ -568,8 +601,12 @@ def _raw_detection_boxes_for_frame(
         if _image_stem(detection_image) != _image_stem(image_name):
             continue
         try:
-            detection_index = int(detection.get("detection_index") or len(boxes) + 1)
-        except (TypeError, ValueError):
+            # Preserve an explicit zero-based index. Treating zero as a
+            # missing value makes two same-frame observations share one ID.
+            detection_index = int(
+                detection.get("detection_index", len(boxes) + 1)
+            )
+        except (TypeError, ValueError, OverflowError):
             detection_index = len(boxes) + 1
         detection_id = make_detection_id(
             payload.get("record_name") or frame_task.get("record_name"),
@@ -612,6 +649,7 @@ def _feature_db(
         raise ValueError("Overlay feature store is missing.")
     connection = sqlite3.connect(str(path), timeout=30.0)
     connection.row_factory = sqlite3.Row
+    _register_exact_reference_functions(connection)
     connection.execute("PRAGMA busy_timeout = 30000")
     try:
         if write:
@@ -625,6 +663,786 @@ def _feature_db(
         raise
     finally:
         connection.close()
+
+
+def _register_exact_reference_functions(connection: sqlite3.Connection) -> None:
+    connection.create_function(
+        "mms_casefold",
+        1,
+        lambda value: str(value or "").strip().casefold(),
+        deterministic=True,
+    )
+
+
+_EXACT_REFERENCE_TRIGGER_NAMES = (
+    "exact_refs_feature_insert",
+    "exact_refs_feature_update",
+    "exact_refs_feature_delete",
+    "exact_refs_provenance_validate_insert",
+    "exact_refs_provenance_validate_update",
+    "exact_refs_provenance_insert",
+    "exact_refs_provenance_update",
+    "exact_refs_provenance_delete",
+    "exact_refs_revision_update",
+)
+
+
+def _exact_reference_index_current(connection: sqlite3.Connection) -> bool:
+    revision = _db_revision(connection)
+    metadata = {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute(
+            """
+            SELECT key,value FROM metadata
+            WHERE key IN ('exact_reference_index_version',
+                          'exact_reference_index_revision')
+            """
+        )
+    }
+    if (
+        metadata.get("exact_reference_index_version")
+        != EXACT_REFERENCE_INDEX_VERSION
+        or metadata.get("exact_reference_index_revision") != str(revision)
+    ):
+        return False
+    table = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type='table' AND name='feature_exact_references'
+        """
+    ).fetchone()
+    if table is None:
+        return False
+    triggers = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='trigger' AND name LIKE 'exact_refs_%'
+            """
+        )
+    }
+    return all(name in triggers for name in _EXACT_REFERENCE_TRIGGER_NAMES)
+
+
+def _rebuild_exact_reference_index(connection: sqlite3.Connection) -> None:
+    """Build normalized exact references once and keep them transactionally current."""
+
+    _ensure_feature_review_tables(connection)
+    invalid_properties = connection.execute(
+        "SELECT id FROM features WHERE json_valid(properties_json)=0 LIMIT 1"
+    ).fetchone()
+    invalid_provenance = connection.execute(
+        """
+        SELECT feature_id FROM feature_provenance
+        WHERE json_valid(provenance_json)=0 LIMIT 1
+        """
+    ).fetchone()
+    if invalid_properties is not None or invalid_provenance is not None:
+        raise TypeError("Overlay exact-reference source JSON is invalid.")
+    invalid_provenance_shape = connection.execute(
+        """
+        SELECT feature_id FROM feature_provenance
+        WHERE json_type(provenance_json,'$.source_detection_ids') IS NOT NULL
+          AND json_type(provenance_json,'$.source_detection_ids') <> 'array'
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_provenance_shape is not None:
+        raise TypeError("Overlay provenance source_detection_ids must be an array.")
+
+    for trigger_name in _EXACT_REFERENCE_TRIGGER_NAMES:
+        connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+    connection.execute("DROP TABLE IF EXISTS feature_exact_references")
+    connection.execute(
+        """
+        CREATE TABLE feature_exact_references (
+            reference_kind TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            feature_id TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            PRIMARY KEY(reference_kind,normalized_value,feature_id,evidence)
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX feature_exact_references_feature
+            ON feature_exact_references(feature_id,reference_kind)
+        """
+    )
+    detection_keys = _json_bytes(list(_DETECTION_REFERENCE_PROPERTY_KEYS)).decode(
+        "utf-8"
+    )
+    support_keys = _json_bytes(list(_SUPPORT_REFERENCE_PROPERTY_KEYS)).decode(
+        "utf-8"
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO feature_exact_references(
+            reference_kind,normalized_value,feature_id,evidence
+        )
+        SELECT
+            CASE
+                WHEN mms_casefold(property.key) IN (
+                    SELECT value FROM json_each(?)
+                ) THEN 'detection'
+                ELSE 'support'
+            END,
+            mms_casefold(property.value),
+            feature.id,
+            'property'
+        FROM features AS feature
+        JOIN json_each(feature.properties_json) AS property
+        WHERE feature.deleted=0
+          AND property.type IN ('text','integer','real','true','false')
+          AND mms_casefold(property.value) <> ''
+          AND (
+              mms_casefold(property.key) IN (SELECT value FROM json_each(?))
+              OR mms_casefold(property.key) IN (SELECT value FROM json_each(?))
+          )
+        """,
+        (detection_keys, detection_keys, support_keys),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO feature_exact_references(
+            reference_kind,normalized_value,feature_id,evidence
+        )
+        SELECT 'detection',mms_casefold(source.value),feature.id,'provenance'
+        FROM features AS feature
+        JOIN feature_provenance AS provenance ON provenance.feature_id=feature.id
+        JOIN json_each(
+            provenance.provenance_json,'$.source_detection_ids'
+        ) AS source
+        WHERE feature.deleted=0
+          AND source.type IN ('text','integer','real','true','false')
+          AND mms_casefold(source.value) <> ''
+        """
+    )
+
+    # These triggers make the index part of the same transaction as every
+    # feature/provenance edit. The revision trigger is the commit marker used by
+    # readers to reject a partial or stale index.
+    trigger_statements = (
+        """
+        CREATE TRIGGER exact_refs_feature_insert AFTER INSERT ON features
+        WHEN NEW.deleted=0
+        BEGIN
+            INSERT OR IGNORE INTO feature_exact_references(
+                reference_kind,normalized_value,feature_id,evidence
+            )
+            SELECT
+                CASE
+                    WHEN lower(trim(CAST(property.key AS TEXT))) IN (
+                        'det_id','detection_id','source_detection_id'
+                    ) THEN 'detection'
+                    ELSE 'support'
+                END,
+                lower(trim(CAST(property.value AS TEXT))),NEW.id,'property'
+            FROM json_each(NEW.properties_json) AS property
+            WHERE property.type IN ('text','integer','real','true','false')
+              AND lower(trim(CAST(property.value AS TEXT))) <> ''
+              AND lower(trim(CAST(property.key AS TEXT))) IN (
+                  'det_id','detection_id','source_detection_id',
+                  'support_id','supportid','pole_id'
+              );
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_feature_update
+        AFTER UPDATE OF properties_json,deleted ON features
+        BEGIN
+            DELETE FROM feature_exact_references WHERE feature_id=NEW.id;
+            INSERT OR IGNORE INTO feature_exact_references(
+                reference_kind,normalized_value,feature_id,evidence
+            )
+            SELECT
+                CASE
+                    WHEN lower(trim(CAST(property.key AS TEXT))) IN (
+                        'det_id','detection_id','source_detection_id'
+                    ) THEN 'detection'
+                    ELSE 'support'
+                END,
+                lower(trim(CAST(property.value AS TEXT))),NEW.id,'property'
+            FROM json_each(NEW.properties_json) AS property
+            WHERE NEW.deleted=0
+              AND property.type IN ('text','integer','real','true','false')
+              AND lower(trim(CAST(property.value AS TEXT))) <> ''
+              AND lower(trim(CAST(property.key AS TEXT))) IN (
+                  'det_id','detection_id','source_detection_id',
+                  'support_id','supportid','pole_id'
+              );
+            INSERT OR IGNORE INTO feature_exact_references(
+                reference_kind,normalized_value,feature_id,evidence
+            )
+            SELECT 'detection',lower(trim(CAST(source.value AS TEXT))),
+                   NEW.id,'provenance'
+            FROM feature_provenance AS provenance
+            JOIN json_each(
+                provenance.provenance_json,'$.source_detection_ids'
+            ) AS source
+            WHERE NEW.deleted=0 AND provenance.feature_id=NEW.id
+              AND source.type IN ('text','integer','real','true','false')
+              AND lower(trim(CAST(source.value AS TEXT))) <> '';
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_feature_delete AFTER DELETE ON features
+        BEGIN
+            DELETE FROM feature_exact_references WHERE feature_id=OLD.id;
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_provenance_validate_insert
+        BEFORE INSERT ON feature_provenance
+        WHEN CASE
+            WHEN json_valid(NEW.provenance_json)=0 THEN 1
+            WHEN json_type(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) IS NULL THEN 0
+            WHEN json_type(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) <> 'array' THEN 1
+            ELSE 0
+        END
+        BEGIN
+            SELECT RAISE(ABORT,'source_detection_ids must be an array');
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_provenance_validate_update
+        BEFORE UPDATE OF provenance_json ON feature_provenance
+        WHEN CASE
+            WHEN json_valid(NEW.provenance_json)=0 THEN 1
+            WHEN json_type(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) IS NULL THEN 0
+            WHEN json_type(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) <> 'array' THEN 1
+            ELSE 0
+        END
+        BEGIN
+            SELECT RAISE(ABORT,'source_detection_ids must be an array');
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_provenance_insert
+        AFTER INSERT ON feature_provenance
+        BEGIN
+            DELETE FROM feature_exact_references
+            WHERE feature_id=NEW.feature_id AND evidence='provenance';
+            INSERT OR IGNORE INTO feature_exact_references(
+                reference_kind,normalized_value,feature_id,evidence
+            )
+            SELECT 'detection',lower(trim(CAST(source.value AS TEXT))),
+                   NEW.feature_id,'provenance'
+            FROM json_each(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) AS source
+            JOIN features AS feature ON feature.id=NEW.feature_id
+            WHERE feature.deleted=0
+              AND source.type IN ('text','integer','real','true','false')
+              AND lower(trim(CAST(source.value AS TEXT))) <> '';
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_provenance_update
+        AFTER UPDATE OF provenance_json ON feature_provenance
+        BEGIN
+            DELETE FROM feature_exact_references
+            WHERE feature_id=NEW.feature_id AND evidence='provenance';
+            INSERT OR IGNORE INTO feature_exact_references(
+                reference_kind,normalized_value,feature_id,evidence
+            )
+            SELECT 'detection',lower(trim(CAST(source.value AS TEXT))),
+                   NEW.feature_id,'provenance'
+            FROM json_each(
+                NEW.provenance_json,'$.source_detection_ids'
+            ) AS source
+            JOIN features AS feature ON feature.id=NEW.feature_id
+            WHERE feature.deleted=0
+              AND source.type IN ('text','integer','real','true','false')
+              AND lower(trim(CAST(source.value AS TEXT))) <> '';
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_provenance_delete
+        AFTER DELETE ON feature_provenance
+        BEGIN
+            DELETE FROM feature_exact_references
+            WHERE feature_id=OLD.feature_id AND evidence='provenance';
+        END;
+        """,
+        """
+        CREATE TRIGGER exact_refs_revision_update
+        AFTER UPDATE OF value ON metadata
+        WHEN NEW.key='revision'
+        BEGIN
+            INSERT INTO metadata(key,value)
+            VALUES('exact_reference_index_revision',NEW.value)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+        END;
+        """,
+    )
+    for statement in trigger_statements:
+        connection.execute(statement)
+    revision = _db_revision(connection)
+    connection.execute(
+        """
+        INSERT INTO metadata(key,value) VALUES('exact_reference_index_version',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (EXACT_REFERENCE_INDEX_VERSION,),
+    )
+    connection.execute(
+        """
+        INSERT INTO metadata(key,value) VALUES('exact_reference_index_revision',?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (str(revision),),
+    )
+
+
+def _ensure_exact_reference_index(layer_dir: Path) -> None:
+    with _feature_db(layer_dir) as connection:
+        if _exact_reference_index_current(connection):
+            return
+    with _feature_db(layer_dir, write=True) as connection:
+        if not _exact_reference_index_current(connection):
+            _rebuild_exact_reference_index(connection)
+
+
+def _exact_reference_index_needs_rebuild(layer_dir: Path) -> bool:
+    with _feature_db(layer_dir) as connection:
+        return not _exact_reference_index_current(connection)
+
+
+def _indexed_detection_reference_rows(
+    layer_dir: Path,
+    requested_ids: set[str],
+    *,
+    row_limit: int,
+) -> tuple[int, list[sqlite3.Row]]:
+    _ensure_exact_reference_index(layer_dir)
+    targets = _json_bytes(sorted(requested_ids)).decode("utf-8")
+    with _feature_db(layer_dir) as connection:
+        if not _exact_reference_index_current(connection):
+            raise ValueError("Overlay exact-reference index is stale.")
+        revision = _db_revision(connection)
+        rows = connection.execute(
+            """
+            SELECT reference.feature_id,reference.normalized_value,
+                   feature.properties_json,
+                   group_concat(reference.evidence,',') AS evidence
+            FROM feature_exact_references AS reference
+            JOIN features AS feature ON feature.id=reference.feature_id
+            WHERE feature.deleted=0
+              AND reference.reference_kind='detection'
+              AND reference.normalized_value IN (
+                  SELECT mms_casefold(value) FROM json_each(?)
+              )
+            GROUP BY reference.feature_id,reference.normalized_value,feature.ordinal
+            ORDER BY feature.ordinal
+            LIMIT ?
+            """,
+            (targets, row_limit + 1),
+        ).fetchall()
+    return revision, rows
+
+
+def _indexed_detection_tombstone_rows(
+    layer_dir: Path,
+    requested_ids: set[str],
+    *,
+    row_limit: int,
+) -> list[sqlite3.Row]:
+    """Return durable deletion markers for exact raw observations."""
+
+    _ensure_exact_reference_index(layer_dir)
+    targets = _json_bytes(sorted(requested_ids)).decode("utf-8")
+    with _feature_db(layer_dir) as connection:
+        if not _exact_reference_index_current(connection):
+            raise ValueError("Overlay exact-reference index is stale.")
+        return connection.execute(
+            """
+            SELECT normalized_observation_id,feature_id,evidence_json,created_at
+            FROM detection_tombstones
+            WHERE normalized_observation_id IN (
+                SELECT mms_casefold(value) FROM json_each(?)
+            )
+            ORDER BY normalized_observation_id,feature_id
+            LIMIT ?
+            """,
+            (targets, row_limit + 1),
+        ).fetchall()
+
+
+def _indexed_support_feature_rows(
+    layer_dir: Path,
+    normalized_support_id: str,
+    *,
+    row_limit: int,
+) -> tuple[int, list[sqlite3.Row]]:
+    _ensure_exact_reference_index(layer_dir)
+    with _feature_db(layer_dir) as connection:
+        if not _exact_reference_index_current(connection):
+            raise ValueError("Overlay exact-reference index is stale.")
+        revision = _db_revision(connection)
+        rows = connection.execute(
+            """
+            SELECT feature.* FROM feature_exact_references AS reference
+            JOIN features AS feature ON feature.id=reference.feature_id
+            WHERE feature.deleted=0
+              AND reference.reference_kind='support'
+              AND reference.normalized_value=?
+            ORDER BY feature.ordinal
+            LIMIT ?
+            """,
+            (normalized_support_id, row_limit + 1),
+        ).fetchall()
+    return revision, rows
+
+
+def _run_result_detection_source_id(manifest: dict[str, Any]) -> str | None:
+    """Return the public detection source that owns one imported result layer."""
+
+    if manifest.get("source_kind") != "run_result":
+        return None
+    reference = str(manifest.get("source_reference") or "")
+    parts = reference.split(":", 2)
+    if len(parts) != 3 or parts[0] != "run" or not parts[1]:
+        return None
+    try:
+        source_path = PurePosixPath(
+            normalize_relative_path(parts[2], allow_empty=False)
+        )
+    except (TypeError, UnsafePath, ValueError):
+        return None
+    model_root = source_path.parent.parent
+    model_key = model_root.as_posix()
+    if model_key in {"", "."}:
+        return None
+    return opaque_id("det-src", parts[1], model_key, length=32)
+
+
+def _normalized_detection_reference(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text.casefold() if text else None
+
+
+def _is_detection_support_feature(properties_json: Any) -> bool:
+    """Identify the pole-side row of a sign/pole detection relation.
+
+    Pipeline pole layers intentionally retain the originating ``det_id`` so
+    audit and provenance remain lossless. That must not make the editable
+    detected object ambiguous when both the object and its support layer are
+    imported: ``pole_type`` is emitted only by the support-pole schema.
+    """
+
+    try:
+        properties = json.loads(str(properties_json))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(properties, dict):
+        return False
+    normalized = {
+        str(key).strip().casefold(): value for key, value in properties.items()
+    }
+    return bool(str(normalized.get("pole_type") or "").strip())
+
+
+def _exclude_layer_tombstoned_detection_boxes(
+    layer_dir: Path,
+    boxes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide only explicitly deleted observations from the legacy layer projection."""
+
+    requested_ids: set[str] = set()
+    for item in boxes:
+        normalized = _normalized_detection_reference(item.get("observation_id"))
+        if normalized is not None:
+            requested_ids.add(normalized)
+    if not requested_ids:
+        return boxes
+    row_limit = len(requested_ids) * (
+        DETECTION_OVERLAY_RESOLVER_MAX_CANDIDATES + 1
+    )
+    _revision, live_rows = _indexed_detection_reference_rows(
+        layer_dir,
+        requested_ids,
+        row_limit=row_limit,
+    )
+    deleted_rows = _indexed_detection_tombstone_rows(
+        layer_dir,
+        requested_ids,
+        row_limit=row_limit,
+    )
+    if len(live_rows) > row_limit or len(deleted_rows) > row_limit:
+        return boxes
+    live_ids = {str(row["normalized_value"]) for row in live_rows}
+    deleted_ids = {
+        str(row["normalized_observation_id"]) for row in deleted_rows
+    } - live_ids
+    return [
+        item
+        for item in boxes
+        if _normalized_detection_reference(item.get("observation_id"))
+        not in deleted_ids
+    ]
+
+
+def resolve_detection_overlay_features(
+    app: Any,
+    dataset_id: str,
+    observations: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Resolve raw detection observations without relying on UI pagination.
+
+    A source ID first restricts the search to Point layers imported from that
+    exact run/model output. Within those layers, only stable detection IDs in
+    feature properties, persisted provenance, or durable deletion tombstones
+    count as evidence. Visibility, spatial preview limits, layer ordering, and
+    timestamps never break ties.
+    """
+
+    if len(observations) > DETECTION_OVERLAY_RESOLVER_MAX_OBSERVATIONS:
+        raise ValueError("Too many detection observations were supplied.")
+
+    requested: dict[tuple[str, str], tuple[str, str]] = {}
+    requested_by_source: dict[str, set[str]] = {}
+    for source_id, observation_id in observations:
+        normalized_source = _normalized_detection_reference(source_id)
+        normalized_observation = _normalized_detection_reference(observation_id)
+        if normalized_source is None or normalized_observation is None:
+            raise ValueError("Detection source and observation IDs are required.")
+        key = (normalized_source, normalized_observation)
+        requested.setdefault(key, (str(source_id).strip(), str(observation_id).strip()))
+        requested_by_source.setdefault(normalized_source, set()).add(
+            normalized_observation
+        )
+
+    candidates: dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]] = {
+        key: {} for key in requested
+    }
+    tombstones: dict[tuple[str, str], dict[tuple[str, str], dict[str, Any]]] = {
+        key: {} for key in requested
+    }
+    incomplete_sources: set[str] = set()
+    if not requested:
+        return {}
+
+    try:
+        root = _existing_overlay_root(app, dataset_id)
+        if root is None:
+            entries = ()
+        else:
+            entries = iter(sorted(root.iterdir(), key=lambda path: path.name))
+        directory_entry_count = 0
+        point_layer_count = 0
+        lazy_migration_count = 0
+        for candidate_dir in entries:
+            directory_entry_count += 1
+            if (
+                directory_entry_count
+                > DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES
+            ):
+                incomplete_sources.update(requested_by_source)
+                break
+            if OVERLAY_ID.fullmatch(candidate_dir.name) is None:
+                continue
+            try:
+                if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+                    continue
+                manifest = _read_manifest(candidate_dir)
+                if manifest.get("dataset_id") != dataset_id:
+                    continue
+                if str(manifest.get("geometry_type") or "").casefold() != "point":
+                    continue
+                source_id = _run_result_detection_source_id(manifest)
+                normalized_source = _normalized_detection_reference(source_id)
+                if normalized_source not in requested_by_source:
+                    continue
+                point_layer_count += 1
+                if (
+                    point_layer_count
+                    > DETECTION_OVERLAY_RESOLVER_MAX_POINT_LAYERS
+                ):
+                    incomplete_sources.update(requested_by_source)
+                    break
+
+                requested_ids = requested_by_source[normalized_source]
+                row_limit = len(requested_ids) * (
+                    DETECTION_OVERLAY_RESOLVER_MAX_CANDIDATES + 1
+                )
+                if _exact_reference_index_needs_rebuild(candidate_dir):
+                    lazy_migration_count += 1
+                    if (
+                        lazy_migration_count
+                        > EXACT_REFERENCE_MAX_LAZY_MIGRATIONS_PER_REQUEST
+                    ):
+                        incomplete_sources.update(requested_by_source)
+                        break
+                revision, rows = _indexed_detection_reference_rows(
+                    candidate_dir,
+                    requested_ids,
+                    row_limit=row_limit,
+                )
+                if len(rows) > row_limit:
+                    incomplete_sources.add(normalized_source)
+                    rows = rows[:row_limit]
+                for row in rows:
+                    normalized_observation = str(row["normalized_value"])
+                    observation_key = (normalized_source, normalized_observation)
+                    feature_key = (candidate_dir.name, str(row["feature_id"]))
+                    observation_candidates = candidates[observation_key]
+                    if (
+                        feature_key not in observation_candidates
+                        and len(observation_candidates)
+                        >= DETECTION_OVERLAY_RESOLVER_MAX_CANDIDATES
+                    ):
+                        incomplete_sources.add(normalized_source)
+                        continue
+                    current = observation_candidates.setdefault(
+                        feature_key,
+                        {
+                            "layer_id": candidate_dir.name,
+                            "feature_id": str(row["feature_id"]),
+                            "revision": revision,
+                            "evidence": set(),
+                            "support_feature": _is_detection_support_feature(
+                                row["properties_json"]
+                            ),
+                        },
+                    )
+                    current["evidence"].update(
+                        str(row["evidence"] or "").split(",")
+                    )
+                deleted_rows = _indexed_detection_tombstone_rows(
+                    candidate_dir,
+                    requested_ids,
+                    row_limit=row_limit,
+                )
+                if len(deleted_rows) > row_limit:
+                    incomplete_sources.add(normalized_source)
+                    deleted_rows = deleted_rows[:row_limit]
+                for row in deleted_rows:
+                    normalized_observation = str(row["normalized_observation_id"])
+                    observation_key = (normalized_source, normalized_observation)
+                    feature_key = (candidate_dir.name, str(row["feature_id"]))
+                    observation_tombstones = tombstones[observation_key]
+                    if (
+                        feature_key not in observation_tombstones
+                        and len(observation_tombstones)
+                        >= DETECTION_OVERLAY_RESOLVER_MAX_CANDIDATES
+                    ):
+                        incomplete_sources.add(normalized_source)
+                        continue
+                    decoded_evidence = json.loads(str(row["evidence_json"]))
+                    if not isinstance(decoded_evidence, list) or any(
+                        not isinstance(value, str) for value in decoded_evidence
+                    ):
+                        raise TypeError("Detection tombstone evidence is invalid.")
+                    observation_tombstones.setdefault(
+                        feature_key,
+                        {
+                            "layer_id": candidate_dir.name,
+                            "feature_id": str(row["feature_id"]),
+                            "evidence": decoded_evidence,
+                            "deleted_at": str(row["created_at"]),
+                        },
+                    )
+            except (
+                FileNotFoundError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                sqlite3.Error,
+            ):
+                # A broken registered layer cannot be assumed not to contain a
+                # duplicate. Fail closed instead of returning a false unique match.
+                incomplete_sources.update(requested_by_source)
+    except (OSError, UnsafePath):
+        incomplete_sources.update(requested_by_source)
+
+    results: dict[tuple[str, str], dict[str, Any]] = {}
+    evidence_order = {"property": 0, "provenance": 1}
+    for key, (source_id, observation_id) in requested.items():
+        items = []
+        for candidate in candidates[key].values():
+            items.append(
+                {
+                    **{
+                        name: value
+                        for name, value in candidate.items()
+                        if name != "support_feature"
+                    },
+                    "_support_feature": bool(candidate["support_feature"]),
+                    "evidence": sorted(
+                        candidate["evidence"],
+                        key=lambda value: evidence_order.get(value, 99),
+                    ),
+                }
+            )
+        items.sort(key=lambda item: (item["layer_id"], item["feature_id"]))
+        deleted_items = list(tombstones[key].values())
+        deleted_items.sort(key=lambda item: (item["layer_id"], item["feature_id"]))
+        scan_complete = key[0] not in incomplete_sources
+        object_items = [item for item in items if not item["_support_feature"]]
+        if scan_complete and len(object_items) == 1:
+            # One editable detection plus one or more pole-side rows is an
+            # exact relation, not an ambiguity. Multiple object rows remain
+            # fail-closed (for example, a duplicate sign-layer import).
+            resolution = "matched"
+            matched_item = object_items[0]
+        elif len(items) > 1:
+            resolution = "ambiguous"
+            matched_item = None
+        elif not scan_complete:
+            resolution = "unavailable"
+            matched_item = None
+        elif deleted_items and items and not object_items:
+            # Deleting the editable detection must continue to suppress its raw
+            # box even when a pole-side relation row with the same det_id is
+            # still imported. A remaining live object row above still wins.
+            resolution = "deleted"
+            matched_item = None
+        elif items:
+            resolution = "matched"
+            matched_item = items[0]
+        elif deleted_items:
+            resolution = "deleted"
+            matched_item = None
+        else:
+            resolution = "not_found"
+            matched_item = None
+        public_items = [
+            {name: value for name, value in item.items() if name != "_support_feature"}
+            for item in items
+        ]
+        public_match = (
+            {
+                name: value
+                for name, value in matched_item.items()
+                if name != "_support_feature"
+            }
+            if matched_item is not None
+            else None
+        )
+        results[key] = {
+            "source_id": source_id,
+            "observation_id": observation_id,
+            "status": resolution,
+            "match": public_match,
+            "candidates": public_items,
+            "candidate_count": len(public_items),
+            "tombstones": deleted_items,
+            "tombstone_count": len(deleted_items),
+            "scan_complete": scan_complete,
+        }
+    return results
 
 
 def _db_revision(connection: sqlite3.Connection) -> int:
@@ -805,6 +1623,23 @@ def _ensure_feature_review_tables(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detection_tombstones (
+            normalized_observation_id TEXT NOT NULL,
+            feature_id TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(normalized_observation_id,feature_id)
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS detection_tombstones_observation
+            ON detection_tombstones(normalized_observation_id)
+        """
+    )
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(edit_transactions)")
@@ -947,10 +1782,11 @@ def _validate_review_task_scope(
 ) -> dict[str, Any] | None:
     if metadata is None:
         return None
-    if any(
-        request.app.state.store.get_frame(dataset_id, frame_id) is None
+    source_frames = [
+        request.app.state.store.get_frame(dataset_id, frame_id)
         for frame_id in metadata.source_frame_ids
-    ):
+    ]
+    if any(frame is None for frame in source_frames):
         raise HTTPException(
             status_code=422,
             detail="Review evidence contains a frame outside this dataset.",
@@ -996,14 +1832,40 @@ def _validate_review_task_scope(
             status_code=409,
             detail="Review task is claimed by another operator.",
         )
-    if (
-        task.get("frame_id") is not None
-        and metadata.source_frame_ids
-        and str(task["frame_id"]) not in set(metadata.source_frame_ids)
+    if not metadata.source_frame_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="Linked review feature edits require source_frame_ids evidence.",
+        )
+    task_frame_start = task.get("frame_start")
+    task_frame_end = task.get("frame_end")
+    if task_frame_start is not None or task_frame_end is not None:
+        task_track_id = task.get("track_id")
+        if (
+            task_frame_start is None
+            or task_frame_end is None
+            or task_track_id is None
+            or any(
+                frame is None
+                or str(frame["track_id"]) != str(task_track_id)
+                or int(frame["ordinal"]) < int(task_frame_start)
+                or int(frame["ordinal"]) > int(task_frame_end)
+                for frame in source_frames
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Review evidence is outside the review task frame range or track."
+                ),
+            )
+    elif (
+        task.get("frame_id") is None
+        or metadata.source_frame_ids != [str(task["frame_id"])]
     ):
         raise HTTPException(
             status_code=422,
-            detail="Review evidence does not include the review task frame.",
+            detail="Review evidence does not exactly match the review task frame.",
         )
     return task
 
@@ -1425,6 +2287,9 @@ def _import_bundle(
                 )
 
         _initialize_feature_store(staging / "features.sqlite3", rows(), fields)
+        # Pay the one-time exact-reference scan during a real import so the
+        # first panorama/point-cloud selection never builds it interactively.
+        _ensure_exact_reference_index(staging)
         shape_type = int(reader.shapeType)
     except OverlayTooLarge:
         raise
@@ -1621,6 +2486,126 @@ def _decode_feature(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def resolve_support_features(
+    app: Any,
+    dataset_id: str,
+    support_id: str,
+) -> dict[str, Any]:
+    """Return every exact Point feature sharing one normalized support identity."""
+
+    normalized_support_id = _normalized_detection_reference(support_id)
+    if normalized_support_id is None:
+        raise ValueError("support_id is required.")
+    matches: list[dict[str, Any]] = []
+    candidate_count = 0
+    scan_complete = True
+    try:
+        root = _existing_overlay_root(app, dataset_id)
+        entries = (
+            ()
+            if root is None
+            else iter(sorted(root.iterdir(), key=lambda path: path.name))
+        )
+        directory_entry_count = 0
+        point_layer_count = 0
+        lazy_migration_count = 0
+        for candidate_dir in entries:
+            directory_entry_count += 1
+            if directory_entry_count > DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES:
+                scan_complete = False
+                break
+            if OVERLAY_ID.fullmatch(candidate_dir.name) is None:
+                continue
+            try:
+                if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+                    continue
+                manifest = _read_manifest(candidate_dir)
+                if manifest.get("dataset_id") != dataset_id:
+                    continue
+                if str(manifest.get("geometry_type") or "").casefold() != "point":
+                    continue
+                fields = manifest.get("fields")
+                if isinstance(fields, list) and fields:
+                    field_names = {
+                        str(field.get("name") or "").strip().casefold()
+                        for field in fields
+                        if isinstance(field, dict)
+                    }
+                    if not field_names.intersection(_SUPPORT_REFERENCE_PROPERTY_KEYS):
+                        continue
+                point_layer_count += 1
+                if point_layer_count > DETECTION_OVERLAY_RESOLVER_MAX_POINT_LAYERS:
+                    scan_complete = False
+                    break
+                remaining = SUPPORT_FEATURE_RESOLVER_MAX_CANDIDATES - candidate_count
+                if _exact_reference_index_needs_rebuild(candidate_dir):
+                    lazy_migration_count += 1
+                    if (
+                        lazy_migration_count
+                        > EXACT_REFERENCE_MAX_LAZY_MIGRATIONS_PER_REQUEST
+                    ):
+                        scan_complete = False
+                        break
+                revision, rows = _indexed_support_feature_rows(
+                    candidate_dir,
+                    normalized_support_id,
+                    row_limit=max(0, remaining),
+                )
+                if len(rows) > remaining:
+                    candidate_count += len(rows)
+                    scan_complete = False
+                    break
+                for row in rows:
+                    candidate_count += 1
+                    matches.append(
+                        {
+                            "layer_id": candidate_dir.name,
+                            "layer_name": str(manifest.get("name") or candidate_dir.name),
+                            "layer_color": manifest.get("color"),
+                            "revision": revision,
+                            "feature": _decode_feature(row),
+                        }
+                    )
+            except (
+                FileNotFoundError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                sqlite3.Error,
+            ):
+                scan_complete = False
+                break
+    except (OSError, UnsafePath):
+        scan_complete = False
+
+    if not scan_complete:
+        return {
+            "dataset_id": dataset_id,
+            "support_id": str(support_id).strip(),
+            "status": "unavailable",
+            "items": [],
+            "count": 0,
+            "candidate_count": candidate_count,
+            "scan_complete": False,
+        }
+    matches.sort(
+        key=lambda item: (
+            item["layer_id"],
+            str(item["feature"]["id"]),
+        )
+    )
+    return {
+        "dataset_id": dataset_id,
+        "support_id": str(support_id).strip(),
+        "status": "matched" if matches else "not_found",
+        "items": matches,
+        "count": len(matches),
+        "candidate_count": len(matches),
+        "scan_complete": True,
+    }
+
+
 def _transform_feature(
     feature: dict[str, Any], transformer: Any | None
 ) -> dict[str, Any]:
@@ -1800,6 +2785,57 @@ def _updated_revision(
     if expected is not None and expected != revision:
         raise RuntimeError(f"revision:{revision}")
     return revision + 1
+
+
+def _record_detection_tombstones(
+    connection: sqlite3.Connection,
+    *,
+    feature_id: str,
+    created_at: str,
+) -> list[str]:
+    """Persist the raw observations owned by a feature before soft deletion."""
+
+    if not _exact_reference_index_current(connection):
+        _rebuild_exact_reference_index(connection)
+    rows = connection.execute(
+        """
+        SELECT normalized_value,group_concat(evidence,',') AS evidence
+        FROM feature_exact_references
+        WHERE feature_id=? AND reference_kind='detection'
+        GROUP BY normalized_value
+        ORDER BY normalized_value
+        """,
+        (feature_id,),
+    ).fetchall()
+    observation_ids: list[str] = []
+    evidence_order = {"property": 0, "provenance": 1}
+    for row in rows:
+        observation_id = str(row["normalized_value"])
+        evidence = sorted(
+            {
+                value
+                for value in str(row["evidence"] or "").split(",")
+                if value
+            },
+            key=lambda value: evidence_order.get(value, 99),
+        )
+        connection.execute(
+            """
+            INSERT INTO detection_tombstones(
+                normalized_observation_id,feature_id,evidence_json,created_at
+            ) VALUES(?,?,?,?)
+            ON CONFLICT(normalized_observation_id,feature_id) DO UPDATE SET
+                evidence_json=excluded.evidence_json
+            """,
+            (
+                observation_id,
+                feature_id,
+                _json_bytes(evidence).decode("utf-8"),
+                created_at,
+            ),
+        )
+        observation_ids.append(observation_id)
+    return observation_ids
 
 
 def _delete_overlay_field_from_store(
@@ -2097,12 +3133,12 @@ def list_overlays(dataset_id: str, request: Request) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     valid_inspected = 0
     for candidate in sorted(root.iterdir(), key=lambda path: path.name):
-        if len(items) >= 500:
+        if len(items) >= DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES:
             break
         if OVERLAY_ID.fullmatch(candidate.name) is None:
             continue
         valid_inspected += 1
-        if valid_inspected > 1_000:
+        if valid_inspected > DETECTION_OVERLAY_RESOLVER_MAX_DIRECTORY_ENTRIES:
             break
         try:
             if candidate.is_symlink() or not candidate.is_dir():
@@ -2115,6 +3151,21 @@ def list_overlays(dataset_id: str, request: Request) -> dict[str, Any]:
             continue
     items.sort(key=lambda item: item["created_at"], reverse=True)
     return {"items": items, "layers": items}
+
+
+@router.get("/datasets/{dataset_id}/overlays/support-features")
+def support_features(
+    dataset_id: str,
+    request: Request,
+    response: Response,
+    support_id: str = Query(..., min_length=1, max_length=160),
+) -> dict[str, Any]:
+    require_ready_dataset(request, dataset_id)
+    normalized = support_id.strip()
+    if not normalized or any(ord(character) < 32 for character in normalized):
+        raise HTTPException(status_code=422, detail="support_id is invalid.")
+    response.headers["Cache-Control"] = "private, no-store"
+    return resolve_support_features(request.app, dataset_id, normalized)
 
 
 @router.get("/datasets/{dataset_id}/overlays/{layer_id}")
@@ -3026,6 +4077,11 @@ async def delete_overlay_feature(
                     raise FileNotFoundError("Feature not found.")
                 revision = _updated_revision(connection, expected_revision)
                 now = utc_now()
+                tombstoned_detection_ids = _record_detection_tombstones(
+                    connection,
+                    feature_id=feature_id,
+                    created_at=now,
+                )
                 connection.execute(
                     "UPDATE features SET deleted=1,updated_at=? WHERE id=?",
                     (now, feature_id),
@@ -3066,6 +4122,8 @@ async def delete_overlay_feature(
         "deleted": True,
         "revision": revision,
         "source_preserved": True,
+        "suppressed_detection_ids": tombstoned_detection_ids,
+        "detection_tombstone_count": len(tombstoned_detection_ids),
     }
 
 
@@ -3186,6 +4244,10 @@ def project_overlay_on_panorama(
             manifest,
             frame["task"],
             feature_ids_by_detection_id,
+        )
+        detection_boxes = _exclude_layer_tombstoned_detection_boxes(
+            layer_dir,
+            detection_boxes,
         )
     except (
         FileNotFoundError,

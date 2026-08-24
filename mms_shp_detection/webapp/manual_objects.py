@@ -1023,6 +1023,42 @@ async def commit_manual_object_proposal(
                 status_code=409,
                 detail="Manual object commits require an active review session.",
             )
+        proposal_frame_id = str(stored["frame_id"])
+        proposal_frame = request.app.state.store.get_frame(
+            dataset_id, proposal_frame_id
+        )
+        if proposal_frame is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Manual object proposal frame is no longer available.",
+            )
+        task_frame_start = linked_task.get("frame_start")
+        task_frame_end = linked_task.get("frame_end")
+        if task_frame_start is not None or task_frame_end is not None:
+            if (
+                task_frame_start is None
+                or task_frame_end is None
+                or int(proposal_frame["ordinal"]) < int(task_frame_start)
+                or int(proposal_frame["ordinal"]) > int(task_frame_end)
+                or linked_task.get("track_id") is None
+                or str(linked_task["track_id"]) != str(proposal_frame["track_id"])
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Review task frame range does not include this proposal frame.",
+                )
+        elif (
+            linked_task.get("frame_id") is None
+            or str(linked_task["frame_id"]) != proposal_frame_id
+            or (
+                linked_task.get("track_id") is not None
+                and str(linked_task["track_id"]) != str(proposal_frame["track_id"])
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Review task frame does not match this proposal frame.",
+            )
         if str(linked_task["status"]) not in {
             "in_progress",
             "manual_added",

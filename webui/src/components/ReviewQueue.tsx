@@ -8,15 +8,17 @@ export function ReviewQueue() {
   if (!review?.enabled || !review.queueOpen || !review.datasetId) return null
 
   const currentComplete = review.currentTask ? isReviewTaskComplete(review.currentTask) : false
-  const busy = Boolean(review.updatingTaskId)
+  const busy = Boolean(
+    review.updatingTaskId || review.creatingSession || review.generatingCandidates,
+  )
   const taskActionsEnabled = review.session?.status === 'active'
 
   return (
-    <aside className="review-queue" aria-label="검수 작업 큐">
+    <aside className="review-queue" aria-label="검수 항목 목록">
       <header className="review-queue-header">
         <span>
           <ClipboardCheck size={15} />
-          <strong>검수 작업</strong>
+          <strong>검수할 항목</strong>
           <small>{review.totalCount.toLocaleString('ko-KR')}</small>
         </span>
         <div>
@@ -91,9 +93,23 @@ export function ReviewQueue() {
       ) : review.error && review.tasks.length === 0 ? (
         <p className="review-queue-message error" role="alert">{review.error}</p>
       ) : !review.session ? (
-        <p className="review-queue-message">이 데이터셋에 사용할 검수 세션이 없습니다.</p>
+        <div className="review-queue-message">
+          <p>아직 시작한 검수 작업이 없습니다.</p>
+          <small>범위와 후보 유형을 고르면 확인할 항목을 자동으로 준비합니다.</small>
+          <button type="button" className="button primary compact" onClick={() => review.setStartGuideOpen(true)}>
+            새 검수 작업 시작
+          </button>
+        </div>
       ) : review.tasks.length === 0 ? (
-        <p className="review-queue-message">현재 세션에 등록된 검수 작업이 없습니다.</p>
+        <div className="review-queue-message">
+          <p>이 작업에 만들어진 후보가 없습니다.</p>
+          <small>후보를 추가하거나, 확인할 후보가 없다면 QA 검사를 실행한 뒤 작업을 완료할 수 있습니다.</small>
+          {review.session.status === 'active' && (
+            <button type="button" className="button primary compact" disabled={busy} onClick={() => review.setCandidateGuideOpen(true)}>
+              검수 후보 만들기
+            </button>
+          )}
+        </div>
       ) : (
         <div className="review-task-list">
           {review.tasks.map((task) => (

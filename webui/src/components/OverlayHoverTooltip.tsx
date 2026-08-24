@@ -1,7 +1,8 @@
-import { Maximize2, Pin, X } from 'lucide-react'
+import { List, Pencil, Pin, X } from 'lucide-react'
 import {
   useEffect,
   useRef,
+  useState,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
@@ -24,6 +25,7 @@ const OVERLAY_HOVER_PREFERRED_KEYS = [
 ] as const
 
 export interface OverlayHoverState {
+  identityKey?: string
   layerId?: string
   layerName: string
   featureId: string | number
@@ -31,6 +33,41 @@ export interface OverlayHoverState {
   layerColor?: string
   x: number
   y: number
+  viewportWidth: number
+  viewportHeight: number
+}
+
+export interface OverlayTooltipPosition {
+  left: number
+  top: number
+}
+
+export function clampOverlayTooltipPosition(
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  padding = 8,
+): OverlayTooltipPosition {
+  const safePadding = Math.max(0, Number.isFinite(padding) ? padding : 0)
+  const maxLeft = Math.max(safePadding, viewportWidth - Math.max(0, width) - safePadding)
+  const maxTop = Math.max(safePadding, viewportHeight - Math.max(0, height) - safePadding)
+  return {
+    left: Math.min(Math.max(left, safePadding), maxLeft),
+    top: Math.min(Math.max(top, safePadding), maxTop),
+  }
+}
+
+interface OverlayTooltipDragState {
+  pointerId: number
+  startX: number
+  startY: number
+  startLeft: number
+  startTop: number
+  width: number
+  height: number
   viewportWidth: number
   viewportHeight: number
 }
@@ -143,7 +180,18 @@ export function OverlayHoverTooltip({
   onDetails?: (hover: OverlayHoverState) => void
 }) {
   const tooltipRef = useRef<HTMLElement>(null)
+  const dragStateRef = useRef<OverlayTooltipDragState | null>(null)
   const overlay = useOptionalOverlayWorkspace()
+  const [expanded, setExpanded] = useState(false)
+  const [dragPosition, setDragPosition] = useState<OverlayTooltipPosition | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const hoverIdentity = hover?.identityKey ?? `${hover?.layerId ?? ''}:${String(hover?.featureId ?? '')}`
+  useEffect(() => {
+    setExpanded(false)
+    setDragPosition(null)
+    setDragging(false)
+    dragStateRef.current = null
+  }, [hoverIdentity, pinned])
   useEffect(() => {
     if (!hover || !pinned || !onClose) return
     const ownerDocument = tooltipRef.current?.ownerDocument ?? document
@@ -168,24 +216,95 @@ export function OverlayHoverTooltip({
   if (!hover) return null
   const alignRight = hover.x > hover.viewportWidth - 320
   const alignBottom = hover.y > hover.viewportHeight - 260
-  const style: CSSProperties = {
-    ...(alignRight ? { right: Math.max(8, hover.viewportWidth - hover.x + 12) } : { left: hover.x + 12 }),
-    ...(alignBottom ? { bottom: Math.max(8, hover.viewportHeight - hover.y + 12) } : { top: hover.y + 12 }),
-  }
+  const style: CSSProperties = dragPosition
+    ? { left: dragPosition.left, top: dragPosition.top }
+    : {
+        ...(alignRight
+          ? { right: Math.max(8, hover.viewportWidth - hover.x + 12) }
+          : { left: hover.x + 12 }),
+        ...(alignBottom
+          ? { bottom: Math.max(8, hover.viewportHeight - hover.y + 12) }
+          : { top: hover.y + 12 }),
+      }
   const allEntries = overlayPropertyEntries(hover.properties)
-  const entries = overlayPropertyPreviewEntries(hover.properties)
-  const hiddenCount = Math.max(0, allEntries.length - entries.length)
+  const previewEntries = overlayPropertyPreviewEntries(hover.properties)
+  const previewKeys = new Set(previewEntries.map(([key]) => key))
+  const orderedEntries = [
+    ...previewEntries,
+    ...allEntries.filter(([key]) => !previewKeys.has(key)),
+  ]
+  const entries = expanded ? orderedEntries : previewEntries
+  const hiddenCount = expanded ? 0 : Math.max(0, allEntries.length - previewEntries.length)
   const className = overlayHoverClassName(hover.properties, hover.featureId)
   const workspaceColor = hover.layerId ? overlay?.layerColor(hover.layerId) : undefined
   const layerColor = overlayHoverLayerColor(
     hover.properties,
     hover.layerColor ?? workspaceColor,
   )
+  const beginDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!pinned || event.button !== 0) return
+    if ((event.target as HTMLElement).closest('button')) return
+    const tooltip = tooltipRef.current
+    if (!tooltip) return
+    const offsetParent = tooltip.offsetParent as HTMLElement | null
+    const tooltipRect = tooltip.getBoundingClientRect()
+    const parentRect = offsetParent?.getBoundingClientRect()
+    const viewportWidth = offsetParent?.clientWidth || hover.viewportWidth
+    const viewportHeight = offsetParent?.clientHeight || hover.viewportHeight
+    const startPosition = clampOverlayTooltipPosition(
+      tooltipRect.left - (parentRect?.left ?? 0),
+      tooltipRect.top - (parentRect?.top ?? 0),
+      tooltipRect.width,
+      tooltipRect.height,
+      viewportWidth,
+      viewportHeight,
+    )
+    dragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: startPosition.left,
+      startTop: startPosition.top,
+      width: tooltipRect.width,
+      height: tooltipRect.height,
+      viewportWidth,
+      viewportHeight,
+    }
+    setDragPosition(startPosition)
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    setDragging(true)
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  const continueDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = dragStateRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    setDragPosition(clampOverlayTooltipPosition(
+      drag.startLeft + event.clientX - drag.startX,
+      drag.startTop + event.clientY - drag.startY,
+      drag.width,
+      drag.height,
+      drag.viewportWidth,
+      drag.viewportHeight,
+    ))
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  const finishDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = dragStateRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    dragStateRef.current = null
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    setDragging(false)
+    event.stopPropagation()
+  }
   const stopPointer = (event: ReactPointerEvent) => event.stopPropagation()
   return (
     <aside
       ref={tooltipRef}
-      className={`overlay-hover-tooltip ${pinned ? 'pinned' : ''}`}
+      className={`overlay-hover-tooltip ${pinned ? 'pinned' : ''} ${dragging ? 'dragging' : ''}`}
       role={pinned ? 'dialog' : 'tooltip'}
       aria-label={pinned ? `${hover.layerName} 고정 속성 미리보기` : undefined}
       data-pinned={pinned ? 'true' : 'false'}
@@ -193,7 +312,14 @@ export function OverlayHoverTooltip({
       onPointerDown={stopPointer}
       onClick={(event) => event.stopPropagation()}
     >
-      <header>
+      <header
+        className={pinned ? 'overlay-hover-drag-handle' : undefined}
+        title={pinned ? '드래그하여 상세정보 카드 이동' : undefined}
+        onPointerDown={beginDrag}
+        onPointerMove={continueDrag}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
+      >
         <span className="overlay-hover-title">
           {pinned && <Pin size={11} aria-hidden="true" />}
           <span>
@@ -227,10 +353,23 @@ export function OverlayHoverTooltip({
       {hiddenCount > 0 && (
         <p className="overlay-hover-more">속성 {hiddenCount.toLocaleString('ko-KR')}개 더 있음</p>
       )}
-      {pinned && onDetails && hover.layerId && (
+      {pinned && (
         <footer>
-          <button type="button" onClick={() => onDetails(hover)}>
-            <Maximize2 size={12} /> 자세히
+          <button
+            type="button"
+            className="secondary"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((current) => !current)}
+          >
+            <List size={12} /> {expanded ? '간단히' : '자세히'}
+          </button>
+          <button
+            type="button"
+            disabled={!onDetails || !hover.layerId}
+            title={!onDetails || !hover.layerId ? '편집 가능한 결과 피처가 연결되지 않았습니다.' : undefined}
+            onClick={() => onDetails?.(hover)}
+          >
+            <Pencil size={12} /> 수정하기
           </button>
         </footer>
       )}

@@ -164,4 +164,47 @@ describe('DatasetPanel data explorer', () => {
       Array.from(document.querySelectorAll('.track-row strong')).map((node) => node.textContent),
     ).toEqual(['전체 구간', 'SEC_01', 'SEC_02', 'SEC_05', 'SEC_10'])
   })
+
+  it('keeps work-section selection separate from per-track visibility controls', () => {
+    const onTrackChange = vi.fn()
+    const onTrackVisibilityChange = vi.fn()
+    const onShowAllTracks = vi.fn()
+    const selectedDataset: DatasetSummary = {
+      ...DATASET,
+      tracks: [
+        DATASET.tracks[0],
+        { id: 'track-2', name: 'Track 02', frame_count: 40 },
+      ],
+    }
+    renderPanel({
+      selectedDataset,
+      selectedTrack: 'track-1',
+      visibleTrackIds: new Set(['track-1']),
+      onTrackChange,
+      onTrackVisibilityChange,
+      onShowAllTracks,
+    })
+
+    const selectedTrackButton = screen.getByText('Track 01').closest('button')
+    const hiddenTrackButton = screen.getByText('Track 02').closest('button')
+    expect(selectedTrackButton).toHaveAttribute('aria-current', 'true')
+    expect(hiddenTrackButton?.closest('.track-row')).toHaveClass('track-hidden')
+
+    fireEvent.click(hiddenTrackButton as HTMLButtonElement)
+    expect(onTrackChange).toHaveBeenCalledWith('track-2')
+    expect(onTrackVisibilityChange).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Track 02 트랙 표시' }))
+    expect(onTrackVisibilityChange).toHaveBeenCalledWith('track-2', true)
+    expect(onTrackChange).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Track 01 트랙 숨기기' }))
+    expect(onTrackVisibilityChange).toHaveBeenLastCalledWith('track-1', false)
+
+    fireEvent.click(screen.getByRole('button', { name: '전체 트랙 표시' }))
+    expect(onShowAllTracks).toHaveBeenCalledOnce()
+
+    fireEvent.click(screen.getByText('전체 구간').closest('button') as HTMLButtonElement)
+    expect(onTrackChange).toHaveBeenLastCalledWith('')
+  })
 })
