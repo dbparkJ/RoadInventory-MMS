@@ -6,5 +6,8 @@ the server must expose locations outside the project data directory.
 """
 
 from .app import WebAppConfig, create_app
+from .panorama_fastpath import install_panorama_fastpath
+
+install_panorama_fastpath()
 
 __all__ = ["WebAppConfig", "create_app"]
