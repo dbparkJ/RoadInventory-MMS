@@ -30,6 +30,14 @@ function hitIndices(intersections: THREE.Intersection[]): number[] {
     .sort((left, right) => left - right)
 }
 
+function deterministicRandom(seed: number): () => number {
+  let state = seed >>> 0
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    return state / 0x1_0000_0000
+  }
+}
+
 describe('accelerated point raycast', () => {
   it('returns the same point indices as the native Three.js raycast', () => {
     const points = denseGrid()
@@ -109,5 +117,52 @@ describe('accelerated point raycast', () => {
 
     expect(first?.buildCount).toBe(1)
     expect(second?.buildCount).toBe(2)
+  })
+
+  it('matches native hits across transforms, draw ranges, and varied rays', () => {
+    const random = deterministicRandom(0x5eed1234)
+    const pointCount = 60_000
+    const positions = new Float32Array(pointCount * 3)
+    for (let index = 0; index < pointCount; index += 1) {
+      positions[index * 3] = (random() - 0.5) * 40
+      positions[index * 3 + 1] = (random() - 0.5) * 24
+      positions[index * 3 + 2] = (random() - 0.5) * 8
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    geometry.setDrawRange(137, pointCount - 911)
+    const points = new THREE.Points(geometry, new THREE.PointsMaterial())
+    points.position.set(13, -7, 4)
+    points.rotation.set(0.31, -0.23, 0.47)
+    points.scale.set(1.3, 0.85, 1.1)
+    points.updateMatrixWorld(true)
+
+    for (let iteration = 0; iteration < 40; iteration += 1) {
+      const target = new THREE.Vector3(
+        (random() - 0.5) * 30,
+        (random() - 0.5) * 18,
+        (random() - 0.5) * 6,
+      ).applyMatrix4(points.matrixWorld)
+      const origin = target.clone().add(new THREE.Vector3(
+        (random() - 0.5) * 18,
+        (random() - 0.5) * 18,
+        12 + random() * 20,
+      ))
+      const raycaster = new THREE.Raycaster(
+        origin,
+        target.clone().sub(origin).normalize(),
+        0.2,
+        80,
+      )
+      raycaster.params.Points = { threshold: 0.08 + random() * 0.35 }
+      const nativeIntersections: THREE.Intersection[] = []
+      THREE.Points.prototype.raycast.call(points, raycaster, nativeIntersections)
+      const acceleratedIntersections: THREE.Intersection[] = []
+      acceleratedPointsRaycast.call(points, raycaster, acceleratedIntersections)
+
+      expect(hitIndices(acceleratedIntersections), `ray ${iteration}`).toEqual(
+        hitIndices(nativeIntersections),
+      )
+    }
   })
 })
