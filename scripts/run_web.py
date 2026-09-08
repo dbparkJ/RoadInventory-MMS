@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-run-worker", action="store_true")
     parser.add_argument("--reload", action="store_true")
     parser.add_argument(
+        "--build-mode", choices=("development", "production"),
+        default=os.environ.get("MMS_WEB_BUILD_MODE", "development"),
+        help="Development warns about unverified UI builds; production refuses startup.",
+    )
+    parser.add_argument("--static-dir", type=Path, help="Serve and verify this UI release directory.")
+    parser.add_argument(
         "--allow-remote-bind",
         action="store_true",
         help=(
@@ -106,6 +112,8 @@ def main() -> None:
         enable_run_worker=not args.no_run_worker,
         auth_username=args.auth_username,
         auth_password=auth_password,
+        build_mode=args.build_mode,
+        static_dir=args.static_dir,
     )
     app = create_app(config)
     try:

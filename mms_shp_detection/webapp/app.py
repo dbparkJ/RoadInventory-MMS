@@ -8,6 +8,7 @@ import math
 import os
 import secrets
 import weakref
+import warnings
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
+from ..build_provenance import enforce_build_policy, inspect_build
 from .datasets import public_dataset, utc_now
 from .datasets import router as datasets_router
 from .detections import router as detections_router
@@ -144,10 +146,13 @@ class WebAppConfig:
     enable_active_learning_export: bool = True
     enable_run_worker: bool = True
     static_dir: Path | None = None
+    build_mode: str = "development"
     auth_username: str | None = None
     auth_password: str | None = None
 
     def __post_init__(self) -> None:
+        if self.build_mode not in {"development", "production"}:
+            raise ValueError("build_mode must be development or production")
         self.project_root = Path(self.project_root).expanduser().resolve(strict=True)
         self.state_dir = (
             Path(self.state_dir).expanduser().resolve(strict=False)
@@ -509,6 +514,10 @@ def create_app(
             enable_run_worker=True if start_runner is None else bool(start_runner),
         )
 
+    build_info = inspect_build(config.project_root, config.static_dir, api_version=API_VERSION)
+    build_warning = enforce_build_policy(build_info, config.build_mode)
+    if build_warning:
+        warnings.warn(build_warning, RuntimeWarning, stacklevel=2)
     config.state_dir.mkdir(parents=True, exist_ok=True)
     roots = _make_storage_roots(config)
     writable_roots = [root for root in roots if root.writable]
@@ -605,6 +614,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.config = config
+    app.state.build_info = {"mode": config.build_mode, **build_info}
     app.state.storage_roots = roots
     app.state.storage_roots_by_id = {root.id: root for root in roots}
     app.state.upload_root = writable_roots[0]
@@ -673,6 +683,11 @@ def create_app(
     app.include_router(runs_router)
     app.include_router(surveys_router)
 
+    @app.get("/api/build", tags=["system"])
+    async def build_metadata(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return app.state.build_info
+
     @app.get("/api/health", tags=["system"])
     async def health() -> dict[str, Any]:
         return {
@@ -719,6 +734,7 @@ def create_app(
         return {
             "api_version": API_VERSION,
             "server_name": config.server_name,
+            "build": app.state.build_info,
             "map": {
                 "provider": "vworld",
                 "engine": "webgl",
