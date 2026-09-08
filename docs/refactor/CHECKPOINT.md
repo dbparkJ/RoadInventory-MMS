@@ -1,53 +1,56 @@
-# RoadInventory-MMS 개선 체크포인트
+﻿# RoadInventory-MMS 개선 체크포인트
 
-- 기록: 2026-09-08 09:35, Asia/Seoul.
-- 브랜치: `refactor/roadinventory-p0-reliability`.
-- 통합 기준 SHA: `d3d7d9af07518282afcb332df100724c1b04de9d`.
-- 구현/테스트 HEAD: `392c3438898d102e5b5d66b98458d0ca79ab119b`, 배포파일 commit `406862c` (이 기록은 이후 문서 전용 커밋).
-- 현재: A0 및 P0 코드/패키지 구현 완료, 실제 MMS/브라우저 gate 차단. 전체 구조 개선 완료가 아님.
-- 작업 트리: 코드·build는 커밋/푸시됨. 이 체크포인트와 연결된 상태 문서만 갱신 중이며 종료 시 선택 커밋/푸시 후 clean 여부를 확인한다.
-- 사용자 변경: 최초 명세 문서는 사전 통합에서 커밋 완료. 원본 data/models/운영 상태 및 별도 worktree는 수정 금지.
+- 기록: 2026-09-08 11:12, Asia/Seoul.
+- 작업 브랜치: `refactor/roadinventory-incremental`.
+- 통합 source HEAD: `f3b1797` (후속 기록/빌드 commit은 `git log -5 --oneline`으로 확인).
+- 기준: `main@d3d7d9af07518282afcb332df100724c1b04de9d`.
+- 판정: **부분 구현 및 자동 검증 완료, 실제 MMS/브라우저·GPU 장애/성능 gate 미완료**. 전체 구조 개선 완료가 아니다.
+- 현재: 독립 변경 통합, 배포 파일·Gitless package·HTTP·CI 최종 확인. 결과는 VALIDATION의 통합 검증 절에 기록한다.
+- working tree: 구현과 개별 branch 빌드는 commit/push 완료. 이 문서와 통합 build 정리 후 최종 clean/push 여부를 확인한다.
+- 사용자 변경: 최초 명세는 사전 통합으로 보존. 원본 data/models/운영 상태와 기존 사용자 별도 worktree는 수정하지 않는다.
 
 ## 완료 및 근거
 
-| 작업 | 상태/증거 | commit |
+| 작업 | 변경과 검증 범위 | branch head / PR |
 |---|---|---|
-| 사전 정리 | [PR #3](https://github.com/dbparkJ/RoadInventory-MMS/pull/3) main 병합 및 로컬 main 동기화; 기존 브랜치 보존 | d3d7d9a |
-| A0 | 기준선/보호 계약/테스트 실패 구분 | 4434120 |
-| P0-1 | build source/backend/asset 검증, 개발 경고·운영 gate, Node-free 설치, Gitless package/API smoke 통과; 실제 browser 미검증 | 9c9b4c4, 406862c |
-| P0-2 | PASSED: Windows/Linux CPU·frontend·build·probes·package 4 job 모두 success | 4093ea0, b1eaa64, 392c343 |
-| P0-3a | 합성 frame/PointZ/DBF/CRS/관계 비교·false-pass 방어 20개 통과 | 371776b |
-| P0-4 | 명시 input/output 오류, 원래 예외 보존, 현재/비활성 기능 체크리스트 분리 | 4529c29 |
+| 사전 정리 | 기존 브랜치 통합 후 GitHub/local main 동기화, 기존 브랜치 보존 | `d3d7d9a`, [merged #3](https://github.com/dbparkJ/RoadInventory-MMS/pull/3) |
+| A0/P0 | source/UI/backend provenance, production gate, Node-free 배포, 4-job CI, 합성 비교, 오류 경계 | `bc5cef6`, [draft #4](https://github.com/dbparkJ/RoadInventory-MMS/pull/4) |
+| P1-1 | 영속 intent·실제 OS identity, private 실행 승인, Windows Job, 재시작·취소·PID 재사용 보호, 대기 사유 안내 | `5631241`, [draft #7](https://github.com/dbparkJ/RoadInventory-MMS/pull/7) |
+| P1-3 | offline evidence, 과거 성공 산출물 bytes 보관, SQLite backup/관계 검사, 별도 경로 restore, 고유 임시 파일·원래 오류 보존 | `9af0ca0`, [draft #8](https://github.com/dbparkJ/RoadInventory-MMS/pull/8) |
+| P2-2 | 동일 최적화 본문을 명시 import로 연결, codec/EXIF/캐시/import 계약 및 hash·시간 측정 | `75210ce`, [draft #6](https://github.com/dbparkJ/RoadInventory-MMS/pull/6) |
+| P3-1 | 등록 경로 auth, 교차 Origin 쓰기 거부, 인증된 media/static private cache, Vite Host 보존 | `fc40b89`, [draft #5](https://github.com/dbparkJ/RoadInventory-MMS/pull/5) |
 
-로컬 전체 Python **560 passed / 7 skipped**, frontend **398 passed / 39 files**. build·source/asset verify·Gitless archive·실제 HTTP production smoke 통과. skip/초기 실패/원격 상태는 [VALIDATION.md](VALIDATION.md)에 명령·로그와 함께 기록했다. 기능 검수 flag, 모델/추론 설정, 계산 알고리즘은 유지했다.
+통합 Python **615 passed / 7 skipped**, 최종 frontend **400 passed / 39 files**. 실제 소유 subprocess, 합성 PointZ/한글 DBF/관계/outbox 복원, auth 경계, 실제 Vite→backend HTTP도 검증했다. [VALIDATION.md](VALIDATION.md)에 명령·로그·원격 결과를 구분한다. 로컬 skip은 Windows symlink 권한 4개와 POSIX launcher 3개다. hosted Linux/Windows가 해당 OS 경로를 검증한다.
 
-최종 코드의 [GitHub CI 34173471638](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173471638)은 전체 success. Python Ubuntu **565 passed / 2 skipped**, Windows **564 passed / 3 skipped**, frontend 양쪽 **398 passed**다. 모든 code/build/test 변경을 검증했으며 이 체크포인트 이후 문서 전용 커밋은 runtime source fingerprint를 바꾸지 않는다.
+각 PR은 P0 기반의 독립 변경이다. 통합에서는 package 문서 allowlist를 합쳤으며 build metadata 충돌은 통합 재빌드로 해결한다. 수치 계산·모델·추론 설정·SHP 계약과 review flag는 유지한다.
 
-검증된 로컬 archive는 `.cache/release/roadinventory-mms-p0-371776b.zip`이다. 이 파일은 Git에 넣지 않았으며 원본 데이터/모델/운영 DB가 포함되지 않는다. 실제 Git archive `406862c`의 source/assets도 verified다.
+## 미검증·차단
 
-## 차단/다음 작업
+| 작업 | 부족한 조건 | 검증된 범위 / 재개 |
+|---|---|---|
+| P0-3b/P1-2/P1-4 | 사용자가 검토된 실제 golden 및 XY·Z tolerance 없음 확인 | 합성 비교 20개·CUDA smoke는 실제 동등성 아님. fixture/profile 확정 후 --require-real; 계산 경로 전환/retry 금지 |
+| P0-1/P2-1 | Browser 연결 discovery 재확인 `[]` | HTTP/jsdom은 실제 WebGL·popup·단축키 증거가 아님. 연결 후 아래 첫 작업 실행 |
+| P1-1 | 실제 GPU/native-hang 복구 및 브라우저 안내 검증 없음 | Windows/Linux CPU subprocess·큐 차단 검증. 불명확한 owner 차단 자동 해제 금지 |
+| P2-2 | 실제 영상/점 선택/browser·안정된 성능 환경 | 992회 source/output bytes 동일. 후보 A 진단 상한 6/16 초과, B 0/16. 성능 통과 선언하지 않음 |
+| P2-3 | 실제 데이터/UI gate 없음 | REVIEW_WORKSPACE_UI_ENABLED=false 유지 |
+| P3-1/R0 | 실제 proxy/TLS/browser/운영 적용 gate 없음 | 서버 계약·개발 proxy HTTP만 통과. 운영 서비스/인증/방화벽/DB 전환 미실행 |
+| P3-2 | 다중 작업자 요구·검증·승인 없음 | 의도적 보류, ASGI 단일 worker 유지 |
 
-| 작업 | 부족한 조건 | 이미 한 검증 | 활성화 금지/재개 |
-|---|---|---|---|
-| P0-3b / P1-2 | 사용자가 검토된 실제 golden/XY·Z tolerance 없음 확인 | GPU smoke 및 합성 비교기 테스트 | 실제 동등성 주장/계산 경로 전환 금지. 대표 fixture와 profile 확정 후 --require-real |
-| P0-1 browser / P2 UI | Browser runtime에서 연결 browser 없음, discovery=[] | 실제 HTTP index/assets/build metadata, jsdom | 실제 화면·popup workflow signoff 아님. 연결 browser에서 체크리스트 실행 |
-| P2-3 | 실제 데이터·browser UI gate 미충족 | 비활성 UI/서버 계약 테스트 유지 | REVIEW_WORKSPACE_UI_ENABLED=false 유지 |
-| R0 운영 | 운영 적용 승인·실제 기능별 gate 없음 | 별도 package/테스트 상태 디렉터리 smoke | 운영 service/DB/release 전환 실행하지 않음 |
+## 다음 하나의 작업
 
-## 다음 하나의 개발 작업
+**연결된 실제 브라우저에서 P0-1 로드 버전 및 P2-1 편집 workflow 기준선을 검증한다.** `webui/src/components/DetachablePanel.tsx`, `OverlayContext.tsx`, `ManualObjectContext.tsx`와 기존 검수 체크리스트의 활성 기능 범위를 먼저 확인한다.
 
-P1-1의 첫 변경 단위: `webapp/runs.py`의 `RunManager._execute`, `recover_after_restart`, `_terminate`와 `tests/test_webapp_run_safety.py`의 restart/cancel 계약을 읽고, **재시작 후 살아 있는 child와 PID 재사용을 구별하는 소유권 증거**의 재현 테스트부터 작성한다. 아직 이 인터페이스나 DB migration을 구현했다고 간주하지 않는다.
-
-```text
+```powershell
 git status --short --branch
 git fetch origin
-python -m pytest -q tests/test_webapp_run_safety.py tests/test_execution_architecture.py
+.venv/Scripts/python.exe scripts/build_web.py verify
+npm --prefix webui test -- --maxWorkers=2
 ```
 
-프로젝트 interpreter를 사용하고 P0 source gate 상태를 먼저 확인한다. 다음 변경도 별도 기능 브랜치/작은 commit으로 분리한다. 성공 조건은 유효한 durable success를 보존하면서, identity가 불명확한 PID를 종료하지 않고 동일 GPU lane의 중복 시작을 차단하는 Windows/Linux subprocess 계약이다. P1-3 보관/복원, P2 UI/성능, P3 운영 경계는 [WORK_ITEMS.md](WORK_ITEMS.md)에 별도 TODO로 남겼다.
+브라우저 연결 후 별도 검증 storage/state와 `--no-run-worker --build-mode production`으로 서버를 연다. 운영 root를 사용하지 않는다. 실제 API/build ID·로드 asset, popup 차단/닫기/복귀, 빠른 frame 전환과 늦은 proposal, 입력 중 B/N/M, 저장 응답 유실·충돌·undo/redo를 확인한다. 소유권 안내는 합성 blocked run에서 확인한다. 생성한 프로세스의 OS 소유권을 확보하고 종료/임시 경로 정리까지 검증한다. 성공 조건은 main/popup/fallback의 선택·draft·오류 보존이며 실제 화면을 열지 못하면 BLOCKED_VALIDATION을 유지한다.
 
-## 원격/운영
+## 원격/운영과 롤백
 
-새 변경은 [draft PR #4](https://github.com/dbparkJ/RoadInventory-MMS/pull/4)에 push했고 main에 병합하지 않았다. 사전 PR #3 통합만 이번 사용자 명시 요청에 따른 예외다. force push/브랜치 삭제/운영 서비스·DB·원본 변경 없음. HTTP smoke의 직접 생성 child는 종료했다.
+PR #4~#8은 draft이며 새 변경을 main에 병합하지 않았다. 사전 PR #3만 사용자 명시 요청으로 병합했다. 통합 branch는 별도 push checkpoint로 보존하며 거대한 통합 PR은 만들지 않는다. force push/브랜치 삭제/운영 서비스 재시작/원본 변경 없음.
 
-롤백은 검증된 이전 release 전환 또는 해당 코드 commit revert이며 reset/DB 삭제를 사용하지 않는다. 이번 변경에는 DB schema migration이 없다. 이전 metadata 없는 설치로 돌아가면 development 호환 경고 상태와 production 시작 gate의 이행 정책을 다시 확인한다.
+P1-1은 registry에 additive `ownership_json`/`ownership_blocked`를 추가한다. 과거 코드로 되돌리려면 모든 실행 종료를 확인한 maintenance 상태에서 검증된 이전 release를 사용한다. 새 컬럼/보존본 삭제나 DB 초기화로 되돌리지 않는다. 실제 운영 보존본 생성·live restore는 수행하지 않았다. 개별 변경은 해당 commit revert 후 같은 source/UI 재빌드로 되돌릴 수 있다.

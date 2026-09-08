@@ -70,7 +70,7 @@ Vite 개발 proxy는 browser-facing Host를 보존하도록 수정했다. API ta
 401·403 보안 헤더와 cache 정책을 검증한다. 기존 health/path/upload/편집 테스트도 실행한다.
 실제 브라우저는 연결 불가여서 실행하지 못했고 MMS 정확도와 무관한 변경이다.
 
-2026-09-08 로컬 Windows/Python 3.12.10에서 신규 경계 테스트 18개가 통과했다.
+2026-09-08 로컬 Windows/Python 3.12.10에서 신규 경계 테스트 19개가 통과했다.
 전체 회귀 결과와 hosted OS 결과는 PR 및 최종 체크포인트에 기록한다.
 
 DB migration과 새 runtime 의존성은 없다. 코드 revert 및 해당 소스에 맞는 UI 재빌드로

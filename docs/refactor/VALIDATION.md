@@ -78,3 +78,28 @@ CPU 환경 smoke는 두 OS에서 실제 CPU wheel로 실행했고, 실패 전파
 - REAL_MMS_PASSED: **아님**. 사용자가 대표 fixture/golden/tolerance profile이 없다고 확인했으며 실제 검증 미완료 기록을 지시했다.
 - BROWSER_PASSED: **아님**. Browser runtime 설정 후 `No browser is available`, 지원되는 discovery 결과 `[]` 확인. 실제 UI 렌더/분리 창/작업 흐름 검증은 차단. HTTP 응답 성공을 브라우저 성공으로 표시하지 않는다.
 - OPERATION_APPROVED: **아님**. 사전 GitHub 브랜치 통합 승인과 운영 적용 승인을 혼동하지 않는다.
+
+## P1/P2/P3 독립 변경 및 통합 검증
+
+2026-09-08, Windows/Python 3.12.10/Node 22.17.0. 모든 실제 HTTP·DB·프로세스 테스트는 별도 합성 state/storage를 사용했다. 운영 데이터 백업/복원이나 실제 MMS 비교는 실행하지 않았다.
+
+| 범위 | 실제 검증 결과 | 근거 |
+|---|---|---|
+| P1 소유권 | 초기 전체 Python 567 passed / 7 skipped. 실제 OS child/grandchild·부모 종료·private 승인·PID 재사용 및 Windows exit 259 테스트 6 passed. 후속 UI 두 파일 12 passed | tests/test_process_ownership.py, test_webapp_run_safety.py, P1_OWNERSHIP.md; 최종 통합 suite 포함 |
+| P1 보존/복원 | 초기 전체 Python 581 passed / 7 skipped. 최종 preservation 22개; provenance/package와 합쳐 48 passed | tests/test_preservation.py, P1_PRESERVATION.md; 실제 운영 DB 복원 아님 |
+| P2 preview | Python 관련 48 passed / 1 local symlink skip; frontend 관련 103 passed. 992회 합성 cold/warm 비교에서 case별 source/output SHA 동일 | P2_PREVIEW.md, P2_PREVIEW_BENCHMARK.json. 성능은 후보 A 6/16 초과, B 0/16이므로 미통과 |
+| P3 경계 | 최종 tests/test_webapp_auth_boundaries.py 19 passed. 실제 Vite proxy→backend 같은 Origin upload 201, 외부 Origin 403 | p3_proxy_smoke.py, p3-proxy-smoke.log; no-run-worker. 합성 프로세스 Job 소유 후 종료·임시 경로 정리까지 성공 |
+| 통합 Python | `.venv/Scripts/python.exe -m pytest -q --junitxml=.cache/refactor-validation/incremental-python.xml` → **615 passed / 7 skipped**, exit 0, 178.66초 | incremental-python.log/xml. 합친 runtime source에서 실행, 이후 UI 안내/문서/빌드만 변경 |
+| 통합 frontend | `npm --prefix webui test -- --maxWorkers=2` → **400 passed / 39 files**, exit 0, 49.89초 | incremental-frontend-final.log. 최종 소유권 안내 포함 |
+
+통합 Python의 142 warnings에는 통합 재빌드 전 의도된 development source/asset 불일치 경고가 포함된다. production gate를 완화하지 않았다. 최종 통합 build/verify 및 원격 clean build 결과를 아래에 별도 기록한다. 로컬 7 skips는 symlink 생성 권한 4개와 POSIX launcher 3개다. hosted Windows에서는 symlink 검사가 실행된다.
+
+최종 개별 코드·asset의 push 및 PR CI 모두 success:
+
+- P0 `bc5cef6`: [push 34173801258](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173801258), [PR 34173803932](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173803932).
+- P3 `fc40b89`: [push 34178066755](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178066755), [PR 34178069397](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178069397).
+- P2 `75210ce`: [push 34177973925](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34177973925), [PR 34177978167](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34177978167).
+- P1 보존 `9af0ca0`: [push 34178161530](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178161530), [PR 34178167114](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178167114).
+- P1 소유권의 UI 추가 전 `cbf41a9`: [push 34178158169](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178158169), [PR 34178164283](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178164283). UI 추가 `5631241`은 후속 원격 실행 결과를 확인한다.
+
+소유권 registry additive migration과 preservation의 미해결 ownership 거부는 통합 suite에서 함께 검증했다. Linux native/GPU hang 즉시 종료, 다중 host exactly-once, 실제 브라우저, 실제 MMS 정확도는 이 CI가 증명하지 않는다. Browser discovery는 재개 후에도 `[]`였다.

@@ -67,4 +67,4 @@ python scripts/benchmark_panorama_preview.py --label baseline-a --samples 31 --o
 # 같은 조건으로 기준 B 실행 후 상한을 고정하고, 후보 checkout에서 후보 A/B를 실행한다.
 ```
 
-실제 MMS golden 및 승인된 비교 자료가 없고 Browser 연결도 없으므로, 실제 equirectangular 영상의 시각 방향·정렬, 실제 점 선택 결과, browser cold/warm 지연·메모리·취소 UX와 운영 rollout은 미검증이다. 후속 검증에서는 동일 실제 입력과 승인된 환경·허용 범위를 사용해야 한다. 이 작업은 dist를 재빌드하거나 운영 배포하지 않았다.
+실제 MMS golden 및 승인된 비교 자료가 없고 Browser 연결도 없으므로, 실제 equirectangular 영상의 시각 방향·정렬, 실제 점 선택 결과, browser cold/warm 지연·메모리·취소 UX와 운영 rollout은 미검증이다. 후속 검증에서는 동일 실제 입력과 승인된 환경·허용 범위를 사용해야 한다. 후속 commit에서 dist를 재빌드했고 Windows/Linux CI와 Gitless package가 통과했다. 운영 배포는 실행하지 않았다.
