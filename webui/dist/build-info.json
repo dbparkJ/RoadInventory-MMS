@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "build_id": "259dc32678ec4e77aa59ba565f304f3f",
+  "build_id": "65dc51bd5bdd469d81b39bcd8d3dbaff",
   "source_policy": "mms-source-v1-text-lf",
-  "source_commit": "fa1fa547862126bcd25945d64a3beb5b470efd9f",
+  "source_commit": "063a8fde54f2edeab441cf79aaa4293531a51861",
   "working_tree_dirty": false,
-  "source_fingerprint": "9032a4a04fe193da5becd848e3e767a82d935d94f8084366a55411687b2a16f5",
+  "source_fingerprint": "eb433f0b8e2eb15bec8edb3c0bf251f29fb4a7272f033b9b75cc869b26e5539e",
   "source_files": {
     "mms_shp_detection/__init__.py": "fccc89643d9c38f9068b1516886d6c45972210968cc94d059a6cde5311682ff1",
     "mms_shp_detection/alignment.py": "28872c8f69a1acb2efb48810a3bd3496868a694fb301921abc35e4790a5e4fce",
@@ -48,7 +48,7 @@
     "mms_shp_detection/review_candidates.py": "624a7daf76611677dbdb24fe7b3689717f5ff2352e3c67d8697f4515e115a32c",
     "mms_shp_detection/shp_writer.py": "6902e2065a3e2c97ce662cce744e1ba37002086d1d5a6907fb79c8ec4e42e1ea",
     "mms_shp_detection/webapp/__init__.py": "9ef6d06ebecd0c5a9f138fa685970b4c38e6a1e583e3aa27e6e3e3d7a0c4ebd8",
-    "mms_shp_detection/webapp/app.py": "c2ab1e451e04d0d4a6afc0a125e8cf92915a6e25629e9caa4134fe2338459146",
+    "mms_shp_detection/webapp/app.py": "08ac50a292962c3065f9a7062ec2d7702828d4d8438e443f384d51fbfc01544f",
     "mms_shp_detection/webapp/datasets.py": "a8f0c3b071d171b70bd1741150f253911a7b2011e27bea60477e4ab3d0498887",
     "mms_shp_detection/webapp/detections.py": "2808bb43789409e7b7f40d3d04f0a53af241c66d43860f59c062ddafdb01ddc7",
     "mms_shp_detection/webapp/manual_objects.py": "550487a14ffa0cf37e0ab12b65270290d0c30cc57e7e183ca19f932d7702d94d",
@@ -148,7 +148,7 @@
   },
   "frontend_lock_hash": "af4930a2bc70a67fc19ad875fec5d151ac2de2621888622be502ce40064a7668",
   "api_contract_version": "1",
-  "built_at": "2026-09-08T00:46:17.315367+00:00",
+  "built_at": "2026-09-08T01:37:34.591987+00:00",
   "assets_manifest_hash": "024fe839e617dfe4397fc0bc0e8c23d79431129ce64a323a4d5195713ca5fe4e",
   "assets": {
     "index.html": "5566d167f9a475b1910ff64d279da89ee4d7bbd6480ca7ec15d4cf9efa1bc2c7",
