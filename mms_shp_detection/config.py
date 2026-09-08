@@ -313,12 +313,15 @@ def _flatten_config(
             raise ConfigError("YAML configuration keys must be non-empty strings.")
         key = raw_key.strip().replace("-", "_")
         path = (*prefix, key)
-        # Model filters are intentionally an opaque mapping.  Their nested
-        # leaves reuse normal pipeline option names (for example ``conf`` and
-        # ``pole_max_drop_m``) once per model, so flattening them here would
-        # incorrectly report duplicate global options.  The pipeline validates
-        # and applies this mapping after a concrete model has been selected.
-        if isinstance(item, dict) and path != ("model_filters",):
+        # Model filters and object-crop settings are intentionally opaque
+        # mappings.  Their nested leaves either reuse normal pipeline option
+        # names once per model or belong to their own versioned contract, so
+        # flattening them here would report false duplicate/unknown options.
+        # Their argparse type functions validate the complete mapping.
+        if isinstance(item, dict) and path not in {
+            ("model_filters",),
+            ("object_crops",),
+        }:
             leaves.extend(_flatten_config(item, prefix=path))
         else:
             leaves.append((path, item))

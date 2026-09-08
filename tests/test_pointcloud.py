@@ -58,6 +58,60 @@ def _write_las(
     las.write(path)
 
 
+def _write_raw_attribute_las(
+    path: Path,
+    *,
+    point_format: int,
+    xyz: np.ndarray,
+    rgb16: np.ndarray | None = None,
+    scan_angle: np.ndarray | None = None,
+    scan_angle_rank: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Write a compact fixture whose raw fields are intentionally nontrivial."""
+
+    version = "1.4" if point_format >= 6 else "1.2"
+    header = laspy.LasHeader(point_format=point_format, version=version)
+    header.scales = np.asarray([0.001, 0.001, 0.001])
+    header.offsets = np.asarray([300_000.0, 4_100_000.0, 100.0])
+    header.global_encoding.gps_time_type = 1
+    las = laspy.LasData(header)
+    count = len(xyz)
+    las.x = xyz[:, 0]
+    las.y = xyz[:, 1]
+    las.z = xyz[:, 2]
+    values = {
+        "intensity": np.asarray([0, 65_535, 12_345, 54_321][:count], dtype=np.uint16),
+        "classification": np.asarray(
+            ([1, 84, 20, 255] if point_format >= 6 else [1, 20, 30, 31])[
+                :count
+            ],
+            dtype=np.uint8,
+        ),
+        "gps_time": np.asarray([10.25, 20.5, 30.75, 40.125][:count], dtype=np.float64),
+        "return_number": np.asarray([1, 2, 1, 3][:count], dtype=np.uint8),
+        "number_of_returns": np.asarray([1, 2, 3, 3][:count], dtype=np.uint8),
+        "point_source_id": np.asarray([0, 1, 32_768, 65_535][:count], dtype=np.uint16),
+        "user_data": np.asarray([0, 1, 128, 255][:count], dtype=np.uint8),
+        "edge_of_flight_line": np.asarray([0, 1, 0, 1][:count], dtype=np.uint8),
+        "scan_direction_flag": np.asarray([1, 0, 1, 0][:count], dtype=np.uint8),
+    }
+    for name, value in values.items():
+        setattr(las, name, value)
+    if rgb16 is not None:
+        las.red = rgb16[:, 0]
+        las.green = rgb16[:, 1]
+        las.blue = rgb16[:, 2]
+    if scan_angle is not None:
+        # Assign the underlying PF6+ int16 storage, not a presentation view.
+        las.points.array["scan_angle"] = np.asarray(scan_angle, dtype=np.int16)
+        values["scan_angle"] = np.asarray(scan_angle, dtype=np.int16)
+    if scan_angle_rank is not None:
+        las.scan_angle_rank = np.asarray(scan_angle_rank, dtype=np.int8)
+        values["scan_angle_rank"] = np.asarray(scan_angle_rank, dtype=np.int8)
+    las.write(path)
+    return values
+
+
 class PointCloudLasTests(unittest.TestCase):
     def test_web_catalog_mode_checks_every_discovered_source_for_links(self) -> None:
         with tempfile.TemporaryDirectory() as root_text:
@@ -187,6 +241,123 @@ class PointCloudLasTests(unittest.TestCase):
             self.assertTrue(np.isnan(records["gps_time"][0]))
             np.testing.assert_array_equal(records["gps_time_type"], [-1])
 
+    def test_modern_las_records_preserve_raw_fields_and_source_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "Job_Raw_Track01.las"
+            xyz = np.asarray(
+                [
+                    [300_000.001, 4_100_000.001, 100.001],
+                    [300_000.002, 4_100_000.002, 100.002],
+                    [300_000.003, 4_100_000.003, 100.003],
+                    [300_000.004, 4_100_000.004, 100.004],
+                ]
+            )
+            rgb_raw = np.asarray(
+                [
+                    [1, 258, 65_534],
+                    [257, 32_769, 65_535],
+                    [513, 1_025, 2_049],
+                    [4_095, 16_385, 49_153],
+                ],
+                dtype=np.uint16,
+            )
+            scan_angle = np.asarray(
+                [-32_768, -1_234, 2_345, 32_767], dtype=np.int16
+            )
+            expected = _write_raw_attribute_las(
+                path,
+                point_format=7,
+                xyz=xyz,
+                rgb16=rgb_raw,
+                scan_angle=scan_angle,
+            )
+            catalog = build_pointcloud_catalog(
+                path.parent,
+                path.parent / "catalog.json",
+                source="las",
+            )
+
+            with PointCloudReaderCache() as readers:
+                records = readers.read_block_records(
+                    path,
+                    {"source_type": "las", "start": 1, "count": 2},
+                )
+
+            np.testing.assert_allclose(records["xyz"], xyz[1:3], atol=0.00051)
+            np.testing.assert_array_equal(records["source_index"], [1, 2])
+            self.assertEqual(records["source_index"].dtype, np.dtype(np.int64))
+            np.testing.assert_array_equal(records["rgb_raw"], rgb_raw[1:3])
+            self.assertEqual(records["rgb_raw"].dtype, np.dtype(np.uint16))
+            expected_rgb8 = (
+                (rgb_raw[1:3].astype(np.uint32) + 128) // 257
+            ).astype(np.uint8)
+            np.testing.assert_array_equal(records["rgb"], expected_rgb8)
+            for name, dtype in (
+                ("point_source_id", np.uint16),
+                ("user_data", np.uint8),
+                ("edge_of_flight_line", np.uint8),
+                ("scan_direction_flag", np.uint8),
+            ):
+                np.testing.assert_array_equal(records[name], expected[name][1:3])
+                self.assertEqual(records[name].dtype, np.dtype(dtype))
+            np.testing.assert_array_equal(records["scan_angle"], scan_angle[1:3])
+            self.assertEqual(records["scan_angle"].dtype, np.dtype(np.int16))
+            np.testing.assert_array_equal(records["scan_angle_rank"], [0, 0])
+            self.assertEqual(records["scan_angle_rank"].dtype, np.dtype(np.int8))
+
+            availability = records["field_availability"]
+            self.assertEqual(availability.shape, (2,))
+            self.assertTrue(np.all(availability["rgb_raw"]))
+            self.assertTrue(np.all(availability["scan_angle"]))
+            self.assertFalse(np.any(availability["scan_angle_rank"]))
+            self.assertTrue(np.all(availability["source_index"]))
+            scan_metadata = catalog["files"][0]["record_field_metadata"][
+                "scan_angle"
+            ]
+            self.assertEqual(scan_metadata["source_dimension"], "scan_angle")
+            self.assertEqual(scan_metadata["source_dtype"], "int16")
+            self.assertEqual(scan_metadata["scale_to_degrees"], 0.006)
+
+    def test_legacy_las_keeps_scan_angle_rank_distinct_from_modern_angle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "Job_Raw_Track01.las"
+            xyz = np.asarray(
+                [
+                    [300_000.001, 4_100_000.001, 100.001],
+                    [300_000.002, 4_100_000.002, 100.002],
+                ]
+            )
+            rank = np.asarray([-128, 127], dtype=np.int8)
+            _write_raw_attribute_las(
+                path,
+                point_format=3,
+                xyz=xyz,
+                rgb16=np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.uint16),
+                scan_angle_rank=rank,
+            )
+            catalog = build_pointcloud_catalog(
+                path.parent,
+                path.parent / "catalog.json",
+                source="las",
+            )
+
+            with PointCloudReaderCache() as readers:
+                records = readers.read_block_records(
+                    path,
+                    {"source_type": "las", "start": 0, "count": 2},
+                )
+
+            np.testing.assert_array_equal(records["scan_angle_rank"], rank)
+            np.testing.assert_array_equal(records["scan_angle"], [0, 0])
+            self.assertTrue(np.all(records["field_availability"]["scan_angle_rank"]))
+            self.assertFalse(np.any(records["field_availability"]["scan_angle"]))
+            scan_metadata = catalog["files"][0]["record_field_metadata"][
+                "scan_angle_rank"
+            ]
+            self.assertEqual(scan_metadata["source_dimension"], "scan_angle_rank")
+            self.assertEqual(scan_metadata["source_dtype"], "int8")
+            self.assertEqual(scan_metadata["scale_to_degrees"], 1.0)
+
     def test_include_jobs_filters_before_opening_las_and_changes_cache_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -222,6 +393,179 @@ class PointCloudLasTests(unittest.TestCase):
             self.assertEqual([item["path"] for item in catalog_b["files"]], [str(job_b.resolve())])
             self.assertNotEqual(catalog_a["signature"], catalog_b["signature"])
             self.assertNotEqual(catalog_a["include_job_keys"], catalog_b["include_job_keys"])
+
+    def test_exact_include_scope_excludes_other_track_before_las_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            track01 = root / "Job_20250311_1043_Track01.las"
+            track02 = root / "Job_20250311_1043_Track02.las"
+            xyz = np.asarray([[300_000.0, 4_100_000.0, 100.0]])
+            _write_las(track01, xyz)
+            # The excluded source is intentionally invalid.  Catalog success
+            # proves exact scope filtering happens before laspy opens Track02.
+            track02.write_bytes(b"excluded invalid Track02")
+            cache_path = root / "catalog.json"
+
+            catalog01 = build_pointcloud_catalog(
+                root,
+                cache_path,
+                source="las",
+                include_scope=[
+                    {
+                        "job_id": "Job_20250311_1043",
+                        "tracks": ["Track01"],
+                    }
+                ],
+            )
+
+            self.assertEqual(
+                [item["path"] for item in catalog01["files"]],
+                [str(track01.resolve())],
+            )
+            self.assertEqual(
+                catalog01["include_scope"],
+                {
+                    "strict": True,
+                    "jobs": [
+                        {
+                            "job_id": "job_20250311_1043",
+                            "tracks": ["track01"],
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(
+                [item["reason"] for item in catalog01["scope_filtered_files"]],
+                ["job_track_not_included"],
+            )
+
+            alias_catalog = build_pointcloud_catalog(
+                root,
+                cache_path,
+                source="las",
+                include_scope={
+                    "strict": True,
+                    "jobs": [
+                        {
+                            "job_id": "job_20250311_1043",
+                            "track_ids": ["track01"],
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(alias_catalog["signature"], catalog01["signature"])
+
+            # A different exact pair produces a distinct cache identity.
+            _write_las(track02, xyz + [10.0, 0.0, 0.0])
+            catalog02 = build_pointcloud_catalog(
+                root,
+                cache_path,
+                source="las",
+                include_scope=[
+                    {
+                        "job_id": "Job_20250311_1043",
+                        "track_ids": ["Track02"],
+                    }
+                ],
+            )
+            self.assertEqual(
+                [item["path"] for item in catalog02["files"]],
+                [str(track02.resolve())],
+            )
+            self.assertNotEqual(catalog01["signature"], catalog02["signature"])
+
+    def test_strict_include_scope_rejects_unknown_las_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            xyz = np.asarray([[300_000.0, 4_100_000.0, 100.0]])
+            _write_las(root / "Job_A_Track01.las", xyz)
+            (root / "unknown.las").write_bytes(b"must not be opened")
+
+            with self.assertRaisesRegex(ValueError, "could not parse exact Job/Track"):
+                build_pointcloud_catalog(
+                    root,
+                    root / "catalog.json",
+                    source="las",
+                    include_scope={
+                        "strict": True,
+                        "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+                    },
+                )
+
+    def test_non_strict_empty_include_scope_preserves_legacy_allow_all(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            xyz = np.asarray([[300_000.0, 4_100_000.0, 100.0]])
+            track01 = root / "Job_A_Track01.las"
+            track02 = root / "Job_A_Track02.las"
+            _write_las(track01, xyz)
+            _write_las(track02, xyz + [1.0, 0.0, 0.0])
+
+            catalog = build_pointcloud_catalog(
+                root,
+                root / "catalog.json",
+                source="las",
+                include_scope={"strict": False, "jobs": []},
+            )
+
+            self.assertEqual(
+                {item["path"] for item in catalog["files"]},
+                {str(track01.resolve()), str(track02.resolve())},
+            )
+            self.assertEqual(
+                catalog["include_scope"], {"strict": False, "jobs": []}
+            )
+
+    def test_strict_include_scope_rejects_pcdb_before_indexing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pcdb_path = root / "legacy.pcdb"
+            # Invalid bytes make an accidental decoder/index open observable.
+            pcdb_path.write_bytes(b"must not be opened")
+            las_path = root / "Job_A_Track01.las"
+            _write_las(
+                las_path,
+                np.asarray([[300_000.0, 4_100_000.0, 100.0]]),
+            )
+            scope = {
+                "strict": True,
+                "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+            }
+
+            for source in ("pcdb", "auto"):
+                with (
+                    self.subTest(source=source),
+                    mock.patch(
+                        "mms_shp_detection.pointcloud._index_single_pcdb"
+                    ) as pcdb_index,
+                    mock.patch(
+                        "mms_shp_detection.pointcloud._index_single_las"
+                    ) as las_index,
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "PCDB source without exact Job/Track identity",
+                    ),
+                ):
+                    build_pointcloud_catalog(
+                        root,
+                        root / f"{source}.json",
+                        source=source,
+                        include_scope=scope,
+                    )
+                pcdb_index.assert_not_called()
+                las_index.assert_not_called()
+
+            # A LAS-only request does not admit or inspect the unrelated PCDB.
+            las_catalog = build_pointcloud_catalog(
+                root,
+                root / "las.json",
+                source="las",
+                include_scope=scope,
+            )
+            self.assertEqual(
+                [item["path"] for item in las_catalog["files"]],
+                [str(las_path.resolve())],
+            )
 
     def test_standard_delivery_las_uses_track_identity_scope_and_nearest_prj(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -321,6 +665,30 @@ class PointCloudLasTests(unittest.TestCase):
                 {item["source_type"] for item in catalog["files"]},
                 {"pcdb", "las"},
             )
+            pcdb_item = next(
+                item for item in catalog["files"] if item["source_type"] == "pcdb"
+            )
+            self.assertFalse(pcdb_item["provenance_complete"])
+            self.assertFalse(pcdb_item["training"])
+            self.assertFalse(pcdb_item["provenance"]["provenance_complete"])
+            self.assertFalse(pcdb_item["provenance"]["training"])
+            self.assertFalse(catalog["provenance_complete"])
+            self.assertFalse(catalog["training"])
+
+            non_strict_catalog = build_pointcloud_catalog(
+                root,
+                root / "non-strict-catalog.json",
+                source="auto",
+                include_scope={
+                    "strict": False,
+                    "jobs": [{"job_id": "SURV01", "tracks": ["TRACK01"]}],
+                },
+            )
+            self.assertEqual(non_strict_catalog["selected_source_type"], "mixed")
+            self.assertEqual(
+                {item["source_type"] for item in non_strict_catalog["files"]},
+                {"pcdb", "las"},
+            )
 
     def test_catalog_prefers_splits_indexes_chunks_and_reuses_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -354,6 +722,8 @@ class PointCloudLasTests(unittest.TestCase):
             )
 
             self.assertEqual(catalog["selected_source_type"], "las")
+            self.assertTrue(catalog["provenance_complete"])
+            self.assertTrue(catalog["training"])
             self.assertEqual(len(catalog["files"]), 2)
             self.assertEqual(len(catalog["excluded_files"]), 1)
             # pyproj may normalize legacy LOCAL_CS WKT into WKT2 ENGCRS.
@@ -506,9 +876,15 @@ class PointCloudLasTests(unittest.TestCase):
                 actual_xyz, rgb, intensity = readers.read_block_points(
                     path, {"source_type": "las", "start": 0, "count": 1}
                 )
+                records = readers.read_block_records(
+                    path, {"source_type": "las", "start": 0, "count": 1}
+                )
             self.assertEqual(actual_xyz.dtype, np.float64)
             np.testing.assert_array_equal(rgb, [[128, 128, 128]])
             np.testing.assert_array_equal(intensity, [10])
+            np.testing.assert_array_equal(records["rgb_raw"], [[0, 0, 0]])
+            self.assertFalse(records["field_availability"]["rgb_raw"][0])
+            self.assertFalse(records["field_availability"]["rgb"][0])
 
     def test_job_track_match_precedes_bbox_distance(self) -> None:
         catalog = {
@@ -815,10 +1191,19 @@ class PointCloudPcdbPrecisionTests(unittest.TestCase):
 
             with PointCloudReaderCache() as readers:
                 xyz, rgb, intensity = readers.read_block_points(path, "block.bpc")
+                records = readers.read_block_records(path, "block.bpc")
             self.assertEqual(xyz.dtype, np.float64)
             self.assertAlmostEqual(float(xyz[1, 1] - xyz[0, 1]), 0.01, places=6)
             np.testing.assert_array_equal(rgb, [[1, 2, 3], [4, 5, 6]])
             np.testing.assert_array_equal(intensity, [10, 20])
+            np.testing.assert_array_equal(records["source_index"], [-1, -1])
+            np.testing.assert_array_equal(records["rgb_raw"], np.zeros((2, 3)))
+            availability = records["field_availability"]
+            self.assertTrue(np.all(availability["xyz"]))
+            self.assertTrue(np.all(availability["rgb"]))
+            self.assertTrue(np.all(availability["intensity"]))
+            self.assertFalse(np.any(availability["rgb_raw"]))
+            self.assertFalse(np.any(availability["source_index"]))
 
 
 if __name__ == "__main__":

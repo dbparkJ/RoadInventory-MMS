@@ -7,6 +7,39 @@
 # true/false는 따옴표 없이 쓰고, 값이 없는 선택 항목은 null로 둡니다.
 config_version: 1
 
+# Record-preserving object crops are an opt-in, versioned output. This entire
+# mapping is validated as one contract and is not flattened into legacy flags.
+object_crops:
+  enabled: false
+  schema_version: "1.0.0"
+  fail_pipeline_on_error: false
+  source_scope:
+    strict: true
+    jobs: []
+  output:
+    directory_name: object_crops_v1
+    evidence_directory_name: object_crop_evidence
+    write_audit_laz: true
+    write_preview: true
+  selection:
+    point_order: source_file_hash_then_record_index
+    panel_margin_m: [0.5, 1.0, 0.5]
+    pole_radial_margin_m: 0.5
+    base_ground_radius_m: 1.5
+    vertical_bottom_margin_m: 0.3
+    vertical_top_margin_m: 0.5
+    context_margin_m: 0.75
+    max_points: 200000
+  canonicalization:
+    convention: panel_front_plus_y_z_up
+    min_confidence_for_model_input: 0.5
+    min_confidence_for_training: 0.8
+  routing:
+    direct_max_panel_support_offset_m: 0.75
+    keep_unsupported_samples: true
+  rays:
+    mode: "off"
+
 paths:
   # 여러 Leica 프로젝트·표준 납품본·기존 MMS 데이터를 포함하는 상위 폴더입니다.
   # 하위 폴더를 재귀 탐색하므로 개별 Neo 모델 폴더로 바꿀 필요가 없습니다.
