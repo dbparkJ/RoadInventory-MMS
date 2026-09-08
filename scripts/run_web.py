@@ -54,11 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-run-worker", action="store_true")
     parser.add_argument("--reload", action="store_true")
     parser.add_argument(
+        "--build-mode", choices=("development", "production"),
+        default=os.environ.get("MMS_WEB_BUILD_MODE", "development"),
+        help="Development warns about unverified UI builds; production refuses startup.",
+    )
+    parser.add_argument("--static-dir", type=Path, help="Serve and verify this UI release directory.")
+    parser.add_argument(
         "--allow-remote-bind",
         action="store_true",
         help=(
-            "Acknowledge that a non-loopback listener is protected by a firewall "
-            "and an authenticated TLS reverse proxy. The app has no built-in login."
+            "Allow a non-loopback listener after network access is protected; this "
+            "does not configure authentication or TLS. Optional HTTP Basic "
+            "authentication is configured separately."
         ),
     )
     parser.add_argument(
@@ -93,9 +100,10 @@ def main() -> None:
         )
     if not is_loopback_bind(args.host) and not args.allow_remote_bind:
         parser.error(
-            "refusing a non-loopback listener because the app has no built-in "
-            "authentication; keep --host 127.0.0.1 behind an authenticated reverse "
-            "proxy, or pass --allow-remote-bind only after network access is protected"
+            "refusing a non-loopback listener without explicit acknowledgement; "
+            "keep --host 127.0.0.1 behind a protected TLS reverse proxy, or pass "
+            "--allow-remote-bind after configuring access control and TLS. "
+            "Optional HTTP Basic authentication does not itself provide TLS"
         )
     config = WebAppConfig(
         project_root=PROJECT_ROOT,
@@ -106,6 +114,8 @@ def main() -> None:
         enable_run_worker=not args.no_run_worker,
         auth_username=args.auth_username,
         auth_password=auth_password,
+        build_mode=args.build_mode,
+        static_dir=args.static_dir,
     )
     app = create_app(config)
     try:

@@ -640,7 +640,7 @@ class CrsPropagationTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             sign_target = root / "detected_signs.shp"
             pole_target = root / "pole_bottoms.shp"
             sign_stage = root / "detected_signs.ready.shp"
@@ -700,7 +700,7 @@ class CrsPropagationTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             sign_target = root / "detected_signs.shp"
             pole_target = root / "pole_bottoms.shp"
             sign_stage = root / "detected_signs.ready.shp"
@@ -762,7 +762,7 @@ class CrsPropagationTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             sign_target = root / "detected_signs.shp"
             pole_target = root / "pole_bottoms.shp"
             sign_stage = root / "detected_signs.ready.shp"
@@ -818,7 +818,7 @@ class CrsPropagationTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             target = root / "detected_signs.shp"
             stage = root / "detected_signs.ready.shp"
             write_shapefile([record("old_sign", 1.0)], target)

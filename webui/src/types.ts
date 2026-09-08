@@ -225,6 +225,7 @@ export interface RunRecord {
   dataset_name?: string
   status: RunStatus
   canonical_status?: CanonicalRunStatus
+  execution?: { requires_inspection: boolean }
   attempt?: number
   manifest_schema_version?: number
   progress: number

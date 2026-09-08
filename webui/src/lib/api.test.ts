@@ -1,5 +1,137 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, ApiError, errorMessageFromPayload } from './api'
+
+describe('point response body lifetime', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  function delayedBodies() {
+    const bodies: ReadableStreamDefaultController<Uint8Array>[] = []
+    const signals: AbortSignal[] = []
+    const responses: Response[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      const signal = options!.signal!
+      if (signal.aborted) throw signal.reason
+      signals.push(signal)
+      const response = new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodies.push(controller)
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true })
+        },
+      }), { headers: { 'Content-Type': 'application/vnd.mmsp' } })
+      responses.push(response)
+      return response
+    })
+    return { bodies, signals, responses }
+  }
+
+  async function settleBodyRead(responses: Response[]) {
+    await vi.waitFor(() => expect(responses[0]?.body?.locked).toBe(true))
+  }
+
+  function closeBodies(bodies: ReadableStreamDefaultController<Uint8Array>[]) {
+    for (const body of bodies) {
+      try { body.close() } catch { /* An aborted stream is already closed. */ }
+    }
+  }
+
+  it('cancels a point transfer when its frame changes after response headers', async () => {
+    const { bodies, signals, responses } = delayedBodies()
+    const controller = new AbortController()
+    const pending = api.points('dataset', 'frame', 250_000, controller.signal)
+    const outcome = pending.then(() => null, (error: unknown) => error)
+    try {
+      await settleBodyRead(responses)
+      controller.abort()
+      expect(signals[0].aborted).toBe(true)
+      expect(await outcome).toMatchObject({ name: 'AbortError' })
+      expect(fetch).toHaveBeenCalledTimes(1)
+    } finally {
+      closeBodies(bodies)
+      await outcome
+    }
+  })
+
+  it('keeps the point timeout active through stalled bodies and bounds retries', async () => {
+    vi.useFakeTimers()
+    const { bodies, signals, responses } = delayedBodies()
+    const pending = api.points('dataset', 'frame', 250_000)
+    const outcome = pending.then(() => null, (error: unknown) => error)
+    try {
+      await settleBodyRead(responses)
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(signals[0].aborted).toBe(true)
+      await vi.runAllTimersAsync()
+      expect(await outcome).toMatchObject({ code: 'NETWORK_ERROR', message: '서버 응답 시간이 초과되었습니다.' })
+      expect(fetch).toHaveBeenCalledTimes(3)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      closeBodies(bodies)
+      await outcome
+    }
+  })
+
+  it('preserves binary bytes and releases timers and caller listeners on completion', async () => {
+    vi.useFakeTimers()
+    const { bodies, signals, responses } = delayedBodies()
+    const controller = new AbortController()
+    const removed = vi.spyOn(controller.signal, 'removeEventListener')
+    const pending = api.points('dataset', 'frame', 250_000, controller.signal)
+    const bytes = Uint8Array.of(77, 77, 83, 80, 0, 127, 255)
+    try {
+      await settleBodyRead(responses)
+      bodies[0].enqueue(bytes)
+      bodies[0].close()
+      expect(new Uint8Array(await pending)).toEqual(bytes)
+      expect(removed).toHaveBeenCalledWith('abort', expect.any(Function))
+      expect(vi.getTimerCount()).toBe(0)
+      controller.abort()
+      expect(signals[0].aborted).toBe(false)
+    } finally {
+      closeBodies(bodies)
+      await pending.catch(() => undefined)
+    }
+  })
+
+  it('releases timers and caller listeners when the response is still indexing', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const removed = vi.spyOn(controller.signal, 'removeEventListener')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({ message: '포인트 인덱스 준비 중' }),
+      { status: 202, headers: { 'Content-Type': 'application/json' } },
+    ))
+    await expect(api.points('dataset', 'frame', 250_000, controller.signal))
+      .rejects.toMatchObject({ status: 202, code: 'INDEXING' })
+    expect(removed).toHaveBeenCalledWith('abort', expect.any(Function))
+    expect(vi.getTimerCount()).toBe(0)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels retry backoff without starting another point request', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Synthetic connection failure'))
+    const controller = new AbortController()
+    let settled = false
+    const outcome = api.points('dataset', 'frame', 250_000, controller.signal)
+      .then(() => null, (error: unknown) => error)
+      .then((result) => { settled = true; return result })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(settled).toBe(true)
+      expect(await outcome).toMatchObject({ name: 'AbortError' })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      await vi.runAllTimersAsync()
+      await outcome
+    }
+  })
+})
 
 describe('errorMessageFromPayload', () => {
   it('renders FastAPI validation arrays as actionable field messages', () => {

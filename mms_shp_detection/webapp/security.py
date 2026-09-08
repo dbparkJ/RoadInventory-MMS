@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
+import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 
@@ -166,6 +169,26 @@ def safe_upload_name(value: str) -> str:
 
 def atomic_replace_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for retry in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32} or retry == 4:
+                    raise
+                time.sleep(0.01 * (retry + 1))
+    finally:
+        primary_error = sys.exception()
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"Temporary-file cleanup also failed: {type(cleanup_error).__name__}")

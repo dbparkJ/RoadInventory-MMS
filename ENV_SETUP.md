@@ -31,10 +31,16 @@ Linux:
 bash scripts/setup_web.sh
 ```
 
-저장소에 빌드된 `webui/dist`가 포함된 운영 배포본은 웹 서버 실행에 Node.js가
-필요하지 않습니다. 소스 UI를 다시 빌드해야 하는 개발 환경에서만 Node.js LTS와 npm이
-필요합니다. launcher는 관리자 권한으로 OS 프로그램을 임의 설치하지 않으며, npm과
-빌드 산출물이 모두 없을 때 필요한 조치를 설명하고 종료합니다.
+소스와 `webui/dist/build-info.json` 및 asset 검증을 통과한 운영 배포본은 웹 서버
+실행에 Node.js가 필요하지 않습니다. 소스 UI를 다시 빌드하는 환경에서는 Node.js와 npm,
+프로젝트 Python interpreter를 사용합니다. launcher는 npm이 없더라도 포함 빌드를
+검증하며, index.html만 있거나 소스와 빌드가 다르면 설치 성공으로 처리하지 않습니다.
+관리자 권한으로 OS 프로그램을 임의 설치하지 않습니다.
+
+기존 서버의 기본 실행은 개발 호환 모드로 유지되며 metadata가 없으면 경고합니다.
+검증된 릴리스는 `scripts/run_web.py --build-mode production`으로 시작해 불일치 시
+시작을 차단할 수 있습니다. [빌드 출처·이행 절차](docs/refactor/BUILD_PROVENANCE.md)와
+[동일 소스 패키지](docs/refactor/CI.md)를 참조하십시오.
 
 설치 예정 명령만 확인하려면 다음처럼 실행합니다. 이 경우 npm 패키지도 설치하지
 않습니다.

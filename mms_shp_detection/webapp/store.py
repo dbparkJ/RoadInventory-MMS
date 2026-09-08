@@ -364,6 +364,10 @@ class WebStore:
                 )
             if "name" not in run_columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN name TEXT")
+            if "ownership_json" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN ownership_json TEXT")
+            if "ownership_blocked" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN ownership_blocked INTEGER NOT NULL DEFAULT 0")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS runs_dismissed_created "
                 "ON runs(dismissed, created_at)"
@@ -1043,6 +1047,7 @@ class WebStore:
         item = dict(row)
         item["request"] = _loads(item.pop("request_json", None), {})
         item["resolved"] = _loads(item.pop("resolved_json", None), {})
+        item["ownership"] = _loads(item.pop("ownership_json", None), None)
         item["cancel_requested"] = bool(item["cancel_requested"])
         item["dismissed"] = bool(item.get("dismissed", 0))
         return item
@@ -2288,7 +2293,7 @@ class WebStore:
             rows = connection.execute(
                 """
                 SELECT * FROM runs
-                WHERE status IN (
+                WHERE ownership_blocked=1 OR status IN (
                     'preparing','starting','running','cancelling','interrupted'
                 )
                    OR (
@@ -2323,7 +2328,7 @@ class WebStore:
             active = connection.execute(
                 """
                 SELECT 1 FROM runs
-                WHERE status IN ('preparing','starting','running','cancelling')
+                WHERE status IN ('preparing','starting','running','cancelling') OR ownership_blocked=1
                 LIMIT 1
                 """
             ).fetchone()
@@ -2352,18 +2357,38 @@ class WebStore:
             claimed["updated_at"] = now
             return self.run_from_row(_MappingRow(claimed))
 
-    def begin_run_start(self, run_id: str, now: str) -> bool:
+    def begin_run_start(self, run_id: str, now: str, ownership: dict[str, Any] | None = None) -> bool:
         """Atomically reserve the final pre-spawn transition for one run."""
 
         with self.connection(write=True) as connection:
             cursor = connection.execute(
                 """
-                UPDATE runs SET status='starting',updated_at=?
+                UPDATE runs SET status='starting',updated_at=?,ownership_json=?
                 WHERE id=? AND status='preparing' AND cancel_requested=0
                 """,
-                (now, run_id),
+                (now, json.dumps(ownership) if ownership is not None else None, run_id),
             )
             return bool(cursor.rowcount)
+
+    def record_run_owner(self, run_id: str, ownership: dict[str, Any], now: str) -> bool:
+        with self.connection(write=True) as connection:
+            cursor = connection.execute(
+                "UPDATE runs SET ownership_json=?,updated_at=? WHERE id=? AND json_extract(ownership_json,'$.launcher')=?",
+                (json.dumps(ownership), now, run_id, ownership["launcher"]),
+            )
+            return bool(cursor.rowcount)
+
+    def set_ownership_block(self, run_id: str, blocked: bool, now: str, reason: str | None = None) -> None:
+        with self.connection(write=True) as connection:
+            connection.execute(
+                "UPDATE runs SET ownership_blocked=?,updated_at=?,error=COALESCE(?,error) WHERE id=?",
+                (int(blocked), now, reason, run_id),
+            )
+
+    def list_ownership_blocks(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute("SELECT * FROM runs WHERE ownership_blocked=1").fetchall()
+        return [self.run_from_row(row) for row in rows]
 
     def mark_run_running(
         self,

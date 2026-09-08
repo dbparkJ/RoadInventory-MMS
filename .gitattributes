@@ -1,0 +1,2 @@
+# Provenance validates artifact bytes; checkout must never rewrite their EOLs.
+/webui/dist/** -text

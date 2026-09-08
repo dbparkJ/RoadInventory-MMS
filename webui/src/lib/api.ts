@@ -105,8 +105,20 @@ export function buildApiUrl(path: string, query?: Record<string, string | number
   return `${API_BASE}${normalized}${suffix}`
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      window.clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      reject(signal?.reason)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
 }
 
 function mergeSignals(signal: AbortSignal | null | undefined, timeout: number): {
@@ -116,7 +128,8 @@ function mergeSignals(signal: AbortSignal | null | undefined, timeout: number): 
   const controller = new AbortController()
   const timeoutId = window.setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), timeout)
   const abort = () => controller.abort(signal?.reason)
-  signal?.addEventListener('abort', abort, { once: true })
+  if (signal?.aborted) abort()
+  else signal?.addEventListener('abort', abort, { once: true })
   return {
     signal: controller.signal,
     cleanup: () => {
@@ -182,7 +195,17 @@ async function parseError(response: Response): Promise<ApiError> {
   }
 }
 
-async function request(path: string, options: RequestOptions = {}): Promise<Response> {
+async function request(path: string, options?: RequestOptions): Promise<Response>
+async function request<T>(
+  path: string,
+  options: RequestOptions,
+  readBody: (response: Response) => Promise<T>,
+): Promise<T>
+async function request<T>(
+  path: string,
+  options: RequestOptions = {},
+  readBody?: (response: Response) => Promise<T>,
+): Promise<Response | T> {
   const method = options.method?.toUpperCase() ?? 'GET'
   const retries = options.retries ?? (method === 'GET' || method === 'HEAD' ? 2 : 0)
   let latestError: unknown
@@ -202,12 +225,14 @@ async function request(path: string, options: RequestOptions = {}): Promise<Resp
         const error = await parseError(response)
         if (response.status >= 500 && attempt < retries) {
           latestError = error
-          await sleep(300 * 2 ** attempt)
+          await sleep(300 * 2 ** attempt, options.signal)
           continue
         }
         throw error
       }
-      return response
+      // Binary point transfers keep cancellation and the timeout until the
+      // complete body is consumed. Header-only callers retain their contract.
+      return readBody ? await readBody(response) : response
     } catch (error) {
       latestError = error
       const canRetry =
@@ -226,7 +251,7 @@ async function request(path: string, options: RequestOptions = {}): Promise<Resp
           error,
         )
       }
-      await sleep(300 * 2 ** attempt)
+      await sleep(300 * 2 ** attempt, options.signal)
     } finally {
       merged.cleanup()
     }
@@ -955,7 +980,7 @@ export const api = {
     const pointUrl = focusQuery.size
       ? `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}${focusQuery.toString()}`
       : baseUrl
-    const response = await request(
+    return request(
       pointUrl,
       {
         signal,
@@ -965,18 +990,20 @@ export const api = {
         timeout: 120_000,
         headers: { Accept: 'application/vnd.mmsp, application/octet-stream' },
       },
+      async (response) => {
+        if (response.status === 202) {
+          let message = '포인트 미리보기를 준비하고 있습니다.'
+          try {
+            const payload = (await response.json()) as { message?: string; detail?: string }
+            message = payload.message ?? payload.detail ?? message
+          } catch {
+            // Keep the useful default.
+          }
+          throw new ApiError(message, 202, 'INDEXING')
+        }
+        return response.arrayBuffer()
+      },
     )
-    if (response.status === 202) {
-      let message = '포인트 미리보기를 준비하고 있습니다.'
-      try {
-        const payload = (await response.json()) as { message?: string; detail?: string }
-        message = payload.message ?? payload.detail ?? message
-      } catch {
-        // Keep the useful default.
-      }
-      throw new ApiError(message, 202, 'INDEXING')
-    }
-    return response.arrayBuffer()
   },
 
   async panoramaPoints(

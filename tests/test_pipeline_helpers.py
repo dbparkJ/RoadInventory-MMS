@@ -2712,7 +2712,7 @@ class MultiModelExecutionTests(unittest.TestCase):
 
     def test_multi_model_wrapper_isolates_outputs_and_writes_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             model_dir = root / "models"
             model_dir.mkdir()
             (model_dir / "b.pt").write_bytes(b"b")
@@ -3233,7 +3233,7 @@ class MultiModelExecutionTests(unittest.TestCase):
 class PipelineInputScopeTests(unittest.TestCase):
     def test_run_level_object_crop_inventory_is_persisted_and_cached_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             data_root = root / "data"
             data_root.mkdir()
             source_path = data_root / "Job_A_Track01.las"

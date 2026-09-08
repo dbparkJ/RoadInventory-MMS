@@ -100,7 +100,81 @@ def write_bundle(path: Path) -> None:
         path.with_suffix(suffix).write_bytes(f"fixture:{suffix}".encode("ascii"))
 
 
+def seed_exited_owner(store: WebStore, run_id: str) -> None:
+    """Explicit termination proof for manifest-only reconciliation fixtures."""
+    with store.connection(write=True) as connection:
+        connection.execute("UPDATE runs SET ownership_json=? WHERE id=?", (
+            json.dumps({"schema": 1, "launcher": "a" * 32, "run_id": run_id, "attempt": 1, "phase": "exited"}), run_id,
+        ))
+
+
 class WebAppRunSafetyTests(unittest.TestCase):
+    def test_recovered_live_owner_blocks_queue_until_confirmed_exit(self) -> None:
+        from mms_shp_detection.infrastructure.process_owner import new_intent, process_identity
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            root = Path(root_text).resolve()
+            app = create_app(allowed_roots=[root], state_dir=Path(state_text), start_runner=False)
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "orphan")
+            seed_run(app.state.store, "next")
+            manifest = seed_manifest(app, "orphan", root)
+            manifest.transition(JobStatus.VALIDATING)
+            manifest.transition(JobStatus.RUNNING)
+            record = {**new_intent("orphan", 1), "phase": "acknowledged", "identity": process_identity(os.getpid())}
+            with app.state.store.connection(write=True) as connection:
+                connection.execute("UPDATE runs SET status='running',ownership_json=? WHERE id='orphan'", (json.dumps(record),))
+            with mock.patch.object(app.state.run_manager, "_terminate") as terminate:
+                app.state.run_manager.recover_after_restart(NOW)
+                self.assertTrue(app.state.store.get_run("orphan")["ownership_blocked"])
+                self.assertEqual(manifest.read()["status"], "running")
+                self.assertIsNone(app.state.store.claim_next_queued_run(NOW))
+                app.state.run_manager.recover_after_restart(NOW)
+                self.assertIsNone(app.state.store.claim_next_queued_run(NOW))
+                terminate.assert_not_called()
+            with mock.patch("mms_shp_detection.webapp.runs.inspect_owner", return_value="exited"):
+                app.state.run_manager._refresh_ownership_blocks()
+            # Persist the observed exit so later PID reuse cannot revive this owner.
+            self.assertEqual(app.state.store.get_run("orphan")["ownership"]["phase"], "exited")
+            app.state.run_manager.recover_after_restart(NOW)
+            self.assertFalse(app.state.store.get_run("orphan")["ownership_blocked"])
+            self.assertEqual(app.state.store.claim_next_queued_run(NOW)["id"], "next")
+
+    def test_recovery_does_not_trust_another_runs_exit_record(self) -> None:
+        with tempfile.TemporaryDirectory() as root_text, tempfile.TemporaryDirectory() as state_text:
+            app = create_app(allowed_roots=[Path(root_text)], state_dir=Path(state_text), start_runner=False)
+            seed_dataset(app.state.store)
+            seed_run(app.state.store, "wrong-owner")
+            seed_exited_owner(app.state.store, "wrong-owner")
+            with app.state.store.connection(write=True) as connection:
+                connection.execute("UPDATE runs SET status='running',ownership_json=json_set(ownership_json,'$.run_id','someone-else') WHERE id='wrong-owner'")
+            app.state.run_manager.recover_after_restart(NOW)
+            self.assertTrue(app.state.store.get_run("wrong-owner")["ownership_blocked"])
+
+    def setUp(self) -> None:
+        # This suite supplies subprocess doubles to exercise manifest/CAS rules.
+        # Kernel identity/tree cleanup is exercised with real children separately
+        # in test_process_ownership.py; a fake PID cannot prove OS ownership.
+        class SimulatedOwner:
+            def __init__(self, record, directory):
+                self.record = dict(record)
+            def environment(self):
+                return {}
+            async def attach(self, process):
+                self.record = {**self.record, "phase": "acknowledged"}
+                return self.record
+            def authorize(self, process):
+                pass
+            def observe(self):
+                return self.record
+            async def terminate(self, process):
+                if hasattr(process, "wait"):
+                    await process.wait()
+            def close(self):
+                self.record = {**self.record, "phase": "exited"}
+        patcher = mock.patch("mms_shp_detection.webapp.runs.OwnedExecution", SimulatedOwner)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_run_visibility_column_migrates_an_existing_registry(self) -> None:
         with tempfile.TemporaryDirectory() as state_text:
             database = Path(state_text) / "registry.sqlite3"
@@ -781,8 +855,8 @@ class WebAppRunSafetyTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as root_text,
             tempfile.TemporaryDirectory() as state_text,
         ):
-            root = Path(root_text)
-            state = Path(state_text)
+            root = Path(root_text).resolve()
+            state = Path(state_text).resolve()
             config = WebAppConfig(
                 project_root=Path(__file__).resolve().parents[1],
                 state_dir=state,
@@ -1419,6 +1493,7 @@ class WebAppRunSafetyTests(unittest.TestCase):
             manifest.transition(JobStatus.VALIDATING)
             manifest.transition(JobStatus.RUNNING)
             app.state.store.update_run("run-restarted", NOW, status="running")
+            seed_exited_owner(app.state.store, "run-restarted")
 
             recovered = app.state.run_manager.recover_after_restart(NOW)
 
@@ -1559,6 +1634,7 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 manifest.transition(JobStatus.SUCCEEDED)
                 return False
 
+            seed_exited_owner(app.state.store, "run-recovery-race")
             with mock.patch(
                 "mms_shp_detection.webapp.runs._sync_manifest_terminal",
                 side_effect=child_commits_success,
@@ -1593,6 +1669,7 @@ class WebAppRunSafetyTests(unittest.TestCase):
                 NOW,
                 status="interrupted",
             )
+            seed_exited_owner(app.state.store, "run-already-interrupted")
 
             app.state.run_manager.recover_after_restart(NOW)
             first_manifest = manifest.read()
@@ -1635,6 +1712,7 @@ class WebAppRunSafetyTests(unittest.TestCase):
                     status=database_status,
                     finished_at=NOW,
                 )
+                seed_exited_owner(app.state.store, run_id)
 
             app.state.run_manager.recover_after_restart(NOW)
 
@@ -1697,9 +1775,13 @@ class WebAppRunSafetyTests(unittest.TestCase):
             for run_id, manifest in manifests.items():
                 stored = app.state.store.get_run(run_id)
                 self.assertEqual(stored["status"], "cancelled")  # type: ignore[index]
-                self.assertEqual(manifest.read()["status"], "cancelled")
+                if run_id == "run-cancelled-while-running":
+                    self.assertTrue(stored["ownership_blocked"])
+                    self.assertEqual(manifest.read()["status"], "running")
+                else:
+                    self.assertEqual(manifest.read()["status"], "cancelled")
             claimed = app.state.store.claim_next_queued_run(NOW)
-            self.assertEqual(claimed["id"], "run-next-after-recovery")  # type: ignore[index]
+            self.assertIsNone(claimed)
 
     def test_restart_does_not_requeue_a_possibly_spawned_starting_run(self) -> None:
         with (
@@ -1727,8 +1809,9 @@ class WebAppRunSafetyTests(unittest.TestCase):
 
             self.assertEqual(recovered, 1)
             stored = app.state.store.get_run("run-starting-at-restart")
-            self.assertEqual(stored["status"], "failed")  # type: ignore[index]
-            self.assertEqual(manifest.read()["status"], "failed")
+            self.assertEqual(stored["status"], "interrupted")  # type: ignore[index]
+            self.assertTrue(stored["ownership_blocked"])
+            self.assertEqual(manifest.read()["status"], "running")
 
     def test_durable_success_wins_a_late_cancellation_request(self) -> None:
         with (
@@ -2061,7 +2144,7 @@ class WebAppRunSafetyTests(unittest.TestCase):
                     mock.patch.object(
                         app.state.run_manager,
                         "_terminate",
-                        new=mock.AsyncMock(),
+                        new=mock.AsyncMock(side_effect=lambda candidate: setattr(candidate, "returncode", -15)),
                     ) as terminate,
                 ):
                     await app.state.run_manager._execute(claimed)  # type: ignore[arg-type]

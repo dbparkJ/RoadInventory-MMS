@@ -9,7 +9,8 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: process.env.MMS_API_TARGET ?? 'http://127.0.0.1:8000',
-        changeOrigin: true,
+        // Preserve the browser-facing Host for the API's same-origin write check.
+        changeOrigin: false,
       },
     },
   },

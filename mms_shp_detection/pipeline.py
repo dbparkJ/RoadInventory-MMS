@@ -47,6 +47,7 @@ from .app.pipeline_service import (
     StageOutcome,
     generate_job_id,
     pipeline_error_info,
+    pipeline_permission_operation,
     pipeline_scope,
     resolve_git_commit,
     tracked_stage,
@@ -1744,8 +1745,9 @@ def resolve_num_workers(args: argparse.Namespace, device: str, logger) -> int:
 
 def atomic_write_text(path: Path, content: str) -> None:
     temp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temp_path.write_text(content, encoding="utf-8")
-    temp_path.replace(path)
+    with pipeline_permission_operation("write_output"):
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -8441,13 +8443,14 @@ def prepare_shared_pipeline_context(
         object_crop_config.source_scope.to_dict() if object_crops_enabled else None
     )
     with _tracked_stage_for_args(args, "discover_inputs") as stage:
-        all_image_tasks = scan_image_tasks(
-            args.data_root,
-            logger,
-            pose_format=args.pose_format,
-            gps_week=args.gps_week,
-            gps_utc_offset_seconds=args.gps_utc_offset_seconds,
-        )
+        with pipeline_permission_operation("read_input"):
+            all_image_tasks = scan_image_tasks(
+                args.data_root,
+                logger,
+                pose_format=args.pose_format,
+                gps_week=args.gps_week,
+                gps_utc_offset_seconds=args.gps_utc_offset_seconds,
+            )
         image_tasks = select_image_tasks_for_scope(
             all_image_tasks,
             args,
@@ -10725,39 +10728,39 @@ def run_pipeline(args: argparse.Namespace) -> None:
             stage.metrics["published_shapefiles"] = len(outputs["shapefiles"])
         manifest.transition(JobStatus.SUCCEEDED)
     except KeyboardInterrupt as exc:
-        document = manifest.read()
-        stage_name = (
-            document["progress"].get("failed_stage")
-            or document["progress"].get("current_stage")
-            or active_stage
-        )
-        error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
-        current = JobStatus(document["status"])
-        if current in {JobStatus.PENDING, JobStatus.VALIDATING, JobStatus.RUNNING}:
-            try:
+        try:
+            document = manifest.read()
+            stage_name = (
+                document["progress"].get("failed_stage")
+                or document["progress"].get("current_stage")
+                or active_stage
+            )
+            error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
+            current = JobStatus(document["status"])
+            if current in {JobStatus.PENDING, JobStatus.VALIDATING, JobStatus.RUNNING}:
                 manifest.transition_terminal(JobStatus.CANCELLED, error=error_info)
-            except (OSError, ValueError) as manifest_error:
-                exc.add_note(f"Could not finalize cancelled manifest: {manifest_error}")
+        except (OSError, ValueError) as manifest_error:
+            exc.add_note(f"Could not finalize cancelled manifest: {manifest_error}")
         raise
     except BaseException as exc:
-        document = manifest.read()
-        stage_name = (
-            document["progress"].get("failed_stage")
-            or document["progress"].get("current_stage")
-            or active_stage
-        )
-        error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
-        current = JobStatus(document["status"])
-        if current in {
-            JobStatus.PENDING,
-            JobStatus.VALIDATING,
-            JobStatus.RUNNING,
-            JobStatus.RETRYING,
-        }:
-            try:
+        try:
+            document = manifest.read()
+            stage_name = (
+                document["progress"].get("failed_stage")
+                or document["progress"].get("current_stage")
+                or active_stage
+            )
+            error_info = pipeline_error_info(exc, job_id=job_id, stage=str(stage_name))
+            current = JobStatus(document["status"])
+            if current in {
+                JobStatus.PENDING,
+                JobStatus.VALIDATING,
+                JobStatus.RUNNING,
+                JobStatus.RETRYING,
+            }:
                 manifest.transition_terminal(JobStatus.FAILED, error=error_info)
-            except (OSError, ValueError) as manifest_error:
-                exc.add_note(f"Could not finalize failed manifest: {manifest_error}")
+        except (OSError, ValueError) as manifest_error:
+            exc.add_note(f"Could not finalize failed manifest: {manifest_error}")
         raise
     finally:
         active_error = sys.exception()

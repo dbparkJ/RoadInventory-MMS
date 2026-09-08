@@ -5,8 +5,10 @@ import os
 import sqlite3
 import struct
 import tempfile
+import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -115,7 +117,7 @@ def _write_raw_attribute_las(
 class PointCloudLasTests(unittest.TestCase):
     def test_web_catalog_mode_checks_every_discovered_source_for_links(self) -> None:
         with tempfile.TemporaryDirectory() as root_text:
-            root = Path(root_text)
+            root = Path(root_text).resolve()
             source = root / "Job_A_Track01.las"
             source.write_bytes(b"not-opened")
             original_is_symlink = Path.is_symlink
@@ -1167,6 +1169,224 @@ class PointCloudDecodedBlockCacheTests(unittest.TestCase):
                 self.assertEqual(uncached._decoded_cache_bytes, 0)
             finally:
                 uncached.close()
+
+
+class PointCloudPreviewCacheTests(unittest.TestCase):
+    def test_las_preview_matches_full_records_and_preserves_raw_attributes(self) -> None:
+        xyz = np.asarray(
+            [[300_000.001, 4_100_000.002, 100.003],
+             [300_001.125, 4_100_001.250, 101.375],
+             [300_002.500, 4_100_002.625, 102.750]]
+        )
+        rgb16 = np.asarray(
+            [[0, 128, 65535], [257, 32768, 12345], [65535, 54321, 0]],
+            dtype=np.uint16,
+        )
+        fields = ("xyz", "rgb", "intensity", "classification")
+        with tempfile.TemporaryDirectory() as directory:
+            for point_format in (0, 3, 7):
+                with self.subTest(point_format=point_format):
+                    path = Path(directory) / f"미리보기-{point_format}.las"
+                    if point_format == 0:
+                        _write_las(path, xyz, classification=np.asarray([0, 2, 31]))
+                        raw_values = {}
+                    else:
+                        raw_values = _write_raw_attribute_las(
+                            path,
+                            point_format=point_format,
+                            xyz=xyz,
+                            rgb16=rgb16,
+                            scan_angle=(np.asarray([-1234, 0, 1234]) if point_format == 7 else None),
+                            scan_angle_rank=(np.asarray([-90, 0, 90]) if point_format == 3 else None),
+                        )
+                    with PointCloudReaderCache() as readers:
+                        with mock.patch.object(
+                            readers, "_read_las_records", side_effect=AssertionError("full decode")
+                        ):
+                            preview = readers.read_preview_block(path, "las:0:3")
+                        self.assertEqual(readers._decoded_cache_bytes, 31 * len(xyz))
+                        cached = next(iter(readers._decoded_blocks.values()))[0]
+                        self.assertEqual(set(cached), set(fields))
+                        full = readers.read_block_records(path, "las:0:3")
+                        for field, array, dtype in zip(
+                            fields, preview, (np.float64, np.uint8, np.uint16, np.int16)
+                        ):
+                            self.assertEqual(array.dtype, dtype)
+                            self.assertEqual(array.tobytes(), full[field].tobytes())
+                            self.assertEqual(array.shape, full[field].shape)
+                            self.assertFalse(array.flags.writeable)
+                            with self.assertRaises(ValueError):
+                                array.flat[0] = 0
+                        for field, expected in raw_values.items():
+                            np.testing.assert_array_equal(full[field], expected)
+                        if point_format != 0:
+                            np.testing.assert_array_equal(full["rgb_raw"], rgb16)
+                        self.assertIn("field_availability", full)
+                        self.assertIn("source_index", full)
+                        np.testing.assert_array_equal(full["source_index"], [0, 1, 2])
+
+    def test_preview_reuses_cached_full_block_without_extra_entry_or_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shared.las"
+            _write_las(path, np.asarray([[300_000.0, 4_100_000.0, 100.0]]))
+            with PointCloudReaderCache() as readers:
+                full = readers.read_block_records(path, "las:0:1")
+                size = readers._decoded_cache_bytes
+                with mock.patch.object(
+                    readers, "_read_las_preview", side_effect=AssertionError("extra decode")
+                ):
+                    preview = readers.read_preview_block(path, "las:0:1")
+                for field, array in zip(("xyz", "rgb", "intensity", "classification"), preview):
+                    self.assertIs(array, full[field])
+                self.assertEqual(len(readers._decoded_blocks), 1)
+                self.assertEqual(readers._decoded_cache_bytes, size)
+
+    def test_pcdb_preview_has_only_display_fields_and_unknown_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.pcdb"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("CREATE TABLE CRYSTAL_CUBE (NAME TEXT, DATA BLOB)")
+                header = struct.pack(
+                    "<6dI", 300_000.0, 4_100_000.0, 100.0,
+                    300_002.0, 4_100_002.0, 102.0, 1,
+                )
+                point = struct.pack("<3f3BH", 0.01, 0.02, 0.03, 1, 128, 255, 65535)
+                connection.execute(
+                    "INSERT INTO CRYSTAL_CUBE (NAME, DATA) VALUES (?, ?)",
+                    ("block.bpc", header + point),
+                )
+                connection.commit()
+            with PointCloudReaderCache() as readers:
+                with mock.patch.object(
+                    readers, "_read_pcdb_records", side_effect=AssertionError("full decode")
+                ):
+                    preview = readers.read_preview_block(path, "block.bpc")
+                self.assertEqual(readers._decoded_cache_bytes, 31)
+                full = readers.read_block_records(path, "block.bpc")
+                for field, array in zip(("xyz", "rgb", "intensity", "classification"), preview):
+                    self.assertEqual(array.tobytes(), full[field].tobytes())
+                    self.assertFalse(array.flags.writeable)
+                np.testing.assert_array_equal(preview[3], [-1])
+                missing = readers.read_preview_block(path, "missing.bpc")
+                self.assertEqual([array.shape for array in missing], [(0, 3), (0, 3), (0,), (0,)])
+                self.assertTrue(all(not array.flags.writeable for array in missing))
+
+    def test_preview_and_full_variants_share_byte_and_entry_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bounded.las"
+            _write_las(path, np.asarray(
+                [[300_000.0, 4_100_000.0, 100.0], [300_001.0, 4_100_001.0, 101.0]]
+            ))
+            for entries, maximum_bytes in ((10, 100), (1, 1_000)):
+                with self.subTest(entries=entries, maximum_bytes=maximum_bytes):
+                    with PointCloudReaderCache(
+                        decoded_cache_max_entries=entries,
+                        decoded_cache_max_bytes=maximum_bytes,
+                    ) as readers:
+                        readers.read_preview_block(path, "las:0:1")
+                        self.assertEqual(readers._decoded_cache_bytes, 31)
+                        readers.read_block_records(path, "las:1:1")
+                        self.assertEqual(readers._decoded_cache_bytes, 80)
+                        self.assertEqual([key[-1] for key in readers._decoded_blocks], ["records"])
+                        readers.read_preview_block(path, "las:0:1")
+                        self.assertEqual(readers._decoded_cache_bytes, 31)
+                        self.assertEqual([key[-1] for key in readers._decoded_blocks], ["preview"])
+                    self.assertEqual(readers._decoded_cache_bytes, 0)
+                    self.assertFalse(readers._decoded_blocks)
+                    with self.assertRaisesRegex(RuntimeError, "closed"):
+                        readers.read_preview_block(path, "las:0:1")
+            with PointCloudReaderCache(decoded_cache_max_bytes=30) as readers, mock.patch.object(
+                readers, "_read_las_preview", wraps=readers._read_las_preview
+            ) as decode:
+                readers.read_preview_block(path, "las:0:1")
+                readers.read_preview_block(path, "las:0:1")
+                self.assertEqual(decode.call_count, 2)
+                self.assertEqual(readers._decoded_cache_bytes, 0)
+
+    def test_reindexed_source_discards_both_preview_and_full_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "versioned.las"
+            xyz = np.asarray(
+                [[300_000.0, 4_100_000.0, 100.0], [300_001.0, 4_100_001.0, 101.0]]
+            )
+            _write_las(path, xyz)
+            first_stat = path.stat()
+            first_file = {"path": str(path), "file_size": first_stat.st_size, "mtime_ns": first_stat.st_mtime_ns}
+            with PointCloudReaderCache() as readers:
+                readers.read_preview_block(first_file, "las:0:1")
+                readers.read_block_records(first_file, "las:1:1")
+                self.assertEqual(len(readers._decoded_blocks), 2)
+                first_reader = readers._las_readers[str(path.resolve())][1]
+                _write_las(path, xyz + 10)
+                rewritten_stat = path.stat()
+                os.utime(path, ns=(rewritten_stat.st_atime_ns, max(
+                    rewritten_stat.st_mtime_ns, first_stat.st_mtime_ns + 1_000_000_000
+                )))
+                second_stat = path.stat()
+                second_file = {"path": str(path), "file_size": second_stat.st_size, "mtime_ns": second_stat.st_mtime_ns}
+                preview = readers.read_preview_block(second_file, "las:0:1")
+                np.testing.assert_array_equal(preview[0], xyz[:1] + 10)
+                self.assertIsNot(readers._las_readers[str(path.resolve())][1], first_reader)
+                self.assertEqual(len(readers._decoded_blocks), 1)
+                self.assertTrue(all(key[2] == (second_stat.st_size, second_stat.st_mtime_ns)
+                                    for key in readers._decoded_blocks))
+                full = readers.read_block_records(second_file, "las:0:1")
+                self.assertEqual(preview[0].tobytes(), full["xyz"].tobytes())
+
+    def test_concurrent_preview_decode_coalesces_and_failed_decode_can_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "concurrent.las"
+            _write_las(path, np.asarray([[300_000.0, 4_100_000.0, 100.0]]))
+            for fail in (False, True):
+                with self.subTest(fail=fail), PointCloudReaderCache() as readers:
+                    entered = threading.Event()
+                    release = threading.Event()
+                    all_waiting = threading.Event()
+                    waiter_lock = threading.Lock()
+                    waiter_count = 0
+                    original_decode = readers._read_las_preview
+
+                    class TrackingFuture(Future):
+                        def result(self, timeout=None):
+                            nonlocal waiter_count
+                            with waiter_lock:
+                                waiter_count += 1
+                                if waiter_count == 3:
+                                    all_waiting.set()
+                            return super().result(timeout=timeout)
+
+                    def decode_once(*args):
+                        entered.set()
+                        if not release.wait(5):
+                            raise TimeoutError("test did not release decode")
+                        if fail:
+                            raise OSError("synthetic read failure")
+                        return original_decode(*args)
+
+                    with mock.patch("mms_shp_detection.pointcloud.Future", TrackingFuture), mock.patch.object(
+                        readers, "_read_las_preview", side_effect=decode_once
+                    ) as decode, ThreadPoolExecutor(max_workers=4) as executor:
+                        futures = [executor.submit(readers.read_preview_block, path, "las:0:1")]
+                        try:
+                            self.assertTrue(entered.wait(5))
+                            futures.extend(executor.submit(readers.read_preview_block, path, "las:0:1")
+                                           for _ in range(3))
+                            self.assertTrue(all_waiting.wait(5))
+                        finally:
+                            release.set()
+                        if fail:
+                            for future in futures:
+                                with self.assertRaisesRegex(OSError, "synthetic read failure"):
+                                    future.result(timeout=5)
+                        else:
+                            values = [future.result(timeout=5) for future in futures]
+                            self.assertTrue(all(value[0] is values[0][0] for value in values))
+                        self.assertEqual(decode.call_count, 1)
+                    self.assertFalse(readers._inflight_decodes)
+                    if fail:
+                        self.assertEqual(readers._decoded_cache_bytes, 0)
+                        recovered = readers.read_preview_block(path, "las:0:1")
+                        self.assertEqual(recovered[0].shape, (1, 3))
 
 
 class PointCloudPcdbPrecisionTests(unittest.TestCase):

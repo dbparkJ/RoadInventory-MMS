@@ -109,9 +109,8 @@ def resize_panorama_fast(source: Path, output_base: Path, width: int) -> tuple[P
 
 
 def install_panorama_fastpath() -> None:
-    """Install the optimized implementation without changing the API route."""
+    """Retain the legacy startup entrypoint without mutating the media module.
 
-    from . import media
-
-    if media._resize_panorama is not resize_panorama_fast:
-        media._resize_panorama = resize_panorama_fast
+    ``media`` explicitly imports the optimized generator. Existing callers may
+    still invoke this function; a patched ``media._resize_panorama`` is retained.
+    """
