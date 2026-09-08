@@ -92,6 +92,12 @@ function mockTwoQaSessions() {
   }))
 }
 
+async function openQaPanel() {
+  const launcher = await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' })
+  await waitFor(() => expect(launcher).toBeEnabled())
+  fireEvent.click(launcher)
+}
+
 afterEach(() => {
   cleanup()
   window.localStorage.clear()
@@ -117,7 +123,7 @@ describe('QaIssuePanel', () => {
       </ReviewProvider>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' }))
+    await openQaPanel()
     expect(await screen.findByText(first.message, undefined, { timeout: 5_000 })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '다음 200개 불러오기' }))
     expect(await screen.findByText(second.message)).toBeInTheDocument()
@@ -148,7 +154,7 @@ describe('QaIssuePanel', () => {
       </ReviewProvider>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' }))
+    await openQaPanel()
     fireEvent.click(await screen.findByText(blockingError.message))
     expect(screen.getByText('오류는 데이터를 수정한 뒤 QA 검사를 다시 실행하면 자동으로 해소됩니다.')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '해결 처리' })).not.toBeInTheDocument()
@@ -190,7 +196,7 @@ describe('QaIssuePanel', () => {
       </ReviewProvider>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' }))
+    await openQaPanel()
     fireEvent.click(screen.getByRole('button', { name: 'QA 검사 실행' }))
 
     await waitFor(() => expect(api.runQa).toHaveBeenCalledWith(SESSION.id, expect.any(AbortSignal)))
@@ -253,7 +259,7 @@ describe('QaIssuePanel', () => {
       </ReviewProvider>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' }))
+    await openQaPanel()
     await screen.findByText(oldIssue.message, undefined, { timeout: 5_000 })
     fireEvent.click(screen.getByRole('button', { name: 'QA 검사 실행' }))
     await waitFor(() => expect(runQa).toHaveBeenCalledWith(SESSION.id, expect.any(AbortSignal)))
@@ -338,7 +344,7 @@ describe('QaIssuePanel', () => {
       </ReviewProvider>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'QA 오류 탐색기 열기' }))
+    await openQaPanel()
     fireEvent.click(await screen.findByText(warningIssue.message, undefined, { timeout: 5_000 }))
     fireEvent.click(screen.getByRole('button', { name: '해결 처리' }))
     fireEvent.change(screen.getByRole('combobox', { name: 'QA 심각도 필터' }), {

@@ -1,0 +1,2 @@
+# Test tooling only; runtime requirements remain in requirements.txt.
+pytest==8.4.2
