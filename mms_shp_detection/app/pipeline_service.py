@@ -6,11 +6,12 @@ import re
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Literal, Protocol
 
 from ..config import ConfigError, PipelineConfig
 from ..domain.models import (
@@ -136,29 +137,70 @@ def resolve_git_commit(project_root: Path) -> str | None:
     return value if re.fullmatch(r"[0-9a-fA-F]{40,64}", value) else None
 
 
+PermissionOperation = Literal["read_input", "write_output"]
+_PERMISSION_OPERATION_ATTRIBUTE = "_mms_pipeline_permission_operation"
+_PERMISSION_DIAGNOSTICS = {
+    "read_input": (
+        "INPUT_READ_FAILED",
+        "Input data could not be read. Check access permissions for the selected dataset.",
+    ),
+    "write_output": (
+        "OUTPUT_WRITE_FAILED",
+        "Output could not be written. Check destination permissions and file locks.",
+    ),
+}
+
+
+@contextmanager
+def pipeline_permission_operation(operation: PermissionOperation) -> Iterator[None]:
+    """Mark a proven I/O boundary without changing the original exception type.
+
+    The innermost boundary owns the diagnostic. Stage names alone cannot identify
+    an operation because one stage can both read inputs and write cached results.
+    """
+
+    if operation not in _PERMISSION_DIAGNOSTICS:
+        raise ValueError(f"Unsupported permission operation: {operation}")
+    try:
+        yield
+    except PermissionError as exc:
+        if not hasattr(exc, _PERMISSION_OPERATION_ATTRIBUTE):
+            setattr(exc, _PERMISSION_OPERATION_ATTRIBUTE, operation)
+        raise
+
+
 def pipeline_error_info(
     exc: BaseException,
     *,
     job_id: str,
     stage: str,
+    operation: PermissionOperation | None = None,
 ) -> PipelineErrorInfo:
     if isinstance(exc, PipelineError):
         return exc.info
+    message = str(exc) or type(exc).__name__
+    context: dict[str, Any] = {}
     if isinstance(exc, ConfigError):
         code = "CONFIG_INVALID"
     elif isinstance(exc, FileNotFoundError):
         code = "INPUT_FILE_MISSING"
     elif isinstance(exc, PermissionError):
+        # Retain the legacy code/message for unclassified callers. Only proven
+        # read/write boundaries use the additive operation and safe guidance.
         code = "OUTPUT_WRITE_FAILED"
+        operation = operation or getattr(exc, _PERMISSION_OPERATION_ATTRIBUTE, None)
+        if operation in _PERMISSION_DIAGNOSTICS:
+            code, message = _PERMISSION_DIAGNOSTICS[operation]
+            context["operation"] = operation
     else:
         code = "PIPELINE_FAILED"
     return PipelineErrorInfo(
         code=code,
-        message=str(exc) or type(exc).__name__,
+        message=message,
         stage=stage,
         job_id=job_id,
         retryable=False,
-        context={},
+        context=context,
         cause_type=type(exc).__name__,
     )
 
@@ -174,22 +216,25 @@ def tracked_stage(
     outcome = StageOutcome()
     try:
         yield outcome
-    except BaseException:
-        manifest.record_stage(
-            StageResult(
-                stage_name=name,
-                stage_version=version,
-                status="failed",
-                started_at=started,
-                finished_at=datetime.now(timezone.utc),
-                input_count=outcome.input_count,
-                output_count=outcome.output_count,
-                rejected_count=outcome.rejected_count,
-                artifacts=tuple(outcome.artifacts),
-                metrics=outcome.metrics,
-                warnings=tuple(outcome.warnings),
+    except BaseException as exc:
+        try:
+            manifest.record_stage(
+                StageResult(
+                    stage_name=name,
+                    stage_version=version,
+                    status="failed",
+                    started_at=started,
+                    finished_at=datetime.now(timezone.utc),
+                    input_count=outcome.input_count,
+                    output_count=outcome.output_count,
+                    rejected_count=outcome.rejected_count,
+                    artifacts=tuple(outcome.artifacts),
+                    metrics=outcome.metrics,
+                    warnings=tuple(outcome.warnings),
+                )
             )
-        )
+        except (OSError, ValueError) as manifest_error:
+            exc.add_note(f"Could not record failed stage {name}: {manifest_error}")
         raise
     else:
         manifest.record_stage(
