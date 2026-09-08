@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .datasets import require_ready_dataset, schedule_catalog
+from .panorama_fastpath import resize_panorama_fast as _resize_panorama
 from .security import UnsafePath, resolve_under_root
 
 router = APIRouter(prefix="/api", tags=["preview"])
@@ -286,59 +287,6 @@ def _panorama_fingerprint(source: Path, width: int, *, frame_id: str) -> str:
         f"panorama-v3\0{frame_id}\0{source}\0{stat.st_size}\0{stat.st_mtime_ns}\0{width}"
     ).encode("utf-8", "surrogatepass")
     return hashlib.sha256(payload).hexdigest()
-
-
-def _resize_panorama(source: Path, output_base: Path, width: int) -> tuple[Path, str]:
-    from PIL import Image, ImageOps, features
-
-    Image.MAX_IMAGE_PIXELS = 600_000_000
-    output_base.parent.mkdir(parents=True, exist_ok=True)
-    use_webp = bool(features.check("webp"))
-    suffix = ".webp" if use_webp else ".jpg"
-    media_type = "image/webp" if use_webp else "image/jpeg"
-    output_path = output_base.with_suffix(suffix)
-    if output_path.is_file():
-        return output_path, media_type
-
-    temporary = output_path.with_name(
-        f".{output_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp{suffix}"
-    )
-    try:
-        with Image.open(source) as opened:
-            image = ImageOps.exif_transpose(opened)
-            target_width = min(width, image.width)
-            if target_width < image.width:
-                target_height = max(1, round(image.height * target_width / image.width))
-                image = image.resize(
-                    (target_width, target_height),
-                    resample=Image.Resampling.LANCZOS,
-                    reducing_gap=3.0,
-                )
-            if use_webp:
-                if image.mode not in {"RGB", "RGBA"}:
-                    image = image.convert("RGB")
-                image.save(
-                    temporary,
-                    format="WEBP",
-                    quality=82,
-                    method=4,
-                    exact=False,
-                )
-            else:
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
-                image.save(
-                    temporary,
-                    format="JPEG",
-                    quality=86,
-                    optimize=True,
-                    progressive=True,
-                )
-        temporary.replace(output_path)
-    finally:
-        if temporary.exists():
-            temporary.unlink(missing_ok=True)
-    return output_path, media_type
 
 
 def _etag_response(

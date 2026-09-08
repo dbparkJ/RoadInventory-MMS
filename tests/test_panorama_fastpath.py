@@ -17,7 +17,7 @@ def _write_jpeg(path: Path, size: tuple[int, int] = (2048, 1024)) -> None:
 
 
 class PanoramaFastPathTests(unittest.TestCase):
-    def test_webapp_installs_panorama_fastpath(self) -> None:
+    def test_webapp_imports_panorama_fastpath(self) -> None:
         self.assertIs(media._resize_panorama, resize_panorama_fast)
 
     def test_resize_panorama_uses_jpeg_decoder_draft(self) -> None:
