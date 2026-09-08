@@ -81,6 +81,15 @@ class ProcessOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(inspect_owner(record), "exited")
 
+    @unittest.skipUnless(os.name == "nt", "Windows STILL_ACTIVE exit-code distinction")
+    async def test_real_exit_259_is_not_mistaken_for_a_live_process(self) -> None:
+        owner, process, record = await self.spawn("import sys,time; print('ready',flush=True); time.sleep(0.1); sys.exit(259)")
+        self.assertEqual((await process.stdout.readline()).strip(), b"ready")
+        self.assertEqual(await asyncio.wait_for(process.wait(), 5), 259)
+        self.assertIsNone(process_identity(record["identity"]["pid"]))
+        owner.close()
+        self.assertEqual(inspect_owner(record), "exited")
+
     async def test_cancel_cleans_descendant_tree(self) -> None:
         body = (
             "import subprocess,sys,time,json; "
