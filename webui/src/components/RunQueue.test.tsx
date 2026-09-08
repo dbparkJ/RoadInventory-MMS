@@ -21,6 +21,13 @@ function run(overrides: Partial<RunRecord> = {}): RunRecord {
 }
 
 describe('RunQueue', () => {
+  it('shows an ownership pause even when durable results are completed', () => {
+    render(<RunQueue runs={[run({ status: 'completed', progress: 100, execution: { requires_inspection: true } })]}
+      open onClose={vi.fn()} onCancel={vi.fn()} onDelete={vi.fn()} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('이전 작업의 종료 확인')
+    expect(screen.getByText('처리 완료')).toBeInTheDocument()
+  })
+
   it('renders an unknown server status with a safe fallback', () => {
     const unknown = run({ status: 'toString' as RunStatus, progress: Number.NaN })
 

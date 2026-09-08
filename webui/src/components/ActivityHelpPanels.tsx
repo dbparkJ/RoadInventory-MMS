@@ -155,6 +155,9 @@ export function ActivityPanel({
                     <time>{formatDate(run.created_at)}</time>
                   </header>
                   <p>{run.error ?? run.message ?? run.stage ?? status.label}</p>
+                  {run.execution?.requires_inspection && (
+                    <p role="alert">이전 작업의 종료 확인이 필요해 새 작업 실행을 일시 중지했습니다.</p>
+                  )}
                   <div className="activity-run-progress">
                     <span style={{ width: `${Math.max(0, Math.min(100, run.progress))}%` }} />
                   </div>

@@ -182,6 +182,9 @@ function RunCard({
         <time>{formatDate(run.created_at)}</time>
       </div>
       <h3>{run.dataset_name ?? run.dataset_id}</h3>
+      {run.execution?.requires_inspection && (
+        <p role="alert">이전 작업의 종료 확인이 필요해 새 작업 실행을 일시 중지했습니다.</p>
+      )}
       <p>
         {run.error_info?.message ??
           run.error ??

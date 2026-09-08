@@ -38,6 +38,8 @@ child 및 필요한 group/job 종료가 확인되면 그 exit 증거를 영속�
 writer 상태를 별도로 확인해야 하며, 이 개발 작업에서 운영 PID를 조회해 종료하지 않았다.
 
 공개 응답의 선택 필드 `execution.requires_inspection` 및 기존 error 문구로 점검 필요를 알린다.
+실행 큐와 알림 화면에서도 이 필드를 표시하므로 durable 결과가 completed여도 새 실행의
+대기 이유를 볼 수 있다. 결과 열기와 완료 상태는 유지한다. 실제 브라우저 UI 확인은 미완료다.
 내부 PID/UUID/receipt 절대경로를 새 API 필드로 노출하지 않는다.
 
 ## 저장소 이행·검증·제한
