@@ -246,7 +246,13 @@ class EnvironmentVerifierTests(unittest.TestCase):
 
     def test_explicit_cpu_fallback_prints_success_marker(self) -> None:
         output = io.StringIO()
+        # This case exercises a CUDA wheel without an available GPU. The host
+        # may have CPU-only wheels; that distinct path is covered below.
         with (
+            mock.patch.object(verifier.torch, "__version__", "2.7.1+cu128"),
+            mock.patch.object(verifier.torchvision, "__version__", "0.22.1+cu128"),
+            mock.patch.object(verifier.torchaudio, "__version__", "2.7.1+cu128"),
+            mock.patch.object(verifier.torch.version, "cuda", "12.8"),
             mock.patch.object(verifier.torch.cuda, "is_available", return_value=False),
             redirect_stdout(output),
         ):
