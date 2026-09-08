@@ -103,3 +103,27 @@ CPU 환경 smoke는 두 OS에서 실제 CPU wheel로 실행했고, 실패 전파
 - P1 소유권의 UI 추가 전 `cbf41a9`: [push 34178158169](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178158169), [PR 34178164283](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178164283). UI 추가 `5631241`은 후속 원격 실행 결과를 확인한다.
 
 소유권 registry additive migration과 preservation의 미해결 ownership 거부는 통합 suite에서 함께 검증했다. Linux native/GPU hang 즉시 종료, 다중 host exactly-once, 실제 브라우저, 실제 MMS 정확도는 이 CI가 증명하지 않는다. Browser discovery는 재개 후에도 `[]`였다.
+
+### 최종 통합 배포 파일과 HTTP
+
+- clean source `c07e4bea2d0136c7a3aa7c3debf0b504fb322875` → `npm --prefix webui run build` exit 0; build ID `dbff836f69bf4365a7bc6d04fb1a1652`, working_tree_dirty=false.
+- source/backend fingerprint `deb1994762982677b7ee2c113b6a2f95291a09ffda50f1b1d43b419eaffc2e7f`; `python scripts/build_web.py verify` verified/exit 0. Logs: incremental-build.log, incremental-build-verify.log.
+- `python scripts/package_release.py --output .cache/release/roadinventory-mms-incremental-c07e4be.zip` → verified, 180 files. 1,784,745 bytes, SHA-256 `a259b8de55dfa41aff1de25d9afe8f4d313327d0804ffc5a0b031af1925cdf7d`. Gitless 추출본 재검증 및 원본 data/models/DB/.env/.git/node_modules 미포함 검사 통과. ZIP은 ignored 로컬 산출물이며 공개 release로 게시하지 않았다.
+- artifact commit `e28c39c1d3f5992f2f3fdd83f00471f9874fd32b`의 실제 `git archive` bytes → verified. Log: incremental-git-archive.log. 과거 asset도 기존 cache 보호를 위해 유지한다.
+- 실제 localhost 서버에 `--no-run-worker --build-mode production` 적용. `/api/build` verified/no-store, bootstrap metadata 일치, index와 참조 asset 4개 exact bytes, 인증 asset private cache 확인. Vite proxy 쓰기 201/외부 Origin 403 확인. Log: incremental-http-smoke.log. 직접 생성한 Python/Node를 시작 전 소유 Job에 연결하고 종료·임시 경로 정리까지 exit 0으로 확인했다. 실제 브라우저 테스트는 아니다.
+- P1 소유권 최종 `5631241`도 [push 34178972208](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178972208), [PR 34178974478](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34178974478)의 Windows/Linux 4개 job 모두 success다.
+
+### 통합 원격 CI 완료
+
+검증된 source/artifact `e28c39c1d3f5992f2f3fdd83f00471f9874fd32b`의 [Validation 34179470399](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34179470399)은 **4개 job 모두 success**다. 실제 로그는 incremental-ci.log에 저장했다.
+
+| hosted job | 결과 |
+|---|---|
+| Python CPU ubuntu-latest | **619 passed / 3 skipped**, 65.01초 |
+| Python CPU windows-latest | **619 passed / 3 skipped**, 195.09초 |
+| Frontend and package ubuntu-latest | **400 passed / 39 files**, tsc/build/failure probes/Gitless package success, 184 package files |
+| Frontend and package windows-latest | **400 passed / 39 files**, tsc/build/failure probes/Gitless package success, 180 package files |
+
+Linux skips는 Windows launcher 2개와 Windows 전용 exit 259 사례 1개다. Windows skips는 POSIX launcher 3개이며 실제 Windows Job/exit 259와 symlink 보호 검사는 실행됐다. 추가 Ubuntu asset 4개는 LF/CRLF 입력에 따라 생성한 chunk와 과거 asset 유지 정책의 결과이며 각 OS package의 source/asset 검증이 통과했다. CPU environment smoke와 의도된 실패 전파도 양 OS에서 통과했다.
+
+이후 체크포인트/검증 기록 commit은 문서만이며 runtime fingerprint와 검증된 build bytes를 바꾸지 않는다. 신규 main 병합/운영 적용은 실행하지 않았다. 최종 branch의 자동 후속 CI는 [브랜치 Actions](https://github.com/dbparkJ/RoadInventory-MMS/actions?query=branch%3Arefactor%2Froadinventory-incremental)에서 확인할 수 있다.

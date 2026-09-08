@@ -1,12 +1,12 @@
 ﻿# RoadInventory-MMS 개선 체크포인트
 
-- 기록: 2026-09-08 11:12, Asia/Seoul.
+- 기록: 2026-09-08 11:23, Asia/Seoul.
 - 작업 브랜치: `refactor/roadinventory-incremental`.
-- 통합 source HEAD: `f3b1797` (후속 기록/빌드 commit은 `git log -5 --oneline`으로 확인).
+- 통합 build source: `c07e4be`, 검증된 artifact HEAD: `e28c39c` (이후 문서 전용 commit은 `git log -5 --oneline`으로 확인).
 - 기준: `main@d3d7d9af07518282afcb332df100724c1b04de9d`.
 - 판정: **부분 구현 및 자동 검증 완료, 실제 MMS/브라우저·GPU 장애/성능 gate 미완료**. 전체 구조 개선 완료가 아니다.
-- 현재: 독립 변경 통합, 배포 파일·Gitless package·HTTP·CI 최종 확인. 결과는 VALIDATION의 통합 검증 절에 기록한다.
-- working tree: 구현과 개별 branch 빌드는 commit/push 완료. 이 문서와 통합 build 정리 후 최종 clean/push 여부를 확인한다.
+- 현재: 독립 변경과 배포 파일 통합 완료. Gitless package·HTTP·Git bytes 및 원격 4-job CI 검증 통과. 최종 근거는 VALIDATION의 통합 검증 절에 기록했다.
+- working tree: 구현·개별 branch·통합 build는 commit/push 완료. 이 기록만 문서 전용 commit으로 마감하며 최종 clean/push 상태를 확인한다.
 - 사용자 변경: 최초 명세는 사전 통합으로 보존. 원본 data/models/운영 상태와 기존 사용자 별도 worktree는 수정하지 않는다.
 
 ## 완료 및 근거
@@ -22,7 +22,9 @@
 
 통합 Python **615 passed / 7 skipped**, 최종 frontend **400 passed / 39 files**. 실제 소유 subprocess, 합성 PointZ/한글 DBF/관계/outbox 복원, auth 경계, 실제 Vite→backend HTTP도 검증했다. [VALIDATION.md](VALIDATION.md)에 명령·로그·원격 결과를 구분한다. 로컬 skip은 Windows symlink 권한 4개와 POSIX launcher 3개다. hosted Linux/Windows가 해당 OS 경로를 검증한다.
 
-각 PR은 P0 기반의 독립 변경이다. 통합에서는 package 문서 allowlist를 합쳤으며 build metadata 충돌은 통합 재빌드로 해결한다. 수치 계산·모델·추론 설정·SHP 계약과 review flag는 유지한다.
+통합 [CI 34179470399](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34179470399)는 전체 success다. Python 양 OS 각각 **619 passed / 3 skipped**, frontend 양 OS 각각 **400 passed**, tsc/build/실패 전파/package 모두 통과했다. 확인된 code/artifact HEAD는 `e28c39c`이며 이후 문서 commit은 source fingerprint를 바꾸지 않는다.
+
+각 PR은 P0 기반의 독립 변경이다. 통합에서는 package 문서 allowlist를 합쳤으며 build metadata 충돌은 통합 재빌드로 해결했다. build ID는 `dbff836f69bf4365a7bc6d04fb1a1652`다. 수치 계산·모델·추론 설정·SHP 계약과 review flag는 유지한다.
 
 ## 미검증·차단
 
@@ -38,7 +40,7 @@
 
 ## 다음 하나의 작업
 
-**연결된 실제 브라우저에서 P0-1 로드 버전 및 P2-1 편집 workflow 기준선을 검증한다.** `webui/src/components/DetachablePanel.tsx`, `OverlayContext.tsx`, `ManualObjectContext.tsx`와 기존 검수 체크리스트의 활성 기능 범위를 먼저 확인한다.
+**연결된 실제 브라우저에서 P0-1 로드 버전 및 P2-1 편집 workflow 기준선을 검증한다.** `webui/src/components/DetachablePanel.tsx`, `OverlayContext.tsx`, `ManualObjectContext.tsx`와 `docs/OPERATOR_MMS_SMOKE_CHECKLIST.md`의 활성 기능 범위를 먼저 확인한다.
 
 ```powershell
 git status --short --branch

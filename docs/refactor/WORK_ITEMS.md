@@ -1,6 +1,6 @@
 ﻿# 작업 상태
 
-기준: `main@d3d7d9af07518282afcb332df100724c1b04de9d`。P0 및 후속 변경은 각각 draft PR로 분리했다. `refactor/roadinventory-incremental`은 함께 검증하는 통합 브랜치다. PASSED는 아래 명시한 검증 범위에 한정한다.
+기준: `main@d3d7d9af07518282afcb332df100724c1b04de9d`. P0 및 후속 변경은 각각 draft PR로 분리했다. `refactor/roadinventory-incremental`은 함께 검증하는 통합 브랜치다. PASSED는 아래 명시한 검증 범위에 한정한다.
 
 | ID | 상태 | 구현 및 남은 gate |
 |---|---|---|
@@ -19,6 +19,6 @@
 | P2-3 | BLOCKED_VALIDATION | P2-1/실제 데이터 gate 미충족. REVIEW_WORKSPACE_UI_ENABLED=false 유지 |
 | P3-1 | IMPLEMENTED_UNVERIFIED | 전체 경로 auth·Origin·private cache·실제 Vite proxy HTTP·양 OS CI 통과. 외부 TLS/Host/proxy·실제 브라우저 Basic 재전송 검증 남음; PR #5 |
 | P3-2 | DEFERRED_WITH_REASON | 다중 작업자 요구·부하·승인 근거 없음 |
-| R0 | IMPLEMENTED_UNVERIFIED | 개별 branch package 통과. 통합 최종 결과는 VALIDATION/CHECKPOINT에 기록. 실제 MMS/browser/운영 전환 gate 남음 |
+| R0 | IMPLEMENTED_UNVERIFIED | 통합 production build·180파일 Gitless ZIP·실제 Git bytes·HTTP index/asset/build/bootstrap 검증 통과. 실제 MMS/browser/운영 전환 gate 남음 |
 
 남은 실제 검증을 합성/CPU 통과 수로 대체하지 않는다. 운영 원본·DB·서비스 변경과 새 main 병합은 실행하지 않았다. 재개할 다음 한 작업과 명령은 [CHECKPOINT.md](CHECKPOINT.md)에 둔다.
