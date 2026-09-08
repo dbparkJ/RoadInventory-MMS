@@ -37,6 +37,8 @@
 Origin의 기본 port를 정규화하되 실제 다른 port는 구분한다. same-site 하위 도메인도
 다른 origin이면 쓰기를 거부한다. CORS를 활성화하거나 허용 origin을 넓히지 않았다.
 업로드 생성 전 거부되어 테스트 저장소에 staging이 생기지 않는지 검증한다.
+Vite 개발 proxy는 browser-facing Host를 보존하도록 수정했다. API target Host로 덮어쓰면
+정상 개발 화면의 Origin도 달라지므로, 실제 Vite→API HTTP 경로에서 쓰기를 확인한다.
 
 ## 운영 조건과 남은 한계
 

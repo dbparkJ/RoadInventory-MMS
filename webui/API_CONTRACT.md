@@ -1,8 +1,10 @@
 # MMS Studio Web API contract
 
-The frontend uses same-origin `/api` requests by default. Set `VITE_API_BASE_URL` only when the
-browser should call a separate API origin. During local development, `MMS_API_TARGET` controls the
-Vite proxy target and defaults to `http://127.0.0.1:8000`.
+The frontend uses same-origin `/api` requests by default. During local development,
+`MMS_API_TARGET` controls the Vite proxy target and defaults to `http://127.0.0.1:8000`.
+The proxy preserves the browser-facing Host so API Origin checks also work in development.
+The built-in API rejects explicit cross-origin browser writes; `VITE_API_BASE_URL` does not
+authorize another origin or configure CORS. Use the same-origin proxy for the built-in server.
 
 All JSON uses UTF-8 and snake_case. Errors should return a non-2xx status with one of:
 
