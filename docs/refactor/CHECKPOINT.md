@@ -1,5 +1,23 @@
 ﻿# RoadInventory-MMS 개선 체크포인트
 
+## 최신 후속 작업: 3D 점군 표시 성능
+
+- 기록: 2026-09-08, Asia/Seoul. 사용자 보고에 따라 3D 점군 지연을 재현하고 수정했다.
+- 현재 branch: `refactor/pointcloud-loading-performance`; source `a4191be`, 검증된 build commit `63dcb96`. 이후 문서 commit은 `git log -5 --oneline`으로 확인한다.
+- 원인: 사전 통합의 catalog v5→v6로 첫 재인덱싱 50.6초, 표시에도 전체 원본 속성 decode, 반복 마스크 계산, body 취소 누락, 41.2초 인덱싱 재시도 한계.
+- 수정: 공유 LRU 내 4필드 preview, 요청당 32MiB 이내 indices 재사용, body/재시도 취소와 총 120초·2초 간격 인덱싱 대기. 좌표·색·표본 순서·예산·원본 record 보존 계약은 유지했다.
+- 실제 100만점 프레임 4회 교차 측정: 첫 생성 중앙값 1474.65→988.54ms, 재생성 691.69→508.18ms, decoded cache 277.27→107.44MiB. 모든 출력 bytes 동일. 실제 전체 MMS/SHP golden 및 browser 검증은 아니다.
+- 로컬 Python 624 passed / 7 OS·권한 skips, frontend 412 passed / 41 files, production build/Gitless package/HTTP/Git bytes 검증 통과. 원격 CI 34181671986의 4개 job 모두 success: 양 OS Python 각각628 passed/3 skips, frontend 각각412 passed. 상세/원시 측정은 [POINT_PREVIEW_PERFORMANCE.md](POINT_PREVIEW_PERFORMANCE.md)에 기록했다.
+- [draft PR #9](https://github.com/dbparkJ/RoadInventory-MMS/pull/9), base는 이전 통합 branch. main 병합·원본/운영 DB/기존 cache 삭제·운영 서버 재시작 없음.
+- 다음 한 작업: 아래 서버 명령과 브라우저 강력 새로고침으로 새 빌드를 적용한 뒤 동일 프레임 첫 진입/이동/재방문의 실제 화면 시간을 확인한다. 브라우저 연결이 없으면 측정 완료로 표시하지 않는다.
+
+```powershell
+cd D:\mms_project
+.\.venv\Scripts\python.exe .\scripts\run_web.py --host 127.0.0.1 --port 8000 --build-mode production
+```
+
+## 이전 통합 단계 기록
+
 - 기록: 2026-09-08 11:23, Asia/Seoul.
 - 작업 브랜치: `refactor/roadinventory-incremental`.
 - 통합 build source: `c07e4be`, 검증된 artifact HEAD: `e28c39c` (이후 문서 전용 commit은 `git log -5 --oneline`으로 확인).

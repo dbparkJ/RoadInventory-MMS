@@ -30,4 +30,28 @@ Windows/Python 3.12.10, 동일 실제 100만점 RGB 프레임. 기준 commit의 
 
 집중 검증에서 실제 LAS PF0/3/7·PCDB 배열 일치, 원본 속성 보존, mixed LRU/버전/동시성/오류 후 재시도, 4색상×3focus 출력 bytes, indices 상한/fallback 및 마스크 재계산 감소를 확인했다. frontend는 delayed body 취소/timeout, late parse, 50.6초 인덱싱 성공, 120초 deadline 및 재시도 취소를 재현했다. 전체 회귀·최종 빌드·CI 결과는 아래에 이어 기록한다.
 
-실제 MMS 추론/SHP 정확도 golden 검증과 실제 브라우저/WebGL 검증은 미완료다. 브라우저 연결 discovery는 `[]`였다. 기존 선택 지주 조회 대기와 scene 재생성 구조는 이번 변경 범위에 포함하지 않았다. 원본 데이터/운영 DB·캐시 삭제나 서버 재시작은 실행하지 않았다. 새 source와 일치하는 dist를 빌드한 뒤 사용자가 서버를 다시 시작해야 적용된다.
+실제 MMS 추론/SHP 정확도 golden 검증과 실제 브라우저/WebGL 검증은 미완료다. 브라우저 연결 discovery는 `[]`였다. 기존 선택 지주 조회 대기와 scene 재생성 구조는 이번 변경 범위에 포함하지 않았다. 원본 데이터/운영 DB·캐시 삭제나 서버 재시작은 실행하지 않았다. 새 source와 일치하는 dist까지 빌드했으며 사용자가 서버를 다시 시작하고 Ctrl+F5로 새로고침하면 적용된다.
+
+## 최종 로컬 검증
+
+- `.venv/Scripts/python.exe -m pytest -q --junitxml=.cache/refactor-validation/point-performance-python.xml`: **624 passed / 7 skipped**, 196.84초, exit 0. Windows symlink 권한 4개/POSIX launcher 3개 skip이며 합성 app metadata 경고 등을 포함한다. Log: point-performance-python.log/xml.
+- `npm --prefix webui test -- --maxWorkers=2`: **412 passed / 41 files**, exit 0. Log: point-performance-frontend.log. 취소/인덱싱 관련 집중 78개와 TypeScript 검사도 통과했다.
+- `npm --prefix webui run build`: clean source `a4191be03462cf31579db70bf3682e29f6b5ac85`에서 build ID `09cbc6fcb12542aebef4e89f9f2c109c`, working_tree_dirty=false. `python scripts/build_web.py verify` verified. Source fingerprint `077a668a573a2b7fb2c6684d066bb694f525801ad4bf168cdaa44f70c5d8c0a8`.
+- artifact commit `63dcb96081c35259e0816292d2f3aa9b3950c752`의 실제 Git archive bytes도 verified. 기존 hashed asset은 유지한다. Log: point-performance-git-archive.log.
+- `python scripts/package_release.py --output .cache/release/roadinventory-mms-point-performance-a4191be.zip`: Gitless 검증 통과, 185 files / 1,963,765 bytes. SHA-256 `6902217c76e4b1510d24b9e0a3daaba78c6b6dd5df34f2ae49fdd709b25de02b`. 원본 data/models/DB/.env/.git/node_modules 0개, 공개 release 업로드 없음.
+- 소유 Job에 연결한 테스트 전용 서버 `--no-run-worker --build-mode production`의 실제 HTTP: API/build/bootstrap 일치, index/참조 asset 4개 exact bytes, 인증 cache private, Vite proxy 같은 Origin 201/외부 Origin 403. 종료/임시 경로 정리까지 exit 0. Log: point-performance-http.log.
+
+변경은 [draft PR #9](https://github.com/dbparkJ/RoadInventory-MMS/pull/9)로 분리했고 main에 병합하지 않았다. 로컬 작업 브랜치는 `refactor/pointcloud-loading-performance`이며 소스·빌드 모두 푸시했다.
+
+## 원격 CI
+
+코드와 build commit `63dcb96081c35259e0816292d2f3aa9b3950c752`의 [Validation 34181671986](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34181671986)은 **Windows/Linux 4개 job 모두 success**다.
+
+| job | 결과 |
+|---|---|
+| Python CPU Windows | **628 passed / 3 skipped**, 215.75초 |
+| Python CPU Ubuntu | **628 passed / 3 skipped**, 64.18초 |
+| Frontend/package Windows | **412 passed / 41 files**, tsc/build/failure probes/package success, 185 files |
+| Frontend/package Ubuntu | **412 passed / 41 files**, tsc/build/failure probes/package success, 189 files |
+
+Windows는 POSIX launcher 3개, Ubuntu는 Windows launcher 2개/exit 259 전용 사례 1개 skip이다. Ubuntu의 추가 4개 asset은 기존 파일 유지 및 LF/CRLF 입력으로 생성되는 chunk 차이이며 각 package의 provenance 검증이 통과했다. Log: point-performance-ci.log. 이 결과 이후 문서 전용 마감 commit은 runtime fingerprint를 바꾸지 않는다.
