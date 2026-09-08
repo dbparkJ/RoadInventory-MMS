@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "build_id": "65dc51bd5bdd469d81b39bcd8d3dbaff",
+  "build_id": "d6c19972a3414905928ee66445b1ad73",
   "source_policy": "mms-source-v1-text-lf",
-  "source_commit": "063a8fde54f2edeab441cf79aaa4293531a51861",
+  "source_commit": "1feee62312708d01ba87505a162a6b37d7778037",
   "working_tree_dirty": false,
-  "source_fingerprint": "eb433f0b8e2eb15bec8edb3c0bf251f29fb4a7272f033b9b75cc869b26e5539e",
+  "source_fingerprint": "5839d8ae066bffb1130f169031c0300e6e46964c49199a425c4e79471096da5e",
   "source_files": {
     "mms_shp_detection/__init__.py": "fccc89643d9c38f9068b1516886d6c45972210968cc94d059a6cde5311682ff1",
     "mms_shp_detection/alignment.py": "28872c8f69a1acb2efb48810a3bd3496868a694fb301921abc35e4790a5e4fce",
@@ -144,11 +144,11 @@
     "webui/tsconfig.app.json": "ba158a678c61d303fd5f1548c74f44f6075612831acd726317833e1dcf4a5451",
     "webui/tsconfig.json": "770b4140bbb581e2dfd9ea9946ffc9c75a1d86ba7d2db5f77c83e37cbdf9d808",
     "webui/tsconfig.node.json": "d34927b60a8b724912e7dd9a0e3d68971488f0f486450fcdda7d033cac3a9e08",
-    "webui/vite.config.ts": "6924d2f9f9ed3c6ec1805012f58cabc76ef514de37f7ce662585ac9552174db9"
+    "webui/vite.config.ts": "2df05eef8b2f4fd60365c8c9c27abb8af185421e17663f4b2ddb6eaa39e2e6a4"
   },
   "frontend_lock_hash": "af4930a2bc70a67fc19ad875fec5d151ac2de2621888622be502ce40064a7668",
   "api_contract_version": "1",
-  "built_at": "2026-09-08T01:37:34.591987+00:00",
+  "built_at": "2026-09-08T01:49:23.319885+00:00",
   "assets_manifest_hash": "024fe839e617dfe4397fc0bc0e8c23d79431129ce64a323a4d5195713ca5fe4e",
   "assets": {
     "index.html": "5566d167f9a475b1910ff64d279da89ee4d7bbd6480ca7ec15d4cf9efa1bc2c7",
