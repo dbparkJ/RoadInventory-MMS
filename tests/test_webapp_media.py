@@ -39,6 +39,7 @@ try:
         _enforce_file_cache_quota,
         _finish_preview_after_request_cancel,
         _focus_roi_mask,
+        _retain_preview_band_indices,
         _prune_address_failure_cache,
         _remember_address_failure,
         _task_point_fingerprint,
@@ -95,6 +96,22 @@ class _StaticReader:
         return None
 
 
+class _CompactPreviewReader(_StaticReader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.preview_calls = 0
+
+    def read_preview_block(self, _point_file, _block):
+        self.preview_calls += 1
+        return self.xyz, self.rgb, self.intensity, self.classification
+
+    def read_block_points(self, *_args):
+        raise AssertionError("Preview must not decode complete source records")
+
+    def read_block_records(self, *_args):
+        raise AssertionError("Preview must not decode complete source records")
+
+
 class _PerBlockReader:
     def __init__(self, blocks):
         self.blocks = blocks
@@ -138,6 +155,58 @@ def _static_catalog(xyz):
 
 @unittest.skipIf(MMSP_IMPORT_ERROR is not None, f"point dependencies missing: {MMSP_IMPORT_ERROR}")
 class WebAppMediaTests(unittest.TestCase):
+    def test_compact_preview_matches_complete_records_for_every_color_and_focus(self) -> None:
+        rng = np.random.default_rng(517)
+        xyz = rng.uniform([-30, -20, -5], [30, 20, 10], (1200, 3))
+        rgb = rng.integers(0, 256, (1200, 3), dtype=np.uint8)
+        intensity = rng.integers(0, 65536, 1200, dtype=np.uint16)
+        classification = np.resize(np.array([-1, 0, 2, 5, 20], dtype=np.int16), 1200)
+        task = {"origin": [0.0, 0.0, 0.0], "job_name": "Job_A", "track_name": "TRACK01"}
+        catalog = _static_catalog(xyz)
+        for mode in ("rgb", "intensity", "classification", "height"):
+            for focus_options in (
+                {},
+                {"focus_center": np.array([10.0, 0.0, 2.0])},
+                {"focus_centers": (np.array([10.0, 0.0]), np.array([12.0, 2.0]))},
+            ):
+                with self.subTest(mode=mode, focus=tuple(focus_options)):
+                    with mock.patch("mms_shp_detection.webapp.media.PREVIEW_BAND_INDEX_CACHE_BYTES", 0):
+                        baseline = _build_mmsp(
+                            task, catalog, _StaticReader(xyz, rgb, intensity, classification),
+                            budget=250, color_mode=mode, **focus_options,
+                        )
+                    compact = _CompactPreviewReader(xyz, rgb, intensity, classification)
+                    actual = _build_mmsp(
+                        task, catalog, compact, budget=250, color_mode=mode, **focus_options,
+                    )
+                    self.assertEqual(actual, baseline)
+                    self.assertEqual(compact.preview_calls, 2)
+
+    def test_preview_band_indices_respect_budget_and_fall_back_without_allocating(self) -> None:
+        masks = (np.array([True, False, True]), np.array([False, True, False]))
+        required = 3 * np.dtype(np.intp).itemsize
+        retained, remaining = _retain_preview_band_indices(masks, (2, 1), required)
+        self.assertEqual(remaining, 0)
+        self.assertEqual(sum(array.nbytes for array in retained), required)
+        np.testing.assert_array_equal(retained[0], [0, 2])
+        np.testing.assert_array_equal(retained[1], [1])
+        with mock.patch("numpy.flatnonzero", side_effect=AssertionError("No index allocation over budget")):
+            self.assertEqual(_retain_preview_band_indices(masks, (2, 1), required - 1), (None, required - 1))
+
+    def test_preview_reuses_focus_calculation_with_identical_fallback_bytes(self) -> None:
+        xyz = np.column_stack((np.linspace(0, 24, 1000), np.zeros(1000), np.zeros(1000)))
+        reader = _StaticReader(xyz, np.full((1000, 3), 170, dtype=np.uint8))
+        task = {"origin": [0.0, 0.0, 0.0], "job_name": "Job_A", "track_name": "TRACK01"}
+        options = {"budget": 250, "focus_center": np.array([10.0, 0.0])}
+        with mock.patch("mms_shp_detection.webapp.media._focus_roi_mask", wraps=_focus_roi_mask) as mask:
+            with mock.patch("mms_shp_detection.webapp.media.PREVIEW_BAND_INDEX_CACHE_BYTES", 0):
+                reference = _build_mmsp(task, _static_catalog(xyz), reader, **options)
+            self.assertEqual(mask.call_count, 2)
+            mask.reset_mock()
+            actual = _build_mmsp(task, _static_catalog(xyz), reader, **options)
+            self.assertEqual(mask.call_count, 1)
+        self.assertEqual(actual, reference)
+
     def test_focus_blocks_are_promoted_before_the_preview_block_cap(self) -> None:
         candidates = [
             (

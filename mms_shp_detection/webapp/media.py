@@ -32,6 +32,9 @@ MMSO_HEADER = struct.Struct("<4sHHI6fI")
 MMSO_RECORD_BYTES = 15
 MMSO_VERSION = 1
 MAX_PREVIEW_BLOCKS = 256
+# Retain exact band indices between counting and sampling, with a per-request
+# bound. Large neighborhoods fall back to recomputation without changing quotas.
+PREVIEW_BAND_INDEX_CACHE_BYTES = 32 * 1024 * 1024
 PANORAMA_POINT_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 POINT_PREVIEW_CACHE_LIMIT_BYTES = 1024 * 1024 * 1024
 POINT_PREVIEW_DEFAULT_BUDGET = 250_000
@@ -529,8 +532,15 @@ def _read_preview_block(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read one block with optional LAS classification and bounded fallbacks."""
 
+    preview_reader = getattr(reader, "read_preview_block", None)
     records_reader = getattr(reader, "read_block_records", None)
-    if include_classification and callable(records_reader):
+    if callable(preview_reader):
+        xyz, rgb, intensity, classification = preview_reader(point_file, block)
+        xyz = np.asarray(xyz, dtype=np.float64)
+        rgb = np.asarray(rgb, dtype=np.uint8)
+        intensity = np.asarray(intensity)
+        classification = np.asarray(classification)
+    elif include_classification and callable(records_reader):
         records = records_reader(point_file, block)
         xyz = np.asarray(records.get("xyz", ()), dtype=np.float64)
         rgb = np.asarray(records.get("rgb", ()), dtype=np.uint8)
@@ -898,6 +908,17 @@ def _focus_roi_mask(
     return mask
 
 
+def _retain_preview_band_indices(
+    masks: tuple[np.ndarray, np.ndarray],
+    counts: tuple[int, int],
+    remaining_bytes: int,
+) -> tuple[tuple[np.ndarray, np.ndarray] | None, int]:
+    required = sum(counts) * np.dtype(np.intp).itemsize
+    if required > remaining_bytes:
+        return None, remaining_bytes
+    return (np.flatnonzero(masks[0]), np.flatnonzero(masks[1])), remaining_bytes - required
+
+
 def _sample_focus_bands(
     candidates: list[tuple[float, dict[str, Any], dict[str, Any]]],
     catalog: dict[str, Any],
@@ -922,11 +943,16 @@ def _sample_focus_bands(
     corridor_squared = focus_corridor_radius * focus_corridor_radius
     maximum_squared = maximum_radius * maximum_radius
     band_counts: list[tuple[int, int]] = []
+    band_indices: list[tuple[np.ndarray, np.ndarray] | None] = []
+    remaining_index_bytes = PREVIEW_BAND_INDEX_CACHE_BYTES
     for point_file, block in safe_candidates:
-        xyz, _rgb, _intensity = reader.read_block_points(point_file, block)
+        xyz, _rgb, _intensity, _classification = _read_preview_block(
+            reader, point_file, block, include_classification=False,
+        )
         xyz = np.asarray(xyz, dtype=np.float64)
         if xyz.size == 0:
             band_counts.append((0, 0))
+            band_indices.append(None)
             continue
         frame_mask = np.sum((xyz - origin[None, :]) ** 2, axis=1) <= maximum_squared
         focus_mask = frame_mask & _focus_roi_mask(
@@ -936,8 +962,13 @@ def _sample_focus_bands(
             corridor_radius_squared=corridor_squared,
         )
         focus_count = int(np.count_nonzero(focus_mask))
-        background_count = int(np.count_nonzero(frame_mask & ~focus_mask))
+        background_mask = frame_mask & ~focus_mask
+        background_count = int(np.count_nonzero(background_mask))
         band_counts.append((focus_count, background_count))
+        retained, remaining_index_bytes = _retain_preview_band_indices(
+            (focus_mask, background_mask), band_counts[-1], remaining_index_bytes,
+        )
+        band_indices.append(retained)
 
     focus_quota, background_quota = _distance_band_quotas(
         sum(count[0] for count in band_counts),
@@ -967,19 +998,21 @@ def _sample_focus_bands(
         )
         if xyz.size == 0:
             continue
-        frame_mask = np.sum((xyz - origin[None, :]) ** 2, axis=1) <= maximum_squared
-        focus_mask = frame_mask & _focus_roi_mask(
-            xyz,
-            focus_centers,
-            focus_radius_squared=focus_squared,
-            corridor_radius_squared=corridor_squared,
-        )
+        indices = band_indices[index]
+        if indices is None:
+            frame_mask = np.sum((xyz - origin[None, :]) ** 2, axis=1) <= maximum_squared
+            focus_mask = frame_mask & _focus_roi_mask(
+                xyz,
+                focus_centers,
+                focus_radius_squared=focus_squared,
+                corridor_radius_squared=corridor_squared,
+            )
+            indices = (np.flatnonzero(focus_mask), np.flatnonzero(frame_mask & ~focus_mask))
         selected_parts: list[np.ndarray] = []
-        for mask, quota in (
-            (focus_mask, focus_by_block[index]),
-            (frame_mask & ~focus_mask, background_by_block[index]),
+        for selected, quota in (
+            (indices[0], focus_by_block[index]),
+            (indices[1], background_by_block[index]),
         ):
-            selected = np.flatnonzero(mask)
             if selected.size > quota:
                 positions = np.linspace(0, selected.size - 1, quota, dtype=np.int64)
                 selected = selected[positions]
@@ -1035,17 +1068,26 @@ def _sample_distance_bands(
     dense_squared = dense_radius * dense_radius
     maximum_squared = maximum_radius * maximum_radius
     band_counts: list[tuple[int, int]] = []
+    band_indices: list[tuple[np.ndarray, np.ndarray] | None] = []
+    remaining_index_bytes = PREVIEW_BAND_INDEX_CACHE_BYTES
     for point_file, block in safe_candidates:
-        xyz, _rgb, _intensity = reader.read_block_points(point_file, block)
+        xyz, _rgb, _intensity, _classification = _read_preview_block(
+            reader, point_file, block, include_classification=False,
+        )
         if xyz.size == 0:
             band_counts.append((0, 0))
+            band_indices.append(None)
             continue
         squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
-        dense_count = int(np.count_nonzero(squared <= dense_squared))
-        sparse_count = int(
-            np.count_nonzero((squared > dense_squared) & (squared <= maximum_squared))
-        )
+        dense_mask = squared <= dense_squared
+        sparse_mask = (squared > dense_squared) & (squared <= maximum_squared)
+        dense_count = int(np.count_nonzero(dense_mask))
+        sparse_count = int(np.count_nonzero(sparse_mask))
         band_counts.append((dense_count, sparse_count))
+        retained, remaining_index_bytes = _retain_preview_band_indices(
+            (dense_mask, sparse_mask), band_counts[-1], remaining_index_bytes,
+        )
+        band_indices.append(retained)
 
     dense_quota, sparse_quota = _distance_band_quotas(
         sum(count[0] for count in band_counts),
@@ -1075,16 +1117,18 @@ def _sample_distance_bands(
         )
         if xyz.size == 0:
             continue
-        squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
+        indices = band_indices[index]
+        if indices is None:
+            squared = np.sum((xyz - origin[None, :]) ** 2, axis=1)
+            indices = (
+                np.flatnonzero(squared <= dense_squared),
+                np.flatnonzero((squared > dense_squared) & (squared <= maximum_squared)),
+            )
         selected_parts: list[np.ndarray] = []
-        for mask, quota in (
-            (squared <= dense_squared, dense_by_block[index]),
-            (
-                (squared > dense_squared) & (squared <= maximum_squared),
-                sparse_by_block[index],
-            ),
+        for selected, quota in (
+            (indices[0], dense_by_block[index]),
+            (indices[1], sparse_by_block[index]),
         ):
-            selected = np.flatnonzero(mask)
             if selected.size > quota:
                 sample_positions = np.linspace(
                     0, selected.size - 1, quota, dtype=np.int64

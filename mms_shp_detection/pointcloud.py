@@ -1775,7 +1775,9 @@ class PointCloudReaderCache:
     """Thread-safe cache for source handles and decoded point-cloud blocks.
 
     Decoded arrays are shared between :meth:`read_block_points` and
-    :meth:`read_block_records`.  Returned arrays are read-only so a caller
+    :meth:`read_block_records`.  :meth:`read_preview_block` retains only the
+    four display fields in the same bounded LRU, or reuses a cached full block.
+    Returned arrays are read-only so a caller
     cannot accidentally corrupt a cached block.  The LRU is constrained by
     both entry count and decoded array bytes; a block larger than the byte
     budget is returned but not retained.
@@ -1806,11 +1808,11 @@ class PointCloudReaderCache:
         self._decoded_cache_max_bytes = int(decoded_cache_max_bytes)
         self._decoded_cache_bytes = 0
         self._decoded_blocks: OrderedDict[
-            tuple[str, str, tuple[int, int], str | int, int | None],
+            tuple[str, str, tuple[int, int], str | int, int | None, str],
             tuple[dict[str, np.ndarray], int],
         ] = OrderedDict()
         self._inflight_decodes: dict[
-            tuple[str, str, tuple[int, int], str | int, int | None],
+            tuple[str, str, tuple[int, int], str | int, int | None, str],
             Future[dict[str, np.ndarray]],
         ] = {}
 
@@ -1966,6 +1968,60 @@ class PointCloudReaderCache:
             else np.zeros((len(points),), dtype=np.uint16)
         )
         return xyz, rgb, intensity
+
+    def _read_las_preview(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        start: int,
+        count: int,
+    ) -> dict[str, np.ndarray]:
+        """Decode display fields without allocating preservation attributes."""
+
+        if start < 0 or count < 0:
+            raise ValueError("LAS block start and count must be non-negative")
+        if count == 0:
+            xyz, rgb, intensity = _empty_points()
+            return {
+                "xyz": xyz,
+                "rgb": rgb,
+                "intensity": intensity,
+                "classification": np.empty((0,), dtype=np.int16),
+            }
+        reader = self._las_reader(path, source_version)
+        reader.seek(start)
+        points = reader.read_points(count)
+        dimension_names = {
+            str(name).casefold() for name in points.point_format.dimension_names
+        }
+        return {
+            "xyz": _xyz_from_las_points(points),
+            "rgb": _rgb8_from_las(points),
+            "intensity": (
+                np.asarray(points.intensity, dtype=np.uint16).copy()
+                if "intensity" in dimension_names
+                else np.zeros((len(points),), dtype=np.uint16)
+            ),
+            "classification": (
+                np.asarray(points.classification, dtype=np.int16).copy()
+                if "classification" in dimension_names
+                else np.full((len(points),), -1, dtype=np.int16)
+            ),
+        }
+
+    def _read_pcdb_preview(
+        self,
+        path: str,
+        source_version: tuple[int, int],
+        block_name: str,
+    ) -> dict[str, np.ndarray]:
+        xyz, rgb, intensity = self._read_pcdb(path, source_version, block_name)
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "intensity": intensity,
+            "classification": np.full((xyz.shape[0],), -1, dtype=np.int16),
+        }
 
     def _read_las_records(
         self,
@@ -2179,7 +2235,7 @@ class PointCloudReaderCache:
 
     def _cached_records(
         self,
-        key: tuple[str, str, tuple[int, int], str | int, int | None],
+        key: tuple[str, str, tuple[int, int], str | int, int | None, str],
         source_lock: threading.RLock,
         decode: Callable[[], dict[str, np.ndarray]],
     ) -> dict[str, np.ndarray]:
@@ -2188,6 +2244,12 @@ class PointCloudReaderCache:
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("PointCloudReaderCache is closed")
+            if key[-1] == "preview":
+                full_key = (*key[:-1], "records")
+                full_cached = self._decoded_blocks.get(full_key)
+                if full_cached is not None:
+                    self._decoded_blocks.move_to_end(full_key)
+                    return full_cached[0]
             cached = self._decoded_blocks.get(key)
             if cached is not None:
                 self._decoded_blocks.move_to_end(key)
@@ -2253,7 +2315,7 @@ class PointCloudReaderCache:
     ) -> dict[str, np.ndarray]:
         resolved = str(Path(path).resolve())
         source_lock = self._source_lock("pcdb", resolved)
-        key = ("pcdb", resolved, source_version, block_name, None)
+        key = ("pcdb", resolved, source_version, block_name, None, "records")
         return self._cached_records(
             key,
             source_lock,
@@ -2273,7 +2335,7 @@ class PointCloudReaderCache:
     ) -> dict[str, np.ndarray]:
         resolved = str(Path(path).resolve())
         source_lock = self._source_lock("las", resolved)
-        key = ("las", resolved, source_version, start, count)
+        key = ("las", resolved, source_version, start, count, "records")
         return self._cached_records(
             key,
             source_lock,
@@ -2283,6 +2345,70 @@ class PointCloudReaderCache:
                 start,
                 count,
             ),
+        )
+
+    def read_preview_block(
+        self,
+        pointcloud: str | Path | dict[str, Any],
+        block: str | dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Read immutable XYZ/RGB/intensity/classification for display only.
+
+        Arrays have float64/uint8/uint16/int16 dtypes respectively.  The source
+        handles, version checks, in-flight coalescing and LRU limits are shared
+        with full records, whose preservation fields remain available through
+        :meth:`read_block_records`.  PCDB classification is unknown (-1).
+        """
+
+        if isinstance(pointcloud, dict):
+            path = str(pointcloud["path"])
+            source_type = str(
+                pointcloud.get("source_type") or pointcloud.get("format") or ""
+            ).casefold()
+        else:
+            path = str(pointcloud)
+            source_type = Path(path).suffix.casefold().lstrip(".")
+        resolved_path = str(Path(path).resolve())
+        if isinstance(block, dict):
+            block_name = str(block.get("name", ""))
+            source_type = str(block.get("source_type") or source_type).casefold()
+            start = block.get("start")
+            count = block.get("count", block.get("point_count"))
+        else:
+            block_name = str(block)
+            start = None
+            count = None
+
+        if source_type == "pcdb" or Path(path).suffix.casefold() == ".pcdb":
+            source_version = self._source_version(pointcloud, resolved_path)
+            key = ("pcdb", resolved_path, source_version, block_name, None, "preview")
+            records = self._cached_records(
+                key,
+                self._source_lock("pcdb", resolved_path),
+                lambda: self._read_pcdb_preview(
+                    resolved_path, source_version, block_name
+                ),
+            )
+        elif source_type == "las" or Path(path).suffix.casefold() == ".las":
+            if start is None or count is None:
+                start, count = _parse_las_block_name(block_name)
+            start, count = int(start), int(count)
+            source_version = self._source_version(pointcloud, resolved_path)
+            key = ("las", resolved_path, source_version, start, count, "preview")
+            records = self._cached_records(
+                key,
+                self._source_lock("las", resolved_path),
+                lambda: self._read_las_preview(
+                    resolved_path, source_version, start, count
+                ),
+            )
+        else:
+            raise ValueError(f"Unsupported point-cloud source type for {path}")
+        return (
+            records["xyz"],
+            records["rgb"],
+            records["intensity"],
+            records["classification"],
         )
 
     def read_block_points(
