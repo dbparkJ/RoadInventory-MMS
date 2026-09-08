@@ -119,7 +119,7 @@ class PipelineDiagnosticIntegrationTests(unittest.TestCase):
 
     def test_actual_pose_read_failure_reaches_manifest_as_input_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             args = self._args(root)
             sphere = (
                 root

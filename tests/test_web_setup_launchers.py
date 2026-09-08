@@ -86,7 +86,7 @@ class WindowsWebSetupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.root = self.base / "project with spaces"
         self.scripts = self.root / "scripts"
         self.scripts.mkdir(parents=True)

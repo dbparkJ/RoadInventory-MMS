@@ -50,7 +50,7 @@ class WebBuildRuntimeTests(unittest.TestCase):
 
     def test_actual_static_override_and_runtime_api_are_passed_to_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             config = WebAppConfig(
                 project_root=root, allowed_roots=[root], state_dir=root / "state",
                 static_dir=root / "release-ui", enable_run_worker=False, build_mode="production",

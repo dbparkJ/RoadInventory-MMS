@@ -115,7 +115,7 @@ def _write_raw_attribute_las(
 class PointCloudLasTests(unittest.TestCase):
     def test_web_catalog_mode_checks_every_discovered_source_for_links(self) -> None:
         with tempfile.TemporaryDirectory() as root_text:
-            root = Path(root_text)
+            root = Path(root_text).resolve()
             source = root / "Job_A_Track01.las"
             source.write_bytes(b"not-opened")
             original_is_symlink = Path.is_symlink

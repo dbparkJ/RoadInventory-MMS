@@ -781,8 +781,8 @@ class WebAppRunSafetyTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as root_text,
             tempfile.TemporaryDirectory() as state_text,
         ):
-            root = Path(root_text)
-            state = Path(state_text)
+            root = Path(root_text).resolve()
+            state = Path(state_text).resolve()
             config = WebAppConfig(
                 project_root=Path(__file__).resolve().parents[1],
                 state_dir=state,
