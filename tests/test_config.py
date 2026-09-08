@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,16 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertIsNone(configured["include_track_names"])
         self.assertIsNone(configured["frame_id_from"])
         self.assertIsNone(configured["frame_id_to"])
+        self.assertFalse(configured["object_crops"]["enabled"])
+        self.assertEqual(configured["object_crops"]["schema_version"], "1.0.0")
+        self.assertEqual(
+            configured["object_crops"]["source_scope"],
+            {"strict": True, "jobs": []},
+        )
+        self.assertEqual(
+            configured["object_crops"]["output"]["directory_name"],
+            "object_crops_v1",
+        )
 
     def test_no_argument_loads_default_yaml_and_cli_can_override_it(self) -> None:
         parser = build_arg_parser()
@@ -160,6 +171,64 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(args.frame_id_from, "frame2")
         self.assertEqual(args.frame_id_to, "frame10")
         self.assertIn("include_job_names", args._cli_override_dests)
+
+    def test_object_crops_is_one_opaque_validated_yaml_and_cli_mapping(self) -> None:
+        payload = {
+            "enabled": True,
+            "source_scope": {
+                "strict": True,
+                "jobs": [{"job_id": "Job_A", "tracks": ["Track01"]}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "object-crops.yaml"
+            config_path.write_text(
+                "config_version: 1\n"
+                "object_crops:\n"
+                "  enabled: true\n"
+                "  source_scope:\n"
+                "    strict: true\n"
+                "    jobs:\n"
+                "      - job_id: Job_A\n"
+                "        tracks: [Track01]\n",
+                encoding="utf-8",
+            )
+            configured = load_config_defaults(build_arg_parser(), config_path)
+
+        self.assertEqual(set(configured), {"object_crops"})
+        self.assertTrue(configured["object_crops"]["enabled"])
+        self.assertEqual(
+            configured["object_crops"]["source_scope"]["jobs"],
+            [{"job_id": "Job_A", "tracks": ["Track01"]}],
+        )
+
+        args = parse_args_with_config(
+            build_arg_parser(),
+            ["--no-config", "--object-crops", json.dumps(payload)],
+        )
+        self.assertEqual(args.object_crops, configured["object_crops"])
+        self.assertEqual(args._cli_override_dests, ("object_crops",))
+
+    def test_object_crop_strict_scope_and_nested_schema_are_enforced(self) -> None:
+        fixtures = {
+            "empty-scope.yaml": (
+                "config_version: 1\nobject_crops:\n"
+                "  enabled: true\n"
+                "  source_scope: {strict: true, jobs: []}\n"
+            ),
+            "unknown-key.yaml": (
+                "config_version: 1\nobject_crops:\n"
+                "  enabled: false\n"
+                "  source_scope: {strict: true, jobs: [], substring: true}\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, content in fixtures.items():
+                path = root / name
+                path.write_text(content, encoding="utf-8")
+                with self.subTest(name=name), self.assertRaises(ConfigError):
+                    load_config_defaults(build_arg_parser(), path)
 
     def test_unknown_duplicate_and_invalid_values_are_rejected(self) -> None:
         fixtures = {

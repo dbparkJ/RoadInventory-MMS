@@ -18,10 +18,11 @@ import sqlite3
 import struct
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import laspy
 import numpy as np
@@ -33,11 +34,36 @@ from .pcdb import (
 )
 
 
-POINTCLOUD_CATALOG_VERSION = 5
+POINTCLOUD_CATALOG_VERSION = 6
 DEFAULT_LAS_CHUNK_SIZE = 250_000
 DEFAULT_DECODED_BLOCK_CACHE_MAX_ENTRIES = 64
 DEFAULT_DECODED_BLOCK_CACHE_MAX_BYTES = 512 * 1024 * 1024
 NEUTRAL_RGB = np.asarray([128, 128, 128], dtype=np.uint8)
+
+# ``read_block_records`` deliberately remains an array-only mapping.  A
+# structured, row-aligned availability array lets all of the existing generic
+# mask/concatenate code continue to work while distinguishing a real zero from
+# a field that the source format cannot provide.
+POINT_RECORD_FIELD_AVAILABILITY_DTYPE = np.dtype(
+    [
+        ("xyz", np.bool_),
+        ("rgb", np.bool_),
+        ("rgb_raw", np.bool_),
+        ("intensity", np.bool_),
+        ("classification", np.bool_),
+        ("gps_time", np.bool_),
+        ("gps_time_type", np.bool_),
+        ("return_number", np.bool_),
+        ("number_of_returns", np.bool_),
+        ("point_source_id", np.bool_),
+        ("scan_angle", np.bool_),
+        ("scan_angle_rank", np.bool_),
+        ("user_data", np.bool_),
+        ("edge_of_flight_line", np.bool_),
+        ("scan_direction_flag", np.bool_),
+        ("source_index", np.bool_),
+    ]
+)
 
 _LAS_NAME_PATTERN = re.compile(
     r"^(?P<job>.+)_(?P<track>Track[_-]?\d+)(?:_(?P<split>[1-9]\d*))?$",
@@ -56,6 +82,15 @@ def _canonical_name(value: Any) -> str | None:
     return canonical or None
 
 
+def _exact_scope_key(value: Any) -> str | None:
+    """Match object-crop identities by normalized case only, not punctuation."""
+
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFC", value.strip()).casefold()
+    return text or None
+
+
 def _normalize_include_jobs(
     include_jobs: Iterable[str] | str | None,
 ) -> tuple[list[str] | None, list[str] | None]:
@@ -71,6 +106,165 @@ def _normalize_include_jobs(
     keys = sorted(names_by_key)
     names = [names_by_key[key] for key in keys]
     return names, keys
+
+
+def _normalize_include_scope(
+    include_scope: Iterable[Mapping[str, Any]] | Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, set[tuple[str, str]] | None]:
+    """Normalize an exact Job/Track allowlist without substring matching.
+
+    Both the configuration shape (``{"strict": true, "jobs": [...]}``) and
+    the compact API shape (``[{"job_id": ..., "track_ids": [...]}]``) are
+    accepted.  ``tracks`` is the canonical key; ``track_ids`` remains an alias
+    for the API example in the P0 specification.
+    """
+
+    if include_scope is None:
+        return None, None
+
+    strict = True
+    if isinstance(include_scope, Mapping):
+        if "jobs" in include_scope:
+            unknown_top_level = set(include_scope) - {"strict", "jobs"}
+            if unknown_top_level:
+                names = ", ".join(sorted(str(name) for name in unknown_top_level))
+                raise ValueError(f"Unknown include_scope fields: {names}")
+            strict_value = include_scope.get("strict", True)
+            if not isinstance(strict_value, bool):
+                raise ValueError("include_scope.strict must be a boolean")
+            strict = strict_value
+            entries_value = include_scope.get("jobs")
+        else:
+            # Also accept one compact job mapping directly.
+            entries_value = [include_scope]
+    else:
+        if isinstance(include_scope, (str, bytes)):
+            raise ValueError("include_scope must contain Job/Track mappings")
+        entries_value = include_scope
+
+    if isinstance(entries_value, Mapping) or isinstance(entries_value, (str, bytes)):
+        raise ValueError("include_scope.jobs must be a list of mappings")
+    try:
+        entries = list(entries_value)
+    except TypeError as exc:
+        raise ValueError("include_scope.jobs must be a list of mappings") from exc
+    if not entries:
+        if strict:
+            raise ValueError("strict include_scope must contain at least one job")
+        # An explicitly non-strict empty scope is the feature-off/legacy
+        # compatible form: retain it in the catalog identity but allow all
+        # discovered sources.
+        return {"strict": False, "jobs": []}, None
+
+    tracks_by_job: dict[str, set[str]] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"include_scope.jobs[{index}] must be a mapping")
+        unknown_fields = set(entry) - {"job_id", "tracks", "track_ids"}
+        if unknown_fields:
+            names = ", ".join(sorted(str(name) for name in unknown_fields))
+            raise ValueError(
+                f"Unknown include_scope.jobs[{index}] fields: {names}"
+            )
+        if "tracks" in entry and "track_ids" in entry:
+            raise ValueError(
+                f"include_scope.jobs[{index}] cannot define both tracks and track_ids"
+            )
+        job_key = _exact_scope_key(entry.get("job_id"))
+        if job_key is None:
+            raise ValueError(f"include_scope.jobs[{index}].job_id is required")
+        track_values = entry.get("tracks", entry.get("track_ids"))
+        if isinstance(track_values, (str, bytes)):
+            track_values = [track_values]
+        if track_values is None:
+            raise ValueError(f"include_scope.jobs[{index}].tracks is required")
+        try:
+            raw_tracks = list(track_values)
+        except TypeError as exc:
+            raise ValueError(
+                f"include_scope.jobs[{index}].tracks must be a list"
+            ) from exc
+        if not raw_tracks:
+            raise ValueError(
+                f"include_scope.jobs[{index}].tracks must not be empty"
+            )
+        job_tracks = tracks_by_job.setdefault(job_key, set())
+        for track_index, raw_track in enumerate(raw_tracks):
+            track_key = _exact_scope_key(raw_track)
+            if track_key is None:
+                raise ValueError(
+                    f"include_scope.jobs[{index}].tracks[{track_index}] is invalid"
+                )
+            job_tracks.add(track_key)
+
+    normalized_jobs = [
+        {"job_id": job_key, "tracks": sorted(tracks_by_job[job_key])}
+        for job_key in sorted(tracks_by_job)
+    ]
+    normalized = {"strict": strict, "jobs": normalized_jobs}
+    pairs = {
+        (job["job_id"], track_key)
+        for job in normalized_jobs
+        for track_key in job["tracks"]
+    }
+    return normalized, pairs
+
+
+def _filter_las_paths_by_scope(
+    paths: Iterable[Path],
+    normalized_scope: dict[str, Any] | None,
+    allowed_pairs: set[tuple[str, str]] | None,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    """Filter LAS paths by parsed identity before any LAS file is opened."""
+
+    if normalized_scope is None or allowed_pairs is None:
+        return list(paths), []
+
+    strict = bool(normalized_scope["strict"])
+    selected: list[Path] = []
+    filtered: list[dict[str, Any]] = []
+    matched_pairs: set[tuple[str, str]] = set()
+    for path in paths:
+        identity = _parse_las_identity(path)
+        job_key = _exact_scope_key(identity.get("job_name"))
+        track_key = _exact_scope_key(identity.get("track_name"))
+        if job_key is None or track_key is None:
+            if strict:
+                raise ValueError(
+                    "Strict include_scope could not parse exact Job/Track identity "
+                    f"for LAS source: {path.resolve()}"
+                )
+            filtered.append(
+                {
+                    "path": str(path.resolve()),
+                    "job_name": identity.get("job_name"),
+                    "track_name": identity.get("track_name"),
+                    "reason": "scope_identity_unavailable",
+                }
+            )
+            continue
+
+        pair = (job_key, track_key)
+        if pair not in allowed_pairs:
+            filtered.append(
+                {
+                    "path": str(path.resolve()),
+                    "job_name": identity.get("job_name"),
+                    "track_name": identity.get("track_name"),
+                    "reason": "job_track_not_included",
+                }
+            )
+            continue
+        selected.append(path)
+        matched_pairs.add(pair)
+
+    missing_pairs = sorted(allowed_pairs - matched_pairs)
+    if strict and missing_pairs:
+        missing = ", ".join(f"{job}/{track}" for job, track in missing_pairs)
+        raise FileNotFoundError(
+            f"No LAS files found for strict include_scope pairs: {missing}"
+        )
+    return selected, filtered
 
 
 def _log(logger: Any, level: str, message: str, *args: Any) -> None:
@@ -605,6 +799,52 @@ def _xyz_from_las_points(points: Any) -> np.ndarray:
     )
 
 
+def _las_record_field_metadata(
+    dimension_names: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    """Describe raw fields whose LAS source semantics must remain explicit."""
+
+    dimensions = {str(name).casefold() for name in dimension_names}
+    metadata: dict[str, dict[str, Any]] = {}
+    if {"red", "green", "blue"}.issubset(dimensions):
+        metadata["rgb_raw"] = {
+            "source_dimensions": ["red", "green", "blue"],
+            "source_dtype": "uint16",
+            "output_dtype": "uint16",
+            "semantic": "las_rgb_channels_raw",
+        }
+    for name, dtype, semantic in (
+        ("point_source_id", "uint16", "las_point_source_id"),
+        ("user_data", "uint8", "las_user_data"),
+        ("edge_of_flight_line", "uint8", "las_edge_of_flight_line_flag"),
+        ("scan_direction_flag", "uint8", "las_scan_direction_flag"),
+    ):
+        if name in dimensions:
+            metadata[name] = {
+                "source_dimension": name,
+                "source_dtype": dtype,
+                "output_dtype": dtype,
+                "semantic": semantic,
+            }
+    if "scan_angle" in dimensions:
+        metadata["scan_angle"] = {
+            "source_dimension": "scan_angle",
+            "source_dtype": "int16",
+            "output_dtype": "int16",
+            "semantic": "las_1_4_scan_angle_raw_0_006_degree",
+            "scale_to_degrees": 0.006,
+        }
+    if "scan_angle_rank" in dimensions:
+        metadata["scan_angle_rank"] = {
+            "source_dimension": "scan_angle_rank",
+            "source_dtype": "int8",
+            "output_dtype": "int8",
+            "semantic": "legacy_las_scan_angle_rank_degrees",
+            "scale_to_degrees": 1.0,
+        }
+    return metadata
+
+
 def _index_single_las(
     path: Path,
     data_root: Path,
@@ -676,6 +916,7 @@ def _index_single_las(
         scales = [float(value) for value in header.scales]
         offsets = [float(value) for value in header.offsets]
         point_format_id = int(header.point_format.id)
+        record_field_metadata = _las_record_field_metadata(dimension_names)
         las_version = str(header.version)
         system_identifier = _safe_text(header.system_identifier)
         generating_software = _safe_text(header.generating_software)
@@ -703,6 +944,8 @@ def _index_single_las(
         relative_path = path.name
     provenance = {
         "source_type": "las",
+        "provenance_complete": True,
+        "training": True,
         "source_path": str(path.resolve()),
         "relative_path": relative_path,
         "index_method": "sequential_point_chunks",
@@ -727,6 +970,8 @@ def _index_single_las(
         "path": str(path.resolve()),
         "source_type": "las",
         "format": "las",
+        "provenance_complete": True,
+        "training": True,
         "job_name": identity["job_name"],
         "track_name": identity["track_name"],
         "split_index": identity["split_index"],
@@ -747,6 +992,7 @@ def _index_single_las(
             "id": point_format_id,
             "dimensions": dimension_names,
         },
+        "record_field_metadata": record_field_metadata,
         "classification_summary": {
             "dimension_present": bool(has_classification),
             "point_count": int(classification_counts.sum()),
@@ -843,6 +1089,8 @@ def _index_single_pcdb(
         "path": str(path.resolve()),
         "source_type": "pcdb",
         "format": "pcdb",
+        "provenance_complete": False,
+        "training": False,
         "route_id": indexed.get("route_id", route_id),
         "timestamp_iso": indexed.get("timestamp_iso", timestamp_iso),
         "scanner_id": indexed.get("scanner_id", scanner_id),
@@ -858,6 +1106,7 @@ def _index_single_pcdb(
         "offsets": None,
         "point_format_id": None,
         "point_format": {"id": None, "dimensions": ["x", "y", "z", "rgb", "intensity"]},
+        "record_field_metadata": {},
         "classification_summary": {
             "dimension_present": False,
             "point_count": 0,
@@ -866,6 +1115,8 @@ def _index_single_pcdb(
         },
         "provenance": {
             "source_type": "pcdb",
+            "provenance_complete": False,
+            "training": False,
             "source_path": str(path.resolve()),
             "relative_path": relative_path,
             "index_method": "crystal_cube_bpc_headers",
@@ -990,6 +1241,7 @@ def build_pointcloud_catalog(
     source: str = "auto",
     las_chunk_size: int = DEFAULT_LAS_CHUNK_SIZE,
     include_jobs: Iterable[str] | str | None = None,
+    include_scope: Iterable[Mapping[str, Any]] | Mapping[str, Any] | None = None,
     reject_symlinks: bool = False,
 ) -> dict[str, Any]:
     """Discover point clouds and build or load their persistent spatial catalog.
@@ -998,7 +1250,10 @@ def build_pointcloud_catalog(
     independent legacy and Leica deliveries. Task identity and spatial scope keep
     duplicate backends from being mixed at projection time. ``include_jobs``
     limits LAS discovery to named Leica jobs before files are opened; it does not
-    filter legacy PCDB files.
+    filter legacy PCDB files. ``include_scope`` adds an exact normalized
+    Job/Track allowlist for LAS.  In strict mode an unparseable LAS identity,
+    an allowlisted pair with no source, or an admitted PCDB source without an
+    exact identity fails closed before any point-cloud file is opened.
     """
 
     data_root = Path(data_root)
@@ -1010,6 +1265,9 @@ def build_pointcloud_catalog(
         raise ValueError("las_chunk_size must be greater than zero")
     las_chunk_size = int(las_chunk_size)
     include_job_names, include_job_keys = _normalize_include_jobs(include_jobs)
+    normalized_include_scope, include_scope_pairs = _normalize_include_scope(
+        include_scope
+    )
 
     pcdb_paths, all_las_paths = _discover_sources(
         data_root,
@@ -1026,6 +1284,18 @@ def build_pointcloud_catalog(
     else:
         selected_source_type = source_mode
 
+    if (
+        normalized_include_scope is not None
+        and bool(normalized_include_scope["strict"])
+        and pcdb_paths
+        and selected_source_type in {"pcdb", "mixed"}
+    ):
+        raise ValueError(
+            "Strict include_scope cannot admit a PCDB source without exact "
+            "Job/Track identity; select source='las' or use a non-strict scope. "
+            f"First unidentified source: {pcdb_paths[0].resolve()}"
+        )
+
     if selected_source_type == "pcdb":
         selected_paths = pcdb_paths
         selection_provenance: dict[str, dict[str, Any]] = {}
@@ -1034,17 +1304,25 @@ def build_pointcloud_catalog(
         discovered_paths = pcdb_paths
         effective_include_job_names: list[str] | None = None
         effective_include_job_keys: list[str] | None = None
+        effective_include_scope: dict[str, Any] | None = None
+        scope_filtered_files: list[dict[str, Any]] = []
     else:
         effective_include_job_names = include_job_names
         effective_include_job_keys = include_job_keys
+        effective_include_scope = normalized_include_scope
+        scope_las_paths, scope_filtered_files = _filter_las_paths_by_scope(
+            all_las_paths,
+            normalized_include_scope,
+            include_scope_pairs,
+        )
         if include_job_keys is None:
-            job_las_paths = all_las_paths
+            job_las_paths = scope_las_paths
             job_filtered_files = []
         else:
             include_job_key_set = set(include_job_keys)
             job_las_paths = []
             job_filtered_files = []
-            for path in all_las_paths:
+            for path in scope_las_paths:
                 identity = _parse_las_identity(path)
                 file_job_key = _canonical_name(identity.get("job_name"))
                 if file_job_key in include_job_key_set:
@@ -1107,6 +1385,7 @@ def build_pointcloud_catalog(
         "selected_source_type": selected_source_type,
         "las_chunk_size": las_chunk_size,
         "include_job_keys": effective_include_job_keys,
+        "include_scope": effective_include_scope,
         "source_files": _source_signature(
             discovered_paths,
             data_root,
@@ -1202,13 +1481,19 @@ def build_pointcloud_catalog(
         "data_root": str(data_root.resolve()),
         "include_jobs": effective_include_job_names,
         "include_job_keys": effective_include_job_keys,
+        "include_scope": effective_include_scope,
         "signature": signature,
         "crs_wkt": common_wkt,
         "wkt": common_wkt,
         "files": files,
+        "provenance_complete": all(
+            bool(item.get("provenance_complete", False)) for item in files
+        ),
+        "training": all(bool(item.get("training", False)) for item in files),
         "classification_summary": _aggregate_classification_summary(files),
         "excluded_files": excluded_files,
         "job_filtered_files": job_filtered_files,
+        "scope_filtered_files": scope_filtered_files,
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = cache_path.with_name(
@@ -1458,6 +1743,34 @@ def _rgb8_from_las(points: Any) -> np.ndarray:
     return ((rgb16.astype(np.uint32) + 128) // 257).astype(np.uint8)
 
 
+def _record_field_availability(
+    count: int,
+    present: Mapping[str, bool],
+) -> np.ndarray:
+    """Build a row-aligned availability array with one stable record dtype."""
+
+    availability = np.zeros(
+        (count,),
+        dtype=POINT_RECORD_FIELD_AVAILABILITY_DTYPE,
+    )
+    for field_name in POINT_RECORD_FIELD_AVAILABILITY_DTYPE.names or ():
+        availability[field_name] = bool(present.get(field_name, False))
+    return availability
+
+
+def _raw_las_dimension(
+    points: Any,
+    name: str,
+    dtype: np.dtype[Any] | type[np.generic],
+) -> np.ndarray:
+    """Copy one LAS dimension without applying a scaled presentation view."""
+
+    raw_names = points.array.dtype.names or ()
+    if name in raw_names:
+        return np.asarray(points.array[name], dtype=dtype).copy()
+    return np.asarray(getattr(points, name), dtype=dtype).copy()
+
+
 class PointCloudReaderCache:
     """Thread-safe cache for source handles and decoded point-cloud blocks.
 
@@ -1668,13 +1981,21 @@ class PointCloudReaderCache:
             return {
                 "xyz": xyz,
                 "rgb": rgb,
+                "rgb_raw": np.empty((0, 3), dtype=np.uint16),
                 "intensity": intensity,
                 "classification": np.empty((0,), dtype=np.int16),
                 "gps_time": np.empty((0,), dtype=np.float64),
                 "gps_time_type": np.empty((0,), dtype=np.int8),
                 "return_number": np.empty((0,), dtype=np.uint8),
                 "number_of_returns": np.empty((0,), dtype=np.uint8),
+                "point_source_id": np.empty((0,), dtype=np.uint16),
+                "scan_angle": np.empty((0,), dtype=np.int16),
+                "scan_angle_rank": np.empty((0,), dtype=np.int8),
+                "user_data": np.empty((0,), dtype=np.uint8),
+                "edge_of_flight_line": np.empty((0,), dtype=np.uint8),
+                "scan_direction_flag": np.empty((0,), dtype=np.uint8),
                 "source_index": np.empty((0,), dtype=np.int64),
+                "field_availability": _record_field_availability(0, {}),
             }
         reader = self._las_reader(path, source_version)
         reader.seek(start)
@@ -1682,6 +2003,18 @@ class PointCloudReaderCache:
         xyz = _xyz_from_las_points(points)
         rgb = _rgb8_from_las(points)
         dimension_names = {str(name).casefold() for name in points.point_format.dimension_names}
+        has_rgb_raw = {"red", "green", "blue"}.issubset(dimension_names)
+        rgb_raw = (
+            np.column_stack(
+                (
+                    _raw_las_dimension(points, "red", np.uint16),
+                    _raw_las_dimension(points, "green", np.uint16),
+                    _raw_las_dimension(points, "blue", np.uint16),
+                )
+            )
+            if has_rgb_raw
+            else np.zeros((len(points), 3), dtype=np.uint16)
+        )
         if "intensity" in dimension_names:
             intensity = np.asarray(points.intensity, dtype=np.uint16).copy()
         else:
@@ -1716,16 +2049,78 @@ class PointCloudReaderCache:
             if "number_of_returns" in dimension_names
             else np.zeros((len(points),), dtype=np.uint8)
         )
+        point_source_id = (
+            _raw_las_dimension(points, "point_source_id", np.uint16)
+            if "point_source_id" in dimension_names
+            else np.zeros((len(points),), dtype=np.uint16)
+        )
+        # Point formats 6+ store a signed int16 scan angle.  Older formats use
+        # the distinct signed int8 scan_angle_rank.  Keep both arrays so their
+        # source semantic and raw dtype can never be conflated.
+        scan_angle = (
+            _raw_las_dimension(points, "scan_angle", np.int16)
+            if "scan_angle" in dimension_names
+            else np.zeros((len(points),), dtype=np.int16)
+        )
+        scan_angle_rank = (
+            _raw_las_dimension(points, "scan_angle_rank", np.int8)
+            if "scan_angle_rank" in dimension_names
+            else np.zeros((len(points),), dtype=np.int8)
+        )
+        user_data = (
+            _raw_las_dimension(points, "user_data", np.uint8)
+            if "user_data" in dimension_names
+            else np.zeros((len(points),), dtype=np.uint8)
+        )
+        edge_of_flight_line = (
+            np.asarray(points.edge_of_flight_line, dtype=np.uint8).copy()
+            if "edge_of_flight_line" in dimension_names
+            else np.zeros((len(points),), dtype=np.uint8)
+        )
+        scan_direction_flag = (
+            np.asarray(points.scan_direction_flag, dtype=np.uint8).copy()
+            if "scan_direction_flag" in dimension_names
+            else np.zeros((len(points),), dtype=np.uint8)
+        )
+        availability = _record_field_availability(
+            len(points),
+            {
+                "xyz": True,
+                "rgb": has_rgb_raw,
+                "rgb_raw": has_rgb_raw,
+                "intensity": "intensity" in dimension_names,
+                "classification": "classification" in dimension_names,
+                "gps_time": "gps_time" in dimension_names,
+                "gps_time_type": "gps_time" in dimension_names,
+                "return_number": "return_number" in dimension_names,
+                "number_of_returns": "number_of_returns" in dimension_names,
+                "point_source_id": "point_source_id" in dimension_names,
+                "scan_angle": "scan_angle" in dimension_names,
+                "scan_angle_rank": "scan_angle_rank" in dimension_names,
+                "user_data": "user_data" in dimension_names,
+                "edge_of_flight_line": "edge_of_flight_line" in dimension_names,
+                "scan_direction_flag": "scan_direction_flag" in dimension_names,
+                "source_index": True,
+            },
+        )
         return {
             "xyz": xyz,
             "rgb": rgb,
+            "rgb_raw": rgb_raw,
             "intensity": intensity,
             "classification": classification,
             "gps_time": gps_time,
             "gps_time_type": gps_time_type,
             "return_number": return_number,
             "number_of_returns": number_of_returns,
+            "point_source_id": point_source_id,
+            "scan_angle": scan_angle,
+            "scan_angle_rank": scan_angle_rank,
+            "user_data": user_data,
+            "edge_of_flight_line": edge_of_flight_line,
+            "scan_direction_flag": scan_direction_flag,
             "source_index": np.arange(start, start + len(points), dtype=np.int64),
+            "field_availability": availability,
         }
 
     def _read_pcdb_records(
@@ -1739,13 +2134,28 @@ class PointCloudReaderCache:
         return {
             "xyz": xyz,
             "rgb": rgb,
+            "rgb_raw": np.zeros((count, 3), dtype=np.uint16),
             "intensity": intensity,
             "classification": np.full((count,), -1, dtype=np.int16),
             "gps_time": np.full((count,), np.nan, dtype=np.float64),
             "gps_time_type": np.full((count,), -1, dtype=np.int8),
             "return_number": np.zeros((count,), dtype=np.uint8),
             "number_of_returns": np.zeros((count,), dtype=np.uint8),
+            "point_source_id": np.zeros((count,), dtype=np.uint16),
+            "scan_angle": np.zeros((count,), dtype=np.int16),
+            "scan_angle_rank": np.zeros((count,), dtype=np.int8),
+            "user_data": np.zeros((count,), dtype=np.uint8),
+            "edge_of_flight_line": np.zeros((count,), dtype=np.uint8),
+            "scan_direction_flag": np.zeros((count,), dtype=np.uint8),
             "source_index": np.full((count,), -1, dtype=np.int64),
+            "field_availability": _record_field_availability(
+                count,
+                {
+                    "xyz": True,
+                    "rgb": True,
+                    "intensity": True,
+                },
+            ),
         }
 
     @staticmethod
@@ -2021,6 +2431,7 @@ __all__ = [
     "DEFAULT_DECODED_BLOCK_CACHE_MAX_ENTRIES",
     "DEFAULT_LAS_CHUNK_SIZE",
     "POINTCLOUD_CATALOG_VERSION",
+    "POINT_RECORD_FIELD_AVAILABILITY_DTYPE",
     "PointCloudReaderCache",
     "build_pointcloud_catalog",
     "match_nearest_pointcloud_files",
