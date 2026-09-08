@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -35,6 +34,9 @@ from mms_shp_detection.infrastructure.manifest_writer import (
     validate_published_outputs,
 )
 from mms_shp_detection.naming import validate_model_output_names
+from mms_shp_detection.infrastructure.process_owner import (
+    OwnedExecution, OwnershipUnknown, inspect_owner, new_intent,
+)
 
 from .datasets import catalog_path as dataset_catalog_path
 from .datasets import require_ready_dataset, seed_catalog_cache, utc_now
@@ -1574,6 +1576,7 @@ def public_run(
         "cancel_requested": bool(item.get("cancel_requested")),
         "return_code": item.get("return_code"),
         "stage": public_status,
+        "execution": {"requires_inspection": bool(item.get("ownership_blocked"))},
     }
     if manifest is not None:
         errors = manifest.get("errors") or []
@@ -1659,6 +1662,47 @@ class RunManager:
         self._active_run_id: str | None = None
         self._active_process: asyncio.subprocess.Process | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._active_owner: OwnedExecution | None = None
+
+    def _observe_owner(self, run: dict[str, Any]) -> str:
+        record = run.get("ownership")
+        if not isinstance(record, dict) or record.get("run_id") != run.get("id"):
+            return "unknown"
+        if isinstance(record, dict) and record.get("phase") == "intent":
+            try:
+                launcher = str(record["launcher"])
+                if not re.fullmatch(r"[0-9a-f]{32}", launcher):
+                    return "unknown"
+                receipt = _run_work_dir(self.app, run) / ".execution" / (launcher + ".json")
+                if receipt.is_file() and not receipt.is_symlink() and receipt.stat().st_size < 8192:
+                    document = json.loads(receipt.read_text(encoding="utf-8"))
+                    if all(document.get(key) == record.get(key) for key in ("schema", "launcher", "run_id", "attempt")) and document.get("phase") == "acknowledged":
+                        if self.app.state.store.record_run_owner(str(run["id"]), document, utc_now()):
+                            record = document
+            except (OSError, ValueError, TypeError, KeyError):
+                return "unknown"
+        return inspect_owner(record)
+
+    def _block_owner(self, run_id: str, observation: str = "unknown") -> None:
+        self.app.state.store.set_ownership_block(
+            run_id, True, utc_now(),
+            "Execution ownership requires inspection (" + observation + "); GPU queue is paused.",
+        )
+
+    def _refresh_ownership_blocks(self) -> None:
+        changed = False
+        for run in self.app.state.store.list_ownership_blocks():
+            if self._observe_owner(run) == "exited":
+                latest = self.app.state.store.get_run(str(run["id"])) or run
+                record = latest.get("ownership")
+                if isinstance(record, dict):
+                    self.app.state.store.record_run_owner(
+                        str(run["id"]), {**record, "phase": "exited"}, utc_now(),
+                    )
+                self.app.state.store.set_ownership_block(str(run["id"]), False, utc_now())
+                changed = True
+        if changed:
+            self.recover_after_restart(utc_now())
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
@@ -1720,6 +1764,18 @@ class RunManager:
                 RUN_EXECUTION_CONTRACT_VERSION
             )
         )
+        for previous in recovery_candidates:
+            if previous.get("status") not in {"queued", "preparing"} or previous.get("ownership_blocked"):
+                observation = self._observe_owner(previous)
+                if observation != "exited":
+                    self._block_owner(str(previous["id"]), observation)
+                else:
+                    latest = self.app.state.store.get_run(str(previous["id"])) or previous
+                    record = latest.get("ownership")
+                    if isinstance(record, dict):
+                        self.app.state.store.record_run_owner(
+                            str(previous["id"]), {**record, "phase": "exited"}, now,
+                        )
         recovered = self.app.state.store.recover_after_restart(now)
         for previous in recovery_candidates:
             run_id = str(previous["id"])
@@ -1734,6 +1790,9 @@ class RunManager:
             manifest, manifest_problem = _read_run_manifest(self.app, current)
             if apply_terminal_manifest(current, manifest, manifest_problem):
                 continue
+            if current.get("ownership_blocked"):
+                self._block_owner(run_id, self._observe_owner(current))
+                continue  # A surviving child may still publish; do not rewrite its manifest.
             target = (
                 JobStatus.CANCELLED
                 if current_status == "cancelled"
@@ -1830,7 +1889,10 @@ class RunManager:
                             cause_type="WorkerShutdown",
                         ),
                     )
-        await self._terminate(process)
+        try:
+            await self._terminate(process)
+        except (OSError, OwnershipUnknown):
+            self._block_owner(run_id)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -1927,50 +1989,15 @@ class RunManager:
         return self.app.state.store.get_run(run_id)  # type: ignore[return-value]
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
-        try:
-            if os.name == "nt":
-                pid = int(process.pid)
-                if pid <= 0:
-                    raise ProcessLookupError("Invalid child process ID.")
-                tree_kill = await asyncio.create_subprocess_exec(
-                    "taskkill",
-                    "/PID",
-                    str(pid),
-                    "/T",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await tree_kill.wait()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
-            await asyncio.wait_for(process.wait(), timeout=10)
-        except (ProcessLookupError, asyncio.TimeoutError):
-            if process.returncode is None:
-                try:
-                    if os.name == "nt":
-                        pid = int(process.pid)
-                        if pid <= 0:
-                            raise ProcessLookupError("Invalid child process ID.")
-                        force_kill = await asyncio.create_subprocess_exec(
-                            "taskkill",
-                            "/PID",
-                            str(pid),
-                            "/T",
-                            "/F",
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        await force_kill.wait()
-                    else:
-                        os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await process.wait()
+        if self._active_owner is None or process is not self._active_process:
+            if self._active_run_id:
+                self._block_owner(self._active_run_id)
+            raise OwnershipUnknown("No retained ownership channel; refusing PID termination.")
+        await self._active_owner.terminate(process)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
+            self._refresh_ownership_blocks()
             run = self.app.state.store.claim_next_queued_run(utc_now())
             if run is None:
                 self._wake.clear()
@@ -1983,6 +2010,8 @@ class RunManager:
 
     async def _execute(self, run: dict[str, Any]) -> None:
         run_id = run["id"]
+        intent = None
+        spawn_requested = False
         latest_before_start = self.app.state.store.get_run(run_id)
         if (
             latest_before_start is None
@@ -1996,6 +2025,10 @@ class RunManager:
             log_dir = work_dir / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "process.log"
+            manifest, _ = _read_run_manifest(self.app, run)
+            intent = new_intent(run_id, int((manifest or {}).get("attempt", 1)))
+            execution_dir = work_dir / ".execution"
+            execution_dir.mkdir(exist_ok=True)
             command = [
                 sys.executable,
                 str(self.app.state.config.project_root / "scripts" / "run_pipeline.py"),
@@ -2020,12 +2053,16 @@ class RunManager:
             async with self._lifecycle_lock:
                 if self._stop.is_set():
                     return
-                if not self.app.state.store.begin_run_start(run_id, utc_now()):
+                if not self.app.state.store.begin_run_start(run_id, utc_now(), intent):
                     return
+                self._active_owner = OwnedExecution(intent, execution_dir)
+                env.update(self._active_owner.environment())
+                spawn_requested = True
                 process = await asyncio.create_subprocess_exec(
                     *command,
                     cwd=str(self.app.state.config.project_root),
                     env=env,
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     **kwargs,
@@ -2043,14 +2080,39 @@ class RunManager:
                 ):
                     await self._terminate(process)
                     return
-            with log_path.open("a", encoding="utf-8", buffering=1) as log:
-                if process.stdout is not None:
-                    while True:
-                        chunk = await process.stdout.read(64 * 1024)
-                        if not chunk:
-                            break
-                        log.write(chunk.decode("utf-8", errors="replace"))
-            return_code = await process.wait()
+                acknowledged = await self._active_owner.attach(process)
+                if not self.app.state.store.record_run_owner(run_id, acknowledged, utc_now()):
+                    raise OwnershipUnknown("Launch identity reservation was replaced.")
+                self._active_owner.authorize(process)
+            async def drain_log() -> None:
+                with log_path.open("a", encoding="utf-8", buffering=1) as log:
+                    if process.stdout is not None:
+                        while True:
+                            chunk = await process.stdout.read(64 * 1024)
+                            if not chunk:
+                                break
+                            log.write(chunk.decode("utf-8", errors="replace"))
+            drain = asyncio.create_task(drain_log())
+            waiting = asyncio.create_task(process.wait())
+            next_observation = asyncio.get_running_loop().time() + 5.0
+            try:
+                while not waiting.done() and process.returncode is None:
+                    if drain.done():
+                        drain.result()  # Preserve log failures and clean the actual child.
+                    if asyncio.get_running_loop().time() >= next_observation:
+                        observation = self._active_owner.observe()
+                        if not self.app.state.store.record_run_owner(run_id, observation, utc_now()):
+                            raise OwnershipUnknown("Durable child observation reservation was replaced.")
+                        next_observation = asyncio.get_running_loop().time() + 5.0
+                    await asyncio.sleep(0.05)
+                self._active_owner.close()  # Windows descendants may hold stdout open.
+                return_code = await asyncio.wait_for(waiting, timeout=10)
+                await asyncio.wait_for(drain, timeout=10)
+            finally:
+                for task in (drain, waiting):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(drain, waiting, return_exceptions=True)
             latest = self.app.state.store.get_run(run_id) or run
             finished = utc_now()
             manifest_error: PipelineErrorInfo | None = None
@@ -2142,7 +2204,17 @@ class RunManager:
             self.app.state.logger.exception("Run %s failed before completion", run_id)
             finished = utc_now()
             latest = self.app.state.store.get_run(run_id)
+            ownership_uncertain = False
+            if self._active_process is not None and self._active_process.returncode is None:
+                try:
+                    await self._terminate(self._active_process)
+                except (OSError, OwnershipUnknown):
+                    ownership_uncertain = True
+                    self._block_owner(run_id)
+            manifest, problem = _read_run_manifest(self.app, latest) if latest else (None, "missing run")
+            durable_success = latest is not None and _succeeded_manifest_contract_problem(self.app, latest, manifest, problem) is None
             final_status = (
+                "completed" if durable_success else "interrupted" if ownership_uncertain else
                 "cancelled" if latest and latest.get("cancel_requested") else "failed"
             )
             error_text = _redact(self.app, str(exc) or type(exc).__name__, run)
@@ -2154,7 +2226,7 @@ class RunManager:
                 error=error_text if final_status == "failed" else None,
                 finished_at=finished,
             )
-            if transitioned and latest is not None:
+            if transitioned and latest is not None and not durable_success and not ownership_uncertain:
                 terminal_run = self.app.state.store.get_run(run_id) or latest
                 if final_status == "cancelled":
                     _sync_manifest_terminal(self.app, terminal_run, JobStatus.CANCELLED)
@@ -2173,6 +2245,26 @@ class RunManager:
                         ),
                     )
         finally:
+            if intent is not None and not spawn_requested:
+                self.app.state.store.record_run_owner(run_id, {**intent, "phase": "exited"}, utc_now())
+            if self._active_owner is not None:
+                try:
+                    if self._active_process is not None and self._active_process.returncode is None:
+                        try:
+                            await self._terminate(self._active_process)
+                        except (OSError, OwnershipUnknown):
+                            self._block_owner(run_id)
+                    self._active_owner.close()
+                    record = self._active_owner.record
+                    if inspect_owner(record) == "exited":
+                        self.app.state.store.record_run_owner(run_id, {**record, "phase": "exited"}, utc_now())
+                    else:
+                        self._block_owner(run_id)
+                except (OSError, ValueError, OwnershipUnknown):
+                    self._block_owner(run_id)
+                finally:
+                    self._active_owner.close()
+                    self._active_owner = None
             self._active_run_id = None
             self._active_process = None
 

@@ -4,6 +4,10 @@ The frontend uses same-origin `/api` requests by default. Set `VITE_API_BASE_URL
 browser should call a separate API origin. During local development, `MMS_API_TARGET` controls the
 Vite proxy target and defaults to `http://127.0.0.1:8000`.
 
+Run responses may include `execution: { requires_inspection: boolean }`. A true value means
+the shared GPU queue is paused because child ownership/liveness is unresolved; read APIs remain
+available. An old server omitting this additive field does not prove execution ownership.
+
 All JSON uses UTF-8 and snake_case. Errors should return a non-2xx status with one of:
 
 ```json
