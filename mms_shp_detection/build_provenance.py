@@ -24,6 +24,7 @@ REQUIRED_INPUTS = (
     "webui/tsconfig.node.json", "webui/scripts/build.mjs",
     "requirements.txt", "scripts/build_web.py", "scripts/run_web.py",
     "scripts/run_pipeline.py", "scripts/setup_web.sh", "scripts/setup_web.ps1",
+    "scripts/preserve_mms_state.py",
 )
 
 

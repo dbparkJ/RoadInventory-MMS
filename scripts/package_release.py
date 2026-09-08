@@ -28,6 +28,7 @@ SUPPORT_FILES = (
     "webui/API_CONTRACT.md", "docs/refactor/BUILD_PROVENANCE.md", "docs/refactor/CI.md",
     "docs/refactor/P3_BOUNDARIES.md",
     "docs/refactor/P1_OWNERSHIP.md",
+    "docs/refactor/P1_PRESERVATION.md",
 )
 
 
