@@ -27,6 +27,7 @@ SUPPORT_FILES = (
     "scripts/verify_environment.py", "scripts/package_release.py",
     "webui/API_CONTRACT.md", "docs/refactor/BUILD_PROVENANCE.md", "docs/refactor/CI.md",
     "docs/refactor/P3_BOUNDARIES.md",
+    "docs/refactor/P1_OWNERSHIP.md",
 )
 
 

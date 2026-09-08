@@ -6,6 +6,10 @@ The proxy preserves the browser-facing Host so API Origin checks also work in de
 The built-in API rejects explicit cross-origin browser writes; `VITE_API_BASE_URL` does not
 authorize another origin or configure CORS. Use the same-origin proxy for the built-in server.
 
+Run responses may include `execution: { requires_inspection: boolean }`. A true value means
+the shared GPU queue is paused because child ownership/liveness is unresolved; read APIs remain
+available. An old server omitting this additive field does not prove execution ownership.
+
 All JSON uses UTF-8 and snake_case. Errors should return a non-2xx status with one of:
 
 ```json
