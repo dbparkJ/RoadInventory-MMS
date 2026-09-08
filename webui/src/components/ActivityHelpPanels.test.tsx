@@ -16,6 +16,13 @@ const RUN: RunRecord = {
 afterEach(cleanup)
 
 describe('ActivityPanel', () => {
+  it('keeps an ownership pause visible for a completed run', () => {
+    render(<ActivityPanel runs={[{ ...RUN, status: 'completed', progress: 100, execution: { requires_inspection: true } }]}
+      alerts={[]} detached={false} onClose={vi.fn()} onOpenQueue={vi.fn()} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('이전 작업의 종료 확인')
+    expect(screen.getByRole('button', { name: 'MMS 구간 1 결과 보기' })).toBeInTheDocument()
+  })
+
   it('shows current work and recent notifications and opens the queue', () => {
     const onOpenQueue = vi.fn()
     render(
