@@ -32,14 +32,14 @@ import {
   type PoleBaseProposalState,
 } from '../components/OverlayContext'
 import { useOptionalManualObjectWorkspace } from '../components/ManualObjectContext'
-import { api, ApiError, type PointPreviewFocus } from '../lib/api'
+import { api, type PointPreviewFocus } from '../lib/api'
 import {
   POINT_CLOUD_DETECTION_FOCUS_EVENT,
   type PointCloudDetectionFocusEventDetail,
 } from '../lib/detectionFocus'
 import { createDemoPointCloud } from '../lib/demo'
 import { formatCount } from '../lib/format'
-import { parseMmsp } from '../lib/mmsp'
+import { loadPointPreview } from '../lib/pointPreviewLoader'
 import { DEFAULT_USER_SETTINGS } from '../lib/userSettings'
 import {
   projectFrameLocalPointToPanorama,
@@ -2002,8 +2002,6 @@ export default function PointCloudView({
       return
     }
     const controller = new AbortController()
-    let retryTimer: number | undefined
-    let attempts = 0
     if (payloadFrameKeyRef.current !== payloadFrameKey) setPayload(null)
     setLoading(true)
     setIndexing(false)
@@ -2013,14 +2011,12 @@ export default function PointCloudView({
       try {
         const data = demoMode
           ? createDemoPointCloud(budget)
-          : parseMmsp(await api.points(
-              datasetId,
-              frame.id,
-              budget,
-              controller.signal,
+          : await loadPointPreview(datasetId, frame.id, budget, {
+              signal: controller.signal,
               colorMode,
-              requestFocuses.length ? requestFocuses : undefined,
-            ))
+              focuses: requestFocuses.length ? requestFocuses : undefined,
+              onIndexing: () => setIndexing(true),
+            })
         if (!controller.signal.aborted) {
           if (requestFocuses.length === 0) {
             basePayloadCacheRef.current = {
@@ -2036,12 +2032,6 @@ export default function PointCloudView({
         }
       } catch (reason) {
         if (controller.signal.aborted) return
-        if (reason instanceof ApiError && reason.status === 202 && attempts < 8) {
-          attempts += 1
-          setIndexing(true)
-          retryTimer = window.setTimeout(load, Math.min(8_000, 1_200 * attempts))
-          return
-        }
         setError(reason instanceof Error ? reason.message : '포인트 데이터를 불러오지 못했습니다.')
         setLoading(false)
       }
@@ -2049,7 +2039,6 @@ export default function PointCloudView({
     void load()
     return () => {
       controller.abort()
-      if (retryTimer) window.clearTimeout(retryTimer)
     }
   }, [
     budget,
