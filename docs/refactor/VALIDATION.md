@@ -15,13 +15,66 @@
 
 Python의 4 skip은 Windows symlink 생성 권한 부족이다. Linux CI에서 해당 계약을 검증할 예정이다. 기존 Starlette/httpx deprecation 경고 1개는 무관한 의존성 업그레이드로 처리하지 않는다.
 
-프런트 기존 실패는 QA 세션 비동기 초기화 전에 disabled launcher를 누르는 테스트 준비 경합으로 조사 중이다. 원래 timeout을 늘리거나 테스트를 제외하지 않는다.
+프런트 기존 실패는 QA 세션 비동기 초기화 전에 disabled launcher를 누르는 테스트 준비 경합이었다. 버튼 활성화를 기다리도록 수정한 뒤 해당 8개와 전체 398개가 통과했다. 원래 timeout·assertion은 유지했다.
+
+## P0 구현 검증
+
+| 범위 | 실제 명령/결과 | 증거 |
+|---|---|---|
+| 전체 Python | `.venv/Scripts/python.exe -m pytest -q --junitxml=.cache/refactor-validation/p0-python.xml` → **560 passed, 7 skipped, 3 warnings**, exit 0, 141.19초 | p0-python.log/xml |
+| 전체 frontend | `npm --prefix webui test -- --maxWorkers=2` → **398 passed / 39 files**, exit 0, 54.00초 | frontend-p0.log |
+| 오류 경계 | diagnostics + execution architecture **35 passed / 2 skips**, pipeline helpers + run safety **122 passed** | P0-4 집중 검증 |
+| 결과 비교 | `python -m unittest discover -s tests -p test_compare_mms_results.py -v` → **20 passed** | 합성 fixture, 실제 MMS 아님 |
+| build/API/install | provenance **19 passed**, runtime API **4 passed**, Windows launcher **2 passed / POSIX 3 skips** | 전체 suite에도 포함 |
+| release 보호 | `python -m pytest -q tests/test_release_package.py` → **7 passed** | config override 유출 방지·disk-full 부분 ZIP 제거·source race 포함 |
+| 실패 전파 | `python scripts/check_ci_failure_propagation.py` → pytest=1, tsc=2, Vitest=1, Vite=1 확인, probe exit 0 | ci-failure-probes.log; 정상 suite와 독립 |
+| 최종 build | `npm --prefix webui run build` → tsc + Vite + staged 검증 exit 0 | p0-build.log |
+| source/assets | `python scripts/build_web.py verify` → verified/exit 0 | p0-build-verify.log, post-commit-verify.log |
+| release archive | `python scripts/package_release.py --output .cache/release/roadinventory-mms-p0-371776b.zip` → verified/exit 0 | p0-package.log, Gitless 추출본 재검증 포함 |
+| 실제 HTTP | 테스트 전용 storage/state, `--no-run-worker --build-mode production`, `/api/build`, bootstrap, index, 4개 참조 asset 확인 → PASS | http-smoke.log; 서버 child 종료 완료 |
+| Git bytes | `git archive HEAD`를 별도 임시 디렉터리에 추출 → source/assets verified | 406862c의 실제 Git 저장 bytes 검증 |
+| CI portability fix | `python -m pytest -q tests/test_bootstrap_environment.py` → **18 passed** | 설치 wheel과 독립적인 CUDA fallback fixture |
+| Windows TEMP 경로 | core/diagnostics/helpers/pointcloud/setup/build-API/run-safety 7개 파일 suite → **189 passed / 4 skipped**, 33.56초 | 기준 root 정규화 후 기존 오류 주입·보호 assertion 유지 |
+
+새 skip 3개는 Windows에서 실행할 수 없는 POSIX 설치 launcher이며, 기존 symlink 4개와 합해 로컬 7개다. Linux CI에서는 POSIX launcher와 symlink 검사를 실행하고 Windows launcher 2개가 skip된다. 전체 suite의 추가 경고 2개는 metadata 없는 합성 app fixture의 의도된 development 경고다.
+
+최종 runtime source build는 clean `371776b8da3f49783f0aeffd9c846c233a88d44d`에서 생성했다. 이후 `b1eaa64`/`392c343`은 테스트 fixture만 변경했고 `406862c`는 생성 artifact만 저장하여 runtime source fingerprint는 동일하다.
+
+- build ID: `3ea5b699776c451b8f3a4187110535af`, `working_tree_dirty=false`.
+- source fingerprint: `22d09af6e7d10680dfe39e6124b1eab750159c66af59d02a9ca9e5c6cc321b64`.
+- build UTC: `2026-09-08T00:18:25.657465+00:00`.
+- 로컬 ZIP: 1,581,886 bytes, SHA-256 `c39c887ab1e5496a5648be08a07b2b383f43469b7955f1a37e9e64e2ced4427f`.
+- Gitless ZIP에는 source 입력 139개, asset 18개 및 필요한 launcher/문서가 포함되며 원본 data/models/DB/.git/node_modules는 0개다.
+- 생성 artifact는 기존 CRLF bytes/라이브러리 shader 문자열을 유지한다. `.gitattributes`로 변환을 막고 checksum을 검증한다. source diff whitespace 검사는 generated dist를 제외하고 통과했다.
+
+## 원격 CI
+
+[초기 실행 34172853900](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34172853900)에서 Windows/Linux frontend+package 두 job이 성공했다. Ubuntu Python은 **564 passed / 1 failed / 2 skipped**였다. 실패는 CUDA wheel의 GPU 부재 경로를 검사하는 기존 fixture가 실제 설치된 CPU wheel metadata를 사용했기 때문이다. `b1eaa64`에서 CUDA wheel metadata를 fixture에 명시했고 출력 assertion은 그대로 유지했다. 실제 환경 smoke는 모의 값 없이 CPU wheel로 계속 검증한다.
+
+수정 후 [406862c push 검증](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173058375)과 [PR 검증](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173060719)에서 Linux/프런트 통과 및 Windows TEMP 경로 문제를 확인했다. 이전 실행의 중단은 새 commit의 concurrency 정책에 따른 것이다.
+
+- Ubuntu CPU: **565 passed / 2 skipped**, 52.46초. skip 2개는 Windows PowerShell launcher이고 POSIX/symlink 계약은 실행됐다. 실제 CPU 환경 smoke와 failure probe도 성공했다.
+- Ubuntu frontend: **398 passed / 39 files**, 28.22초. production build·실패 전파·Gitless package 성공.
+- Windows frontend: **398 passed / 39 files**, 41.95초. production build·실패 전파·Gitless package 성공.
+- Windows CPU 첫 재검증: **553 passed / 11 failed / 3 skipped**. hosted runner의 TEMP 짧은 경로(`RUNNER~1`)와 `Path.resolve()`의 정규 경로가 달라 테스트 fixture의 경로 equality 및 오류 주입 대상이 어긋났다. 실패한 fixture의 기준 root를 정규화하는 test-only 수정으로 assertion·rollback/권한 오류 주입·symlink 방어를 그대로 유지하며 재검증한다. runtime 계산/저장 코드를 변경하는 우회는 하지 않는다.
+- 원격 두 ZIP의 source fingerprint와 source 파일 139개는 로컬과 정확히 같다. Ubuntu asset 22개/Windows 18개 차이는 LF/CRLF 입력에서 생성한 새 chunk와 이전 asset 유지 정책의 결과이며 source 차이가 아니다. 각 ZIP은 자신의 실제 artifact bytes로 검증됐다.
+
+최종 코드 `392c3438898d102e5b5d66b98458d0ca79ab119b`의 [Validation 34173471638](https://github.com/dbparkJ/RoadInventory-MMS/actions/runs/34173471638)은 **4개 job 모두 success**로 완료됐다.
+
+| 최종 hosted job | 결과 | 시간/skip |
+|---|---|---|
+| Python CPU (ubuntu-latest) | **565 passed / 2 skipped** | 49.01초; Windows PowerShell launcher 2개 |
+| Python CPU (windows-latest) | **564 passed / 3 skipped** | 110.84초; POSIX launcher 3개, symlink 보호 검사 실행됨 |
+| Frontend and package (ubuntu-latest) | **398 passed / 39 files**, tsc/build/probes/package 통과 | frontend 26.57초 |
+| Frontend and package (windows-latest) | **398 passed / 39 files**, tsc/build/probes/package 통과 | frontend 27.26초 |
+
+CPU 환경 smoke는 두 OS에서 실제 CPU wheel로 실행했고, 실패 전파 probe도 각각 성공했다. 이 코드 이후 체크포인트/기록 변경은 문서만이며 source fingerprint는 동일하다. 현재 PR의 최신 check 상태는 [PR #4](https://github.com/dbparkJ/RoadInventory-MMS/pull/4)에서 확인한다. required checks 설정은 변경하지 않았다.
 
 ## 검증 수준
 
 - STATIC_REVIEWED: A0 호출/저장/설정 경계.
-- UNIT_CONTRACT_PASSED: baseline Python에 한정, 프런트 실패는 별도 표시.
-- INTEGRATION_PASSED: CUDA environment smoke에 한정.
-- REAL_MMS_PASSED: **아님**. 대표 fixture/golden/tolerance profile 미확정.
-- BROWSER_PASSED: 아직 미실행.
+- UNIT_CONTRACT_PASSED: P0 Python/frontend/합성 비교/배포 계약.
+- INTEGRATION_PASSED: CUDA environment smoke, 설치 wrapper, 실제 localhost API/static 및 Gitless package에 한정.
+- REAL_MMS_PASSED: **아님**. 사용자가 대표 fixture/golden/tolerance profile이 없다고 확인했으며 실제 검증 미완료 기록을 지시했다.
+- BROWSER_PASSED: **아님**. Browser runtime 설정 후 `No browser is available`, 지원되는 discovery 결과 `[]` 확인. 실제 UI 렌더/분리 창/작업 흐름 검증은 차단. HTTP 응답 성공을 브라우저 성공으로 표시하지 않는다.
 - OPERATION_APPROVED: **아님**. 사전 GitHub 브랜치 통합 승인과 운영 적용 승인을 혼동하지 않는다.
