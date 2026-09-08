@@ -313,6 +313,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             or request.url.path.endswith("/vworld-2d-map.html")
         ):
             response.headers["Cache-Control"] = "no-cache"
+        if self.authenticated and "cache-control" in response.headers:
+            # Media/FileResponse and 304 routes also set their own cache policy.
+            # Keep browser reuse, but never opt authenticated content into shared caches.
+            response.headers["Cache-Control"] = ", ".join(
+                "private" if directive.strip().lower() == "public" else directive.strip()
+                for directive in response.headers["Cache-Control"].split(",")
+            )
         return response
 
 

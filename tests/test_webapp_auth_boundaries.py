@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from mms_shp_detection.webapp import WebAppConfig, create_app
@@ -116,3 +117,26 @@ def test_remote_acknowledgement_does_not_enable_authentication(monkeypatch):
     help_text = " ".join(parser.format_help().split())
     assert "does not configure authentication or TLS" in help_text
     assert "no built-in login" not in help_text
+
+
+def test_authenticated_media_and_not_modified_responses_are_private(secured_app):
+    from mms_shp_detection.webapp.media import _etag_response
+
+    @secured_app.get("/test-media")
+    async def media(request: Request):
+        return _etag_response(
+            request, secured_app.state.config.static_dir / "assets/test.js",
+            etag_value="fixture", media_type="text/plain", cache_seconds=60,
+        )
+
+    # The real application's catch-all static mount is last; keep this fixture
+    # route before it just as the actual media router is registered.
+    secured_app.router.routes.insert(0, secured_app.router.routes.pop())
+    with TestClient(secured_app) as client:
+        client.auth = ("operator", "fixture-only")
+        full = client.get("/test-media")
+        assert full.status_code == 200 and full.text == "// test asset"
+        assert full.headers["cache-control"] == "private, max-age=60, immutable"
+        cached = client.get("/test-media", headers={"If-None-Match": full.headers["etag"]})
+        assert cached.status_code == 304
+        assert cached.headers["cache-control"] == "private, max-age=60, immutable"

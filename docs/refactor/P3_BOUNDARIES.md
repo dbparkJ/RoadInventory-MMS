@@ -29,6 +29,7 @@
   `Cache-Control: no-store`를 지정한다.
 - Basic 인증을 설정한 정적 assets는 브라우저의 immutable cache를 유지하되 shared cache에
   공개 저장되지 않도록 `private`로 지정한다. 인증 없는 assets의 기존 public cache는 유지한다.
+  기존 media FileResponse/304의 명시 public cache도 인증이 켜져 있으면 private로 바꾼다.
 - POST/PUT/PATCH/DELETE 등 쓰기 요청의 Origin이 현재 요청의 scheme/host/port와 다르거나
   불투명(null)·복수·잘못된 값이면 endpoint 실행 전에 403을 반환한다.
   `Sec-Fetch-Site: cross-site`도 거부한다. 같은 origin 및 Origin 없는 CLI 요청은 지원한다.
