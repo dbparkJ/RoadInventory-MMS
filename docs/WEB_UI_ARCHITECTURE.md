@@ -218,8 +218,10 @@ XY/Z 오차, REVIEW 비율을 목적함수로 사용하는 trial runner가 필�
 
 ## 서버 배포 체크리스트
 
-- 앱에는 자체 로그인이 없으므로 API는 loopback에 바인딩하고 TLS·사용자 인증을
-  적용한 reverse proxy만 외부에 노출
+- 앱은 선택형 HTTP Basic 인증을 지원한다. 기본 바인딩은 loopback이며 외부 공개 시
+  TLS·접근 통제를 갖춘 reverse proxy를 사용한다. `--allow-remote-bind` 자체는
+  인증이나 TLS를 설정하지 않는다. 실제 적용 범위와 단일 작업자 식별의 한계는
+  [운영 경계 검증](refactor/P3_BOUNDARIES.md)을 참고한다.
 - 비-loopback 바인딩은 방화벽으로 앱 포트의 직접 접근을 차단한 환경에서만
   `--allow-remote-bind`로 명시적으로 허용
 - 하나의 `state_dir`에는 ASGI worker를 정확히 1개만 실행. 두 번째 worker는 GPU

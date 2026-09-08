@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -285,6 +286,10 @@ def _setup_logger(state_dir: Path) -> logging.Logger:
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: Any, *, authenticated: bool = False) -> None:
+        super().__init__(app)
+        self.authenticated = authenticated
+
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -293,9 +298,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault(
             "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
         )
-        if request.url.path.startswith("/assets/"):
+        if response.status_code in {401, 403}:
+            response.headers["Cache-Control"] = "no-store"
+        elif request.url.path.startswith("/assets/"):
             response.headers.setdefault(
-                "Cache-Control", "public, max-age=31536000, immutable"
+                "Cache-Control",
+                ("private" if self.authenticated else "public")
+                + ", max-age=31536000, immutable",
             )
         elif (
             request.url.path == "/"
@@ -305,6 +314,52 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         ):
             response.headers["Cache-Control"] = "no-cache"
         return response
+
+
+def _http_origin(value: str) -> tuple[str, str, int] | None:
+    """Parse a single serialized HTTP origin, without accepting userinfo or paths."""
+    if any(char.isspace() for char in value) or "\\" in value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment
+        ):
+            return None
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        return parsed.scheme, parsed.hostname.lower(), port
+    except ValueError:
+        return None
+
+
+class BrowserWriteOriginMiddleware(BaseHTTPMiddleware):
+    """Reject explicit cross-origin browser writes; preserve non-browser API clients.
+
+    This is not authentication or a Host allowlist. The deployment must constrain
+    accepted hosts and trusted proxy headers; absent browser headers remain allowed.
+    """
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origins = request.headers.getlist("origin")
+            hosts = request.headers.getlist("host")
+            expected = _http_origin(
+                f"{request.scope['scheme']}://{hosts[0]}"
+            ) if len(hosts) == 1 else None
+            rejected = request.headers.get("sec-fetch-site", "").lower() == "cross-site"
+            if origins:
+                actual = _http_origin(origins[0]) if len(origins) == 1 else None
+                rejected = rejected or actual is None or actual != expected
+            if rejected:
+                return Response(
+                    "Cross-origin browser writes are not allowed.", status_code=403,
+                    media_type="text/plain", headers={"Cache-Control": "no-store"},
+                )
+        return await call_next(request)
 
 
 class BasicAuthMiddleware(BaseHTTPMiddleware):
@@ -660,14 +715,18 @@ def create_app(
         app.state.point_preview_available = False
     app.state.run_manager = RunManager(app)
 
-    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.add_middleware(BrowserWriteOriginMiddleware)
     if config.auth_username is not None and config.auth_password is not None:
         app.add_middleware(
             BasicAuthMiddleware,
             username=config.auth_username,
             password=config.auth_password,
         )
+    # Outermost application middleware also covers auth/origin early responses.
+    app.add_middleware(
+        SecurityHeadersMiddleware, authenticated=config.auth_username is not None,
+    )
     app.include_router(datasets_router)
     app.include_router(detections_router)
     app.include_router(media_router)

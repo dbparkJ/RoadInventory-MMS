@@ -26,6 +26,7 @@ SUPPORT_FILES = (
     "scripts/setup.ps1", "scripts/setup.sh", "scripts/bootstrap_environment.py",
     "scripts/verify_environment.py", "scripts/package_release.py",
     "webui/API_CONTRACT.md", "docs/refactor/BUILD_PROVENANCE.md", "docs/refactor/CI.md",
+    "docs/refactor/P3_BOUNDARIES.md",
 )
 
 
